@@ -166,6 +166,42 @@ describe('SA-124 local AI model management', () => {
     expect(state.canDownload).toBe(false)
   })
 
+  it('combines repeated LM Link keys without merging different models with the same display name', async () => {
+    servers('lmstudio')
+    const nomic = { key: 'text-embedding-nomic-embed-text-v1.5', display_name: 'Nomic Embed', format: 'gguf', loaded_instances: [] }
+    routes['/api/v1/models'] = { body: { models: [nomic, { ...nomic, key: 'another-nomic-quant' }, nomic] } }
+
+    const state = await readLocalAiManagement('josh', 'lmstudio')
+    expect(state.models.map(({ id, loaded }) => [id, loaded])).toEqual([
+      ['text-embedding-nomic-embed-text-v1.5', false], ['another-nomic-quant', false]
+    ])
+    expect(state.models.every(({ label, format }) => label === 'Nomic Embed' && format === 'gguf')).toBe(true)
+    expect(calls.every(({ method }) => method === 'GET')).toBe(true)
+  })
+
+  it.each([false, true])('preserves every LM Studio instance across repeated keys (empty first: %s)', async (emptyFirst) => {
+    servers('lmstudio')
+    const empty = { key: 'qwen/model', display_name: 'Qwen', loaded_instances: [] }
+    const instanceA = { id: 'local-instance-a', config: { context_length: 4096 } }
+    const instanceB = { id: 'linked-instance-b', config: { context_length: 8192 } }
+    const populated = [
+      { ...empty, loaded_instances: [instanceA] },
+      { ...empty, loaded_instances: [instanceA, instanceB] }
+    ]
+    routes['/api/v1/models'] = { body: { models: emptyFirst ? [empty, ...populated] : [...populated, empty] } }
+    routes['/api/v1/models/unload'] = { body: { instance_id: instanceB.id } }
+
+    const state = await readLocalAiManagement('josh', 'lmstudio')
+    expect(state.models.map(({ id, loaded, contextLength }) => [id, loaded, contextLength])).toEqual([
+      ['local-instance-a', true, 4096], ['linked-instance-b', true, 8192]
+    ])
+    expect(state.models.map(({ label }) => label)).toEqual(['Qwen (local-instance-a)', 'Qwen (linked-instance-b)'])
+    await unloadLocalAiModel('josh', 'lmstudio', instanceB.id, state.connectionKey)
+    expect(calls.filter(({ method }) => method === 'POST').map(({ url, body }) => ({ url, body }))).toEqual([
+      { url: '/api/v1/models/unload', body: { instance_id: 'linked-instance-b' } }
+    ])
+  })
+
   it('treats an oMLX 401 as "needs a key", never as offline', async () => {
     servers('omlx')
     routes['/admin/api/models'] = { status: 401, body: { detail: 'unauthorized' } }
@@ -227,7 +263,10 @@ describe('SA-124 local AI model management', () => {
 
   it('loads LM Studio by `model` and reports the time it took', async () => {
     servers('lmstudio')
-    routes['/api/v1/models'] = { body: { models: [{ key: 'qwen/qwen3-27b', loaded_instances: [] }] } }
+    routes['/api/v1/models'] = { body: { models: [
+      { key: 'qwen/qwen3-27b', loaded_instances: [] },
+      { key: 'qwen/qwen3-27b', loaded_instances: [] }
+    ] } }
     routes['/api/v1/models/load'] = {
       body: { instance_id: 'a', load_time_seconds: 24.107, status: 'loaded' }
     }

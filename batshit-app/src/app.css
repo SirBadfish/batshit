@@ -62,6 +62,10 @@
 /* Component overrides */
 @import "$lib/styles/components/shadcn-overrides.css";
 
+/* The looks (Cave, Minimal; OG is everything above with nothing on top). Unlayered, so they
+   sit over the layered rules below without a specificity fight. */
+@import "$lib/styles/themes/looks.css";
+
 @layer base {
   :root {
     color-scheme: dark;
@@ -335,6 +339,125 @@
   pointer-events: auto;
 }
 
+/*
+ * Mac app window without a title bar (batshit-mac/src-electron/main-window-policy.mjs). The red,
+ * yellow and green window buttons sit at the left of Batshit's own top bar, centred in its
+ * --app-header-height. The Mac preload marks <html> with data-batshit-mac-titlebar="hidden", so
+ * nothing here reaches a browser or the Docker app. env(titlebar-area-x) is where the window
+ * buttons end; it is unset in full screen, where they hide, and the layout falls back to its
+ * ordinary spacing there.
+ *
+ * Dragging: .app-window-drag-strip, the first element of the layout, is the window's drag handle.
+ * Electron builds the drag area from app-region in document order, so anything clickable that can
+ * sit over the strip, and every overlay that can cover it, opts out with no-drag; a drag area
+ * swallows clicks. Keep that list current when a control or overlay moves into the top bar.
+ */
+:root[data-batshit-mac-titlebar='hidden'] .app-window-drag-strip {
+  display: block;
+  position: fixed;
+  inset: 0 0 auto;
+  height: var(--app-header-height);
+  pointer-events: none;
+  -webkit-app-region: drag;
+}
+
+:root[data-batshit-mac-titlebar='hidden'] :is(
+  .main-sidebar-header :is(button, a),
+  .main-sidebar-tab-trigger,
+  [data-slot='sidebar-rail'],
+  .chat-header-actions-slot > *,
+  .chat-header-actions-slot :is(button, a),
+  .artifact-icon-column,
+  .artifact-header-overlay,
+  .artifact-header-overlay-backdrop,
+  .first-run-setup,
+  [data-slot='sidebar'][data-mobile='true'],
+  [data-slot='sheet-overlay'],
+  [data-slot='dialog-overlay'],
+  [data-slot='alert-dialog-overlay'],
+  [data-slot='sheet-content'],
+  [data-slot='dialog-content'],
+  [data-slot='alert-dialog-content'],
+  [data-slot='dropdown-menu-content'],
+  [data-slot='dropdown-menu-sub-content'],
+  [data-slot='context-menu-content'],
+  [data-slot='select-content'],
+  [data-bits-floating-content-wrapper],
+  [data-sonner-toast],
+  [data-sonner-toast] button
+) {
+  -webkit-app-region: no-drag;
+}
+
+/* Open sidebar: the logo row shares the top bar with the window buttons, after them. */
+:root[data-batshit-mac-titlebar='hidden'] .main-sidebar-header {
+  padding-top: calc((var(--app-header-height) - 40px) / 2);
+}
+
+:root[data-batshit-mac-titlebar='hidden'] .main-sidebar-header-row {
+  padding-left: max(0.25rem, calc(env(titlebar-area-x, 0px) - 0.25rem));
+}
+
+/* Closed sidebar: the top bar runs over the rail and holds the buttons, the logo and the
+   open-sidebar tab, in that order; the rail starts under the bar. */
+:root[data-batshit-mac-titlebar='hidden'] .app-shell-root:has(> [data-slot='sidebar'][data-state='collapsed']) .batshit-sidebar {
+  margin-top: var(--app-header-height);
+  height: calc(100% - var(--app-header-height));
+}
+
+:root[data-batshit-mac-titlebar='hidden'] .app-shell-root:has(> [data-slot='sidebar'][data-state='collapsed']) .main-sidebar-header-row {
+  display: none;
+}
+
+:root[data-batshit-mac-titlebar='hidden'] .app-shell-root:has(> [data-slot='sidebar'][data-state='collapsed']) .app-header-bar {
+  margin-left: calc(-1 * var(--sidebar-width-icon));
+  padding-left: env(titlebar-area-x, 0.75rem);
+}
+
+:root[data-batshit-mac-titlebar='hidden'] .app-shell-root:has(> [data-slot='sidebar'][data-state='collapsed']) .app-header-logo {
+  display: block;
+}
+
+:root[data-batshit-mac-titlebar='hidden'] .app-shell-root:has(> [data-slot='sidebar'][data-state='collapsed']) .main-sidebar-tab-trigger {
+  top: calc((var(--app-header-height) - 32px) / 2 - var(--app-header-height));
+  right: auto;
+  left: calc(env(titlebar-area-x, 0.75rem) + 41px + 0.75rem);
+  border-width: 1px;
+  border-radius: 6px;
+}
+
+/* Settings covers the whole window: its title row moves past the window buttons and becomes the
+   drag handle while Settings is open. The icon rail (medium widths) keeps its empty top as the
+   handle. The narrow layout's centred title clears the buttons and has no handle. */
+:root[data-batshit-mac-titlebar='hidden'] .batshit-settings-nav {
+  padding-top: 0;
+}
+
+:root[data-batshit-mac-titlebar='hidden'] .batshit-settings-nav .batshit-settings-nav-title {
+  display: flex;
+  align-items: center;
+  height: var(--app-header-height);
+  margin: 0 0 0.5rem;
+  padding-left: max(0.5rem, calc(env(titlebar-area-x, 0px) - 1rem));
+  -webkit-app-region: drag;
+}
+
+:root[data-batshit-mac-titlebar='hidden'] .batshit-settings-icon-rail {
+  position: relative;
+}
+
+:root[data-batshit-mac-titlebar='hidden'] .batshit-settings-icon-rail::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 3rem;
+  -webkit-app-region: drag;
+}
+
+:root[data-batshit-mac-titlebar='hidden'] .artifact-header-overlay-bar {
+  padding-left: max(1rem, env(titlebar-area-x, 0px));
+}
+
 @layer base {
   * {
     border-color: var(--border);
@@ -464,6 +587,18 @@
   .app-header-spacer {
     flex: 1 1 auto;
     min-width: 0;
+  }
+
+  /* Only the Mac app window shows these (the unlayered "Mac app window without a title bar" block). */
+  .app-window-drag-strip,
+  .app-header-logo {
+    display: none;
+  }
+
+  .app-header-logo {
+    width: auto;
+    height: 20px;
+    flex-shrink: 0;
   }
 
   .app-content {
@@ -3991,6 +4126,18 @@
     padding-left: 1.65rem;
   }
 
+  .batshit-settings-tool-grid-label.is-source {
+    padding-left: 1.65rem;
+  }
+
+  .batshit-settings-tool-grid-mcp-sources .batshit-settings-tool-grid-label.is-group {
+    padding-left: 3.3rem;
+  }
+
+  .batshit-settings-tool-grid-mcp-sources .batshit-settings-table-cell.is-nested {
+    padding-left: 4.9rem;
+  }
+
   .batshit-settings-tool-grid-name {
     min-width: 0;
     color: var(--bs-settings-label);
@@ -4930,7 +5077,6 @@
     line-height: 1.25;
   }
 
-  .batshit-agent-type-badge,
   .batshit-settings-agent-type-pill {
     --bs-agent-type-badge-height: 1.25rem;
     --bs-agent-type-badge-line-height: calc(var(--bs-agent-type-badge-height) - 2px);
@@ -4952,31 +5098,15 @@
       inset 0 1px 0 oklch(0.94 0.006 289.95 / 0.05);
   }
 
-  .batshit-agent-type-badge.is-agent-type-api,
-  .batshit-settings-agent-type-pill.is-agent-type-api,
+  /* SA-139 R6 (D16): the menu's only pill is a role label (Primary Agent or Subagent); the API, CLI
+     and n8n type tones went with the types. */
   .batshit-settings-agent-type-pill.is-managed {
     border-color: color-mix(in oklab, var(--batshit-primary) 58%, transparent);
     background: color-mix(in oklab, var(--batshit-primary) 20%, var(--bs-app-field));
     color: color-mix(in oklab, var(--batshit-primary) 82%, var(--bs-app-title));
   }
 
-  .batshit-agent-type-badge.is-agent-type-cli,
-  .batshit-settings-agent-type-pill.is-agent-type-cli {
-    border-color: oklch(0.72 0.006 289 / 0.34);
-    background: oklch(0.13 0.006 289 / 0.72);
-    color: oklch(0.78 0.006 289);
-  }
-
-  .batshit-agent-type-badge.is-agent-type-n8n,
-  .batshit-settings-agent-type-pill.is-agent-type-n8n,
-  .batshit-settings-agent-type-pill.is-n8n {
-    border-color: var(--n8n-border);
-    background: var(--n8n-secondary);
-    color: var(--n8n-brand);
-  }
-
-  .batshit-settings-agent-type-pill,
-  .batshit-settings-identity-meta-item .batshit-agent-type-badge {
+  .batshit-settings-agent-type-pill {
     padding-block: 0;
   }
 
@@ -6647,29 +6777,6 @@
     font-size: 0.76rem;
   }
 
-  .batshit-settings-model-support-legend-trigger {
-    display: inline-flex;
-    min-height: 1rem;
-    align-items: center;
-    gap: 0.18rem;
-    border: 1px solid transparent;
-    border-radius: 999px;
-    background: transparent;
-    padding: 0.12rem 0.26rem;
-    color: var(--bs-settings-muted-text);
-    transition:
-      background-color 150ms ease-out,
-      border-color 150ms ease-out,
-      color 150ms ease-out;
-  }
-
-  .batshit-settings-model-support-legend-trigger:hover,
-  .batshit-settings-model-support-legend-trigger[data-state='open'] {
-    border-color: var(--bs-settings-line);
-    background: oklch(0.12 0.01 250 / 0.42);
-    color: var(--bs-settings-title);
-  }
-
   .batshit-settings-parameter-trigger-row {
     min-height: 2.56rem;
     align-items: center;
@@ -6689,8 +6796,7 @@
   }
 
   .batshit-settings-parameter-trigger-main:focus-visible,
-  .batshit-settings-parameter-chevron-button:focus-visible,
-  .batshit-settings-model-support-legend-trigger:focus-visible {
+  .batshit-settings-parameter-chevron-button:focus-visible {
     outline: none;
     box-shadow: 0 0 0 3px var(--bs-settings-primary-faint);
   }
@@ -6728,21 +6834,6 @@
   .batshit-settings-parameter-chevron-button:hover {
     background: oklch(0.12 0.01 250 / 0.42);
     color: var(--bs-settings-title);
-  }
-
-  .batshit-settings-parameter-support-icons {
-    display: inline-flex;
-    flex: 0 0 auto;
-    align-items: center;
-    gap: 0.12rem;
-    line-height: 0;
-    opacity: 0.86;
-  }
-
-  .batshit-settings-parameter-support-icons :where(svg),
-  .batshit-settings-model-support-legend-trigger :where(svg) {
-    display: block;
-    flex: 0 0 auto;
   }
 
   .batshit-settings-disclosure-row.is-form-line .batshit-settings-disclosure-trigger {

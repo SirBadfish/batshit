@@ -59,13 +59,14 @@ describe('/api/cli-tools/execute', () => {
       input: { path: 'README.md' },
       selectedToolIds: ['tool-1'],
       allowRisky: true,
+      sessionId: undefined,
+      messageId: undefined,
       // PR #106 review F-5: the route hands the lane down so the card lands where it can be answered.
       actorType: 'service',
       projectPath: '/Users/example/batshit'
-    }, {
-      // The service lane has no bound chat, so no Stop (`stop-signal.test.ts` pins the agent lane).
-      abortSignal: undefined
     })
+    // A service caller cannot take Stop authority from a body-named chat.
+    expect(mocks.executeCliTool.mock.calls[0]).toHaveLength(1)
   })
 
   it('ignores body projectPath for session-authenticated CLI tool execution', async () => {
@@ -91,9 +92,9 @@ describe('/api/cli-tools/execute', () => {
     expect(response.status).toBe(200)
     expect(mocks.executeCliTool).toHaveBeenCalledWith(
       expect.objectContaining({
-        projectPath: null
-      }),
-      { abortSignal: undefined }
+        actorType: 'session', projectPath: null
+      })
     )
+    expect(mocks.executeCliTool.mock.calls[0]).toHaveLength(1)
   })
 })

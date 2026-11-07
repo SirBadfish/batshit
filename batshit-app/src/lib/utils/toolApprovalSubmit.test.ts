@@ -69,6 +69,14 @@ describe('markApprovalDecisionsSent (the server accepted the answer)', () => {
   })
 })
 
+describe('markApprovalDecisionsSent: an entry the server marked expired meanwhile (SA-139 P3 Part 3)', () => {
+  it('stays expired with its reason: a Claude plan card whose run had ended shows "the reply ended", not the Approve sent', () => {
+    const card = [entry('a', 'expired', { expiryReason: 'run_ended', expiredAt: 't' }), entry('b', 'pending')]
+    const next = markApprovalDecisionsSent(card, [entry('a', 'approved')])
+    expect(next).toEqual([entry('a', 'expired', { expiryReason: 'run_ended', expiredAt: 't', submitted: true }), entry('b', 'pending')])
+  })
+})
+
 describe('returnRefusedApprovalDecisions (the server refused, or the answer never arrived)', () => {
   it('puts every Approve and Deny it carried back to pending, so the buttons come back', () => {
     const sent = [entry('a', 'approved'), entry('c', 'denied')]

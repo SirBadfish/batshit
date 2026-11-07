@@ -3,7 +3,7 @@ import fs from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { fileURLToPath } from 'node:url'
+import { APP_ACTIONS_SKILL_ID, APP_ACTIONS_COMMAND_ID, isCanonicalAppActionsCommand, isCanonicalAppActionsSkill, BUILTIN_PLUGIN_SKILLS, getBuiltinSystemSkillsRoot, resolveBuiltinSystemSkillDirectory } from './systemPluginPackage'
 
 import { redis } from '$lib/server/redis'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
@@ -19,6 +19,8 @@ import type {
   SlashCommandRow
 } from '$lib/types/database'
 import { sanitizeId } from '$lib/utils/idSanitizer'
+import { acquireSettingsMutation, assertSettingsLifecycle, captureSettingsLifecycle, type SettingsLifecycleSnapshot } from './appActions/settings/lifecycle'
+import { beginSlashCommandWrite, captureSlashCommandWriteBasis, type SlashCommandWritePreparation, COMMAND_ACCESS_FIELDS, saveSlashCommandRecord } from './slashCommandRevision'
 import {
   normalizeAllowedTools,
   splitFrontmatter
@@ -52,7 +54,8 @@ const BINARY_EXTENSIONS = new Set([
   '.ttf',
   '.otf'
 ])
-let startupFilesystemPassPromise: Promise<void> | null = null
+export type SkillFilesystemStartupResult = { complete: boolean; failed: number }
+let startupFilesystemPassPromise: Promise<SkillFilesystemStartupResult> | null = null
 
 const INTEGRATION_LABELS: Record<string, string> = {
   n8n_mcp: 'n8n MCP',
@@ -108,6 +111,8 @@ export interface UpsertSkillInput {
   userId: string
   commandId: string
   nowIso?: string
+  /** Internal canonical-package seed only; never copied from a model's skill payload. */
+  builtinAppActionsSeed?: boolean
   skill: {
     id?: string
     name?: string
@@ -173,11 +178,6 @@ function buildSkillMetadataPath(skillId: string) {
   return path.join(buildSkillDirectory(skillId), 'metadata.json')
 }
 
-function getSystemSkillsRoot() {
-  const currentFile = fileURLToPath(import.meta.url)
-  return path.join(path.dirname(currentFile), '..', 'system-skills')
-}
-
 function isRepoBackedSystemSkill(skill: Pick<SkillRow, 'is_system' | 'source'>) {
   return skill.is_system === true || skill.source === 'system'
 }
@@ -185,25 +185,19 @@ function isRepoBackedSystemSkill(skill: Pick<SkillRow, 'is_system' | 'source'>) 
 function resolveSystemSkillSourceDir(skill: Pick<SkillRow, 'id' | 'name' | 'source_ref' | 'is_system' | 'source'>): string | null {
   if (!isRepoBackedSystemSkill(skill)) return null
 
+  // The shipped identity owns built-in source binding, including older records
+  // whose source_ref still points at a previous checkout or package version.
+  for (const identity of [skill.id, skill.name]) {
+    const builtin = resolveBuiltinSystemSkillDirectory(identity)
+    if (builtin && (!['app-actions', APP_ACTIONS_SKILL_ID].includes(identity) || isCanonicalAppActionsSkill(skill))) return builtin
+  }
+
   const sourceRef = normalizeString(skill.source_ref)
   if (sourceRef) {
     const resolved = path.resolve(sourceRef)
     const asDir = path.extname(resolved).toLowerCase() === '.md' ? path.dirname(resolved) : resolved
     if (existsSync(path.join(asDir, 'SKILL.md'))) {
       return asDir
-    }
-  }
-
-  const systemSkillsRoot = getSystemSkillsRoot()
-  const candidates = [
-    normalizeString(skill.name),
-    normalizeString(skill.id)
-  ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
-
-  for (const candidate of candidates) {
-    const sourceDir = path.join(systemSkillsRoot, candidate)
-    if (existsSync(path.join(sourceDir, 'SKILL.md'))) {
-      return sourceDir
     }
   }
 
@@ -757,6 +751,11 @@ function buildStoredSkillRecord(params: {
     params.snapshot.hasAssets
 
   const source = input?.source || existing?.source || 'custom'
+  const builtinSource = (source === 'system' || input?.isSystem === true || existing?.is_system === true) &&
+    (params.skillId !== APP_ACTIONS_SKILL_ID || isCanonicalAppActionsSkill({ id: params.skillId, user_id: params.userId,
+      source, is_system: input?.isSystem ?? existing?.is_system, source_ref: inputSourceRef || existing?.source_ref }, params.userId))
+    ? resolveBuiltinSystemSkillDirectory(params.skillId) || resolveBuiltinSystemSkillDirectory(inputName || existing?.name || '')
+    : null
 
   const parsedName = normalizeString(parsed.name)
   const name = inputName || parsedName || existing?.name || params.commandId
@@ -784,7 +783,7 @@ function buildStoredSkillRecord(params: {
     skill_markdown: '',
     source,
     source_ref:
-      inputSourceRef ||
+      builtinSource || inputSourceRef ||
       existing?.source_ref ||
       (source === 'system' ? params.snapshot.rootDir : undefined),
     dependencies,
@@ -842,13 +841,71 @@ async function ensureSkillFilesystemSnapshot(
   return snapshot
 }
 
+// One write, guarded by BOTH originally observed namespace owners. Settings replacement
+// fencing alone does not order ordinary command saves against awaited filesystem work.
+const APP_ACTIONS_SKILL_PUBLICATION_SCRIPT = `
+-- BATSHIT_APP_ACTIONS_SKILL_PUBLICATION_V1
+for index = 1, 2 do
+  local kind = redis.call('TYPE', KEYS[index]).ok
+  if kind ~= 'none' and kind ~= 'ReJSON-RL' then return 'CHANGED' end
+  if (redis.call('JSON.GET', KEYS[index], '$') or '') ~= ARGV[index] then return 'CHANGED' end
+end
+local ok, value = pcall(cjson.decode, ARGV[3])
+if not ok or type(value) ~= 'table' or value.id ~= 'app_actions' or type(value.user_id) ~= 'string' or
+  KEYS[1] ~= 'skill:' .. value.user_id .. ':app_actions' or KEYS[2] ~= 'slash_command:' .. value.user_id .. ':app-actions' then return 'INVALID' end
+local written = redis.pcall('JSON.SET', KEYS[1], '$', ARGV[3])
+if type(written) == 'table' and written.ok == 'OK' then return 'APPLIED' end
+return 'UNCONFIRMED'
+`
+
 async function persistMetadataOnlySkill(
   key: string,
   stored: SkillRow,
-  snapshot: SkillFilesystemSnapshot
+  snapshot: SkillFilesystemSnapshot,
+  reserved?: { raw: string | null; commandRaw: string | null; commandKey: string; lifecycle: SettingsLifecycleSnapshot }
 ): Promise<void> {
-  await redis.json.set(key, '$', stored)
+  if (stored.id === APP_ACTIONS_SKILL_ID) {
+    if (!reserved) throw new Error('The App Actions metadata publication has no original identity capture.')
+    let issued = false
+    let lease: ReturnType<typeof acquireSettingsMutation> | undefined
+    try {
+      const encoded = JSON.stringify(stored)
+      const answer = await redis.execute(client => {
+        lease = acquireSettingsMutation(reserved.lifecycle); lease.check(); issued = true
+        return client.eval(APP_ACTIONS_SKILL_PUBLICATION_SCRIPT, { keys: [key, reserved.commandKey],
+          arguments: [reserved.raw ?? '', reserved.commandRaw ?? '', encoded] })
+      })
+      if (!['APPLIED', 'CHANGED', 'INVALID'].includes(answer as string)) throw new Error('The namespace publication returned an unconfirmed outcome.')
+      lease?.settle(); issued = false
+      if (answer !== 'APPLIED') throw new Error('The saved App Actions skill or command identity changed. Metadata was not published; skill files were kept.')
+    } catch (error) {
+      if (issued) { lease?.unknown(); throw new Error('The App Actions skill metadata write is unconfirmed. Existing files were kept; reload before another write.') }
+      lease?.settle(); throw error
+    }
+  } else await redis.json.set(key, '$', stored)
   await writeSkillFilesystemMetadata(stored, snapshot)
+}
+
+async function reservedAppActionsState(key: string, userId: string) {
+  const commandKey = `slash_command:${userId}:${APP_ACTIONS_COMMAND_ID}`
+  const lifecycle = captureSettingsLifecycle([key, commandKey])
+  const raw = await redis.json.getRaw(key, '$')
+  const commandRaw = await redis.json.getRaw(commandKey, '$')
+  let command: Record<string, unknown> | null = null
+  if (commandRaw !== null) {
+    const values: unknown = JSON.parse(commandRaw)
+    if (!Array.isArray(values) || values.length !== 1 || !values[0] || typeof values[0] !== 'object' || Array.isArray(values[0])) throw new Error('The App Actions command identity is unreadable; nothing was published.')
+    command = values[0] as Record<string, unknown>
+  }
+  let existing: SkillRow | null = null
+  if (raw !== null) {
+    const values: unknown = JSON.parse(raw)
+    if (!Array.isArray(values) || values.length !== 1 || !values[0] || typeof values[0] !== 'object' || Array.isArray(values[0]) ||
+        values[0].id !== APP_ACTIONS_SKILL_ID || values[0].user_id !== userId) throw new Error('The saved App Actions skill identity is unreadable; nothing was published.')
+    existing = values[0] as SkillRow
+  }
+  assertSettingsLifecycle(lifecycle)
+  return { existing, raw, lifecycle, command, commandRaw, commandKey }
 }
 
 async function refreshSkillRecordFromFilesystem(
@@ -856,6 +913,14 @@ async function refreshSkillRecordFromFilesystem(
   existing: SkillRow,
   options?: { allowLegacyMaterialize?: boolean; forcePersist?: boolean; nowIso?: string }
 ): Promise<SkillRow | null> {
+  const reserved = existing.id === APP_ACTIONS_SKILL_ID ? await reservedAppActionsState(key, existing.user_id) : undefined
+  if (reserved) {
+    if (!reserved.existing) return null
+    existing = reserved.existing
+    if (reserved.command && isCanonicalAppActionsCommand(reserved.command, existing.user_id) !== isCanonicalAppActionsSkill(existing, existing.user_id)) {
+      throw new Error('The saved App Actions command and skill have different owners. Their files and metadata were preserved.')
+    }
+  }
   const now = options?.nowIso ?? new Date().toISOString()
   const snapshot = await ensureSkillFilesystemSnapshot(existing, {
     allowLegacyMaterialize: options?.allowLegacyMaterialize
@@ -882,7 +947,7 @@ async function refreshSkillRecordFromFilesystem(
 
   if (shouldPersist) {
     nextStored.updated_at = options?.nowIso ?? (changed || hadLegacy ? now : nextStored.updated_at)
-    await persistMetadataOnlySkill(key, nextStored, snapshot)
+    await persistMetadataOnlySkill(key, nextStored, snapshot, reserved)
   }
 
   return hydrateRuntimeSkillRow(nextStored, snapshot)
@@ -952,7 +1017,17 @@ export async function upsertSkill(input: UpsertSkillInput): Promise<SkillRow> {
   const now = input.nowIso ?? new Date().toISOString()
   const skillId = normalizeSkillId(input.skill.id, input.skill.name || input.commandId)
   const key = buildSkillKey(input.userId, skillId)
-  const existing = (await redis.json.get(key)) as SkillRow | null
+  const reserved = skillId === APP_ACTIONS_SKILL_ID ? await reservedAppActionsState(key, input.userId) : undefined
+  const existing = reserved ? reserved.existing : (await redis.json.get(key)) as SkillRow | null
+  if (input.builtinAppActionsSeed && (skillId !== APP_ACTIONS_SKILL_ID || input.commandId !== APP_ACTIONS_COMMAND_ID || input.skill.source !== 'system' || input.skill.isSystem !== true)) {
+    throw new Error('Invalid canonical App Actions seed. No skill files or metadata were changed.')
+  }
+  if (reserved && existing && (input.builtinAppActionsSeed === true) !== isCanonicalAppActionsSkill(existing, input.userId)) {
+    throw new Error('The App Actions skill ID is owned by another saved skill. Its files, metadata and access were preserved.')
+  }
+  if (reserved?.command && (input.builtinAppActionsSeed === true) !== isCanonicalAppActionsCommand(reserved.command, input.userId)) {
+    throw new Error('The App Actions command ID is owned by another saved item. Its skill files, metadata and access were preserved.')
+  }
   const nextSkillShape: Pick<SkillRow, 'id' | 'name' | 'source_ref' | 'is_system' | 'source'> = {
     id: skillId,
     name: input.skill.name || existing?.name || input.commandId,
@@ -1010,7 +1085,10 @@ export async function upsertSkill(input: UpsertSkillInput): Promise<SkillRow> {
     nowIso: now
   })
 
-  await persistMetadataOnlySkill(key, stored, snapshot)
+  if (input.builtinAppActionsSeed && existing && !skillMetadataChanged(existing, stored)) {
+    return hydrateRuntimeSkillRow(existing, snapshot)
+  }
+  await persistMetadataOnlySkill(key, stored, snapshot, reserved)
 
   return hydrateRuntimeSkillRow(stored, snapshot)
 }
@@ -1130,13 +1208,20 @@ export function getSkillCacheRoot() {
   return SKILL_FILESYSTEM_ROOT
 }
 
-async function stripLegacySkillBundleFilesFromSlashCommands(options?: { userId?: string | null }) {
+async function stripLegacySkillBundleFilesFromSlashCommands(originalLifecycle: SettingsLifecycleSnapshot, options?: { userId?: string | null }) {
   const userId = options?.userId?.trim()
   const pattern = userId ? `slash_command:${userId}:*` : 'slash_command:*:*'
   const keys = await redis.keys(pattern)
   if (keys.length === 0) return
 
+  const preparations = new Map<string, SlashCommandWritePreparation>()
   for (const key of keys) {
+    const match = /^slash_command:([A-Za-z0-9_-]+):([A-Za-z0-9_-]+)$/.exec(key)
+    if (!match) throw new Error('Invalid saved command identity.')
+    assertSettingsLifecycle(originalLifecycle)
+    let preparation = preparations.get(match[1])
+    if (!preparation) { preparation = beginSlashCommandWrite(match[1]); preparations.set(match[1], preparation) }
+    const basis = await captureSlashCommandWriteBasis(preparation, [match[2]])
     const command = (await redis.json.get(key)) as SlashCommandRow | null
     if (!command || command.type !== 'skill') continue
 
@@ -1150,14 +1235,16 @@ async function stripLegacySkillBundleFilesFromSlashCommands(options?: { userId?:
       updated_at: new Date().toISOString()
     }
 
-    await redis.json.set(key, '$', next)
+    await saveSlashCommandRecord(command.user_id, { record: next, mode: 'update', preserveAccess: COMMAND_ACCESS_FIELDS }, basis)
   }
 }
 
 export async function runSkillFilesystemMigrationPass(options?: { userId?: string | null }) {
+  const originalLifecycle = captureSettingsLifecycle([])
   const userId = options?.userId?.trim()
   const pattern = userId ? `skill:${userId}:*` : 'skill:*:*'
   const keys = await redis.keys(pattern)
+  let failed = 0
 
   for (const key of keys) {
     try {
@@ -1169,11 +1256,13 @@ export async function runSkillFilesystemMigrationPass(options?: { userId?: strin
         forcePersist: true
       })
     } catch (error) {
+      failed += 1
       console.warn('[skillRegistry] Filesystem migration skipped invalid skill key', key, error)
     }
   }
 
-  await stripLegacySkillBundleFilesFromSlashCommands(options)
+  await stripLegacySkillBundleFilesFromSlashCommands(originalLifecycle, options)
+  return { complete: failed === 0, failed }
 }
 
 export async function runSkillCacheIntegrityPass(options?: { userId?: string | null }) {
@@ -1181,16 +1270,13 @@ export async function runSkillCacheIntegrityPass(options?: { userId?: string | n
 }
 
 async function cleanupSystemSkillRuntimeCopies(): Promise<void> {
-  const systemSkillsRoot = getSystemSkillsRoot()
-  if (!existsSync(systemSkillsRoot)) return
-
-  const entries = await fs.readdir(systemSkillsRoot, { withFileTypes: true })
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue
-
+  if (!existsSync(getBuiltinSystemSkillsRoot())) return
+  // Keep the existing six reserved legacy names. Adding a new package member
+  // must not delete a user's previously valid same-name custom skill folder.
+  for (const entry of BUILTIN_PLUGIN_SKILLS.filter((skill) => skill.skillId !== 'goon_guide')) {
     const candidates = new Set<string>([
-      entry.name,
-      normalizeSkillId(entry.name, entry.name)
+      entry.legacyDirectory,
+      normalizeSkillId(entry.legacyDirectory, entry.legacyDirectory)
     ])
 
     for (const candidate of candidates) {
@@ -1207,9 +1293,10 @@ export function ensureSkillFilesystemStartup() {
   if (!startupFilesystemPassPromise) {
     startupFilesystemPassPromise = (async () => {
       await cleanupSystemSkillRuntimeCopies()
-      await runSkillFilesystemMigrationPass()
+      return await runSkillFilesystemMigrationPass()
     })().catch((error) => {
       console.warn('[skillRegistry] Startup filesystem migration pass failed:', error)
+      return { complete: false, failed: 1 }
     })
   }
   return startupFilesystemPassPromise

@@ -145,10 +145,28 @@ button.mini {
   }
 }
 
+/* The Mac window has no title bar (src-electron/main-window-policy.mjs). This strip, first in
+   the page, is its drag handle, as tall as the title bar overlay, and the page starts below the
+   window buttons.
+   env(titlebar-area-height) is unset in full screen, where the buttons hide. */
+.window-drag-strip {
+  position: fixed;
+  inset: 0 0 auto;
+  height: env(titlebar-area-height, 0px);
+  pointer-events: none;
+  -webkit-app-region: drag;
+}
+
+/* The page scrolls under the strip; its controls stay clickable there. */
+button {
+  -webkit-app-region: no-drag;
+}
+
 .shell {
+  --shell-top: max(16px, env(titlebar-area-height, 0px));
   width: min(1120px, calc(100vw - 32px));
-  min-height: calc(100vh - 32px);
-  margin: 16px auto;
+  min-height: calc(100vh - var(--shell-top) - 16px);
+  margin: var(--shell-top) auto 16px;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -419,8 +437,9 @@ footer {
 
 @media (max-width: 760px) {
   .shell {
+    --shell-top: max(10px, env(titlebar-area-height, 0px));
     width: min(100vw - 20px, 680px);
-    margin: 10px auto;
+    margin: var(--shell-top) auto 10px;
   }
 
   .mast,

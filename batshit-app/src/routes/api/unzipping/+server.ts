@@ -6,6 +6,9 @@ import { withZipStateLock } from '$lib/server/services/zipStateLock'
 import { tooLargeCoolToolHoldTokens } from '$lib/server/services/toolResultHoldAdmission'
 import { resolveSessionZipForHold } from '$lib/server/services/resolveSessionZipForHold'
 import { isZipStateSource, type ZipStateSource } from '$lib/services/zipping'
+import { holdSkillSessionRead, readSkillSessionZipContexts } from '$lib/server/services/skillSessions'
+import { publishUserEvent } from '$lib/server/ssePublisher'
+import type { UnzippedItem } from '$lib/services/zipping'
 
 // GET: Get unzipped items for a session
 export const GET: RequestHandler = async ({ url, locals }) => {
@@ -20,13 +23,15 @@ export const GET: RequestHandler = async ({ url, locals }) => {
     // Get all unzipped items for this session
     const unzippedKey = `unzipped:${sessionId}`
     const unzippedIds = await redis.sMembers(unzippedKey)
+    const skillContexts = await readSkillSessionZipContexts({ userId: user.value.id, sessionId: sessionId! })
     
     const unzipped = []
     for (const zipId of unzippedIds) {
       const itemKey = `unzipped_item:${sessionId}:${zipId}`
-      const itemData = await redis.get(itemKey)
+      const itemData = await redis.json.get(itemKey)
       if (itemData) {
-        unzipped.push(itemData)
+        const { skillSessionContext: _old, ...stored } = itemData as UnzippedItem
+        unzipped.push({ ...stored, ...(skillContexts.has(zipId) ? { skillSessionContext: skillContexts.get(zipId) } : {}) })
       }
     }
 
@@ -35,7 +40,7 @@ export const GET: RequestHandler = async ({ url, locals }) => {
     const rezippedIds = await redis.sMembers(rezippedKey)
     const rezippedSources: Record<string, ZipStateSource> = {}
     for (const zipId of rezippedIds || []) {
-      const marker = await redis.get(`rezipped_item:${sessionId}:${zipId}`)
+      const marker = await redis.json.get(`rezipped_item:${sessionId}:${zipId}`)
       const source = (marker as any)?.source
       // A marker with no readable source predates sources and was always the user's.
       rezippedSources[zipId] = isZipStateSource(source) ? source : 'user'
@@ -69,12 +74,16 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     // write another source, name an agent, or attach a hold path.
     delete item.path
     delete item.agentId
+    delete item.skillSession
+    delete item.skillSessionUserHold
+    delete item.skillSessionContext
     item.source = 'user'
+    let skillItem: UnzippedItem | null = null
 
     // One writer at a time per chat (SA-129 P2b, BL-352): a reply end's hold move or countdown
     // never lands between these writes, and never writes back over them.
     const refusal = await withZipStateLock(item.sessionId, async () => {
-      const resolved = await resolveSessionZipForHold(item.sessionId, item.zipId)
+      const resolved = await resolveSessionZipForHold(item.sessionId, item.zipId, { strict: true })
       if (resolved.status === 'missing') return json({ error: 'Zip not found; nothing was held.' }, { status: 404 })
       if (resolved.status === 'ambiguous') return json({ error: 'Zip ID is ambiguous in this chat; nothing was held.' }, { status: 409 })
       const { zipData } = resolved
@@ -94,6 +103,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         }, { status: 413 })
       }
       item.zipId = resolved.stateZipId
+      skillItem = await holdSkillSessionRead({ userId: user.value.id, sessionId: item.sessionId, zipId: item.zipId, item })
+      if (skillItem) return null
       // Add to unzipped set
       const unzippedKey = `unzipped:${item.sessionId}`
       await redis.sAdd(unzippedKey, item.zipId)
@@ -114,7 +125,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     // A temporary hold counts down on the server: one count per accepted user message and per
     // finished reply (`advanceZipCountdowns`, SA-129 P2).
 
-    return json({ success: true })
+    if (skillItem) await publishUserEvent(user.value.id, { type: 'zip_state_changed', sessionId: item.sessionId,
+      source: 'user', opened: [item.zipId], rezipped: [] })
+    return json({ success: true, ...(skillItem ? { item: skillItem } : {}) })
   } catch (error) {
     console.error('Failed to unzip item:', error)
     return new Response('Failed to unzip item', { status: 500 })

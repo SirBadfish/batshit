@@ -41,7 +41,7 @@ export const TYPESAFE_FEATURES = {
   /** The Settings → Admin → Judge Juice "Test" button: one fixed sample question. Not a feature switch. */
   connection_test: { label: 'Connection test', switchLabel: null },
   /** SA-120 P1: skill and tool hints in the DCM tail plus the capability-gap chip (per-agent switch). */
-  skill_tool_hints: { label: 'Skill and tool hints', switchLabel: 'Judge Juice: Suggest Skills and Tools' },
+  skill_tool_hints: { label: 'Skills and tools', switchLabel: 'Judge Juice: Skills and Tools' },
   /** SA-120 P2: the agent-callable `sys.judge.ask` tool (per-agent switch). */
   judge_ask: { label: 'Judgment tool (sys.judge.ask)', switchLabel: 'Judge Juice: Judgment Tool' },
   /** SA-120 P3: group speaker selection and follow-up gating (the `smart` speaking preset on a group agent). */

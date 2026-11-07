@@ -1,5 +1,6 @@
 import path from 'node:path'
-import { access, constants as fsConstants, stat } from 'node:fs/promises'
+import { statSync, realpathSync } from 'node:fs'
+import { access, constants as fsConstants, stat, realpath } from 'node:fs/promises'
 
 import { redis } from '$lib/server/redis'
 import {
@@ -462,4 +463,71 @@ export async function resolveManagedStdioEnvironmentValues(params: {
   }
 
   return values
+}
+
+/** Same package prerequisite classification used by supplied candidates. A runner
+ * being executable never attests that its requested server is installed. */
+export function stdioCommandNeedsInstallation(command: string): boolean {
+  return ['npx','uvx','bunx','pipx','pnpm','npm','yarn'].includes((command.split(/[\\/]/).at(-1)?.toLowerCase() ?? '').replace(/\.(?:cmd|exe)$/, ''))
+}
+type InstalledStdioFile = Readonly<{ path: string; directory: boolean; dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number }>
+export type InstalledStdioLaunch = Readonly<Omit<ResolvedStdioGatewayProcessConfig, 'env' | 'args'> & { args: readonly string[]; executableIdentity: string; files: readonly InstalledStdioFile[] }>
+/** Finite direct-executable cohort, not a parser for wrapper command lines or
+ * an attestation of arbitrary program bytes. Shared at saved and realpath cuts. */
+function assertInstalledStdioExecutable(command: string, args: readonly string[]): boolean {
+  const base = (command.split(/[\\/]/).at(-1)?.toLowerCase() ?? '').replace(/\.exe$/, '')
+  if (stdioCommandNeedsInstallation(command) || /^(?:npx|npm|pnpm|yarn)(?:-cli)?\.(?:cjs|mjs|js)$/.test(base) ||
+    STDIO_SHELL_COMMANDS.has(base) || /\.(?:cmd|bat|ps1)$/i.test(command) ||
+    /^(?:env|nice|nohup|timeout|stdbuf|setsid|sudo|doas|xargs|chroot|command|exec|busybox|time|arch|caffeinate|uv|deno|bun|pip|pip3|docker|podman)$/.test(base) ||
+    args.some(arg => /^-(?:[ecmpr]|lc|ic)/i.test(arg) || /^--(?:eval|print|import|require|module|loader)(?:=|$)/i.test(arg))) {
+    throw new Error('Wrappers, installation, inline execution and runtime launchers are outside this saved STDIO cohort.')
+  }
+  const interpreter = /^(?:node|nodejs|python(?:\d+(?:\.\d+)?)?|ruby|perl|php|lua)$/.test(base)
+  if (interpreter && (!args[0] || !path.isAbsolute(args[0]))) throw new Error('A saved interpreter requires its concrete absolute installed local server entry.')
+  return interpreter
+}
+/** Finite saved-only cohort. This is file identity, not provenance or byte
+ * attestation. Ordinary resolution above intentionally keeps its own behavior. */
+export function assertSavedInstalledStdioConfig(gateway: MCPGateway): void {
+  const config = gateway.stdioConfig
+  if (gateway.type !== 'stdio' || !config || gateway.url !== undefined || gateway.authKeyName !== undefined ||
+    gateway.metadata && Object.hasOwn(gateway.metadata, 'authToken') || !validateStdioGatewayConfig(config).valid ||
+    config.command !== config.command.trim() || stdioCommandNeedsInstallation(config.command) ||
+    !['none','fixed'].includes(config.cwdPolicy ?? 'none') ||
+    config.cwdPolicy === 'fixed' && config.cwdValue !== config.cwdValue?.trim() ||
+    (config.args ?? []).some(arg => typeof arg !== 'string' || !arg || arg !== arg.trim() || arg.includes('\0')) ||
+    (config.envRefs ?? []).some(row => row.envVar !== row.envVar.trim() || row.savedKeyRef !== normalizeApiKeyServiceName(row.savedKeyRef)) ||
+    new Set((config.envRefs ?? []).map(row => row.savedKeyRef)).size > 13) throw new Error('This saved STDIO launch is outside the installed-source cohort.')
+  assertInstalledStdioExecutable(config.command, config.args ?? [])
+  for (const { value, maximum } of [{ value: config.startupTimeoutMs, maximum: MAX_STDIO_STARTUP_TIMEOUT_MS },
+    { value: config.toolCallTimeoutMs, maximum: MAX_STDIO_TOOL_TIMEOUT_MS }]) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < MIN_STDIO_TIMEOUT_MS || value > maximum)) throw new Error('The saved STDIO timeout cannot be silently normalized.')
+  }
+}
+function installedFile(file: string, directory: boolean): InstalledStdioFile {
+  const found = statSync(file)
+  if (directory ? !found.isDirectory() : !found.isFile()) throw new Error('The retained installed STDIO path is unavailable.')
+  return Object.freeze({ path: file, directory, dev: found.dev, ino: found.ino, size: directory ? 0 : found.size, mtimeMs: directory ? 0 : found.mtimeMs, ctimeMs: directory ? 0 : found.ctimeMs })
+}
+/** Synchronous final file fence, after every awaited admission and before spawn/send. */
+export function assertInstalledStdioLaunchCurrent(launch: InstalledStdioLaunch): void {
+  if (realpathSync(launch.command) !== launch.executableIdentity) throw new Error('The original installed STDIO executable identity changed.')
+  for (const file of launch.files) {
+    if (JSON.stringify(installedFile(file.path, file.directory)) !== JSON.stringify(file)) throw new Error('The original installed STDIO executable, entry or cwd changed.')
+  }
+}
+export async function resolveInstalledStdioLaunch(gateway: MCPGateway): Promise<InstalledStdioLaunch> {
+  assertSavedInstalledStdioConfig(gateway)
+  const config = gateway.stdioConfig!
+  const cwd = config.cwdPolicy === 'fixed' ? await ensureDirectoryExists(config.cwdValue!, 'STDIO fixed cwd') : undefined
+  const command = await resolveCommandExecutable(config.command, cwd)
+  const args = [...(config.args ?? [])]
+  const executableIdentity = await realpath(command)
+  const interpreter = assertInstalledStdioExecutable(executableIdentity, args)
+  if (JSON.stringify(await rewriteContainerFilesystemArgs(config)) !== JSON.stringify(args)) throw new Error('A held STDIO launch cannot adopt a container path rewrite.')
+  const files = [installedFile(command, false)]
+  if (interpreter || /^(?:node|nodejs|python(?:\d+(?:\.\d+)?)?|ruby|perl|php|lua)(?:\.exe)?$/.test(path.basename(config.command).toLowerCase())) files.push(installedFile(args[0], false))
+  if (cwd) files.push(installedFile(cwd, true))
+  return Object.freeze({ command, executableIdentity, args: Object.freeze(args), ...(cwd ? { cwd } : {}), files: Object.freeze(files),
+    startupTimeoutMs: config.startupTimeoutMs ?? DEFAULT_STDIO_STARTUP_TIMEOUT_MS, toolCallTimeoutMs: config.toolCallTimeoutMs ?? DEFAULT_STDIO_TOOL_TIMEOUT_MS })
 }

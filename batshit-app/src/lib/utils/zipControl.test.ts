@@ -4,7 +4,6 @@ import {
   extractToolNotes,
   extractZipControl,
   hideStreamingHiddenControlBlocks,
-  resolveZipControlZipIds,
   stripZipControlBlocks,
   TOOL_NOTES_BLOCK_LIMIT
 } from './zipControl'
@@ -133,65 +132,6 @@ describe('extractZipControl', () => {
 
     expect(result.hadBlock).toBe(false)
     expect(stripZipControlBlocks(result.cleaned)).toBe('Visible response.')
-  })
-})
-
-describe('resolveZipControlZipIds', () => {
-  it('resolves requested zip IDs against the trusted session zip set', () => {
-    expect(
-      resolveZipControlZipIds(
-        [' cool_tool_1 ', 'cool_tool_1', 'error_2'],
-        ['cool_tool_1', 'error_2']
-      )
-    ).toEqual(['cool_tool_1', 'error_2'])
-  })
-
-  it('does not resolve tool call IDs that are not zip IDs', () => {
-    expect(resolveZipControlZipIds(['call_123'], ['cool_tool_1'])).toEqual([])
-  })
-
-  it('resolves one-based current tool result aliases before normal ID matching', () => {
-    const first = 'cool_tool_1780541000000_abcd1'
-    const second = 'cool_tool_1780541000001_abcd2'
-    const third = 'cool_tool_1780541000002_abcd3'
-
-    expect(
-      resolveZipControlZipIds(
-        ['tool_result_1', 'tool_result_3'],
-        [first, second, third],
-        {
-          currentToolZipIds: [first, second, third]
-        }
-      )
-    ).toEqual([first, third])
-  })
-
-  it('does not resolve zero-based or out-of-range current tool result aliases', () => {
-    const first = 'cool_tool_1780541000000_abcd1'
-
-    expect(
-      resolveZipControlZipIds(
-        ['tool_result_0', 'tool_result_2'],
-        [first],
-        {
-          currentToolZipIds: [first]
-        }
-      )
-    ).toEqual([])
-  })
-
-  it('deduplicates zip IDs resolved through aliases and direct IDs', () => {
-    const first = 'cool_tool_1780541000000_abcd1'
-
-    expect(
-      resolveZipControlZipIds(
-        ['tool_result_1', first],
-        [first],
-        {
-          currentToolZipIds: [first]
-        }
-      )
-    ).toEqual([first])
   })
 })
 

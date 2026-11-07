@@ -7,6 +7,7 @@ import {
   RECIPE_AUTHOR_CHANGE_FAMILY_RULES,
   RECIPE_AUTHOR_UPDATE_CLASSIFICATIONS,
   classifyRecipeAuthorUpdatePlan,
+  isRecognizedFirstPartyRecipeSourcePair,
   isSupportedFirstPartyRecipeBase,
   type RecipeAuthorUpdateClassification
 } from './recipeAuthorUpdatePolicy'
@@ -108,9 +109,32 @@ describe('Recipe Blender-author update policy', () => {
 
   it('keeps the initial supported author contract first-party-only', () => {
     expect(isSupportedFirstPartyRecipeBase('batshit-base-f-v1')).toBe(true)
+    expect(isSupportedFirstPartyRecipeBase('batshit-base-m-v1')).toBe(false)
     expect(isSupportedFirstPartyRecipeBase('batshit-base-f')).toBe(false)
     expect(isSupportedFirstPartyRecipeBase('independent-avatar')).toBe(false)
     expect(isSupportedFirstPartyRecipeBase(null)).toBe(false)
+  })
+
+  it('recognizes exact Source pairs without granting male product or author-update eligibility', () => {
+    for (const baseId of ['batshit-base-f-v1', 'batshit-base-m-v1']) {
+      expect(isRecognizedFirstPartyRecipeSourcePair({ baseId, fitFamily: baseId })).toBe(true)
+    }
+    for (const value of [
+      undefined, null, false, 1, 'batshit-base-m-v1', [],
+      { baseId: 'batshit-base-m-v1' }, { fitFamily: 'batshit-base-m-v1' },
+      { baseId: 'batshit-base-m-v1', fitFamily: 'batshit-base-f-v1' },
+      { baseId: 'batshit-base-f-v1', fitFamily: 'batshit-base-m-v1' },
+      { baseId: 'independent-avatar', fitFamily: 'independent-avatar' },
+      { baseId: ['batshit-base-m-v1'], fitFamily: 'batshit-base-m-v1' },
+      Object.create({ baseId: 'batshit-base-m-v1', fitFamily: 'batshit-base-m-v1' })
+    ]) expect(isRecognizedFirstPartyRecipeSourcePair(value)).toBe(false)
+    for (const overrides of [
+      { fromBaseId: 'batshit-base-m-v1' }, { toBaseId: 'batshit-base-m-v1' },
+      { fromBaseId: 'batshit-base-m-v1', toBaseId: 'batshit-base-m-v1' }
+    ]) {
+      expect(classifyRecipeAuthorUpdatePlan(policyPlan('automatic-appearance-preserving', overrides)))
+        .toBe('blocked-ineligible')
+    }
   })
 
   it('fails closed when a nominal automatic plan lacks exact appearance-preservation proof', () => {

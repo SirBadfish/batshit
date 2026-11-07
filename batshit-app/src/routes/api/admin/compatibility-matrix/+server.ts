@@ -4,7 +4,6 @@ import type { RequestHandler } from './$types'
 import {
   loadPublishedCompatibilityMatrix
 } from '$lib/server/services/compatibilityMatrixAdmin'
-import { loadN8nCompatibilitySnapshot } from '$lib/server/services/n8nParameterCompatibility'
 
 export const GET: RequestHandler = async ({ locals }) => {
   if (!locals.user) {
@@ -15,10 +14,6 @@ export const GET: RequestHandler = async ({ locals }) => {
   }
 
   const published = await loadPublishedCompatibilityMatrix()
-  const n8nSnapshot = await loadN8nCompatibilitySnapshot()
 
-  return json({
-    published,
-    n8n: n8nSnapshot
-  })
+  return json({ published })
 }

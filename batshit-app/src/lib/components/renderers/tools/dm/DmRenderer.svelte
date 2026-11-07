@@ -92,7 +92,7 @@
 		const nested = (envelope as any)?.input
 		const direct = tool?.toolInput
 		// SA-120 P7, found live: the managed CLI lane keeps the agent's input under
-		// `toolArgs.input` (its result envelope has no `input`), so a Codex or Claude
+		// `toolArgs.input` (its result envelope has no `input`), so a Claude CLI
 		// `sys.dm.read` / `claim` card had no DM id and an empty subtitle.
 		const cliInput = tool?.toolArgs?.input
 		const merged: Record<string, any> = {}

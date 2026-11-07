@@ -10,6 +10,10 @@ import {
   type ParameterValue
 } from '$lib/data/parameter-schemas'
 import { describeUnlistedSelectValue, resolveSavedSelectValue } from '$lib/utils/parameterValueAdapter'
+import { REVIEWED_REASONING_SETTING_OWNERS, reviewedReasoningBinding, isOllamaReasoningConnection } from '$lib/data/reasoning-controls'
+import { CLAUDE_PLAN_REASONING_ADAPTER, ClaudePlanSettingsError, isClaudePlanSelection, readClaudePlanSettings } from '$lib/utils/claudePlanConnection'
+import type { LocalReasoningContract, ExplicitReasoningSnapshot } from '$lib/types/reasoningControls'
+import { ModelReasoningSettingError, reasoningProviderValue, validateReviewedReasoningSettings } from '$lib/utils/modelReasoningControls'
 import {
   DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
   normalizeRuntimeMaxOutputTokens
@@ -58,7 +62,7 @@ export function resolveProviderOptionsSegment(provider: string): string {
  * P2: a local send carried `"nativeTools":{"executionBackend":"local",
  * "bashAccessMode":"plan"}` in the chat-completions body.
  */
-const INTERNAL_SETTING_PREFIXES = ['codex_', 'claude_', 'batshit_'] as const
+export const INTERNAL_SETTING_PREFIXES = ['codex_', 'claude_', 'batshit_'] as const
 /**
  * BL-515: also the agent-owned keys a preset never holds, which is why they survive when an
  * agent's runtime settings are rebuilt from the preset it names (`mergePresetRuntimeSettings`):
@@ -67,7 +71,7 @@ const INTERNAL_SETTING_PREFIXES = ['codex_', 'claude_', 'batshit_'] as const
  * `native<Name>` key, plus the unprefixed names below). Dropping one would quietly turn a tool
  * setting such as `bashEnabled: false` back to its default.
  */
-const INTERNAL_SETTING_NAMES: ReadonlySet<string> = new Set([
+export const INTERNAL_SETTING_NAMES: ReadonlySet<string> = new Set([
   'nativeTools',
   'batshitNativeTools',
   'bashEnabled',
@@ -129,9 +133,13 @@ export interface RuntimeSettingsArgs {
   purpose?: ModelPurpose | null
   settings?: Record<string, ParameterValue> | null
   fallbacks?: RuntimeModelStandardSettings
+  localReasoning?: LocalReasoningContract | null
+  /** Server-only identity proof. Preview never exposes wire options or needs this value. */
+  localReasoningConnectionKey?: string
+  explicitReasoning?: ExplicitReasoningSnapshot[]
 }
 
-export function buildRuntimeModelSettings({
+function mapRuntimeModelSettings({
   provider,
   modelId,
   vercelId,
@@ -140,7 +148,7 @@ export function buildRuntimeModelSettings({
   capabilities,
   purpose,
   settings,
-  fallbacks
+  fallbacks, localReasoning, localReasoningConnectionKey, explicitReasoning
 }: RuntimeSettingsArgs): RuntimeModelSettings {
   const parameterProvider = resolveParameterProvider(provider, connection)
   const definitions = filterParameters({
@@ -148,6 +156,7 @@ export function buildRuntimeModelSettings({
     modelId: modelId ?? undefined,
     vercelId: vercelId ?? undefined,
     capabilities: capabilities ?? null,
+    connectionInfo: connection,
     purpose: purpose ?? 'chat'
   })
   const knownKeys = new Set(definitions.map((definition) => definition.name))
@@ -188,7 +197,7 @@ export function buildRuntimeModelSettings({
       // SA-102 P2: a parameter Batshit defines but did NOT offer for this model
       // was excluded on purpose. Only genuine user-authored Custom Parameters
       // reach the passthrough below.
-      if (ALL_DEFINED_PARAMETER_NAMES.has(key)) continue
+      if (ALL_DEFINED_PARAMETER_NAMES.has(key) && (!REVIEWED_REASONING_SETTING_OWNERS[key] || REVIEWED_REASONING_SETTING_OWNERS[key] === parameterProvider)) continue
       if (isParameterSuppressedForModel(key, { provider: parameterProvider, modelId, vercelId })) {
         continue
       }
@@ -243,13 +252,59 @@ export function buildRuntimeModelSettings({
     contextWindow
   })
 
-  // A thinking setting the AI SDK would rewrite for this model without a word is refused here,
-  // with a sentence that says what to change (`anthropicThinkingGuard.ts`).
-  refuseAnthropicThinkingTheModelRejects({ provider, modelId, vercelId, connection, providerOptions })
+  const explicit = localReasoningSelection({ modelId, connection, explicitReasoning })
+  if (explicit) {
+    if (!reviewedReasoningBinding({ modelId, connection, localReasoning })) throw new ModelReasoningSettingError('Ollama Thinking options could not be verified. Your saved choice was kept.')
+    const ollama = { ...providerOptions.ollama }
+    if (explicit.selection.mode === 'provider-default') delete ollama.think
+    else if (typeof explicit.selection.value === 'boolean') ollama.think = explicit.selection.value
+    else throw new ModelReasoningSettingError('Ollama Thinking requires On or Off.')
+    providerOptions.ollama = ollama
+    providerOptions.batshit_reasoning = { ...providerOptions.batshit_reasoning, ollama: {
+      modelId, adapterVersion: localReasoning!.adapterVersion, runtimeVersion: localReasoning!.runtimeVersion,
+      connectionKey: localReasoningConnectionKey ?? '', ...explicit.selection
+    } }
+  }
+  return { standard, providerOptions }
+}
 
-  return {
-    standard,
-    providerOptions
+function localReasoningSelection(args: Pick<RuntimeSettingsArgs, 'connection' | 'modelId' | 'explicitReasoning'>) {
+  if (!isOllamaReasoningConnection(args.connection)) return undefined
+  return args.explicitReasoning?.find(entry => entry.control === 'thinking' && isOllamaReasoningConnection(entry.identity.connection) && entry.identity.effectiveModelId === args.modelId)
+}
+function validateRuntimeReasoning(args: RuntimeSettingsArgs, mapped: RuntimeModelSettings, requireServerIdentity = true) {
+  if (requireServerIdentity && localReasoningSelection(args) && !/^[a-f0-9]{64}$/.test(args.localReasoningConnectionKey ?? '')) {
+    throw new ModelReasoningSettingError('The server-owned Ollama connection could not be verified. Your saved choice was kept.')
+  }
+  refuseAnthropicThinkingTheModelRejects({ ...args, providerOptions: mapped.providerOptions })
+  // SA-139: a Claude plan selection's settings never become provider options, so the reviewed check
+  // below sees nothing; Send and the chat-bar preview run the plan's own check instead (same words as admission).
+  if (isClaudePlanSelection(args.connection) && args.modelId) {
+    try { readClaudePlanSettings(args.settings, args.modelId, { where: 'run', allowKey: isAgentRuntimeSettingKey }) }
+    catch (error) { if (error instanceof ClaudePlanSettingsError) throw new ModelReasoningSettingError(error.message); throw error }
+  }
+  validateReviewedReasoningSettings({ ...args, providerOptions: mapped.providerOptions })
+}
+
+export function buildRuntimeModelSettings(args: RuntimeSettingsArgs): RuntimeModelSettings {
+  const mapped = mapRuntimeModelSettings(args)
+  validateRuntimeReasoning(args, mapped)
+  return mapped
+}
+
+/** UI gets only control values and the same refusal as Send, never unchecked wire options. */
+export function previewRuntimeReasoningSettings(args: RuntimeSettingsArgs): { values: Record<string, unknown>; error: string | null } {
+  const binding = reviewedReasoningBinding(args)
+  const values: Record<string, unknown> = {}
+  try {
+    const mapped = mapRuntimeModelSettings(args)
+    // SA-139: the Claude plan's controls never become provider options; their value is the setting itself.
+    for (const control of binding?.controls ?? []) values[control.id] = binding!.adapter.package === CLAUDE_PLAN_REASONING_ADAPTER
+      ? args.settings?.[control.setting] ?? undefined : reasoningProviderValue(mapped.providerOptions, control.providerPath)
+    validateRuntimeReasoning(args, mapped, false)
+    return { values, error: null }
+  } catch (error) {
+    return { values, error: error instanceof Error ? error.message : 'This reasoning configuration cannot be sent.' }
   }
 }
 
@@ -423,9 +478,8 @@ function assignProviderOption(
   let cursor = providerOptions[provider]
   while (segments.length > 1) {
     const segment = segments.shift()!
-    if (!cursor[segment]) {
-      cursor[segment] = {}
-    }
+    const previous = cursor[segment]
+    cursor[segment] = previous && typeof previous === 'object' && !Array.isArray(previous) ? { ...previous } : previous || {}
     cursor = cursor[segment]
   }
 

@@ -9,20 +9,22 @@ import { captureCacheForensicsRecord } from './record'
 /**
  * SA-093 managed subagent adapter (P4).
  *
- * A managed subagent run (API Subagent through VercelAIBrain, CLI Subagent
- * through the Codex/Claude bridges) fingerprints ITS OWN compiled contract —
- * the runner-built system prompt + memory + chat input message array — never
- * the parent's fingerprint. The record is stored on the PARENT send's
- * Execution Viewer snapshot (DL-093-10: no new storage), marked
+ * A managed subagent run (through VercelAIBrain) fingerprints ITS OWN compiled
+ * contract — the runner-built system prompt + memory + chat input message
+ * array — never the parent's fingerprint. The record is stored on the PARENT
+ * send's Execution Viewer snapshot (DL-093-10: no new storage), marked
  * `actor: 'subagent'` with a pseudonymous `parentRunId` for correlation.
  *
  * Honesty (DL-093-07/08): the tool contract of a managed subagent rides the
- * brain-resolved gateway set or the managed CLI profile, and the provider
- * request boundary is not exposed on these lanes — both facts are disclosed
- * in notes instead of being guessed at.
+ * brain-resolved gateway set, and the provider request boundary is not exposed
+ * on this lane — both facts are disclosed in notes instead of being guessed at.
+ *
+ * SA-139 R5: the Claude Code CLI Subagent lane is gone, so new records are API
+ * only. Records saved earlier with runtime `claude` stay readable where records
+ * are read; this module only writes.
  */
 
-export type ManagedSubagentForensicsLane = 'api' | 'codex' | 'claude'
+export type ManagedSubagentForensicsLane = 'api'
 
 function providerCacheUsageFromLane(
   usage: unknown,
@@ -66,19 +68,13 @@ export function buildManagedSubagentCacheForensicsRecord(args: {
   experimentGroup?: string | null
   capturedAt?: string
 }): CacheForensicsRecord {
-  const laneNotes =
-    args.lane === 'api'
-      ? [
-          'Managed API Subagent run: the provider-request boundary is not exposed on this lane, so segments cover the runner-compiled boundary only.',
-          'The subagent tool contract is resolved inside the brain from gateway selections and is not fingerprinted in v1.',
-        ]
-      : [
-          `Managed ${args.lane === 'codex' ? 'Codex' : 'Claude'} CLI Subagent run: the harness adds native instructions, tools, and provider serialization after this boundary; that hidden material is unavailable to Batshit.`,
-          'The subagent tool contract rides the managed CLI profile and is not fingerprinted in v1.',
-        ]
+  const laneNotes = [
+    'Managed Subagent run: the provider-request boundary is not exposed on this lane, so segments cover the runner-compiled boundary only.',
+    'The subagent tool contract is resolved inside the brain from gateway selections and is not fingerprinted in v1.',
+  ]
 
   const record = captureCacheForensicsRecord({
-    runtime: args.lane === 'api' ? 'vercel' : args.lane,
+    runtime: 'vercel',
     boundary: 'batshit-compiled',
     confidence: 'exact',
     agentId: args.subagentId,

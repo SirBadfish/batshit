@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   memorySearchLaneActive,
   useMemorySearchTestServer
@@ -91,7 +91,6 @@ import {
   getFixedSessionGraduationState,
   type FixedSessionGraduationEvent
 } from '$lib/utils/fixedSessionGraduation'
-import { reportForCliSnapshot } from '$lib/utils/cliContextWindow'
 import {
   clearSessionTurn,
   registerSessionTurn,
@@ -109,13 +108,6 @@ const ARCHIVED_SESSION = 'sess_dream_archived'
 const PRESET_ID = 'preset_dream_test'
 
 const NOW = new Date('2026-06-10T12:00:00.000Z')
-const CLAUDE_CAP_ENV_KEYS = [
-  'CLAUDE_CODE_DISABLE_1M_CONTEXT',
-  'ANTHROPIC_BASE_URL',
-  'CLAUDE_CODE_USE_BEDROCK',
-  'CLAUDE_CODE_USE_VERTEX',
-  'CLAUDE_CODE_USE_FOUNDRY'
-] as const
 
 function agentRecord(overrides: Record<string, any> = {}) {
   return {
@@ -135,44 +127,6 @@ function agentRecord(overrides: Record<string, any> = {}) {
   }
 }
 
-function namedClaudeCliAgent(memoryWindow: Record<string, unknown> = {
-  floor_mode: 'auto',
-  ceiling_headroom_mode: 'auto',
-  nap_threshold_percent: 80
-}, overrides: Record<string, unknown> = {}) {
-  return agentRecord({
-    primary_model_preset_id: null,
-    primary_model_provider: 'claude-cli',
-    primary_model_name: 'claude/claude-cli',
-    primary_model_connection: { id: 'claude-cli', type: 'direct', service: 'claude-cli' },
-    claude_settings: { permissionMode: 'default', model: 'sonnet' },
-    memory_window: memoryWindow,
-    ...overrides
-  })
-}
-
-async function seedCliContextReport(sessionId: string, agent: Record<string, any>, contextWindow: number) {
-  const report = reportForCliSnapshot({
-    runtime: 'claude',
-    model: 'sonnet',
-    actualModel: 'claude-sonnet-5',
-    contextWindow,
-    evidence: 'runtime',
-    disableClaude1M: false,
-    reportedAt: NOW.getTime()
-  }, agent, null, null, agent.primary_model_name)
-  await redis.json.set(`session:${sessionId}:execution_log`, '$', [{
-    id: `reply-${sessionId}`,
-    sessionId,
-    userId: USER,
-    agentId: agent.id,
-    agentName: 'Claude context report fixture',
-    agentType: 'cli',
-    createdAt: NOW.toISOString(),
-    runtime: { runtimeId: 'claude', metadata: { cliContextWindow: report } }
-  }] as never)
-}
-
 async function seedAgent(overrides: Record<string, any> = {}) {
   await redis.json.set(`agent:${AGENT}`, '$', agentRecord(overrides) as never)
   await redis.sAdd(`user:${USER}:agents`, AGENT)
@@ -180,12 +134,12 @@ async function seedAgent(overrides: Record<string, any> = {}) {
 
 async function seedSession(
   sessionId: string,
-  options: { fixed?: boolean; archived?: boolean; metadata?: Record<string, any> } = {}
+  options: { fixed?: boolean; archived?: boolean; metadata?: Record<string, any>; agentId?: string } = {}
 ) {
   await redis.json.set(`session:${sessionId}`, '$', {
     id: sessionId,
     user_id: USER,
-    agent_id: AGENT,
+    agent_id: options.agentId ?? AGENT,
     ...(options.archived ? { archived: true } : {}),
     last_modified_at: '2026-06-10T00:00:00.000Z',
     metadata: {
@@ -204,13 +158,14 @@ async function seedMessage(
   role: 'user' | 'assistant',
   content: string,
   createdAt: string,
-  metadata: Record<string, any> = {}
+  metadata: Record<string, any> = {},
+  agentId = AGENT
 ) {
   await redis.json.set(`message:${sessionId}:${id}`, '$', {
     id,
     session_id: sessionId,
     user_id: USER,
-    agent_id: AGENT,
+    agent_id: agentId,
     role,
     content,
     created_at: createdAt,
@@ -235,13 +190,16 @@ async function seedEpisode(sessionId: string, episode: Partial<EpisodeRecord> & 
 }
 
 async function seedMemory(overrides: Partial<CreateMemoryInput> & { content: string }) {
+  const fixtureId = overrides.id ?? `mem_dream_fixture_${Math.random().toString(36).slice(2)}`
   return createMemory({
     agent_id: AGENT,
     user_id: USER,
     lane: 'ltm',
     importance: 5,
     provenance: [{ session_id: 'sess_origin', source: 'agent' }],
-    ...overrides
+    ...overrides,
+    id: fixtureId,
+    ...(overrides.media ? { media: overrides.media.map(media => ({ ...media, filename: `${AGENT}/${fixtureId}/${media.filename.split('/').pop()}` })) } : {})
   } as CreateMemoryInput)
 }
 
@@ -251,7 +209,6 @@ const bigText = (label: string) => `${label} ${'x'.repeat(6_000)}`
 
 describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
   beforeEach(async () => {
-    for (const key of CLAUDE_CAP_ENV_KEYS) vi.stubEnv(key, '')
     await setMemoryConfig({
       lane: 'local-ai',
       modelId: 'local-ai:test-embedder',
@@ -270,10 +227,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
       provider: 'openai',
       contextWindow: 200_000
     } as never)
-  })
-
-  afterEach(() => {
-    vi.unstubAllEnvs()
+    await redis.sAdd(`user:${USER}:models`, PRESET_ID)
   })
 
   // -------------------------------------------------------------------------
@@ -460,10 +414,10 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Expiry processing (packet §1.2 phase 4 — demote, never erase)
+  // Expiry processing (phase4: hidden expired LTM, never erase)
   // -------------------------------------------------------------------------
 
-  it('demotes expired memories by lane and settles them exactly once', async () => {
+  it('retains every expired lane as expired LTM and settles each once', async () => {
     const past = new Date(NOW.getTime() - 86_400_000).toISOString()
     const awarenessWithTriggers = await seedMemory({
       content: 'Remember the birthday party plan every day until it happens',
@@ -490,7 +444,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
     const unexpired = await seedMemory({
       content: 'The venue balance is due at the end of next month',
       lane: 'awareness',
-      expires_at: new Date(NOW.getTime() + 86_400_000).toISOString()
+      expires_at: new Date(Math.max(Date.now(), NOW.getTime()) + 86_400_000).toISOString()
     })
 
     const run = await runDreamingPass({
@@ -502,12 +456,13 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
     })
     expect(run.counts.expiriesDemoted).toBe(4)
 
-    expect((await getMemory(AGENT, awarenessWithTriggers.id))?.lane).toBe('stm')
+    expect((await getMemory(AGENT, awarenessWithTriggers.id))?.lane).toBe('ltm')
     expect((await getMemory(AGENT, awarenessPlain.id))?.lane).toBe('ltm')
     expect((await getMemory(AGENT, stm.id))?.lane).toBe('ltm')
     const settledLtm = await getMemory(AGENT, ltm.id)
     expect(settledLtm?.lane).toBe('ltm')
-    expect(settledLtm?.expired_demoted_to).toBe('ltm')
+    expect(settledLtm?.expired_demoted_to).toBeUndefined()
+    expect(settledLtm?.expiry_processed_at).toEqual(expect.any(String))
     expect((await getMemory(AGENT, unexpired.id))?.lane).toBe('awareness')
     // Nothing was erased.
     expect((await listMemories(AGENT)).length).toBeGreaterThanOrEqual(5)
@@ -549,7 +504,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
       linger_override: null
     }) as never
 
-  it('expiry demotion turns a standing image to recall-only, logs it, and the panel can save the record (BL-786)', async () => {
+  it('plain expiry retains the owned photo as recall-only history and the panel can save the record (BL-786)', async () => {
     const standing = await seedMemory({
       lane: 'awareness',
       content: '[vec5] The photo of the conference badge',
@@ -574,8 +529,8 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
       (entry) => entry.kind === 'expire_demote' && entry.refs?.memoryId === standing.id
     )
     expect(action?.status).toBe('done')
-    expect(action?.why).toMatch(/only when the memory is recalled/)
-    expect(action?.refs).toMatchObject({ mediaMode: { from: 'always', to: 'on_recall' } })
+    expect(action?.why).toMatch(/explicit expired lookup/)
+    expect(action?.refs).not.toHaveProperty('to')
 
     const saved = await updateManagedMemory({ userId: USER, agentId: AGENT }, standing.id, panelSave(8))
     expect(saved.importance).toBe(8)
@@ -593,10 +548,9 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
     const record = (await getMemory(AGENT, stuck.id)) as Record<string, any>
     record.lane = 'ltm'
     record.expired_demoted_to = 'ltm'
+    record.media_mode = 'always'
     await redis.json.set(`memory:${AGENT}:${stuck.id}`, '$', record as never)
-    await expect(
-      updateManagedMemory({ userId: USER, agentId: AGENT }, stuck.id, panelSave(8))
-    ).rejects.toThrow(/before moving this memory out of Awareness/)
+    expect((await getMemory(AGENT, stuck.id))?.media_mode).toBe('always')
 
     const run = await runDreamingPass({
       userId: USER,
@@ -613,8 +567,8 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
     const action = run.actions.find(
       (entry) => entry.kind === 'expire_demote' && entry.refs?.memoryId === stuck.id
     )
-    expect(action?.why).toMatch(/only when the memory is recalled/)
-    expect(action?.refs).toMatchObject({ mediaMode: { from: 'always', to: 'on_recall' } })
+    expect(action?.why).toMatch(/explicit expired lookup/)
+    expect(action?.refs).not.toHaveProperty('to')
     expect((await updateManagedMemory({ userId: USER, agentId: AGENT }, stuck.id, panelSave(8))).importance).toBe(8)
 
     // Settled once: the next dream finds nothing to do for it.
@@ -894,10 +848,22 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
     expect(holdSkip?.why).toContain('held')
   })
 
-  it('uses each fixed session report for dreaming floor and era-summary budgets', async () => {
-    const cliAgent = namedClaudeCliAgent()
-    const reportSession = 'sess_dream_cli_report'
-    const choiceSession = 'sess_dream_cli_choice'
+  it('uses each agent selected API preset for dreaming floor and era-summary budgets', async () => {
+    const memoryWindow = { floor_mode: 'auto', ceiling_headroom_mode: 'auto', nap_threshold_percent: 80 }
+    const longPreset = 'preset_dream_one_million'
+    await redis.json.set(`model:${longPreset}`, '$', {
+      id: longPreset, modelId: 'test-long-model', modelName: 'Test Long Model',
+      provider: 'openai', contextWindow: 1_000_000
+    } as never)
+    const shortAgent = agentRecord({ agentType: 'api', memory_window: memoryWindow })
+    const longAgent = agentRecord({
+      id: `${AGENT}_long`, agentType: 'api', primary_model_preset_id: longPreset,
+      memory_window: memoryWindow
+    })
+    await redis.json.set(`agent:${longAgent.id}`, '$', longAgent as never)
+    await redis.sAdd(`user:${USER}:agents`, longAgent.id)
+    const shortSession = 'sess_dream_api_short'
+    const longSession = 'sess_dream_api_long'
     const oldGraduationEvents = (sessionId: string): FixedSessionGraduationEvent[] =>
       Array.from({ length: 13 }, (_, index) => ({
         id: `grad_${sessionId}_${index}`,
@@ -911,9 +877,10 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
         summaryTokenEstimate: 18_000
       }))
 
-    for (const sessionId of [reportSession, choiceSession]) {
+    for (const [sessionId, agent] of [[shortSession, shortAgent], [longSession, longAgent]] as const) {
       await seedSession(sessionId, {
         fixed: true,
+        agentId: agent.id,
         metadata: {
           fixedSession: {
             version: 1,
@@ -923,45 +890,51 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
           }
         }
       })
-      await seedMessage(sessionId, `old-${sessionId}-1`, 'user', 'Earlier episode start.', '2026-06-09T08:00:00.000Z')
-      await seedMessage(sessionId, `old-${sessionId}-2`, 'assistant', 'Earlier episode reply.', '2026-06-09T08:05:00.000Z')
-      await seedMessage(sessionId, `old-${sessionId}-3`, 'user', 'Earlier episode follow-up.', '2026-06-09T08:10:00.000Z')
-      await seedMessage(sessionId, `old-${sessionId}-4`, 'assistant', `Older episode detail ${'episode detail '.repeat(14_000)}`, '2026-06-09T08:15:00.000Z')
-      await seedMessage(sessionId, `recent-${sessionId}`, 'user', `Recent tail ${'recent detail '.repeat(18_000)}`, '2026-06-10T11:00:00.000Z')
+      await seedMessage(sessionId, `old-${sessionId}-1`, 'user', 'Earlier episode start.', '2026-06-09T08:00:00.000Z', {}, agent.id)
+      await seedMessage(sessionId, `old-${sessionId}-2`, 'assistant', 'Earlier episode reply.', '2026-06-09T08:05:00.000Z', {}, agent.id)
+      await seedMessage(sessionId, `old-${sessionId}-3`, 'user', 'Earlier episode follow-up.', '2026-06-09T08:10:00.000Z', {}, agent.id)
+      await seedMessage(sessionId, `old-${sessionId}-4`, 'assistant', `Older episode detail ${'episode detail '.repeat(14_000)}`, '2026-06-09T08:15:00.000Z', {}, agent.id)
+      await seedMessage(sessionId, `recent-${sessionId}`, 'user', `Recent tail ${'recent detail '.repeat(18_000)}`, '2026-06-10T11:00:00.000Z', {}, agent.id)
       await seedEpisode(sessionId, {
         id: `closed-${sessionId}`,
+        agent_id: agent.id,
         state: 'closed',
         opened_at: '2026-06-09T08:00:00.000Z',
         closed_at: '2026-06-09T09:00:00.000Z',
         boundary_signal: 'agent_mark'
       })
     }
-    await seedCliContextReport(reportSession, cliAgent, 200_000)
-
     const eraHardMaxes: number[] = []
-    const run = await runDreamingPass({
-      userId: USER,
-      agent: cliAgent,
-      trigger: 'manual',
-      now: NOW,
-      generateSummary: async (prompt, hardMaxTokens) => {
-        if (prompt.includes('STRETCH 1 (graduated')) eraHardMaxes.push(hardMaxTokens)
-        return prompt.includes('STRETCH 1 (graduated')
-          ? 'Era summary: older chapters form one arc.'
-          : 'Episode summary: preserve the earlier decision.'
-      }
-    })
+    const eraCounts: number[] = []
+    for (const agent of [shortAgent, longAgent]) {
+      const run = await runDreamingPass({
+        userId: USER,
+        agent,
+        trigger: 'manual',
+        now: NOW,
+        generateSummary: async (prompt, hardMaxTokens) => {
+          if (prompt.includes('STRETCH 1 (graduated')) eraHardMaxes.push(hardMaxTokens)
+          return prompt.includes('STRETCH 1 (graduated')
+            ? 'Era summary: older chapters form one arc.'
+            : 'Episode summary: preserve the earlier decision.'
+        }
+      })
+      eraCounts.push(run.counts.eraConsolidations)
+    }
 
-    const graduated = await listMemorySegments(AGENT)
-    expect.soft(graduated.some((segment) => segment.episode_id === `closed-${reportSession}`)).toBe(true)
-    expect.soft(graduated.some((segment) => segment.episode_id === `closed-${choiceSession}`)).toBe(false)
-    expect(run.counts.eraConsolidations).toBe(2)
+    const shortGraduated = await listMemorySegments(shortAgent.id)
+    const longGraduated = await listMemorySegments(longAgent.id)
+    expect.soft(shortGraduated.some((segment) => segment.episode_id === `closed-${shortSession}`)).toBe(true)
+    expect.soft(longGraduated.some((segment) => segment.episode_id === `closed-${longSession}`)).toBe(false)
+    expect(eraCounts).toEqual([1, 1])
     expect.soft(eraHardMaxes.sort((a, b) => a - b)).toEqual([5_000, 16_000])
   })
 
-  it('skips unknown CLI-default floor and era work without summary calls', async () => {
-    const unknownAgent = namedClaudeCliAgent(undefined, {
-      claude_settings: { permissionMode: 'default' }
+  it('skips unknown API-context floor and era work without summary calls', async () => {
+    const unknownAgent = agentRecord({
+      agentType: 'api', primary_model_preset_id: null,
+      primary_model_provider: 'unknown-test-provider', primary_model_name: 'unknown-test-model',
+      memory_window: { floor_mode: 'auto', ceiling_headroom_mode: 'auto', nap_threshold_percent: 80 }
     })
     const events: FixedSessionGraduationEvent[] = Array.from({ length: 13 }, (_, index) => ({
       id: `unknown-grad-${index}`,

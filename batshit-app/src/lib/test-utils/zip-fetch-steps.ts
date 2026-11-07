@@ -174,7 +174,8 @@ export function directHelperZipFetchOutput(): Record<string, any> {
 
 /**
  * Managed Codex lane, direct helper: Codex wraps every helper call's arguments in
- * `{ arguments }` and its result in an MCP text envelope; send-routed adds `input`.
+ * `{ arguments }` and its result in an MCP text envelope; send-routed adds `input`. SA-139 R1
+ * removed that lane; this is the saved step an old chat keeps.
  */
 export function codexDirectZipFetchStep(server = MANAGED_HELPER_SERVER): Record<string, any> {
   const args = { arguments: { zipId: FETCHED_ZIP_ID, includeContent: true, maxChars: 20000 } }

@@ -190,6 +190,44 @@ describe('a message waiting in the line (BL-4)', () => {
     expect(ids.filter((id: string) => id === 'msg-2')).toHaveLength(1)
   })
 
+  // BL-903 (a): a kept send's reason is written by the same one-step script, beside its other
+  // metadata, and only when the caller gives one.
+  it('saves a kept send\'s mark in the same step, keeping the record\'s other metadata', async () => {
+    await seedFiveMessages()
+    await redis.execute((client) =>
+      client.json.set(`message:${SESSION}:msg-3`, '$.metadata', { clipIds: ['clip_1'] } as never)
+    )
+
+    const moved = await redis.moveMessageToEnd(SESSION, 'msg-3', { keptSend: { reason: 'stopped' } })
+    expect(moved?.metadata).toEqual({ clipIds: ['clip_1'], keptSend: { reason: 'stopped' } })
+    const stored = (await redis.getAllMessages(SESSION)).at(-1)
+    expect(stored?.id).toBe('msg-3')
+    expect(stored?.metadata).toEqual({ clipIds: ['clip_1'], keptSend: { reason: 'stopped' } })
+
+    // A record with no metadata object gets one; a move without a mark adds none.
+    // A whole-record write (node-redis `json.del(key, path)` can drop the whole record).
+    await redis.execute(async (client) => {
+      const record = (await client.json.get(`message:${SESSION}:msg-1`)) as Record<string, unknown>
+      delete record.metadata
+      await client.json.set(`message:${SESSION}:msg-1`, '$', record as never)
+    })
+    expect((await redis.moveMessageToEnd(SESSION, 'msg-1', { keptSend: { reason: 'overflow' } }))?.metadata).toEqual({
+      keptSend: { reason: 'overflow' }
+    })
+    expect((await redis.moveMessageToEnd(SESSION, 'msg-5'))?.metadata?.keptSend).toBeUndefined()
+
+    // The send facts its request carried ride in the mark, nested, as given; none adds no key.
+    const sendFacts = { projectPath: '/work/p', projectRules: { notes: 'r' }, claudePermissionMode: 'acceptEdits', selectedTools: ['a', 'b'] }
+    expect((await redis.moveMessageToEnd(SESSION, 'msg-2', { keptSend: { reason: 'stopped', sendFacts } }))?.metadata?.keptSend).toEqual({
+      reason: 'stopped',
+      sendFacts
+    })
+    expect((await redis.getAllMessages(SESSION)).at(-1)?.metadata?.keptSend).toEqual({ reason: 'stopped', sendFacts })
+    expect((await redis.moveMessageToEnd(SESSION, 'msg-4', { keptSend: { reason: 'stopped', sendFacts: {} } }))?.metadata?.keptSend).toEqual({
+      reason: 'stopped'
+    })
+  })
+
   it('dates a resent message with the time its tab sent it, when the caller gives one', async () => {
     await seedFiveMessages()
     const sentAt = '2026-09-22T19:00:00.000Z'

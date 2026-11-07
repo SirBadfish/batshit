@@ -47,7 +47,7 @@ describe('the steady line on a held read (DL-03)', () => {
   })
 })
 
-describe('Current Zip State (the DCM)', () => {
+describe('Zip Holds lines (the Zip Index; the DCM\'s Current Zip State until 2026-10-23)', () => {
   it('names the path and the holder for an agent hold, and whether the held copy was compressed as dead', () => {
     expect(describeUnzippedItemForDcm(agentHold, { agentId: 'agent-1' })).toBe(
       '- src/app.ts | zip_a | held by you | until you release it'

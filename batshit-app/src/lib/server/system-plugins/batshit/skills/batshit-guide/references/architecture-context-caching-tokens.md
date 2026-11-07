@@ -1,0 +1,73 @@
+# Context, caching, and token optimization
+
+Batshit is built so the stable parts of a conversation stay reusable, bulky output gets compressed before a provider ever sees it, and you can check the cache evidence instead of taking it on faith. This page explains how that works and, just as important, what it does not promise.
+
+## Why request shape matters
+
+Every model call re-sends context. The model has no memory between calls, so each turn ships the system prompt, the tools, and the conversation so far. Two things make that expensive:
+
+- **Extras on every message.** Anything attached to a message is sent again on every later turn, so a small extra per message adds up over a long conversation.
+- **Dragging everything along.** Long logs, diffs, and tool results get carried through the whole conversation even when they're done being useful.
+
+There's a second, less obvious lever: **provider prompt caching rewards stable, repeated prefixes.** If the beginning of your request is identical to last time, a provider that supports caching can reuse that work cheaply. So the *order* of a request matters as much as its size — the more of the front that stays byte-for-byte stable, the more there is to reuse.
+
+## The layered context model
+
+Batshit assembles a Primary Agent request from most stable to most volatile, on purpose:
+
+1. **Stable setup first** — the base agent prompt, agent and user policies, the compact native-tool guidance, and the deterministic native tool schemas. These don't change from one of your messages to the next.
+2. **Semi-stable next** — agent settings, project context, and the conversation history so far.
+3. **Volatile last** — your newest message, the Dynamic Current Message (Batshit's per-send context block), the current Clip and Zip state, interruption notes, and anything that's true only for this one send.
+
+Putting the churn at the end means everything in front of it can stay reusable. Stable policy settings (like default Zip behavior) live in the stable region; genuinely per-send state (like "these exact Zips are open right now") stays at the volatile tail, where it belongs.
+
+## Batshit's own optimization comes first
+
+Before any provider caching enters the picture, Batshit already shrinks what it sends:
+
+- **Plain text, one simple tag per message.** Your conversation reaches the model as plain text, with each message inside its own tag: `<user>` for you, `<assistant>` for the agent's own earlier replies, `<agent name="…">` for any other agent in the chat, and `<note>` for Batshit's own entries, such as a summary of older messages or a DM that woke the agent. The first message of each day carries its date and time, and your newest message carries the current time inside a `<current_message>` tag. Batshit adds nothing else to the messages: no message IDs, session IDs, or model settings. If a message or a web page contains text that looks like one of these tags, Batshit disarms it (its `<` becomes `&lt;`), so it can't pretend to be you. The **Compiled Messages** section of the [Execution Viewer](../chat/execution-viewer.md) shows the result for recent runs.
+- **Zips.** Large tool output and long results are compressed to small references; the model only carries the full content when it's actually needed. See [Zips](../tools/zips.md).
+- **Clips.** Files and images are stored once and referenced, and images reach the model as structured image input — never as raw bytes pasted into prompt text. See [Clips](../clips/overview.md).
+- **Dynamic Tool Search.** Only a small, stable set of native tools is described in every request. Every other tool — MCP, CLI Tools, Artifacts, Fabric — is discovered on demand through a search-and-use contract, so thousands of tokens of tool schemas don't ride along on every message. See [Tools](../tools/overview.md).
+
+**Agent Setup** keeps stable tool hints and the enabled Skills catalog for an agent in a chat. Current change notes keep it informed when capabilities change. Batshit refreshes setup when needed; provider caching still depends on the provider and does not guarantee a saving. Settings changes apply to the next message, and every tool call checks current access.
+
+[Dynamic Schema Hints](../admin/overview.md#dynamic-schema-hints) controls scalable hints, separately from fixed features and Skills. **Preview Agent Setup Tools** shows estimated tokens, not billed usage.
+
+These are why a Batshit request is already smaller and steadier before caching does anything.
+
+## Provider caching builds on the stable prefix
+
+Once the front of a request is genuinely stable, providers that support prompt caching can reuse it. Batshit makes Primary Agent requests cache-friendly by default and adds the right provider-specific decoration at the transport edge — you don't hand-fill provider fields:
+
+- **OpenAI** caches automatically on recent models. Batshit attaches a stable cache key so repeated sends route to the same cached prefix. On a direct OpenAI connection with GPT-5.6 or later, Batshit also sends the chat's earlier turns as separate blocks and marks the latest two, so each new turn reads the earlier conversation from the cache instead of writing it again.
+- **Anthropic** uses explicit cache markers. Batshit places one on the stable system block, so the first eligible send writes the cache and later sends read it. On a direct Anthropic connection, and on OpenRouter with a Claude model, Batshit also sends the chat's earlier turns as separate blocks with a marker after the latest one, so each new turn reads the earlier conversation from the cache and pays the cache-write price only for what is new. When a reply calls tools, Batshit also turns on Anthropic's moving cache point from the first step: the first step writes the message that starts the reply, and each later step reads the step before it from the cache. A reply with no tool call pays that one small cache write without reading it back. Subagents and Workers on their parent's model get it too.
+- **Gemini** caches implicitly on recent models once the stable prefix is large enough. Batshit keeps the prefix in the right order and reads the cache-hit counts back into its own usage numbers.
+- **OpenRouter** keeps a conversation on the same provider endpoint (sticky routing) and passes per-message cache markers where the underlying provider needs them. For an OpenAI GPT-5.6 or later model on OpenRouter, Batshit also sends the chat's earlier turns as separate blocks and marks the latest two, as on a direct OpenAI connection.
+- **Vercel AI Gateway** can cache automatically; Batshit turns that on for gateway-routed models and leaves implicit-cache providers alone.
+
+Gemini deserves one extra note: Batshit intentionally does **not** use Google's explicit `cachedContent` API for normal agents right now. Google's explicit cache is a named, mostly frozen resource that must be created ahead of time, and current Google behavior rejects a `cachedContent` request if the live model call also sends system instructions, tools, or tool config. Batshit agents normally keep tools enabled, so using that API would mean building a special Google-only transport that moves tool declarations into the cached resource without breaking tool execution. Until Google improves that contract, Batshit uses Gemini's implicit caching and shows whatever cache-token evidence Google reports.
+
+Existing per-model cache settings still work as advanced overrides, but the default path is cache-friendly without manual setup.
+
+## Honest caveats
+
+Caching is a provider behavior, not a Batshit guarantee:
+
+- **Short prompts may never hit a cache.** Providers have minimum token thresholds, and caches expire — often after a few minutes, sometimes an hour.
+- **Image turns can change provider cache behavior.** Batshit keeps Clips out of prompt text and reuses stable image references where possible, but some providers may still miss or shrink cache reads when images are attached.
+- **Not every model reports cache numbers,** and what's reported differs by provider.
+- **Batshit never silently falls back.** If a provider rejects a cache option, you get a clear error — not a quiet uncached retry pretending optimization happened.
+
+So the honest version of the claim is: Batshit is shaped so the stable parts of your context stay reusable, and it shows you the evidence where providers report it. It does **not** promise that every chat is cached.
+
+## Seeing the evidence
+
+The [Execution Viewer](../chat/execution-viewer.md) shows, in plain terms, what was actually sent and how a run used cache — cached input tokens read, and cache tokens created on the first eligible send — for the providers that report it. That's how you confirm caching is working on your own setup instead of trusting a marketing line.
+
+## Related
+
+- [Zips](../tools/zips.md) · [Clips](../clips/overview.md) · [Tools](../tools/overview.md)
+- [Tools without prompt bloat](tools-without-bloat.md)
+- [Streaming, recovery, and transparency](streaming-and-recovery.md)
+- [Execution Viewer](../chat/execution-viewer.md)

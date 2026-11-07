@@ -26,7 +26,7 @@ For exact models with verified OpenAI documentation, **View Details** shows imag
 
 **Refresh** reloads the selected accounts' current model lists, preserving their names and order. A model listed in the paid OpenAI catalog may still be unavailable to your ChatGPT account. Published properties use a dated snapshot audited by Batshit's existing daily catalog maintenance; changed or unreadable documentation requires a reviewed update. Account Refresh does not imply that the published-property snapshot was reverified or updated. A new exact model without verified metadata keeps unknown capabilities and limits.
 
-If the account disconnects or needs reconnecting, its presets stay saved but cannot run until you reconnect and choose the right connection. Switching accounts cannot resume an approval from the previous connection. See [ChatGPT plan setup](api-keys-and-models.md#connect-a-chatgpt-plan-in-the-mac-app).
+If the account disconnects or needs reconnecting, its presets stay saved but cannot run until you reconnect and choose the right connection. Switching accounts cannot resume an approval from the previous connection. See [ChatGPT plan setup](api-keys-and-models.md#connect-a-chatgpt-plan-in-a-local-installation).
 
 ## How a model gets named
 
@@ -104,22 +104,31 @@ When you edit a preset, every agent that uses it sends the new values on its nex
 
 Reasoning-capable models do not all send their thinking the same way. Some providers return a dedicated reasoning field, while models such as MiMo or some DeepSeek/open-model routes may place it inside `<think>...</think>` tags in the ordinary text stream.
 
-For `API` agents, Batshit normalizes both formats into the same reasoning panel when the preset is marked reasoning-capable or the model/provider is a known MiMo or DeepSeek path. **Display Reasoning** controls whether that panel is shown. When it is on and the model emits reasoning, Batshit saves that reasoning with the message so it remains visible after refresh regardless of the Preserve setting. **Preserve Reasoning In Chat History** separately controls the agent-facing history: turn it on to include that agent's saved reasoning in later model requests, or leave it off to keep the reasoning visible to you without spending later context tokens on it.
+Batshit normalizes both formats into the same reasoning panel when the preset is marked reasoning-capable or the model/provider is a known MiMo or DeepSeek path. It saves the reasoning the model exposes independently of **Display Reasoning**, which controls only whether you see that panel. In Agent Settings, **Reasoning Retention** chooses **Whiteboard Only**, **Preserve Reasoning Only**, **Whiteboard + Preserved Reasoning** or **Neither** for later requests. The starting choice is Whiteboard Only. See [Whiteboard and reasoning retention](../chat/memory-and-infinite-sessions.md#whiteboard-and-reasoning-retention).
 
-An interruption is the one safety override. If you stop an agent while it is reasoning, Batshit gives that unfinished reasoning and plan back to the same agent on its next request even when Display and Preserve are both off. It stays hidden from other agents and disappears after the original agent completes a successful response; failed or interrupted retries do not clear it. Batshit stores and reuses one fixed recovery block, so the interruption and its later expiry each cause only one bounded prompt-cache change. The source run's Execution Viewer reports the pending recovery, and the next run's **Compiled Messages** shows the exact block the agent received. Reasoning tags and their contents do not become part of the normal assistant answer.
+An interruption is the one safety override. If you stop an agent while it is reasoning, Batshit gives that unfinished reasoning and plan back to the same agent on its next request even when Display Reasoning is off and Reasoning Retention omits completed-reply reasoning. It stays hidden from other agents and disappears after the original agent completes a successful response; failed or interrupted retries do not clear it. Batshit stores and reuses one fixed recovery block, so the interruption and its later expiry each cause only one bounded prompt-cache change. The source run's Execution Viewer reports the pending recovery, and the next run's **Compiled Messages** shows the exact block the agent received. Reasoning tags and their contents do not become part of the normal assistant answer.
 
 For MiMo M2.5 through Vercel Gateway, Batshit normally uses Xiaomi's creator-hosted route because it returns reasoning and final text as separate stream parts. If you explicitly configure a Gateway provider order or restriction, Batshit preserves that choice and still normalizes tagged reasoning when the selected route emits it. Display Reasoning remains a visibility choice; it does not turn the model's thinking mode on or off.
 
 ### Thinking mode on Claude models
 
-A Claude preset has a **Thinking mode** (Settings → Models, in the preset's **Reasoning** options). Most Claude models offer **Disabled** and **Enabled**, and a **Thinking budget tokens** box sits beside them. Leave both blank and Batshit sends nothing, so Anthropic's own default applies. Batshit sends the setting on the Anthropic API and on the Vercel AI Gateway; OpenRouter does not carry it.
+Claude's Thinking mode and effort are separate choices. Sonnet 5.5 supports **Adaptive** and **Between tools**; Between tools supports Low, Medium and High effort. Choose Adaptive to use Extra high or Max. Haiku 5.5 also offers Disabled, with effort up to High in that mode. Other supported Claude models offer the modes listed for that exact model. Batshit keeps an incompatible saved combination visible and asks you to change it rather than lowering your effort silently. An older saved Sonnet Disabled setting still means Between tools.
 
-**Claude Sonnet 5.5 cannot turn thinking off**, and Anthropic refuses the Disabled and Enabled settings for it. Its Thinking mode has one choice, **Between tools (lowest)**: no thinking before the reply, and short progress notes between tool calls. Batshit offers no budget box for this model, because Between tools takes none, and a budget saved earlier is not sent (the preset editor may still list it under Custom Parameters as a row that Batshit does not send).
+**Send prior reasoning to Claude** controls whether available reasoning from earlier messages is included as input. It does not turn reasoning output on or off; **Display Reasoning** controls what is shown in chat.
 
-- A Sonnet 5.5 preset saved with **Disabled** is shown as **Between tools (lowest)** and sent that way. The word stored in the preset may still read Disabled; what you see and what Batshit sends is Between tools.
-- A Sonnet 5.5 preset saved with **Enabled** cannot be sent on the Anthropic API or the Vercel AI Gateway. Batshit does not swap it for another setting: the message says so, and a note appears beside the field in Settings → Models. Choose Between tools, or clear the field, and send again.
+### Per-agent reasoning level
 
-**Claude Opus 5.5, Claude Fable 5, and Claude Fable 5.1 always think.** A preset saved with **Disabled**, **Enabled**, or a **Thinking budget tokens** value cannot be sent to them on the Anthropic API or the Vercel AI Gateway. Batshit does not change the preset for you: the message says what to clear. Leave both fields blank and Batshit sends nothing, so Anthropic's default applies.
+For a supported model, use the **Brain** menu in chat or the matching control in that agent’s **Agent Settings**. The choice belongs to that agent and the exact model connection. It does not edit the shared preset or affect other agents, and it applies to the next reply; a reply already underway keeps the choice it started with.
+
+**Use preset** keeps the reasoning choice saved in the Model Preset. **Provider default** sends no Batshit-selected value for that control, so the provider chooses its default. Choices depend on the exact model and connection: supported OpenAI models show effort, Claude can show separate effort and Thinking mode, and supported Gemini models show Thinking level. Direct MiMo V2.5, V2.5 Pro and V2.6 Pro have Thinking On/Off; GLM 5.3 through Qwen Cloud offers Low, High and Max effort. Those direct-connection controls do not establish support through a Token Plan or another connection. ChatGPT Plan offers controls only for models available to your connected account. This does not promise support for every hosted provider or Local AI program.
+
+Gemini 2.5 models use a **Thinking budget** instead of named levels. **Dynamic** lets the model choose; **Off** is offered only on models that support it. **Set token budget…** opens a number field with Save and Cancel. Invalid input stays visible and is not saved. This is a requested budget, not a guaranteed hard limit. **Use preset** and **Provider default** remain separate from an explicit number.
+
+For Ollama, Batshit checks the selected model’s own Thinking information. When that model and the installed Ollama adapter support the checked boolean contract, the Brain menu offers **On**, **Off**, **Use preset**, and **Provider default**. Use preset preserves the existing preset behavior; a blank Ollama preset currently requests Off. Provider default instead lets the model choose its own default, which may be On. These choices are different. If the model’s options cannot be verified, Batshit keeps your saved choice visible and does not guess. Other Local AI programs keep their existing Model Preset controls; a new Brain menu is offered only after that program and model have a verified contract.
+
+This setting controls how much reasoning the model is asked to do. It is separate from **Display Reasoning**, which controls what you see, and **Reasoning Retention** in Agent Settings → Core, whose four modes choose whether later requests receive a Whiteboard, preserved reasoning, both or neither. A model’s reasoning-token budget is also a separate setting.
+
+If a saved choice no longer fits the selected model or connection, Batshit keeps it visible rather than changing it to a nearby choice. Choose a supported level or **Provider default** before sending. Resolve a failed save before the next send.
 
 ## How presets connect to keys and Local AI
 
@@ -140,15 +149,15 @@ Batshit normally fills the category from the catalog. If a provider's metadata i
 
 Existing catalog-backed presets are checked again when Batshit loads them. If an older preset was accidentally classified from a capability tag — for example, a chat model with OCR support being placed under Utility — Batshit repairs it from the catalog unless you deliberately chose a manual category.
 
-## How each Primary Agent type uses models
+### Claude plan models
 
-Model Presets are an `API` concept. The other Primary Agent types pick models differently:
+When Claude Code is installed, the **Claude Plan** connection lists the Claude Code models Batshit tested, plus **CLI default** (Claude Code chooses). They are separate from paid Anthropic API models and never borrow their prices or limits. A Claude plan preset offers only what Claude Code can honor: **Reasoning effort** and, on Opus 4.8, Opus 4.6 and Sonnet 5, **Thinking**. Sampling settings, output limits and Custom Parameters are not offered. Opus 4.6 does not take Extra High effort. If Claude Code is not ready, the connection shows why and its presets cannot run until you fix it. See [Claude plan](claude-plan.md).
 
-- **`API` Primary Agents** select a saved Model Preset directly. This is the path this page is about.
-- **n8n Workflow Subagents** use whatever model and provider nodes you configure inside the n8n workflow. Their credentials live in n8n, while the saved Batshit model preset records compatibility and presentation.
-- **`CLI` Primary Agents** use their CLI runtime's own model selection (the Codex or Claude Code login), not an `API` Model Preset.
+## How agents use models
 
-If you connect more than one Primary Agent type, expect models to be configured in more than one place — that's by design, not a bug.
+Every Primary Agent and Subagent selects a saved Model Preset directly, on any connection, the Claude plan included. This is the path this page is about.
+
+A saved preset on a removed connection (Claude Code CLI or Codex CLI) stays under **Saved Models** so you can delete it, but pickers show it as **This preset can no longer be used**, and saving it on an agent or Subagent is refused. Batshit won't delete a preset that something still uses, so delete a leftover CLI Subagent that names it first.
 
 ## Troubleshooting
 
@@ -191,6 +200,8 @@ The preset holds Thinking mode Disabled or Enabled, or a Thinking budget. Open t
 ### A manually entered model says “not found”
 
 Manual entries are sent using the Developer ID and Model ID you enter. Copy the exact request identifier from that provider's documentation or model list, including punctuation and capitalization. Catalog-backed presets do this automatically.
+
+See [App Actions](../fabric/app-actions.md) for approved changes an agent can make to supported settings, with your selected scope and permission.
 
 ## Related docs
 

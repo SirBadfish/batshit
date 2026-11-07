@@ -4,17 +4,7 @@ import {
   PORTABLE_SKILL_SCOPED_EXECUTION,
   resolveNativeToolUser
 } from '$lib/server/services/nativeToolAuth'
-import {
-  bindActingAgentId,
-  bindActingSessionId,
-  boundDelegatedAllowedControlIds,
-  boundRunCredential,
-  boundScopeAgentId,
-  boundSessionId
-} from '$lib/server/services/actingAgentIdentity'
 import { useControl, type ControlUseErrorCode } from '$lib/server/services/fabricRegistry'
-import { getRunCredentialStopSignal } from '$lib/server/services/streamAbortRegistry'
-import { toolTextBudgetHeaders } from '$lib/server/services/toolTextBudget'
 import {
   getPortableSkillFamilyDefinitions,
   getPortableSkillRequiredFamiliesForControl,
@@ -75,29 +65,6 @@ function statusForControlError(code?: ControlUseErrorCode): number {
       return 500
     default:
       return 500
-  }
-}
-
-/** Private transport hint for the managed helper's final model-text guard. The resolved
- * Fabric control id comes from useControl, never a helper-supplied label or result body. */
-function memoryResultHeaders(authKind: string, requestedControlId: string, resolvedControlId: string): Record<string, string> {
-  return authKind === 'agent' && requestedControlId === resolvedControlId &&
-    /^sys\.memory\.[a-z][a-z0-9_]*$/.test(resolvedControlId)
-    ? { 'x-batshit-memory-no-retain': '1' }
-    : {}
-}
-
-function finalResultHeaders(
-  auth: NonNullable<Awaited<ReturnType<typeof resolveNativeToolUser>>>,
-  requestedControlId: string,
-  resolvedControlId: string,
-  success: boolean
-): Record<string, string> {
-  return {
-    ...toolTextBudgetHeaders(auth),
-    ...memoryResultHeaders(auth.auth, requestedControlId, resolvedControlId),
-    ...(auth.auth === 'agent' && success && resolvedControlId === 'sys.zip.fetch' &&
-      requestedControlId === resolvedControlId ? { 'x-batshit-tool-page-kind': 'fetch-zip' } : {})
   }
 }
 
@@ -185,8 +152,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       )
     }
 
-    if (controlId === 'sys.zip.fetch' &&
-      (auth.auth !== 'agent' || auth.fetchZipAllowed !== true)) {
+    if (controlId === 'sys.zip.fetch') {
       return json(
         {
           success: false,
@@ -225,99 +191,21 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       )
     }
 
-    /**
-     * SA-117 DL-117-04 — the acting agent, bound.
-     *
-     * This is the line P1 left open (F-P1-3): the route forwarded `auth.credentialId` to the
-     * audit but still passed `body.agentId` as the actor, so the audit could name a
-     * credential beside an agent id the body had claimed. Now the bound id wins, and a body
-     * id that DIFFERS is refused rather than corrected — a mismatch is a bug in a caller or
-     * a forgery, and either one should be visible.
-     */
-    const agentBinding = bindActingAgentId(auth, body.agentId)
-    if (!agentBinding.ok) {
-      return json(
-        {
-          auth: auth.auth,
-          userId: auth.userId,
-          success: false,
-          controlId,
-          error: { code: agentBinding.code, message: agentBinding.message }
-        },
-        { status: 400 }
-      )
-    }
+    // An HTTP caller may supply a scope hint; it does not become a vouched identity.
+    const agentId = typeof body.agentId === 'string' ? body.agentId.trim() || undefined : undefined
 
-    // `sessionId` and `messageId` are body text — the woken-turn gate reads the first and
-    // the approval card is pinned to the second. `resolveApprovalCardTarget` owns both
-    // ownership checks for this route and `/api/cli-tools/execute` alike, because the same
-    // rule written twice is how DL-116-14's hole came to exist in two files.
-    //
-    // SA-117 DL-117-04: on the agent lane the credential's session is authoritative, so the
-    // ownership check below runs against the bound id rather than whatever the body sent.
     const { sessionId, messageId } = await resolveApprovalCardTarget({
       userId: auth.userId,
-      sessionId: bindActingSessionId(auth, body.sessionId),
-      messageId: auth.auth === 'agent' ? auth.messageId : body.messageId
+      sessionId: body.sessionId,
+      messageId: body.messageId
     })
-
-    /**
-     * SA-117 DL-117-10 (AMD-117-02) — the acting agent, on the wire, for the Execution Viewer.
-     *
-     * Present ONLY when the server bound it: `auth.auth === 'agent'` means it came off a
-     * credential Batshit minted for this run. It is deliberately absent on every other lane
-     * rather than echoing `body.agentId` back, because a label sourced from the caller's own
-     * claim would read as though the server had vouched for it — which is worse than no
-     * label, and is exactly why F-P1-2 moved this half of DL-117-10 out of P1.
-     *
-     * BL-81: a delegated run's label stays its PER-RUN id, not its scope id. The label shows
-     * only when it differs from the chat's agent, and a Subagent's record id can equal a
-     * primary's, so the scope id would hide it exactly when a Subagent acted; a built-in
-     * Worker's scope id is a random `worker_…` id that names nothing a person can find.
-     *
-     * The managed CLI helper returns this response verbatim as its MCP tool result, so the
-     * value reaches the Execution Viewer inside the step's own output.
-     */
-    const actingAgentField =
-      auth.auth === 'agent' && agentBinding.agentId
-        ? { actingAgentId: agentBinding.agentId }
-        : {}
-
-    /**
-     * BL-81 — a Subagent or Worker run may use exactly what its DCM index offered it.
-     *
-     * Its credential carries that list (`boundDelegatedAllowedControlIds`; `[]` for one minted
-     * before BL-81) and the Subagent whose artifact allowlists apply (`boundScopeAgentId`). The
-     * per-run runtime id bound above as `agentId` keeps every other decision: the identity gate,
-     * the risk gate, the handler, the audit's `agentId` and the label above. Before BL-81 this
-     * route checked none of it, so a CLI Subagent could call any Fabric control, although
-     * SA-064 keeps that plane primary-only. Both are `undefined` on every call but a delegated
-     * one on the agent lane, where the route's existing rules apply unchanged.
-     */
-    const delegatedAllowedControlIds = boundDelegatedAllowedControlIds(auth)
-    const scopeAgentId = boundScopeAgentId(auth) || undefined
 
     const result = await useControl({
       userId: auth.userId,
-      agentId: agentBinding.agentId,
+      agentId,
       sessionId,
       messageId,
       controlId,
-      // BL-601: the Stop of the reply that made this call. The managed CLI helper sends every
-      // `mcp:` ref and `batshit_server_dynamic_mcp_use` here as `sys.mcp.dynamic.use`, whose
-      // gateway call ends on it (BL-454). The request cannot carry a Stop (SvelteKit aborts
-      // `request.signal` only before the body is read), so it comes from the run credential:
-      // BL-1321, a primary run hears only its own reply's Stop (already aborted once that reply
-      // has ended or been replaced), a Subagent or Worker run its chat's running reply (the
-      // parent's); the other lanes have no bound chat and get none.
-      abortSignal: getRunCredentialStopSignal(boundRunCredential(auth)),
-      // BL-1314: the chat and the reply this run credential was minted for, from the credential
-      // (never the body). `useControl` admits a Settings write only on the Stop of that exact
-      // reply, read at admission, so a still-valid credential of an earlier run cannot borrow a
-      // newer reply's Stop. Absent on every other lane, where a Settings write is refused.
-      originatingReply: auth.auth === 'agent'
-        ? { sessionId: boundSessionId(auth), messageId: auth.messageId ?? null }
-        : undefined,
       input: body.input && typeof body.input === 'object' ? body.input : {},
       dryRun: body.dryRun === true,
       // DL-116-01/DL-116-09: the flag survives for exactly one lane. `body.allowRisky` is
@@ -325,20 +213,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       // helper all pause and wait for a click, the same as the model does.
       allowRisky: auth.auth === 'portable-skill',
       actorType: auth.auth,
-      // SA-117 DL-117-10: names the run credential this call arrived on, which is what makes
-      // the `agentId` beside it readable as server-bound rather than body-claimed. DL-117-04
-      // does the binding above.
-      credentialId: auth.credentialId,
-      // F-P2-1: a Subagent or Worker run's credential is real, and still names nobody who
-      // can act. `useControl` refuses the identity-bearing families for it.
-      delegatedRun: auth.delegated === true,
-      // BL-81: what that run may use, and whose artifact allowlists apply; both read beside the
-      // flag above and only with it.
-      delegatedAllowedControlIds,
-      scopeAgentId,
-      // The credential carries the turn's gateway ceiling. The request's selectedGateways
-      // remains a model-supplied narrowing filter, never a replacement for that ceiling.
-      ...(auth.auth === 'agent' ? { mcpGatewayScope: auth.mcpGatewayScope ?? [] } : {}),
+      ...(auth.auth === 'portable-skill' && auth.portableSkillToken ? { portableSettingsActor: {
+        tokenId: auth.portableSkillToken.id, authorityGeneration: auth.portableSkillToken.authorityGeneration ?? 0
+      } } : {}),
       selectedGateways: Array.isArray(body.selectedGateways) ? body.selectedGateways : undefined,
       allowedControlIds:
         auth.auth === 'portable-skill'
@@ -369,21 +246,18 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       if (approvalRequest && !messageId) {
         console.warn(
           `[Controls Use] Paused "${result.controlId}" for approval, but no message id was ` +
-            'verified for this call, so no approval card can render. The managed CLI ' +
-            'profiles forward BATSHIT_MESSAGE_ID — regenerate them if this persists.'
+            'verified for this call, so no approval card can render.'
         )
       }
       return json(
         {
           auth: auth.auth,
           userId: auth.userId,
-          ...actingAgentField,
           ...result,
           ...(approvalRequest ? { approvalRequest } : {})
         },
         {
-          status: statusForControlError(result.error.code),
-          headers: finalResultHeaders(auth, controlId, result.controlId, false)
+          status: statusForControlError(result.error.code)
         }
       )
     }
@@ -391,9 +265,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     return json({
       auth: auth.auth,
       userId: auth.userId,
-      ...actingAgentField,
       ...result
-    }, { headers: finalResultHeaders(auth, controlId, result.controlId, true) })
+    })
   } catch (error) {
     console.error('[Controls Use] failed:', error)
     return json(

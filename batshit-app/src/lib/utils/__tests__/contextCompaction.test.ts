@@ -5,7 +5,6 @@ import {
   buildCompactionTranscript,
   getSmartAutoCompactTriggerTokens,
   hasPendingCompactApproval,
-  resolveCurrentModelCompactRuntime,
   resolveEffectiveAutoCompactSettings,
   selectMessagesForCompaction,
   type ContextCompactionEvent
@@ -241,25 +240,9 @@ describe('contextCompaction helpers', () => {
       ].join('\n')
     )
   })
-
-  it('routes current-model compaction to the Codex CLI worker for Codex CLI agents', () => {
-    expect(
-      resolveCurrentModelCompactRuntime({
-        agentType: 'cli',
-        primary_model_provider: 'openai-codex',
-        primary_model_connection: { id: 'codex-cli' }
-      })
-    ).toBe('codex-cli')
-    expect(
-      resolveCurrentModelCompactRuntime({
-        agentType: 'cli',
-        primary_model_provider: 'anthropic-claude-cli',
-        primary_model_connection: { id: 'claude-cli' }
-      })
-    ).toBe('claude-cli')
-    expect(resolveCurrentModelCompactRuntime({ agentType: 'api' })).toBe('api')
-    expect(resolveCurrentModelCompactRuntime({ agentType: 'n8n' })).toBe('n8n')
-  })
+  // SA-139 R4: `resolveCurrentModelCompactRuntime` left with the Claude Code CLI Primary. Compact
+  // now refuses a retired Primary type by `retiredPrimaryAgentRefusal` in `generateModelSummary`
+  // (pinned, with the "codex"-in-the-model-id and custom-provider cases, in summaryGeneration.test.ts).
 })
 
 /**

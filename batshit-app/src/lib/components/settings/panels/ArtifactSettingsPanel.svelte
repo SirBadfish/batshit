@@ -1217,10 +1217,13 @@
                     </div>
 
                     {#if powerSource === 'pinokio_app'}
-                      <ArtifactPinokioAppFields
-                        metadata={pendingMetadata}
-                        onChange={(next) => (pendingMetadata = next)}
-                      />
+                      {#key selectedArtifact.id}
+                        <ArtifactPinokioAppFields
+                          metadata={pendingMetadata}
+                          disabled={artifactDetailLoadedId !== selectedArtifact.id}
+                          onChange={(next) => { if (artifactDetailLoadedId === selectedArtifact?.id) pendingMetadata = next }}
+                        />
+                      {/key}
                     {/if}
 
                     {#if selectedPowerSourceOption.usesWebhook}

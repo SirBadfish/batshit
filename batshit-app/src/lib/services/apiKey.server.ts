@@ -18,6 +18,33 @@ interface StoredApiKey {
   updatedAt: string;
 }
 
+/** Private request-local value use. Never a browser/report DTO or a retained credential cache. */
+export type ConfiguredApiKeyUseState = Readonly<{
+  key: string; raw: string; state: 'absent' | 'readable' | 'unreadable'; value: string | null
+}>
+/** Count/type/length-admit the fixed saved-key record before fetching its private raw fence. */
+export const READ_API_KEY_REFERENCE_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return {'', 'absent'} end
+if redis.call('JSON.TYPE', KEYS[1], '$')[1] ~= 'object' then return {'', 'malformed'} end
+local count = redis.call('JSON.OBJLEN', KEYS[1], '$')[1]
+if type(count) ~= 'number' or count < 3 or count > 4 then return {'', 'malformed'} end
+local fields = redis.call('JSON.OBJKEYS', KEYS[1], '$')[1]
+for _, field in ipairs(fields) do
+  if field ~= 'encrypted' and field ~= 'iv' and field ~= 'authTag' and field ~= 'updatedAt' then return {'', 'malformed'} end
+  local at = '$.' .. field
+  if redis.call('JSON.TYPE', KEYS[1], at)[1] ~= 'string' then return {'', 'malformed'} end
+  local length = redis.call('JSON.STRLEN', KEYS[1], at)[1]
+  if type(length) ~= 'number' or length == 0 then return {'', 'malformed'} end
+  if length > 16384 then return redis.error_reply('MCP_KEY_REFERENCE_BYTES') end
+end
+for _, field in ipairs({'encrypted', 'iv', 'authTag'}) do
+  if redis.call('JSON.TYPE', KEYS[1], '$.' .. field)[1] ~= 'string' then return {'', 'malformed'} end
+end
+local raw = redis.call('JSON.GET', KEYS[1], '$')
+if #raw > 16384 then return redis.error_reply('MCP_KEY_REFERENCE_BYTES') end
+return {raw, 'present'}
+`
+
 export const INFRA_API_KEY_SERVICES = new Set([
   'batshit_token',
   'n8n_api_key',
@@ -194,6 +221,31 @@ class ApiKeyService {
     return `api_keys:${userId}:${normalizeApiKeyServiceName(service)}`;
   }
 
+  /** Reference-only MCP evidence. Presence/shape is not decryptability or readiness.
+   * The exact encrypted raw cut stays server-private and is never a report or digest input. */
+  async readReferenceState(service: string, userId: string): Promise<{ key: string; raw: string; present: boolean; shapeValid: boolean }> {
+    const normalized = normalizeApiKeyServiceName(service)
+    if (!normalized || Buffer.byteLength(normalized, 'utf8') > 128 || !normalized.isWellFormed() || INFRA_API_KEY_SERVICES.has(normalized)) {
+      throw new Error('That saved-key reference is unavailable.')
+    }
+    const key = this.storedKeyName(normalized, userId)
+    const answer = await redis.execute(client => client.eval(READ_API_KEY_REFERENCE_SCRIPT, { keys: [key], arguments: [] }))
+      .catch(error => { throw new Error('The saved-key reference is unavailable.', { cause: error }) })
+    if (!Array.isArray(answer) || answer.length !== 2 || typeof answer[0] !== 'string' || typeof answer[1] !== 'string' ||
+      !['absent', 'malformed', 'present'].includes(answer[1]) || Buffer.byteLength(answer[0], 'utf8') > 16_384) throw new Error('The saved-key reference is unavailable.')
+    const [raw, state] = answer
+    if (state === 'absent') { if (raw !== '') throw new Error('The saved-key reference is unavailable.'); return { key, raw, present: false, shapeValid: true } }
+    if (state === 'malformed') { if (raw !== '') throw new Error('The saved-key reference is unavailable.'); return { key, raw, present: true, shapeValid: false } }
+    let shapeValid = false
+    try {
+      const values: unknown = JSON.parse(raw)
+      const record = Array.isArray(values) && values.length === 1 ? values[0] : null
+      shapeValid = !!record && typeof record === 'object' && ['encrypted', 'iv', 'authTag'].every(field =>
+        typeof record[field] === 'string' && record[field].length > 0)
+    } catch { /* Present malformed state stays unavailable; no decryption or repair. */ }
+    return { key, raw, present: true, shapeValid }
+  }
+
   /**
    * BL-1397: the saved key's exact `$` text ('' when there is none) and what it holds, for a
    * compare-and-set. A record that does not decrypt or has the wrong shape is `unreadable`: it is
@@ -247,6 +299,46 @@ class ApiKeyService {
       console.error(`Failed to decrypt API key for ${normalizedService}:`, error);
       return null;
     }
+  }
+
+  /** A10 private configured-state evidence. Plaintext exists only in the read owner and is
+   * neither retained in its result nor logged. The encrypted raw fence is never a public DTO. */
+  async readConfiguredState(service: string, userId: string): Promise<{ key: string; raw: string; configured: boolean; readable: boolean }> {
+    const key = this.storedKeyName(service, userId)
+    const raw = await redis.json.getRaw(key, '$')
+    if (raw === null) return { key, raw: '[]', configured: false, readable: true }
+    if (Buffer.byteLength(raw, 'utf8') > 16384) throw new Error('Configured key state is unavailable.')
+    try {
+      const values: unknown = JSON.parse(raw)
+      const record = Array.isArray(values) && values.length === 1 ? values[0] : null
+      if (record && typeof record.encrypted === 'string' && typeof record.iv === 'string' && typeof record.authTag === 'string') {
+        return { key, raw, configured: Boolean(apiKeyEncryption.decrypt(record.encrypted, record.iv, record.authTag)), readable: true }
+      }
+    } catch { /* Unreadable is present, never silently absent. No secret/decrypt error is logged. */ }
+    return { key, raw, configured: false, readable: false }
+  }
+
+  /** One bounded private consumer receives the actual value and its SAME saved source cut.
+   * Parsing/decrypt failure stays present/unreadable; a consumer failure is never swallowed. */
+  async withConfiguredValue<Result>(service: string, userId: string,
+    consume: (source: ConfiguredApiKeyUseState) => Promise<Result>): Promise<Result> {
+    const key = this.storedKeyName(service, userId)
+    const raw = await redis.json.getRaw(key, '$')
+    if (raw !== null && (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > 16384)) throw new Error('Configured key state is unavailable.')
+    const source: { key: string; raw: string; state: ConfiguredApiKeyUseState['state']; value: string | null } = {
+      key, raw: raw ?? '[]', state: raw === null ? 'absent' : 'unreadable', value: null
+    }
+    if (raw !== null) {
+      try {
+        const values: unknown = JSON.parse(raw)
+        const record = Array.isArray(values) && values.length === 1 ? values[0] : null
+        if (record && typeof record.encrypted === 'string' && typeof record.iv === 'string' && typeof record.authTag === 'string') {
+          const value = apiKeyEncryption.decrypt(record.encrypted, record.iv, record.authTag)
+          if (Buffer.byteLength(value, 'utf8') <= 16384) { source.value = value; source.state = 'readable' }
+        }
+      } catch { /* No decrypt exception, private value or raw source is logged. */ }
+    }
+    try { return await consume(source) } finally { source.value = null }
   }
 
   /**

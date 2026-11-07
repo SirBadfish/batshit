@@ -20,7 +20,8 @@ import type { UntrustedTextScreen } from '$lib/types/typesafe'
  *   1. INPUTS. The exact set of fields each gate accepts. A new field is a decision somebody
  *      has to make in review with this file open, not a quiet addition.
  *   2. REACH. Neither gate's module, nor anything it statically or dynamically imports, is a
- *      Judge Juice module. The gate cannot read a screen it cannot import.
+ *      Judge Juice execution/screen module. Configuration data is separately pinned below;
+ *      the gate cannot read a screen or ask a judge through those data-only imports.
  *   3. BEHAVIOR. In a chat a DM started, the gate's answer is the same when that DM carries a
  *      flag, carries "no flag", or was never screened: a flag cannot refuse or skip an approved
  *      call, and "no flag" cannot un-pause a woken turn. The Judge Juice entry points throw if
@@ -114,6 +115,7 @@ describe('1. INPUTS — the fields each gate accepts', () => {
       'scopeKey',
       'grant',
       'portableSkillScope',
+      'settingsPolicyConsent',
       'toolCallId',
       'now'
     ])
@@ -159,6 +161,24 @@ describe('2. REACH — what the gates can import', () => {
   const JEV_MODULE =
     /(\/server\/services\/typesafe\/|\.jev(\.ts)?$|untrustedText|skillImportScreen|jevJuiceTurn|zipStateInferred|judgeAsk)/
   const SWEEP_ONLY_STATE = /postTurnCheckState\.ts$/
+  // Skill-session cleanup shares only this stored-preference normalizer and constants.
+  // Neither asks a judge nor holds a judgment. Exact imports/request absence are pinned below;
+  // this is not an exception for another module in the typesafe directory.
+  const CONFIG_DATA_IMPORTS = new Map<string, string[]>([
+    ['lib/server/services/typesafe/typesafeConfig.ts', [
+      '$lib/server/redis', '$lib/utils/judgeProviders', '$lib/utils/jevJuiceControl', '$lib/utils/logger', './typesafe.constants'
+    ]],
+    ['lib/server/services/typesafe/typesafe.constants.ts', []]
+  ])
+
+  function runtimeImports(source: string): string[] {
+    const specifiers: string[] = []
+    for (const match of source.matchAll(/^\s*import\s+(?!type\b)[^'"]*?from\s+['"]([^'"]+)['"]/gm)) specifiers.push(match[1])
+    for (const match of source.matchAll(/^\s*import\s+['"]([^'"]+)['"]/gm)) specifiers.push(match[1])
+    for (const match of source.matchAll(/\bimport\(\s*['"]([^'"]+)['"]\s*\)/g)) specifiers.push(match[1])
+    for (const match of source.matchAll(/^\s*export\s+(?!type\b)[^'"]*?from\s+['"]([^'"]+)['"]/gm)) specifiers.push(match[1])
+    return specifiers
+  }
 
   function resolveImport(fromFile: string, specifier: string): string | null {
     let base: string
@@ -181,18 +201,13 @@ describe('2. REACH — what the gates can import', () => {
    * Every module reachable through static `import … from` (type-only imports are erased) and
    * dynamic `import()`, with the module that first imported each one.
    */
-  function reach(entry: string): Map<string, string | null> {
+  function reach(entry: string, sourceOverrides = new Map<string, string>()): Map<string, string | null> {
     const importedBy = new Map<string, string | null>([[entry, null]])
     const queue = [entry]
     while (queue.length > 0) {
       const file = queue.shift() as string
-      const source = readFileSync(file, 'utf8')
-      const specifiers: string[] = []
-      for (const match of source.matchAll(/^\s*import\s+(?!type\b)[^'"]*?from\s+['"]([^'"]+)['"]/gm)) specifiers.push(match[1])
-      for (const match of source.matchAll(/^\s*import\s+['"]([^'"]+)['"]/gm)) specifiers.push(match[1])
-      for (const match of source.matchAll(/\bimport\(\s*['"]([^'"]+)['"]\s*\)/g)) specifiers.push(match[1])
-      for (const match of source.matchAll(/^\s*export\s+(?!type\b)[^'"]*?from\s+['"]([^'"]+)['"]/gm)) specifiers.push(match[1])
-      for (const specifier of specifiers) {
+      const source = sourceOverrides.get(file) ?? readFileSync(file, 'utf8')
+      for (const specifier of runtimeImports(source)) {
         const resolved = resolveImport(file, specifier)
         if (resolved && !importedBy.has(resolved)) {
           importedBy.set(resolved, file)
@@ -203,7 +218,24 @@ describe('2. REACH — what the gates can import', () => {
     return importedBy
   }
 
-  const relative = (file: string) => path.relative(SRC_DIR, file)
+  const relative = (file: string) => path.relative(SRC_DIR, file).split(path.sep).join('/')
+  const judgmentModules = (importedBy: Map<string, string | null>) => Array.from(importedBy.keys())
+    .map(relative).filter(file => JEV_MODULE.test(file) && !CONFIG_DATA_IMPORTS.has(file))
+
+  it.each([...CONFIG_DATA_IMPORTS])('%s remains configuration data, with no client or screen dependency', (file, imports) => {
+    const source = readFileSync(path.join(SRC_DIR, file), 'utf8')
+    expect(runtimeImports(source).sort()).toEqual([...imports].sort())
+    expect(source).not.toMatch(/\b(?:fetch|runTypesafeJudgment|getTypesafeClient|createTypesafeClient|screenUntrustedText|buildUntrustedTextAdvisory)\s*\(/)
+    expect(source).not.toMatch(/\b(?:confidence|probabilities|findings|UntrustedTextScreen|TypesafeCallRecord)\b/)
+  })
+
+  it('the configuration-data exception cannot hide an actual client import', () => {
+    const config = path.join(SERVICES_DIR, 'typesafe/typesafeConfig.ts')
+    // A read-only source override: this parses the real graph, never loads or calls the client.
+    const source = readFileSync(config, 'utf8') + "\nimport './typesafeClient'\n"
+    const reached = reach(config, new Map([[config, source]]))
+    expect(judgmentModules(reached)).toContain('lib/server/services/typesafe/typesafeClient.ts')
+  })
 
   it('the walker really walks (it follows the gate into the woken-turn reader and the DM store)', () => {
     const reached = Array.from(reach(path.join(SERVICES_DIR, 'controlApprovals.ts')).keys()).map(relative)
@@ -211,11 +243,15 @@ describe('2. REACH — what the gates can import', () => {
     expect(reached).toContain('lib/server/services/dm/dmStore.ts') // the dynamic import for the "needs you" stamp
     expect(reached).toContain('lib/server/services/wakeRunRegistry.ts')
     expect(reached).toContain('lib/server/redis.ts')
+    const commandReach = Array.from(reach(path.join(SERVICES_DIR, 'cliToolRegistry.ts')).keys()).map(relative)
+    expect(commandReach).toContain('lib/server/services/ownedCommandGroup.ts')
+    expect(commandReach).toContain('lib/server/services/hostCommandOwnership.ts')
+    expect(commandReach).not.toContain('lib/server/services/appActions/mcp/originalTask.ts')
   })
 
   it.each(['controlApprovals.ts', 'cliToolRegistry.ts'])('%s cannot reach a module that asks Jev or holds a screen', (entry) => {
     const importedBy = reach(path.join(SERVICES_DIR, entry))
-    const offenders = Array.from(importedBy.keys()).filter((file) => JEV_MODULE.test(file)).map(relative)
+    const offenders = judgmentModules(importedBy)
     expect(offenders).toEqual([])
 
     // P6's record store is reachable, but only as something `redis.ts` sweeps on a delete.

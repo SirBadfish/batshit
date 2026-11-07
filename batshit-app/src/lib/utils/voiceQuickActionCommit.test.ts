@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   createVoiceQuickActionCommitCoordinator,
   createVoiceNoReplyCompletion,
@@ -12,6 +12,44 @@ import type { LiveSubscriptionHandlers } from '$lib/services/liveHub/liveHubClie
 const context = (sessionId: string | null, agentId: string | null) => ({ sessionId, agentId })
 
 describe('voice quick-action commit coordinator', () => {
+  it.each(['preparing', 'sending'])('transfers only its exact null-chat %s owner before created-session selection', phase => {
+    const commits = createVoiceQuickActionCommitCoordinator()
+    const original = { ...context(null, 'agent-a'), voiceLifetimeKey: 'voice-a' }
+    const token = commits.begin(original)
+    if (phase === 'sending') expect(commits.finish(token)).toBe(true)
+    expect(commits.adoptCreatedSession(token, original, 'created-chat')).toBe(true)
+    expect(commits.invalidateContext(original)).toBe(false)
+    expect(commits.ownsLatestGeneration(token)).toBe(true)
+    expect(token.context.sessionId).toBe('created-chat')
+    expect(commits.adoptCreatedSession(token, original, 'another-chat')).toBe(false)
+  })
+
+  it.each([
+    { sessionId: 'selected-elsewhere', agentId: 'agent-a', voiceLifetimeKey: 'voice-a' },
+    { sessionId: null, agentId: 'agent-b', voiceLifetimeKey: 'voice-a' },
+    { sessionId: null, agentId: 'agent-a', voiceLifetimeKey: 'voice-b' }
+  ])('never adopts a created session after another context or lifetime won: %j', current => {
+    const commits = createVoiceQuickActionCommitCoordinator()
+    const original = { ...context(null, 'agent-a'), voiceLifetimeKey: 'voice-a' }
+    const token = commits.begin(original)
+    commits.finish(token)
+    expect(commits.adoptCreatedSession(token, current, 'created-chat')).toBe(false)
+    expect(token.context.sessionId).toBeNull()
+  })
+
+  it('cannot revive a retired or superseded null-chat send through creation', () => {
+    const commits = createVoiceQuickActionCommitCoordinator()
+    const original = { ...context(null, 'agent-a'), voiceLifetimeKey: 'voice-a' }
+    const retired = commits.begin(original)
+    commits.finish(retired)
+    commits.invalidateContext(original)
+    expect(commits.adoptCreatedSession(retired, original, 'created-chat')).toBe(false)
+    const old = commits.begin(original)
+    commits.finish(old)
+    commits.begin(original)
+    expect(commits.adoptCreatedSession(old, original, 'created-chat')).toBe(false)
+  })
+
   it('binds a pending verdict to the session and agent that started it', () => {
     const commits = createVoiceQuickActionCommitCoordinator()
     const token = commits.begin(context('chat-a', 'agent-a'))
@@ -273,6 +311,25 @@ describe('voice quick-action commit coordinator', () => {
     await expect(running).rejects.toThrow('persist failed')
     expect(releases).toBe(1)
     expect(composer).toBe('spoken words')
+  })
+
+  it('keeps Auto Listen waiting until action-only persistence settles without repeating the applied action', async () => {
+    const commits = createVoiceQuickActionCommitCoordinator()
+    const token = commits.begin(context('chat-a', 'agent-a'))
+    let finish!: () => void
+    const save = new Promise<void>(resolve => { finish = resolve })
+    const applied = vi.fn(), released = vi.fn(), persisting = vi.fn(() => save)
+    const running = runVoiceQuickActionCommit({ coordinator: commits, token, currentContext: () => token.context,
+      requestVerdict: async () => ({ action: 'stop' }), decide: () => ({ mark: 'stop', onlyThis: true }),
+      applyAction: applied, persistOnly: persisting, send: async () => { throw new Error('Action-only turn was sent') },
+      releasePending: released })
+    await vi.waitFor(() => expect(persisting).toHaveBeenCalledOnce())
+    expect(applied).toHaveBeenCalledOnce()
+    expect(released).not.toHaveBeenCalled()
+    finish()
+    await expect(running).resolves.toBe('only-this')
+    expect(released).toHaveBeenCalledOnce()
+    expect(applied).toHaveBeenCalledOnce()
   })
 
   it('does not let an older refused send clear a newer generation waiting state', async () => {

@@ -120,9 +120,12 @@ describe('SA-120 P10b: agent-facing judgment text says "the judge" and states th
 
   it('the packaged guidance names the chosen judge, Jev only as the default, and promises no limit a smaller judge cannot meet', () => {
     expect(packaged).toContain("the judge your user chose for this tool (TypeSafe's Jev unless they picked another)")
-    expect(packaged).toContain('## What the judge cannot do')
-    expect(packaged).toContain('a smaller judge takes fewer Choice options and less state')
-    expect(packaged).toContain('refused as too large for this judge, with the limit named')
+    // Decision 11 (Josh, 2026-10-24): title-case header, and no fixed request size; each judge's
+    // own limits are named in the refusal.
+    expect(packaged).toContain('## What the Judge Cannot Do')
+    expect(packaged).toContain('a smaller judge may take fewer')
+    expect(packaged).toContain('Each judge also has its own limits (how much `state` and `questions` may hold together, how many Choice options); a request over one is refused, and the refusal names the limit.')
+    expect(packaged).not.toContain('30k')
     expect(packaged).not.toContain('provider_limit')
     expect(packaged).not.toContain('Jev cannot')
     expect(packaged).not.toContain('Jev sees')
@@ -141,6 +144,9 @@ describe('SA-120 P10b: agent-facing judgment text says "the judge" and states th
 
   it("the guidance prompt's registry version moved with its wording, so an uncustomized copy refreshes", () => {
     // Anchored to this entry: no other `defaultVersion` may sit between its id and the date.
-    expect(registry).toMatch(/id: 'jev_juice_guidance',(?:(?!defaultVersion)[\s\S])*defaultVersion: '2026-10-12'/)
+    // c9e3eadf6 (2026-10-16) moved it again with the guidance file's neutral utility-ref wording.
+    // Decision 11 (2026-10-24) moved it again with the rewritten guidance (the exact call).
+    // The approved October25 reduction moved fields into Agent Setup and bumped this owner.
+    expect(registry).toMatch(/id: 'jev_juice_guidance',(?:(?!defaultVersion)[\s\S])*defaultVersion: '2026-10-25-prompt-reduction'/)
   })
 })

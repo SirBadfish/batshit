@@ -1,6 +1,15 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import dns from 'node:dns'
 import { describe, expect, it, vi } from 'vitest'
+
+const agentOptions = vi.hoisted(() => new Map<object, any>())
+vi.mock('undici', async () => {
+  const actual = await vi.importActual<typeof import('undici')>('undici')
+  return { ...actual, Agent: class extends actual.Agent {
+    constructor(options?: any) { super(options); agentOptions.set(this, options) }
+  } }
+})
 
 import {
   PinokioAppRunError,
@@ -9,11 +18,14 @@ import {
   parseGradioEventStream,
   unwrapGradioUpdate,
   readFileArgument,
+  readBytes,
+  gradioFileUrl,
   runPinokioAppArtifact,
   type PinokioRunnerDeps,
   type PinokioRunFile
 } from '../pinokioAppRunner'
 import type { PinokioAppEndpoint } from '../pinokioAppEndpoint'
+import { guardedLookup } from '../skillImportNetworkGuard'
 import { readPinokioArtifactBinding } from '$lib/artifacts/pinokioArtifact'
 
 /**
@@ -277,6 +289,47 @@ describe('Gradio through Pinokio', () => {
     expect(result.metadata).toMatchObject({ kind: 'gradio', apiName: '/predict', fieldsApplied: ['image', 'note'] })
   })
 
+
+  it('routes config/defaults/upload/call/stream/output through one bound app reader while resolving input bytes locally', async () => {
+    const remoteBase = 'http://192.168.1.90:7777'
+    const appCalls: string[] = []
+    const boundFetch = vi.fn(async (resource: any, init?: RequestInit) => {
+      const url = String(resource)
+      appCalls.push(url)
+      expect(init?.signal).toBeInstanceOf(AbortSignal)
+      if (url.endsWith('/config')) return json({ api_prefix: '/gradio_api' })
+      if (url.endsWith('/info')) return json({ named_endpoints: { '/predict': { parameters: [{}, { parameter_has_default: true, parameter_default: 'default note' }] } } })
+      if (url.endsWith('/upload')) return json(['/tmp/upload.png'])
+      if (url.endsWith('/call/predict')) return json({ event_id: 'ev' })
+      if (url.endsWith('/call/predict/ev')) return new Response('event: complete\ndata: ["result", {"url":"http://127.0.0.1:7860/gradio_api/file=/tmp/result.png"}]\n\n')
+      if (url.endsWith('/gradio_api/file=/tmp/result.png')) return new Response(PNG, { headers: { 'content-type': 'image/png' } })
+      throw new Error(`unexpected app route ${url}`)
+    }) as typeof fetch
+    const remoteEndpoint: PinokioAppEndpoint = { ok: true, appId: 'ocr.git', title: 'OCR', baseUrl: remoteBase, machineId: 'd86fbc94-7364-4bbc-bb21-f21627736492', machineRevision: 3, nativeReadyOrigins: ['http://127.0.0.1:7860'], fetch: boundFetch }
+    const { deps, calls } = makeDeps(url => {
+      expect(url).toBe('https://public.example/input.png')
+      return new Response(PNG, { headers: { 'content-type': 'image/png' } })
+    }, remoteEndpoint)
+    const out = collector()
+    const remoteMetadata = { ...metadata, pinokio_machine_id: 'd86fbc94-7364-4bbc-bb21-f21627736492' }
+    const remoteBinding = readPinokioArtifactBinding({ metadata: remoteMetadata })!
+    await runPinokioAppArtifact({ artifactId: 'a', binding: remoteBinding, metadata: remoteMetadata, userId: 'josh', values: { image: 'https://public.example/input.png' }, signal: new AbortController().signal }, out.emit, deps)
+    expect(deps.resolveEndpoint).toHaveBeenCalledWith('ocr.git', expect.objectContaining({ userId: 'josh', machineId: remoteMetadata.pinokio_machine_id }))
+    expect(remoteMetadata).not.toHaveProperty('pinokio_machine_revision')
+    expect(calls.map(call => call.url)).toEqual(['https://public.example/input.png'])
+    expect(appCalls).toEqual(['/config', '/gradio_api/info', '/gradio_api/upload', '/gradio_api/call/predict', '/gradio_api/call/predict/ev', '/gradio_api/file=/tmp/result.png'].map(path => remoteBase + path))
+    expect(out.files).toHaveLength(1)
+    expect(out.files[0].metadata).toMatchObject({ machineId: 'd86fbc94-7364-4bbc-bb21-f21627736492', machineRevision: 3 })
+  })
+
+  it('stops a pending owned Clip read before any upload can be sent', async () => {
+    const stop = new AbortController()
+    const { deps, calls } = makeDeps(url => url.endsWith('/config') ? json({ api_prefix: '/gradio_api' }) : json({}), gradioEndpoint)
+    deps.readClip = vi.fn(async () => { stop.abort(); return { dataUrl: 'data:image/png;base64,AAAA', filename: 'owned.png' } })
+    await expect(runPinokioAppArtifact({ artifactId: 'a', binding, metadata, values: { image: 'clip_owned', note: 'hi' }, userId: 'josh', signal: stop.signal }, collector().emit, deps)).rejects.toMatchObject({ code: 'timed_out' })
+    expect(calls.map(call => call.url)).toEqual([`${GBASE}/config`])
+  })
+
   // The shape LightOnOCR-2-1B's /process_input really returns (SA-072 P2 live proof, 2026-09-25):
   // Markdown, the same text raw, a status line, a preview of the input page, a slider update.
   const OCR_COMPLETE =
@@ -379,6 +432,8 @@ describe('file arguments cannot reach another local service', () => {
   it.each([
     'http://127.0.0.1:6379/',
     'http://localhost:5620/api/settings',
+    'http://localhost.:5620/api/settings',
+    'http://[::ffff:127.0.0.1]:9000/',
     'http://192.168.1.10/admin',
     'http://10.0.0.2/x',
     'http://169.254.169.254/latest/meta-data',
@@ -394,6 +449,30 @@ describe('file arguments cannot reach another local service', () => {
     await expect(readFileArgument(deps, 'data:text/plain,hi', '"image"')).resolves.toMatchObject({ mediaType: 'text/plain' })
     await expect(readFileArgument(deps, 'http://localhost:5600/api/secret', '"image"')).rejects.toThrow(/private network/)
     await expect(readFileArgument(deps, 'ftp://example.com/a', '"image"')).rejects.toThrow(/http\(s\) or data/)
+  })
+
+  it('uses the existing socket-bound guard for public DNS and keeps exact owned uploads separate', async () => {
+    const lookup = vi.spyOn(dns, 'lookup').mockImplementation(((_host: string, _options: unknown, callback: any) => {
+      callback(null, [{ address: '8.8.8.8', family: 4 }, { address: '10.0.0.2', family: 4 }])
+    }) as never)
+    const socketFetch = vi.fn(async (resource: any, init?: RequestInit) => {
+      const dispatcher = (init as RequestInit & { dispatcher?: object })?.dispatcher
+      const socketLookup = dispatcher ? agentOptions.get(dispatcher)?.connect?.lookup : undefined
+      expect(socketLookup).toBe(guardedLookup)
+      await new Promise<void>((resolve, reject) => socketLookup(new URL(String(resource)).hostname, { all: true }, (error: Error | null) => error ? reject(error) : resolve()))
+      throw new Error('a private DNS answer must refuse before connection')
+    }) as typeof fetch
+    const guardedDeps = { ...deps, fetch: socketFetch }
+    try {
+      await expect(readFileArgument(guardedDeps, 'https://public.example/input.png', '"image"')).rejects.toThrow(/Blocked private\/internal address/)
+      expect(lookup).toHaveBeenCalledWith('public.example', expect.objectContaining({ all: true }), expect.any(Function))
+      const owned = makeDeps((_url, init) => {
+        expect((init as RequestInit & { dispatcher?: object })?.dispatcher).toBeUndefined()
+        return new Response(PNG, { headers: { 'content-type': 'image/png' } })
+      }).deps
+      await expect(readFileArgument(owned, 'http://localhost:5600/uploads/owned.png', '"image"')).resolves.toMatchObject({ name: 'owned.png' })
+      expect(lookup).toHaveBeenCalledTimes(1)
+    } finally { lookup.mockRestore() }
   })
 
   it('reads an attached picture by its Clip id, for the run\'s own user only', async () => {
@@ -436,5 +515,52 @@ describe('a custom API app', () => {
     expect(calls[0].url).toBe('http://127.0.0.1:9000/api/run')
     expect(JSON.parse(String(calls[0].init?.body))).toEqual({ q: 'x' })
     expect(result.text).toBe('done')
+  })
+})
+
+describe('same-app Gradio file route normalization', () => {
+  const base = 'http://192.168.1.90:7777'
+  const aliases = ['http://127.0.0.1:7860']
+  it('normalizes only the exact advertised native alias, allowing native port mapping', () => {
+    expect(gradioFileUrl({ url: 'http://127.0.0.1:7860/gradio_api/file=/tmp/out.png' }, base, '/gradio_api', aliases)).toBe(`${base}/gradio_api/file=/tmp/out.png`)
+    expect(gradioFileUrl({ path: '/tmp/out.png' }, base, '/gradio_api', aliases)).toBe(`${base}/gradio_api/file=%2Ftmp%2Fout.png`)
+  })
+  it.each([
+    'http://127.0.0.1:9999/gradio_api/file=/tmp/out.png',
+    'http://localhost:7860/gradio_api/file=/tmp/out.png',
+    'http://192.168.1.91:7777/gradio_api/file=/tmp/out.png',
+    'https://public.example/gradio_api/file=/tmp/out.png',
+    'http://127.0.0.1:7860/api/delete',
+    'http://192.168.1.90:7777/api/delete'
+  ])('refuses unrelated origins and arbitrary app API paths: %s', url => {
+    expect(gradioFileUrl({ url, path: '/fallback.png' }, base, '/gradio_api', aliases)).toBeNull()
+  })
+})
+
+describe('bounded Pinokio file response reads', () => {
+  it.each([undefined, '1'])('cancels an unknown or understated streamed body as soon as its byte cap is exceeded (%s)', async length => {
+    const cancelled = vi.fn()
+    let pulls = 0
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) { pulls += 1; controller.enqueue(new Uint8Array([1, 2, 3])) },
+      cancel: cancelled
+    }, { highWaterMark: 0 })
+    const response = new Response(body, { headers: length ? { 'content-length': length } : {} })
+    await expect(readBytes(response, 4, 'An output file')).rejects.toMatchObject({ code: 'app_error' })
+    expect(pulls).toBe(2)
+    expect(cancelled).toHaveBeenCalledTimes(1)
+    expect(response.body!.locked).toBe(false)
+  })
+  it('cancels an oversized declaration before pulling bytes and releases successful reads', async () => {
+    const cancelled = vi.fn()
+    const pulled = vi.fn()
+    const response = new Response(new ReadableStream<Uint8Array>({ pull: pulled, cancel: cancelled }, { highWaterMark: 0 }), { headers: { 'content-length': '5' } })
+    await expect(readBytes(response, 4, 'An input file')).rejects.toMatchObject({ code: 'app_error' })
+    expect(pulled).not.toHaveBeenCalled()
+    expect(cancelled).toHaveBeenCalledTimes(1)
+    expect(response.body!.locked).toBe(false)
+    const accepted = new Response(new Uint8Array([1, 2, 3, 4]))
+    await expect(readBytes(accepted, 4, 'An input file')).resolves.toEqual(new Uint8Array([1, 2, 3, 4]))
+    expect(accepted.body!.locked).toBe(false)
   })
 })

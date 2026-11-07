@@ -1,0 +1,10 @@
+{
+  "name": "batshit",
+  "version": "1.1.0",
+  "description": "Batshit help and skills for App Actions, artifacts, CLI tools, Goons, skills, and voice engines.",
+  "author": {
+    "name": "Batshit"
+  },
+  "homepage": "https://batshit.ai",
+  "repository": "https://github.com/SirBadfish/batshit"
+}

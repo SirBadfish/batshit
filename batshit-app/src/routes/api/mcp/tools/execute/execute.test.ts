@@ -115,43 +115,6 @@ describe('POST /api/mcp/tools/execute', () => {
     expect(loadToolsForUser).toHaveBeenCalledTimes(1)
   })
 
-  it('passes the credential gateway ceiling separately from a narrowing body filter', async () => {
-    resolveNativeToolUser.mockResolvedValue({
-      userId: 'josh', auth: 'agent', agentId: 'agent_1', mcpGatewayScope: ['gw_agent']
-    })
-    loadToolsForUser.mockResolvedValue({ tools: {}, metadata: new Map() })
-    const response = await routeModule.POST({
-      request: new Request('http://localhost/api/mcp/tools/execute', {
-        method: 'POST', body: JSON.stringify({
-          toolName: 'redis_get', selectedGateways: ['gw_other'], mcpGatewayScope: ['gw_other']
-        })
-      }),
-      locals: {}
-    } as any)
-    expect(response.status).toBe(404)
-    expect(resolveDynamicMcpGatewayScope).toHaveBeenCalledWith({
-      userId: 'josh', agentId: 'agent_1', mcpGatewayScope: ['gw_agent'], selectedGateways: ['gw_other']
-    })
-    expect(loadToolsForUser).toHaveBeenCalledTimes(1)
-  })
-
-  it('refuses an unoffered delegated execution before scope resolution or discovery', async () => {
-    resolveNativeToolUser.mockResolvedValue({
-      userId: 'josh', auth: 'agent', agentId: 'subagent_cli_1', delegated: true,
-      delegatedAllowedControlIds: [], mcpGatewayScope: ['gw_agent']
-    })
-    const response = await routeModule.POST({
-      request: new Request('http://localhost/api/mcp/tools/execute', {
-        method: 'POST', body: JSON.stringify({ toolName: 'redis_get' })
-      }),
-      locals: {}
-    } as any)
-    expect(response.status).toBe(403)
-    expect((await response.json()).code).toBe('CONTROL_NOT_ALLOWED')
-    expect(resolveDynamicMcpGatewayScope).not.toHaveBeenCalled()
-    expect(loadToolsForUser).not.toHaveBeenCalled()
-  })
-
   // BL-687: a Portable Skill Token names no agent, so the scope would be every gateway the user
   // enabled. No portable family grants the dynamic MCP controls, so the route refuses it, the
   // way `/api/controls/use` refuses `sys.mcp.dynamic.use` for the same token.
@@ -198,19 +161,5 @@ describe('POST /api/mcp/tools/execute', () => {
     } as any)
     expect(response.status).toBe(200)
     expect(execute).toHaveBeenCalledTimes(1)
-  })
-
-  it('passes an empty ceiling for an older agent credential without a snapshot', async () => {
-    resolveNativeToolUser.mockResolvedValue({ userId: 'josh', auth: 'agent', agentId: 'agent_1' })
-    loadToolsForUser.mockResolvedValue({ tools: {}, metadata: new Map() })
-    await routeModule.POST({
-      request: new Request('http://localhost/api/mcp/tools/execute', {
-        method: 'POST', body: JSON.stringify({ toolName: 'redis_get', gatewayFilter: ['gw_other'] })
-      }),
-      locals: {}
-    } as any)
-    expect(resolveDynamicMcpGatewayScope).toHaveBeenCalledWith({
-      userId: 'josh', agentId: 'agent_1', mcpGatewayScope: [], selectedGateways: ['gw_other']
-    })
   })
 })

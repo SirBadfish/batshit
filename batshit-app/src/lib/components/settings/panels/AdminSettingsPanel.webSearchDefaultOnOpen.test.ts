@@ -1,5 +1,8 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+vi.mock('$app/env', () => ({ browser: true }))
+import { resolveToolOperationalSettings } from '$lib/utils/toolOperationalSettings'
+import { resetToolOperationsSource } from '$lib/stores/toolOperationalSettings.svelte'
 import AdminSettingsPanel from './AdminSettingsPanel.svelte'
 
 /**
@@ -75,12 +78,17 @@ function installRoutes(admin: Record<string, unknown>) {
 
     if (path === '/api/user/settings' && method === 'GET') {
       settingsReads += 1
+      if (url.includes('toolOperations=1')) return jsonResponse({ toolOperations: { revision: 'sha256:' + 'a'.repeat(64), values: resolveToolOperationalSettings({ admin_settings: savedAdminSettings }), host: { containerized: false } } })
       return jsonResponse({ settings: { admin_settings: savedAdminSettings } })
     }
     if (path === '/api/user/settings' && method === 'POST') {
       const body = JSON.parse(String(init.body ?? '{}'))
       posts.push({ body })
-      if (body.admin_settings) savedAdminSettings = body.admin_settings
+      if (body.admin_settings) savedAdminSettings = { ...savedAdminSettings, ...body.admin_settings }
+      if (body.tool_operations_patch) {
+        savedAdminSettings.web_search_default_provider = body.tool_operations_patch.webSearchProvider
+        return jsonResponse({ toolOperations: { revision: 'sha256:' + 'b'.repeat(64), values: resolveToolOperationalSettings({ admin_settings: savedAdminSettings }), host: { containerized: false } } })
+      }
       return jsonResponse({ settings: { admin_settings: savedAdminSettings } })
     }
     if (path === '/api/settings/api-keys') {
@@ -105,12 +113,14 @@ describe('Admin Settings keeps a saved default web search provider whose key is 
   const originalFetch = global.fetch
 
   beforeEach(() => {
+    resetToolOperationsSource()
     ensureBrowserStubs()
     vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.spyOn(console, 'warn').mockImplementation(() => {})
   })
 
   afterEach(() => {
+    resetToolOperationsSource()
     vi.restoreAllMocks()
     global.fetch = originalFetch
   })
@@ -127,15 +137,64 @@ describe('Admin Settings keeps a saved default web search provider whose key is 
   }, 60_000)
 
   it('the form keeps the saved value: a later edit of another field posts it unchanged', async () => {
-    installRoutes({ web_search_default_provider: 'exa', web_search_exa_type: 'fast' })
+    const saved = {
+      web_search_default_provider: 'exa', web_search_exa_type: 'fast',
+      dcm_schema_hint_required_limit: 6, dcm_schema_hint_optional_limit: 0,
+      dcm_schema_hint_max_chars: 240, dcm_tool_name_threshold: 6,
+      dcm_schema_hint_total_tokens: 7300
+    }
+    installRoutes(saved)
     await openPanel()
     expect(posts).toEqual([])
 
     await fireEvent.click(document.getElementById('goon-lip-sync-lab-enabled') as HTMLElement)
     await waitFor(() => expect(posts.length).toBe(1), { timeout: 5_000 })
 
-    expect(posts[0].body.admin_settings.web_search_default_provider).toBe('exa')
+    expect(posts[0].body.admin_settings).not.toHaveProperty('web_search_default_provider')
+    expect(savedAdminSettings.web_search_default_provider).toBe('exa')
     expect(posts[0].body.admin_settings.goon_lip_sync_lab_enabled).toBe(true)
+    expect(savedAdminSettings).toMatchObject(saved)
+  }, 60_000)
+
+  it('missing hint settings show the approved factory values without saving, and a budget edit preserves the other choices', async () => {
+    installRoutes({ web_search_default_provider: 'exa' })
+    await openPanel()
+
+    expect(posts).toEqual([])
+    for (const [id, value] of Object.entries({
+      'dcm-schema-required-limit': '10', 'dcm-schema-optional-limit': '10',
+      'dcm-schema-max-chars': '400', 'dcm-tool-name-threshold': '30',
+      'dcm-schema-total-tokens': '3000'
+    })) {
+      expect((document.getElementById(id) as HTMLInputElement).value).toBe(value)
+    }
+
+    await fireEvent.input(document.getElementById('dcm-schema-total-tokens') as HTMLInputElement, {
+      target: { value: '4200' }
+    })
+    await waitFor(() => expect(posts).toHaveLength(1), { timeout: 5_000 })
+    expect(posts[0].body.admin_settings).toMatchObject({
+      dcm_schema_hint_required_limit: 10, dcm_schema_hint_optional_limit: 10,
+      dcm_schema_hint_max_chars: 400, dcm_tool_name_threshold: 30,
+      dcm_schema_hint_total_tokens: 4200
+    })
+  }, 60_000)
+
+  it('a deliberate total hint budget edit stays within 500–20000 estimated tokens', async () => {
+    installRoutes({ dcm_schema_hint_total_tokens: 7300, web_search_default_provider: 'perplexity' })
+    await openPanel()
+    const budget = document.getElementById('dcm-schema-total-tokens') as HTMLInputElement
+    expect(budget.value).toBe('7300')
+    expect(posts).toEqual([])
+
+    await fireEvent.input(budget, { target: { value: '50000' } })
+    await waitFor(() => expect(posts).toHaveLength(1), { timeout: 5_000 })
+    expect(posts[0].body.admin_settings.dcm_schema_hint_total_tokens).toBe(20000)
+    await fireEvent.input(budget, { target: { value: '100' } })
+    await waitFor(() => expect(posts).toHaveLength(2), { timeout: 5_000 })
+    expect(posts[1].body.admin_settings.dcm_schema_hint_total_tokens).toBe(500)
+    expect(posts[1].body.admin_settings).not.toHaveProperty('web_search_default_provider')
+    expect(savedAdminSettings.web_search_default_provider).toBe('perplexity')
   }, 60_000)
 
   it('the key status arrives after the settings loaded: the saved default is still kept and opening writes nothing', async () => {
@@ -209,7 +268,7 @@ describe('Admin Settings keeps a saved default web search provider whose key is 
     await fireEvent.pointerUp(option as HTMLElement, { pointerType: 'mouse' })
 
     await waitFor(() => expect(posts.length).toBe(1), { timeout: 5_000 })
-    expect(posts[0].body.admin_settings.web_search_default_provider).toBe('duckduckgo-html')
+    expect(posts[0].body).toEqual({ expectedToolOperations: 'sha256:' + 'a'.repeat(64), tool_operations_patch: { webSearchProvider: 'duckduckgo-html' } })
     expect(savedAdminSettings.web_search_default_provider).toBe('duckduckgo-html')
     await pause(SAVE_DEBOUNCE_PAST)
     expect(posts.length).toBe(1)

@@ -71,18 +71,6 @@ vi.mock('$lib/server/services/slashCommandCapabilities', () => ({
 }))
 
 // Mock the AI SDK
-// Mock workflow tools
-vi.mock('../workflowTools', () => ({
-  loadWorkflowTools: vi.fn().mockResolvedValue({
-    'analyze_data': {
-      description: 'Analyze data workflow',
-      inputSchema: {},
-      execute: vi.fn().mockResolvedValue({ result: 'analyzed' })
-    }
-  }),
-  callWorkflow: vi.fn().mockResolvedValue({ success: true })
-}))
-
 // Mock environment
 vi.mock('$env/dynamic/private', () => ({
   env: {
@@ -94,6 +82,9 @@ vi.mock('$env/dynamic/private', () => ({
 vi.mock('$lib/server/redis', () => ({
   redis: {
     get: vi.fn().mockResolvedValue(null),
+    // BL-2190: the delegated base prompt is read raw; absent here, so the packaged default compiles.
+    execute: vi.fn(async (operation: (client: { get: (key: string) => Promise<null> }) => unknown) =>
+      operation({ get: async () => null })),
     getUserSettings: vi.fn().mockResolvedValue(null)
   }
 }))
@@ -103,6 +94,9 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    // A pre-dispatch Stop correctly never reaches the SDK. Drop any once-only
+    // response that such a refused request did not consume before the next case.
+    vi.mocked(streamText).mockReset()
 
     vi.mocked(convertToModelMessages).mockImplementation((messages) => messages)
     vi.mocked(tool).mockImplementation((config) => config)
@@ -166,7 +160,7 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
   })
 
   describe('Subagent prompt compilation', () => {
-    it('includes subagent-enabled Skills & Prompts guidance when commands are assigned', async () => {
+    it('leaves the enabled skills catalog to the one runtime appendix, with no base-prompt lookup or duplicate', async () => {
       vi.mocked(redis.get).mockResolvedValueOnce('# Base subagent prompt' as any)
       slashCommandCapabilityMocks.getEnabledAgentSlashCapabilities.mockResolvedValueOnce([
         {
@@ -197,20 +191,19 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
         'user-1'
       )
 
-      expect(slashCommandCapabilityMocks.getEnabledAgentSlashCapabilities).toHaveBeenCalledWith(
-        'user-1',
-        'subagent-1'
-      )
-      expect(compiled.systemPrompt).toContain('==== SKILLS & PROMPTS (AGENT ACCESS) ====')
-      expect(compiled.systemPrompt).toContain(
-        '- /artifact-creator | skill | skillId=artifact_creator — Build artifacts'
-      )
+      expect(slashCommandCapabilityMocks.getEnabledAgentSlashCapabilities).not.toHaveBeenCalled()
+      expect(slashCommandCapabilityMocks.buildSkillsCommandsDcmLines).not.toHaveBeenCalled()
+      expect(compiled.systemPrompt).not.toContain('==== SKILLS & PROMPTS (AGENT ACCESS) ====')
+      expect(compiled.systemPrompt).not.toContain('skills_commands:')
       expect(compiled.systemPrompt).toContain('==== SUBAGENT RUNTIME CONTEXT ====')
+      // BL-2190: no stored base prompt compiles the packaged default, never nothing.
+      expect(compiled.systemPrompt.startsWith('==== BATSHIT SUB-AGENT SYSTEM PROMPT ====\n\n# Batshit Subagent\n')).toBe(true)
       // SA-106 DL-106-02: this fixture carries no subagentType and no workflow target.
       // It used to fall through the silent default to the retired `n8n-subnode` type;
-      // it now resolves to a LIVE type, which is also the correct one here — this is
-      // `compileManagedSubagentSystemPrompt`, the API/CLI managed subagent lane.
-      expect(compiled.systemPrompt).toContain('type: api (API Subagent)')
+      // it now resolves to the LIVE type, which is also the correct one here — this is
+      // `compileManagedSubagentSystemPrompt`, the managed subagent lane. SA-139 R6 cut the
+      // "type:" line (one Subagent kind); the API lane's runner line is what shows it.
+      expect(compiled.systemPrompt).toContain('runtime: Batshit direct subagent runner.')
     })
   })
 
@@ -255,44 +248,6 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       expect(response.content).toBe('Hello from Mode 3!')
     })
 
-  })
-
-  describe('AC2: Workflows callable as tools', () => {
-    it('5.7-UNIT-003: Test workflow tools integration', async () => {
-      const request: NativeModeRequest = {
-        messages: [
-          { role: 'user', content: 'Analyze this data' }
-        ],
-        model: 'claude-3-5-sonnet',
-        availableWorkflows: ['analyze-data'],
-        sessionId: 'test-session',
-        messageId: 'test-message'
-      }
-
-      const response = await brain.processNativeMode(request)
-
-      expect(response).toBeDefined()
-      expect(response.intermediateSteps).toBeDefined()
-      expect(response.intermediateSteps?.[0]?.toolName).toBe('test_tool')
-    })
-
-    it('5.7-UNIT-004: Test multiple workflows as tools', async () => {
-      const request: NativeModeRequest = {
-        messages: [
-          { role: 'user', content: 'Process data and generate report' }
-        ],
-        model: 'claude-3-5-sonnet',
-        availableWorkflows: ['analyze-data', 'generate-report'],
-        sessionId: 'test-session',
-        messageId: 'test-message',
-        maxToolRounds: 5
-      }
-
-      const response = await brain.processNativeMode(request)
-
-      expect(response).toBeDefined()
-      expect(response.metadata?.mode).toBe('native')
-    })
   })
 
   describe('AC3: Messages use existing compileForAI()', () => {
@@ -403,11 +358,6 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
           { role: 'user', content: 'Use a tool' }
         ],
         model: 'claude-3-5-sonnet',
-        availableTools: [{
-          name: 'test_tool',
-          description: 'A test tool',
-          schema: { properties: { input: { type: 'string' } } }
-        }],
         sessionId: 'test-session',
         messageId: 'test-message'
       }
@@ -664,18 +614,15 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
     })
 
     it('keeps model-facing tool output readable and free of any zip id (F-P4-9)', async () => {
-      const request: NativeModeRequest = {
-        messages: [{ role: 'user', content: 'Use a workflow tool' }],
-        model: 'claude-3-5-sonnet',
-        sessionId: 'test-session',
-        messageId: 'test-message',
-        availableWorkflows: ['analyze_data']
-      }
-
-      await brain.streamNativeMode(request)
-
-      const callArgs = vi.mocked(streamText).mock.calls.at(-1)?.[0] as any
-      const analyzeTool = callArgs.tools?.analyze_data
+      // A plain executable tool, through the one wrapper `streamNativeMode` puts around every tool it registers.
+      const wrapped = (brain as any).wrapToolsWithReadableModelOutput({
+        analyze_data: {
+          description: 'Analyze data',
+          inputSchema: {},
+          execute: vi.fn().mockResolvedValue({ result: 'analyzed' })
+        }
+      }, { userId: 'josh', sessionId: 'test-session', messageId: 'test-message', agentId: 'agent-1' })
+      const analyzeTool = wrapped.analyze_data
       expect(analyzeTool).toBeTruthy()
 
       await analyzeTool.execute({ rows: [1, 2, 3] }, { toolCallId: 'call_workflow_1' })
@@ -1006,7 +953,8 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
    * Before this story the hook existed only on SA-105's text-only image lanes. It is now
    * registered on EVERY streaming run, and DL-105-13's "call shape unchanged" promise
    * becomes the stricter one these tests pin: always present, and returning `undefined` —
-   * the SDK's own "change nothing" answer — whenever nothing is pending.
+   * the SDK's own "change nothing" answer — whenever nothing is pending. The hook is
+   * asynchronous because open skill guidance refreshes before the next step is prepared.
    */
   describe('SA-114 steer delivery (DL-114-05)', () => {
     const baseRequest = (overrides: Partial<NativeModeRequest> = {}): NativeModeRequest => ({
@@ -1027,7 +975,7 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       return callArgs.prepareStep as (args: {
         messages: any[]
         steps: any[]
-      }) => any
+      }) => Promise<any>
     }
 
     it('registers prepareStep on every run, with or without a steer channel', async () => {
@@ -1068,16 +1016,16 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       for (const lane of lanes) {
         const prepareStep = await getPrepareStep(baseRequest({ takeSteers: () => [], ...lane }))
         const name = lane.model ?? 'claude-3-5-sonnet, no connection'
-        expect(prepareStep({ messages, steps: [] }), name).toBeUndefined()
-        expect(prepareStep({ messages, steps: [toolResultStep()] }), name).toBeUndefined()
+        expect(await prepareStep({ messages, steps: [] }), name).toBeUndefined()
+        expect(await prepareStep({ messages, steps: [toolResultStep()] }), name).toBeUndefined()
         expect(
-          prepareStep({ messages, steps: [toolResultStep(), toolResultStep()] }),
+          await prepareStep({ messages, steps: [toolResultStep(), toolResultStep()] }),
           name
         ).toBeUndefined()
       }
     })
 
-    it('BL-77: an Anthropic run adds exactly one request-level cache point from step two, and no message', async () => {
+    it('BL-77: an Anthropic run adds exactly one request-level cache point on every step, the first included (BL-1976), and no message', async () => {
       const prepareStep = await getPrepareStep(
         baseRequest({
           model: 'claude-sonnet-5',
@@ -1087,11 +1035,10 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       )
       const messages = [{ role: 'user', content: 'do some work' }]
 
-      // Step one: nothing — a one-step reply never pays for a cache write nobody reads.
-      expect(prepareStep({ messages, steps: [] })).toBeUndefined()
-      // Every later step: the cache point and NOTHING else (the SDK keeps its own messages).
-      for (const steps of [[toolResultStep()], [toolResultStep(), toolResultStep()]]) {
-        expect(prepareStep({ messages, steps })).toEqual({
+      // Every step, the first included (BL-1976, Josh 2026-10-21: the first call writes the
+      // step-start message, the second reads it): the cache point and NOTHING else.
+      for (const steps of [[], [toolResultStep()], [toolResultStep(), toolResultStep()]]) {
+        expect(await prepareStep({ messages, steps })).toEqual({
           providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } }
         })
       }
@@ -1107,10 +1054,10 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       )
       const messages = [{ role: 'user', content: 'do some work' }]
 
-      const first = prepareStep({ messages, steps: [toolResultStep()] })
+      const first = await prepareStep({ messages, steps: [toolResultStep()] })
       first.providerOptions.anthropic.cacheControl.ttl = '1h'
       first.providerOptions.anthropic.thinking = { type: 'adaptive' }
-      const second = prepareStep({ messages, steps: [toolResultStep(), toolResultStep()] })
+      const second = await prepareStep({ messages, steps: [toolResultStep(), toolResultStep()] })
 
       expect(second.providerOptions).not.toBe(first.providerOptions)
       expect(second).toEqual({
@@ -1134,8 +1081,14 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
         content: [{ type: 'tool-result', toolCallId: 'call_1', toolName: 'echo', output: { type: 'text', value: 'ok' } }]
       }
 
-      expect(prepareStep({ messages: [compiled], steps: [] })).toBeUndefined()
-      const second = prepareStep({ messages: [compiled, call, result], steps: [toolResultStep()] })
+      // BL-1976: step one marks a COPY of the step-start message (the last compiled one).
+      const first = await prepareStep({ messages: [compiled], steps: [] })
+      expect(first.providerOptions).toBeUndefined()
+      expect(first.messages).toHaveLength(1)
+      expect(first.messages[0]).toEqual({ ...compiled, providerOptions: { openrouter: { cacheControl: { type: 'ephemeral' } } } })
+      expect(compiled).not.toHaveProperty('providerOptions')
+      // The SDK carries step one's messages forward; step two puts the compiled original back.
+      const second = await prepareStep({ messages: [first.messages[0], call, result], steps: [toolResultStep()] })
       expect(second.providerOptions).toBeUndefined()
       expect(second.messages[0]).toBe(compiled)
       expect(second.messages[1]).toBe(call)
@@ -1144,8 +1097,6 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       })
       // A copy: the SDK's own result object is never marked.
       expect(result.content[0]).not.toHaveProperty('providerOptions')
-      // Nothing of the loop yet (a step that only has the compiled messages): nothing to do.
-      expect(prepareStep({ messages: [compiled], steps: [toolResultStep()] })).toBeUndefined()
     })
 
     it("BL-77: a preset's Prompt cache TTL already covers every step, so the hook adds nothing", async () => {
@@ -1159,8 +1110,8 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       )
       const messages = [{ role: 'user', content: 'do some work' }]
 
-      expect(prepareStep({ messages, steps: [] })).toBeUndefined()
-      expect(prepareStep({ messages, steps: [toolResultStep()] })).toBeUndefined()
+      expect(await prepareStep({ messages, steps: [] })).toBeUndefined()
+      expect(await prepareStep({ messages, steps: [toolResultStep()] })).toBeUndefined()
     })
 
     it('BL-77: a steer and the cache point arrive together, and the steer stays the last message', async () => {
@@ -1184,7 +1135,7 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       )
       const messages = [{ role: 'user', content: 'do some work' }]
 
-      const result = prepareStep({ messages, steps: [toolResultStep()] }) as any
+      const result = await prepareStep({ messages, steps: [toolResultStep()] }) as any
       expect(result.providerOptions).toEqual({
         anthropic: { cacheControl: { type: 'ephemeral' } }
       })
@@ -1219,7 +1170,7 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       const prepareStep = await getPrepareStep(baseRequest({ takeSteers }))
       const messages = [{ role: 'user', content: 'do some work' }]
 
-      const result = prepareStep({ messages, steps: [toolResultStep()] })
+      const result = await prepareStep({ messages, steps: [toolResultStep()] })
       expect(takeSteers).toHaveBeenCalledWith(1)
       expect(result?.messages).toHaveLength(2)
 
@@ -1240,11 +1191,11 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       const messages = [{ role: 'user', content: 'do some work' }]
 
       // Before the first model call: `steps` is empty, so there is nothing to land after.
-      expect(prepareStep({ messages, steps: [] })).toBeUndefined()
+      expect(await prepareStep({ messages, steps: [] })).toBeUndefined()
       // A text-only step means the model has stopped calling tools; anything still waiting
       // is promoted (DL-114-07) rather than injected here.
       expect(
-        prepareStep({ messages, steps: [{ content: [{ type: 'text' }] }] })
+        await prepareStep({ messages, steps: [{ content: [{ type: 'text' }] }] })
       ).toBeUndefined()
       expect(takeSteers).not.toHaveBeenCalled()
     })
@@ -1268,7 +1219,7 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
         })
       )
 
-      const result = prepareStep({ messages: [], steps: [toolResultStep()] })
+      const result = await prepareStep({ messages: [], steps: [toolResultStep()] })
       expect(result?.messages[0].content[0].text).toBe(
         '[Agent DM — from Cooper, not from the user, delivered mid-reply: the build is red]'
       )

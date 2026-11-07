@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
@@ -79,6 +79,16 @@ exec "${process.execPath}" "${FAKE_SBX}" "$@"
 
   const env = {
     ...process.env,
+    HOME: root,
+    BATSHIT_RUNTIME_OWNER: 'docker-operator-test',
+    BATSHIT_CONTAINERIZED: '',
+    BATSHIT_RUNTIME_ENV: '',
+    BATSHIT_HOME_DIR: '',
+    BATSHIT_HOST_RUNTIME_ROOT: path.join(root, '.batshit'),
+    BATSHIT_AGENT_RUNTIME_ROOT: '',
+    BATSHIT_SANDBOX_PROTECTED_HOME_DIR: '',
+    BATSHIT_MAC_DATA_DIR: path.join(root, 'mac-data'),
+    BATSHIT_RUNTIME_ADDON_OPERATOR_WATCH: '0',
     PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`,
     FAKE_SBX_STATE: stateDir,
     BATSHIT_RUNTIME_ADDON_OPERATOR_ROOT: root,
@@ -116,6 +126,8 @@ exec "${process.execPath}" "${FAKE_SBX}" "$@"
   }
   const startVoice = (recipe) => call('POST', '/v1/voice-engines/start', signedVoiceRecipe(recipe))
   return {
+    root,
+    workspace,
     stateDir,
     keyFile,
     url: base,
@@ -155,6 +167,14 @@ exec "${process.execPath}" "${FAKE_SBX}" "$@"
       }),
     status: () => call('GET', '/v1/sandbox/status'),
     health: () => call('GET', '/health'),
+    admit: (overrides = {}) => call('POST', '/v1/sandbox/workspace/admit', {
+      v: 1,
+      workspaceRoot: '/workspace',
+      cwd: '/workspace',
+      expectedContainerRoot: env.BATSHIT_SANDBOX_CONTAINER_WORKSPACE_ROOT,
+      expectedHostRoot: path.resolve(env.BATSHIT_RUNTIME_ADDON_OPERATOR_ROOT, env.BATSHIT_SANDBOX_HOST_WORKSPACE_ROOT),
+      ...overrides
+    }),
     events: async () =>
       (await readFile(path.join(stateDir, 'events.log'), 'utf8').catch(() => '')).split('\n').filter(Boolean),
     sandboxNames: async () =>
@@ -243,7 +263,7 @@ test('status says what to set up, and health reports the sandbox revision', asyn
   assert.equal(ready.body.available, true)
   assert.equal(ready.body.cli, 'sbx')
   const revision = (await operator.health()).body.sandboxRevision
-  assert.equal(revision, 12)
+  assert.equal(revision, 13)
   // `start-docker` replaces an operator that reports less than it requires, so the two move
   // together or users keep the old operator after an update.
   const launcher = await readFile(fileURLToPath(new URL('./start-docker.mjs', import.meta.url)), 'utf8')
@@ -434,13 +454,18 @@ async function voiceHost(t) {
     await rm(hostRoot, { recursive: true, force: true })
   })
   // An "engine" whose command line carries its install path, like a real one.
+  // Install once: another launch must not truncate a script the first is still loading.
+  const installed = new Map()
   const install = async (engineId) => {
+    if (installed.has(engineId)) return installed.get(engineId)
     const installRoot = path.join(hostRoot, 'installs', engineId)
     await mkdir(installRoot, { recursive: true })
     const command = path.join(installRoot, 'fake-voice-engine')
     await writeFile(command, `#!${process.execPath}\nsetInterval(() => {}, 1000)\n`)
     await chmod(command, 0o755)
-    return { installRoot, command }
+    const installation = { installRoot, command }
+    installed.set(engineId, installation)
+    return installation
   }
   return {
     hostRoot,
@@ -819,6 +844,7 @@ if (command === 'ps') {
     calls: async () => (await readFile(path.join(root, 'calls.log'), 'utf8').catch(() => '')).split('\n').filter(Boolean),
     env: {
       PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`,
+      BATSHIT_RUNTIME_ADDON_OPERATOR_WATCH: '1',
       BATSHIT_RUNTIME_ADDON_OPERATOR_WATCH_MS: '100',
       BATSHIT_RUNTIME_ADDON_OPERATOR_GONE_AFTER_MS: '600',
       BATSHIT_RUNTIME_ADDON_OPERATOR_UNREACHABLE_AFTER_MS: '2000',
@@ -1379,4 +1405,156 @@ test('a usable m3 sandbox made for a protected folder is never reused (BL-1277)'
   // The old sandbox is left as it was: it was never used, and it is fresh, so the hourly prune of
   // abandoned sandboxes does not take it yet.
   assert.ok((await operator.sandboxNames()).includes(m3Name))
+})
+
+test('workspace admission is authenticated, exact v1, and never contacts sbx', async (t) => {
+  const operator = await startOperator(t)
+  const denied = await fetch(`${operator.url}/v1/sandbox/workspace/admit`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ v: 1 })
+  })
+  assert.equal(denied.status, 401)
+  const valid = { v: 1, workspaceRoot: '/workspace', cwd: '/workspace', expectedContainerRoot: '/workspace', expectedHostRoot: operator.workspace }
+  const missingCwd = { ...valid }
+  delete missingCwd.cwd
+  for (const body of [
+    {}, [], null, missingCwd, { ...valid, extra: true }, { ...valid, hostRoot: operator.workspace },
+    { ...valid, v: 0 }, { ...valid, v: 2 }, { ...valid, v: '1' },
+    { ...valid, workspaceRoot: 1 }, { ...valid, cwd: null }, { ...valid, expectedContainerRoot: [] },
+    { ...valid, expectedHostRoot: {} }, { ...valid, workspaceRoot: '/workspace\0outside' }
+  ]) {
+    const answer = await operator.call('POST', '/v1/sandbox/workspace/admit', body)
+    assert.equal(answer.status, 400, JSON.stringify(answer.body))
+    assert.equal(answer.body.admitted, false)
+  }
+  assert.deepEqual(await operator.events(), [])
+})
+
+test('valid darwin workspace admission binds the trusted tuple and canonical mapping without readiness or a sandbox', { skip: process.platform !== 'darwin' }, async (t) => {
+  const operator = await startOperator(t)
+  await mkdir(path.join(operator.workspace, 'project', 'src'), { recursive: true })
+  const hostRoot = await realpath(operator.workspace)
+  const answer = await operator.admit({ workspaceRoot: '/workspace/project', cwd: '/workspace/project/src' })
+  assert.equal(answer.status, 200, JSON.stringify(answer.body))
+  assert.deepEqual(answer.body, {
+    ok: true, admitted: true, v: 1, hostPlatform: 'darwin',
+    requestedWorkspaceRoot: '/workspace/project', requestedCwd: '/workspace/project/src',
+    containerRoot: '/workspace', configuredHostRoot: operator.workspace, hostRoot,
+    hostWorkspaceRoot: path.join(hostRoot, 'project'), hostCwd: path.join(hostRoot, 'project', 'src')
+  })
+  assert.deepEqual(await operator.events(), [], 'admission invoked sbx version/list/policy/create/exec')
+  assert.deepEqual(await operator.sandboxNames(), [])
+})
+
+test('typed admission refuses hosts without the qualified darwin boundary', { skip: process.platform === 'darwin' }, async (t) => {
+  const operator = await startOperator(t)
+  const answer = await operator.admit()
+  assert.equal(answer.status, 503)
+  assert.equal(answer.body.admitted, false)
+  assert.match(answer.body.error, /darwin host operator/)
+  assert.deepEqual(await operator.events(), [])
+})
+
+test('workspace admission rejects tuple mismatches, host-namespace shortcuts and mappings outside the bind', { skip: process.platform !== 'darwin' }, async (t) => {
+  const operator = await startOperator(t)
+  await mkdir(path.join(operator.workspace, 'project'))
+  const outside = path.join(operator.root, 'outside')
+  await mkdir(outside)
+  await symlink(outside, path.join(operator.workspace, 'outside-link'))
+  for (const overrides of [
+    { expectedContainerRoot: '/other' },
+    { expectedHostRoot: outside },
+    { expectedHostRoot: `${operator.workspace}/` },
+    { workspaceRoot: operator.workspace, cwd: operator.workspace },
+    { workspaceRoot: '/workspace-other', cwd: '/workspace-other' },
+    { workspaceRoot: '/workspace/../../outside', cwd: '/workspace/../../outside' },
+    { workspaceRoot: '/workspace/outside-link', cwd: '/workspace/outside-link' },
+    { workspaceRoot: '/workspace/project', cwd: '/workspace' }
+  ]) {
+    const answer = await operator.admit(overrides)
+    assert.equal(answer.status, 400, JSON.stringify({ overrides, answer: answer.body }))
+    assert.equal(answer.body.admitted, false)
+  }
+  assert.deepEqual(await operator.events(), [])
+})
+
+async function assertPolicyRefusesWithoutSbx(operator, pattern) {
+  const before = await operator.events()
+  if (process.platform === 'darwin') {
+    const admitted = await operator.admit()
+    assert.equal(admitted.status, 400, JSON.stringify(admitted.body))
+    assert.match(admitted.body.error, pattern)
+  }
+  const executed = await operator.execute('pwd', 'strict-policy-refusal')
+  assert.notEqual(executed.status, 200, JSON.stringify(executed.body))
+  assert.match(executed.body.error, pattern)
+  const recovered = await operator.call('POST', '/v1/sandbox/recover', { workspaceRoot: '/workspace', cwd: '/workspace' })
+  assert.notEqual(recovered.status, 200, JSON.stringify(recovered.body))
+  assert.match(recovered.body.error, pattern)
+  assert.deepEqual(await operator.events(), before, 'a refusal contacted sbx before the policy passed')
+}
+
+test('missing protected leaves under an aliased existing parent refuse admission, execute and recover', { skip: process.platform === 'win32' }, async (t) => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'batshit-operator-protected-alias-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const physical = path.join(home, 'physical-home')
+  const alias = path.join(home, 'alias-home')
+  await mkdir(physical)
+  await symlink(physical, alias)
+  const operator = await startOperator(t, {
+    HOME: home, BATSHIT_HOME_DIR: alias, BATSHIT_HOST_RUNTIME_ROOT: '',
+    BATSHIT_SANDBOX_HOST_WORKSPACE_ROOT: physical
+  })
+  await assertPolicyRefusesWithoutSbx(operator, /managed agent homes.*protected runtime\/Pinokio data/)
+})
+
+test('a non-ENOENT protected-path failure refuses instead of falling back to its spelling', { skip: process.platform === 'win32' }, async (t) => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'batshit-operator-protected-error-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const managed = path.join(home, 'managed')
+  await mkdir(managed)
+  await symlink('agents', path.join(managed, 'agents'))
+  const operator = await startOperator(t, { HOME: home, BATSHIT_HOME_DIR: managed, BATSHIT_HOST_RUNTIME_ROOT: '' })
+  await assertPolicyRefusesWithoutSbx(operator, /ELOOP|too many symbolic links/i)
+})
+
+test('the host operator protects normal Mac app credential roots despite its Docker role', { skip: process.platform !== 'darwin' }, async (t) => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'batshit-operator-mac-custody-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const config = path.join(home, 'Library', 'Application Support', 'Batshit', 'config')
+  await mkdir(config, { recursive: true })
+  const operator = await startOperator(t, {
+    HOME: home, BATSHIT_RUNTIME_OWNER: 'docker', BATSHIT_CONTAINERIZED: '1',
+    BATSHIT_MAC_DATA_DIR: '', BATSHIT_SANDBOX_HOST_WORKSPACE_ROOT: config
+  })
+  await assertPolicyRefusesWithoutSbx(operator, /credential storage/)
+})
+
+test('known credential hardlinks and uncertain credential metadata refuse every sandbox admission path', { skip: process.platform !== 'darwin' }, async (t) => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'batshit-operator-credential-alias-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const data = path.join(home, 'mac-app')
+  const config = path.join(data, 'config')
+  const credential = path.join(config, 'runtime.env')
+  await mkdir(config, { recursive: true })
+  await writeFile(credential, 'fixture only\n')
+  await link(credential, path.join(home, 'credential-alias'))
+  const operator = await startOperator(t, { HOME: home, BATSHIT_RUNTIME_OWNER: 'docker', BATSHIT_MAC_DATA_DIR: data })
+  await assertPolicyRefusesWithoutSbx(operator, /credential storage has a hardlink alias/)
+  await rm(path.join(home, 'credential-alias'))
+  await rm(credential)
+  await symlink('runtime.env', credential)
+  await assertPolicyRefusesWithoutSbx(operator, /credential storage metadata could not be checked/)
+})
+
+test('a currently reusable sandbox is refused before listing or reuse when a protected alias appears', { skip: process.platform === 'win32' }, async (t) => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'batshit-operator-reuse-policy-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const protectedAlias = path.join(home, 'new-protected-alias')
+  const operator = await startOperator(t, { HOME: home, BATSHIT_SANDBOX_PROTECTED_HOME_DIR: protectedAlias })
+  const first = await operator.execute('pwd', 'strict-policy-refusal')
+  assert.equal(first.status, 200, JSON.stringify(first.body))
+  assert.ok((await operator.sandboxNames()).includes(first.body.sandboxName))
+  await symlink(operator.workspace, protectedAlias)
+  await assertPolicyRefusesWithoutSbx(operator, /managed agent homes.*protected runtime\/Pinokio data/)
+  assert.ok((await operator.sandboxNames()).includes(first.body.sandboxName), 'refusal removed the existing sandbox')
 })

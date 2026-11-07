@@ -1,3 +1,5 @@
+import type { AppActionsApprovalPreview } from '$lib/appActions/settings/managementContract'
+
 export type ToolApprovalMode = 'off' | 'all'
 
 export type ToolApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired'
@@ -12,6 +14,8 @@ export type ToolApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired'
  * state instead of trusting an id a client chose (F-P1-4).
  */
 export interface ToolApprovalControl {
+  /** Supplemental server-held Settings preview; never an execution grant. */
+  settingsPreview?: AppActionsApprovalPreview
   /** The `apr_…` approval record id. */
   approvalId: string
   controlId: string

@@ -1,6 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte'
-  import { debounce } from '$lib/utils/debounce'
+  import { onDestroy, onMount, untrack } from 'svelte'
   import * as Card from '$lib/components/ui/card'
   import * as Collapsible from '$lib/components/ui/collapsible'
   import { Button } from '$lib/components/ui/button'
@@ -36,6 +35,22 @@
   import { normalizeIconRef } from '$lib/icons/iconLegacy'
   import { iconRefKey, type IconRef } from '$lib/icons/iconTypes'
   import { dispatchProjectPreferencesUpdated } from '$lib/utils/liveSettingsEvents'
+  import { DEFAULT_PROJECT_NAME } from '$lib/projects/defaultProject'
+  import {
+    cancelQueuedProjectSave,
+    dropProjectLane,
+    flushQueuedProjectSaves,
+    hasOtherProjectCopy,
+    latestProjectDraft,
+    latestProjectRevision,
+    onProjectSaved,
+    publishProjectSaved,
+    queueProjectSave,
+    saveProjectNow,
+    waitForProjectSaves,
+    type SavedProjectAnswer
+  } from '$lib/components/settings/projects/projectAutosave'
+  import { applySavedAnswersSince, projectAnswerSeq } from '$lib/projects/projectSaveAnswers'
 
   const SECURITY_EXCLUSIONS: string[] = [...PROJECT_SECURITY_EXCLUSIONS]
   const DEFAULT_EXCLUSIONS: string[] = [...PROJECT_DEFAULT_EXCLUSIONS]
@@ -81,6 +96,7 @@
   }
 
   const projectService = new ProjectService()
+  const projectWriteGenerations = new Map<string, number>()
   let preferences = $state<ProjectPreferences | null>(null)
   let defaultWorkspacePath = $state('')
   let preferencesLoading = $state(true)
@@ -88,6 +104,7 @@
   let prefSaveState = $state<'idle' | 'saving' | 'saved'>('idle')
   let prefPersistedValue = $state('')
   let prefHydrating = $state(false)
+  let preferencesLoadFailed = $state(false)
 
   let {
     data = null,
@@ -104,6 +121,9 @@
   let listLoading = $state(true)
   let listError = $state<string | null>(null)
   let selectedProjectId = $state<string | null>(null)
+  // BL-2373: the Default Project (built from the Default Project Path) is the first Saved Projects
+  // row; selecting it shows its path editor instead of a saved project's form.
+  let defaultProjectSelected = $state(false)
 
   let projectForm = $state<ProjectFormState>({ ...EMPTY_FORM })
   let formPersistedSignature = $state<string | null>(null)
@@ -122,6 +142,18 @@
   let createRulesEditorOpen = $state(false)
   let projectCustomExclusionsEditorOpen = $state(false)
   let projectRulesEditorOpen = $state(false)
+  // BL-2384: saves outlive the panel. After it closes, a failed save is a toast naming the
+  // project, never an error written to a panel nobody sees.
+  let destroyed = false
+  // A project being deleted: a save failure that lands meanwhile is held, and shown only if the
+  // delete fails. A deleted project: its late save failures (404 once it is gone) are expected.
+  const deletingProjectIds = new Set<string>()
+  const deletedProjectIds = new Set<string>()
+  const failuresDuringDelete = new Map<string, string>()
+
+  // BL-2384 round 5: every saved answer reaches the mounted panel, also one sent by a panel that
+  // has since closed (its write outlived it and the bounded wait).
+  const stopAnswers = onProjectSaved<Project, ProjectFormState>(applySavedAnswer)
 
   onMount(async () => {
     await Promise.all([loadProjects(), loadPreferences()])
@@ -136,7 +168,7 @@
     } else if (initialMode === 'list') {
       createMode = false
       createError = null
-      if (!selectedProjectId && projects.length > 0) {
+      if (!selectedProjectId && !defaultProjectSelected && projects.length > 0) {
         const firstProject = projects[0]
         if (firstProject) {
           selectProject(firstProject)
@@ -152,22 +184,27 @@
     listError = null
 
     try {
-      const loaded = await projectService.loadProjects(data?.user?.id ?? '')
+      // A reopened panel reads only after the writes an earlier panel admitted have answered,
+      // so its saved copy is never older than a save it did not see (BL-2384). The wait is
+      // bounded (round 4): a write that never answers must not hold the panel on its loading
+      // state; a copy still on its way keeps showing through `latestProjectDraft`.
+      await waitForProjectSaves()
+      // A save answering while this read is on its way wins over the list, unless the list holds
+      // a newer copy. `loadProjects` applies every answer since its read began; laying them over
+      // again here, where the list is assigned, covers one that lands after it returned.
+      const answersBefore = projectAnswerSeq()
+      const loaded = applySavedAnswersSince(await projectService.loadProjects(data?.user?.id ?? ''), answersBefore)
       projects = loaded
       projectStore.setProjects(loaded)
 
       if (loaded.length > 0) {
         const existing = selectedProjectId ? loaded.find((project) => project.id === selectedProjectId) : undefined
         const initial = existing ?? loaded[0]
-        if (initial) {
+        if (initial && !defaultProjectSelected) {
           selectProject(initial)
         }
       } else {
-        untrack(() => {
-          selectedProjectId = null
-          projectForm = { ...EMPTY_FORM }
-          formPersistedSignature = null
-        })
+        selectDefaultProject()
       }
     } catch (error) {
       console.error('Failed to load projects:', error)
@@ -189,12 +226,23 @@
     preferencesError = null
     prefHydrating = true
     try {
-      const loaded = await projectService.loadPreferences()
+      let loaded: ProjectPreferences | null = null
+      // The store's guard drops this answer when the path was written while it was on its way
+      // (a newer save or read); the field then shows the store's newer value.
+      const installed = await projectStore.loadDefaultProjectPath(async () => {
+        loaded = await projectService.loadPreferences()
+        return loaded
+      })
       preferences = loaded
-      defaultWorkspacePath = loaded?.default_workspace_path ?? ''
+      defaultWorkspacePath = installed
+        ? ((loaded as ProjectPreferences | null)?.default_workspace_path ?? '')
+        : (projectStore.getDefaultProjectPath() ?? '')
       prefPersistedValue = defaultWorkspacePath.trim()
+      prefCommittedValue = null
+      preferencesLoadFailed = false
     } catch (error) {
       console.error('Failed to load project preferences:', error)
+      preferencesLoadFailed = true
       preferencesError =
         error instanceof Error ? error.message : 'Failed to load preferences'
     } finally {
@@ -203,15 +251,37 @@
     }
   }
 
+  function selectDefaultProject() {
+    createMode = false
+    createError = null
+
+    formHydrating = true
+    untrack(() => {
+      defaultProjectSelected = true
+      selectedProjectId = null
+      projectForm = { ...EMPTY_FORM }
+      formPersistedSignature = null
+      validationError = null
+      saveError = null
+      saveState = 'idle'
+    })
+    formHydrating = false
+  }
+
   function selectProject(project: Project) {
     createMode = false
     createError = null
 
     formHydrating = true
     untrack(() => {
+      defaultProjectSelected = false
       selectedProjectId = project.id
-      projectForm = normaliseProject(project)
-      formPersistedSignature = makeFormSignature(projectForm)
+      // BL-2384: a save of this project still waiting or on its way is newer than the saved list
+      // copy, so the form shows it; the baseline stays the confirmed copy until that save answers.
+      const pending = latestProjectDraft<ProjectFormState>(project.id)
+      const saved = normaliseProject(project)
+      projectForm = pending ? structuredClone(pending) : saved
+      formPersistedSignature = makeFormSignature(saved)
       validationError = null
       saveError = null
       saveState = 'idle'
@@ -257,6 +327,37 @@
     })
   }
 
+  const PROJECT_FORM_FIELDS = [
+    'name',
+    'root_path',
+    'max_depth',
+    'use_default_exclusions',
+    'custom_exclusions',
+    'rules_json',
+    'iconRef'
+  ] as const
+
+  function sameFormField(field: (typeof PROJECT_FORM_FIELDS)[number], a: ProjectFormState, b: ProjectFormState) {
+    return field === 'iconRef' ? iconRefKey(a.iconRef) === iconRefKey(b.iconRef) : a[field] === b[field]
+  }
+
+  /**
+   * BL-2384: the form after a save answered. Each field the user changed since the submitted
+   * copy keeps the user's newer value (and the autosave sends it next); every other field takes
+   * the server's saved value. Text typed during the round trip is never thrown away.
+   */
+  function keepEditsSince(
+    submitted: ProjectFormState,
+    current: ProjectFormState,
+    saved: ProjectFormState
+  ): ProjectFormState {
+    const next: ProjectFormState = structuredClone(saved)
+    for (const field of PROJECT_FORM_FIELDS) {
+      if (!sameFormField(field, current, submitted)) (next as any)[field] = structuredClone(current[field])
+    }
+    return next
+  }
+
   function validateProjectForm(form: ProjectFormState): ValidationResult {
     if (!form.name.trim()) {
       return { ok: false, error: 'Project name is required.' }
@@ -290,8 +391,9 @@
 
     let maxDepth: number | null = null
     if (form.max_depth.trim()) {
-      const value = Number(form.max_depth)
-      if (!Number.isFinite(value) || value < 0) {
+      const text = form.max_depth.trim()
+      const value = Number(text)
+      if (!/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?$/i.test(text) || !Number.isFinite(value) || value < 0) {
         return { ok: false, error: 'Max depth must be a non-negative number.' }
       }
       maxDepth = value
@@ -349,21 +451,28 @@
   }
 
   async function persistProjectForm(nextForm: ProjectFormState) {
-    if (!selectedProjectId) return
+    // BL-2384: the form names the project it was filled for, and each project has its own ordered
+    // lane (`projectAutosave.ts`), so a save that fires after the user picked another project (or
+    // the Default Project, or closed the panel) writes to the project typed into.
+    const projectId = nextForm.id
+    if (!projectId) return
 
     const validation = validateProjectForm(nextForm)
+    const shown = untrack(() => selectedProjectId) === projectId
     if (!validation.ok) {
-      validationError = validation.error
+      if (shown) validationError = validation.error
       throw new Error(validation.error)
     }
 
-    validationError = null
+    if (shown) validationError = null
 
+    const writeGeneration = (projectWriteGenerations.get(projectId) ?? 0) + 1
+    projectWriteGenerations.set(projectId, writeGeneration)
     const response = await fetch('/api/projects', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        projectId: selectedProjectId,
+        projectId,
         updates: buildProjectPayload(nextForm, validation)
       })
     })
@@ -376,16 +485,35 @@
     const result = await response.json()
     const updated: Project = result.project
 
-    projects = projects.map((project) => (project.id === updated.id ? updated : project))
+    // A newer issued save owns its result/error, even if it failed. An older
+    // success must not hide that error, publish stale values or trigger a retry.
+    if (projectWriteGenerations.get(projectId) !== writeGeneration) return
+    // The store is updated here whether or not any panel is mounted; the mounted panel (this one
+    // or one opened since) takes the answer through `applySavedAnswer`.
     projectStore.updateProject(updated.id, updated)
+    publishProjectSaved<Project, ProjectFormState>(projectId, updated, nextForm)
+  }
 
+  /**
+   * A saved answer, from this panel or from a panel that closed with the write on its way: the
+   * list takes the saved copy, and the shown project's form keeps the user's newer typing
+   * (`keepEditsSince`) over a baseline that is now the saved copy.
+   */
+  function applySavedAnswer(answer: SavedProjectAnswer<Project, ProjectFormState>) {
+    if (destroyed) return
+    const updated = answer.project
+    projects = projects.map((project) => (project.id === updated.id ? updated : project))
+    if (untrack(() => selectedProjectId) !== updated.id) return
+    const persisted = normaliseProject(updated)
     formHydrating = true
     untrack(() => {
-      projectForm = normaliseProject(updated)
-      formPersistedSignature = makeFormSignature(projectForm)
+      projectForm = keepEditsSince(answer.submitted, $state.snapshot(projectForm) as ProjectFormState, persisted)
+      formPersistedSignature = makeFormSignature(persisted)
     })
     formHydrating = false
 
+    // Saved only when no other copy of this project is still waiting or on its way (round 6).
+    if (hasOtherProjectCopy(updated.id, answer.submitted)) return
     untrack(() => {
       saveState = 'saved'
       saveError = null
@@ -400,32 +528,75 @@
     }, 2000)
   }
 
-  const saveProject = debounce(
-    async (nextForm: ProjectFormState) => {
-      try {
-        await persistProjectForm(nextForm)
-      } catch (error) {
-        console.error('Project save failed:', error)
-        untrack(() => {
-          saveState = 'idle'
-          saveError = error instanceof Error ? error.message : 'Failed to save project'
-        })
+  async function runProjectSave(nextForm: ProjectFormState) {
+    try {
+      await persistProjectForm(nextForm)
+    } catch (error) {
+      console.error('Project save failed:', error)
+      const message = error instanceof Error ? error.message : 'Failed to save project'
+      const failure = `${nextForm.name.trim() || 'A project'} was not saved: ${message}`
+      // A deleted project's save fails because it is gone: nothing to report.
+      if (nextForm.id && deletedProjectIds.has(nextForm.id)) return
+      // While its delete runs, hold the failure: it matters only if the delete fails.
+      if (nextForm.id && deletingProjectIds.has(nextForm.id)) {
+        failuresDuringDelete.set(nextForm.id, failure)
+        return
       }
-    },
-    600
-  )
+      // BL-2384: a failed save of a project no longer shown, or after the panel closed, names
+      // that project, not the one shown.
+      if (destroyed || untrack(() => selectedProjectId) !== nextForm.id) {
+        toast.error(failure)
+        return
+      }
+      untrack(() => {
+        saveState = 'idle'
+        saveError = message
+      })
+    }
+  }
 
-  const savePreferences = debounce(async (value: string) => {
+  // BL-2384: one ordered lane PER PROJECT (`projectAutosave.ts`, module level so it outlives
+  // this panel). A shared debounce kept only its latest call and dropped another project's edit;
+  // unordered writes of one project could land out of order.
+  function queueFormSave(form: ProjectFormState): boolean {
+    if (!form.id) return false
+    return queueProjectSave(form.id, form, makeFormSignature(form), runProjectSave)
+  }
+
+  // BL-2373 review A4: the Default Project Path is saved only when the user commits it (leaves
+  // the field, or presses Enter), never at a pause in typing. Every agent on Default works in
+  // this folder and the open sidebar loads it, so a half-typed path (`/`, `/Users/jo`) must never
+  // become the saved folder, load a tree or start a file walk. Saves run one after another in
+  // the order committed; only the last one sets the field's saved state.
+  let prefSaveChain: Promise<void> = Promise.resolve()
+  let prefSaveGeneration = 0
+  // The value of the latest commit, saved or still on its way; a second commit of it sends nothing.
+  let prefCommittedValue: string | null = null
+
+  // A saved value a newer commit superseded before it answered: published only if that newer
+  // commit fails, so the store and the event always end on what the server holds.
+  let prefUnpublishedValue: string | null = null
+
+  function publishDefaultProjectPath(value: string) {
+    projectStore.setDefaultProjectPath(value.length ? value : null)
+    dispatchProjectPreferencesUpdated({ defaultWorkspacePath: value.length ? value : null })
+  }
+
+  async function savePreferencesNow(value: string, generation: number) {
     try {
       const saved = await projectService.savePreferences({
         defaultWorkspacePath: value.length ? value : null
       })
+      // A newer commit is queued behind this one: it publishes (review: check before writing).
+      if (generation !== prefSaveGeneration) {
+        prefUnpublishedValue = value
+        return
+      }
+      prefUnpublishedValue = null
+      publishDefaultProjectPath(value)
       preferences = saved
       prefPersistedValue = value
       prefSaveState = 'saved'
-      dispatchProjectPreferencesUpdated({
-        defaultWorkspacePath: value.length ? value : null
-      })
       setTimeout(() => {
         if (prefSaveState === 'saved') {
           prefSaveState = 'idle'
@@ -433,16 +604,27 @@
       }, 2000)
     } catch (error) {
       console.error('Failed to save project preferences:', error)
+      if (generation !== prefSaveGeneration) return
+      const message = error instanceof Error ? error.message : 'Failed to save preferences'
+      // An older commit saved before this one failed: that is what the server holds now.
+      if (prefUnpublishedValue !== null) {
+        publishDefaultProjectPath(prefUnpublishedValue)
+        prefPersistedValue = prefUnpublishedValue
+        prefUnpublishedValue = null
+      }
+      prefCommittedValue = prefPersistedValue
       prefSaveState = 'idle'
-      preferencesError =
-        error instanceof Error ? error.message : 'Failed to save preferences'
+      preferencesError = message
+      if (destroyed) toast.error(`The Default Project path was not saved: ${message}`)
     }
-  }, 600)
+  }
 
-  $effect(() => {
-    if (preferencesLoading || prefHydrating) return
+  function commitDefaultProjectPath() {
+    // Never write over a value this panel could not read.
+    if (preferencesLoading || prefHydrating || preferencesLoadFailed) return
     const trimmed = defaultWorkspacePath.trim()
-    if (trimmed === prefPersistedValue) {
+    if (trimmed === (prefCommittedValue ?? prefPersistedValue)) {
+      if (prefSaveState !== 'saving') preferencesError = null
       return
     }
     if (trimmed.length > 0 && !trimmed.startsWith('/')) {
@@ -452,7 +634,19 @@
     }
     preferencesError = null
     prefSaveState = 'saving'
-    savePreferences(trimmed)
+    prefCommittedValue = trimmed
+    const generation = ++prefSaveGeneration
+    prefSaveChain = prefSaveChain.then(() => savePreferencesNow(trimmed, generation))
+  }
+
+  // Closing the panel: a Root Path edit that never lost focus is committed, and every project
+  // edit still waiting is sent at once (each is a completed edit). Their answers arrive after
+  // the panel is gone, so failures become named toasts (`destroyed`).
+  onDestroy(() => {
+    commitDefaultProjectPath()
+    flushQueuedProjectSaves()
+    destroyed = true
+    stopAnswers()
   })
 
   $effect(() => {
@@ -460,7 +654,16 @@
     if (!selectedProjectId) return
 
     const signature = makeFormSignature(projectForm)
-    if (!formPersistedSignature || signature === formPersistedSignature) {
+    if (!formPersistedSignature) return
+    if (signature === formPersistedSignature) {
+      // The edit went back to the saved copy: a copy still waiting is no longer wanted. With
+      // nothing of this project left waiting or on its way, the status leaves Saving (BL-2384
+      // round 6; the round-3 cancel left it showing Saving until the next edit).
+      untrack(() => {
+        const projectId = selectedProjectId!
+        cancelQueuedProjectSave(projectId)
+        if (saveState === 'saving' && latestProjectDraft(projectId) === null) saveState = 'idle'
+      })
       return
     }
 
@@ -471,8 +674,10 @@
     }
 
     validationError = null
-    saveState = 'saving'
-    saveProject(projectForm)
+    // A plain copy: the queued save must hold the values of THIS edit, not a live form. The
+    // status says Saving only for a copy this panel queued (round 5): a reopened panel showing a
+    // copy an earlier panel sent leaves it alone, and the answer sets it to Saved.
+    if (queueFormSave($state.snapshot(projectForm) as ProjectFormState)) saveState = 'saving'
   })
 
   async function handleCreateProject() {
@@ -507,15 +712,25 @@
   }
 
   async function handleDeleteProject() {
-    if (!selectedProjectId) return
+    const projectId = selectedProjectId
+    if (!projectId) return
     deleteBusy = true
     saveError = null
+    // BL-2384 (review S3): a deliberate delete cancels the project's waiting save, so no PUT and
+    // no "was not saved" notice follow it. A save already on its way answers 404 once the
+    // project is gone, and that is expected; if the delete fails instead, its failure is shown.
+    // A failed delete queues the cancelled edit again, unless a newer copy of the project was
+    // queued meanwhile (round 4).
+    deletingProjectIds.add(projectId)
+    failuresDuringDelete.delete(projectId)
+    const cancelled = cancelQueuedProjectSave<ProjectFormState>(projectId)
+    let deleted = false
 
     try {
       const response = await fetch('/api/projects', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId: selectedProjectId })
+        body: JSON.stringify({ projectId })
       })
 
       if (!response.ok) {
@@ -523,24 +738,30 @@
         throw new Error(message)
       }
 
-      projects = projects.filter((project) => project.id !== selectedProjectId)
-      projectStore.deleteProject(selectedProjectId)
+      deleted = true
+      deletedProjectIds.add(projectId)
+      // Nothing more is sent for a project that is gone (a copy queued while the delete ran).
+      dropProjectLane(projectId)
+      projects = projects.filter((project) => project.id !== projectId)
+      projectStore.deleteProject(projectId)
 
       toast.success('Project deleted')
 
       if (projects.length > 0) {
         selectProject(projects[0])
       } else {
-        untrack(() => {
-          selectedProjectId = null
-          projectForm = { ...EMPTY_FORM }
-          formPersistedSignature = null
-        })
+        selectDefaultProject()
       }
     } catch (error) {
       console.error('Failed to delete project:', error)
+      if (cancelled && latestProjectRevision(projectId) < cancelled.revision) queueFormSave(cancelled.form)
       saveError = error instanceof Error ? error.message : 'Failed to delete project'
     } finally {
+      deletingProjectIds.delete(projectId)
+      const held = failuresDuringDelete.get(projectId)
+      failuresDuringDelete.delete(projectId)
+      // The project still exists, so the save that failed while the delete ran did not land.
+      if (!deleted && held) toast.error(held)
       deleteBusy = false
     }
   }
@@ -561,16 +782,30 @@
     saveError = null
 
     try {
-      await persistProjectForm({
-        ...projectForm,
-        custom_exclusions: nextValue
-      })
+      await saveFieldFromEditor('custom_exclusions', nextValue)
     } catch (error) {
       console.error('Failed to save custom exclusions:', error)
       saveState = 'idle'
       saveError = error instanceof Error ? error.message : 'Failed to save custom exclusions'
       throw error
     }
+  }
+
+  /**
+   * An editor's explicit Save: the form takes the editor's value first (so the answer's merge
+   * keeps it), then the save joins the project's ordered lane behind any write on its way,
+   * replacing a waiting autosave copy, which the new form already includes. Rejects on failure.
+   */
+  async function saveFieldFromEditor(field: 'custom_exclusions' | 'rules_json', nextValue: string) {
+    const projectId = selectedProjectId
+    if (!projectId) return
+    const next = { ...($state.snapshot(projectForm) as ProjectFormState), [field]: nextValue }
+    formHydrating = true
+    untrack(() => {
+      projectForm = structuredClone(next)
+    })
+    formHydrating = false
+    await saveProjectNow(projectId, next, makeFormSignature(next), persistProjectForm)
   }
 
   async function saveProjectRulesFromEditor(nextValue: string) {
@@ -581,16 +816,20 @@
     saveError = null
 
     try {
-      await persistProjectForm({
-        ...projectForm,
-        rules_json: nextValue
-      })
+      await saveFieldFromEditor('rules_json', nextValue)
     } catch (error) {
       console.error('Failed to save project rules:', error)
       saveState = 'idle'
       saveError = error instanceof Error ? error.message : 'Failed to save project rules'
       throw error
     }
+  }
+
+  // Refresh reloads the list and retries a preference read that failed; a working read is left
+  // alone so it cannot replace an edit in the Root Path field.
+  function handleRefresh() {
+    void loadProjects()
+    if (preferencesLoadFailed) void loadPreferences()
   }
 
   function handleStartCreate() {
@@ -649,7 +888,7 @@
         </div>
       </div>
       <div class="flex items-center gap-2">
-        <Button variant="outline" size="sm" onclick={loadProjects}>
+        <Button variant="outline" size="sm" onclick={handleRefresh}>
           <RefreshCcw  />
           Refresh
         </Button>
@@ -662,49 +901,6 @@
 
     <div class="batshit-settings-surface">
       <div class="space-y-4">
-        <SettingsAccordionCard
-          name="project-settings-cards"
-          title="Default Project Path"
-          batshitIcon="projects"
-          open
-        >
-          {#snippet info()}
-            <SettingsInfoMenu ariaLabel="About Default Project Path">
-              <p>
-                Used by all agent modes when no Project is selected. Leave it blank to fall back to
-                the Batshit working directory instead.
-              </p>
-              <p class="mt-2">
-                This must be an absolute path such as <code>/path/to/project</code>.
-              </p>
-            </SettingsInfoMenu>
-          {/snippet}
-          {#snippet actions()}
-            <SettingsSaveStatus
-              state={preferencesError ? 'error' : prefSaveState}
-              error={preferencesError}
-              savedLabel="Path Saved"
-            />
-          {/snippet}
-          <div class="batshit-settings-form-stack">
-            <div class="batshit-settings-form-row">
-              <div class="batshit-settings-form-copy">
-                <div class="batshit-settings-form-label-line">
-                  <Label.Label class="batshit-settings-form-label">Path</Label.Label>
-                </div>
-              </div>
-              <div class="batshit-settings-form-control is-wide">
-                <Input
-                  placeholder="/Users/me/projects/my-app"
-                  value={defaultWorkspacePath}
-                  disabled={preferencesLoading}
-                  oninput={(event) => (defaultWorkspacePath = (event.target as HTMLInputElement).value)}
-                />
-              </div>
-            </div>
-          </div>
-        </SettingsAccordionCard>
-
         <div class="grid gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
         <Card.Root class="batshit-settings-card batshit-settings-card-default">
           <Card.Header class="pb-2">
@@ -716,35 +912,62 @@
             </div>
           </Card.Header>
           <Card.Content class="batshit-settings-card-content-flush">
+            <div class="settings-sidebar-items">
+              <button
+                type="button"
+                class="settings-sidebar-item settings-sidebar-item-with-avatar"
+                data-state={defaultProjectSelected && !createMode ? 'active' : 'inactive'}
+                data-testid="default-project-row"
+                onclick={selectDefaultProject}
+              >
+                <div class="settings-sidebar-item-media pt-0.5">
+                  <div class="batshit-settings-icon-frame h-9 w-9">
+                    <IconRenderer
+                      ref={DEFAULT_PROJECT_ICON_REF}
+                      class="h-5 w-5 text-muted-foreground"
+                      iconClass="h-4 w-4"
+                      label={DEFAULT_PROJECT_NAME}
+                    />
+                  </div>
+                </div>
+                <div class="settings-sidebar-item-content">
+                  <span class="settings-sidebar-item-title truncate">{DEFAULT_PROJECT_NAME}</span>
+                  <span class="settings-sidebar-item-subtext truncate">
+                    {preferencesLoading
+                      ? 'Loading…'
+                      : preferencesLoadFailed
+                        ? 'Unavailable'
+                        : prefPersistedValue || 'Not set'}
+                  </span>
+                </div>
+              </button>
+              {#each projects as project (project.id)}
+                <button
+                  type="button"
+                  class="settings-sidebar-item settings-sidebar-item-with-avatar"
+                  data-state={project.id === selectedProjectId && !createMode ? 'active' : 'inactive'}
+                  onclick={() => selectProject(project)}
+                >
+                  <div class="settings-sidebar-item-media pt-0.5">
+                    <div class="batshit-settings-icon-frame h-9 w-9">
+                      <IconRenderer
+                        ref={normalizeIconRef(project.icon_ref, DEFAULT_PROJECT_ICON_REF)}
+                        class="h-5 w-5 text-muted-foreground"
+                        iconClass="h-4 w-4"
+                        label={project.name}
+                      />
+                    </div>
+                  </div>
+                  <div class="settings-sidebar-item-content">
+                    <span class="settings-sidebar-item-title truncate">{project.name}</span>
+                    <span class="settings-sidebar-item-subtext truncate">{project.root_path}</span>
+                  </div>
+                </button>
+              {/each}
+            </div>
             {#if projects.length === 0}
               <div class="batshit-settings-empty-state">
-                No projects yet. Create one to define file system boundaries for agents.
-              </div>
-            {:else}
-              <div class="settings-sidebar-items">
-                {#each projects as project (project.id)}
-	                  <button
-	                    type="button"
-	                    class="settings-sidebar-item settings-sidebar-item-with-avatar"
-	                    data-state={project.id === selectedProjectId && !createMode ? 'active' : 'inactive'}
-	                    onclick={() => selectProject(project)}
-	                  >
-                      <div class="settings-sidebar-item-media pt-0.5">
-                        <div class="batshit-settings-icon-frame h-9 w-9">
-                          <IconRenderer
-                            ref={normalizeIconRef(project.icon_ref, DEFAULT_PROJECT_ICON_REF)}
-                            class="h-5 w-5 text-muted-foreground"
-                            iconClass="h-4 w-4"
-                            label={project.name}
-                          />
-                        </div>
-                      </div>
-                      <div class="settings-sidebar-item-content">
-	                    <span class="settings-sidebar-item-title truncate">{project.name}</span>
-	                    <span class="settings-sidebar-item-subtext truncate">{project.root_path}</span>
-                      </div>
-	                  </button>
-                {/each}
+                No saved projects yet. Create one to define file system boundaries for agents.
               </div>
             {/if}
           </Card.Content>
@@ -831,8 +1054,8 @@
                     <div class="batshit-settings-form-control">
                       <Input
                         id="create-depth"
-                        type="number"
-                        min="0"
+                        type="text"
+                        inputmode="decimal"
                         placeholder="10"
                         bind:value={createForm.max_depth}
                       />
@@ -934,23 +1157,62 @@
                 </div>
               </Card.Content>
             </Card.Root>
-          {:else if !selectedProjectId}
-            <Card.Root class="batshit-settings-card batshit-settings-card-default">
-              <Card.Header>
-                <div class="flex items-center gap-1">
-                  <Card.Title>Select a Project</Card.Title>
-                  <SettingsInfoMenu ariaLabel="About Project Settings">
-                    <p>
-                      Projects define the filesystem sandbox for your agents. Root path, exclusions,
-                      and AI rules all live here.
-                    </p>
-                  </SettingsInfoMenu>
+          {:else if defaultProjectSelected}
+            <SettingsAccordionCard
+              name="projects-settings-cards"
+              title={DEFAULT_PROJECT_NAME}
+              batshitIcon="projects"
+              open
+            >
+              {#snippet info()}
+                <SettingsInfoMenu ariaLabel="About the Default Project">
+                  <p>
+                    The folder for every agent whose Default Project is Use Global Default Project. The
+                    Projects sidebar lists it first and shows it selected for those agents.
+                  </p>
+                  <p class="mt-2">
+                    Leave it blank to fall back to the Batshit working directory instead; the sidebar then
+                    has no Default Project.
+                  </p>
+                  <p class="mt-2">
+                    This must be an absolute path such as <code>/path/to/project</code>. It is saved when you
+                    leave the field, press Enter, or close Settings. The always-excluded and recommended exclusions apply.
+                  </p>
+                </SettingsInfoMenu>
+              {/snippet}
+              {#snippet actions()}
+                <SettingsSaveStatus
+                  state={preferencesError ? 'error' : prefSaveState}
+                  error={preferencesError}
+                  savedLabel="Path Saved"
+                />
+              {/snippet}
+              <div class="batshit-settings-form-stack">
+                <div class="batshit-settings-form-row">
+                  <div class="batshit-settings-form-copy">
+                    <div class="batshit-settings-form-label-line">
+                      <Label.Label for="default-project-root" class="batshit-settings-form-label">Root Path</Label.Label>
+                    </div>
+                  </div>
+                  <div class="batshit-settings-form-control is-wide">
+                    <Input
+                      id="default-project-root"
+                      placeholder="/Users/me/projects/my-app"
+                      value={defaultWorkspacePath}
+                      disabled={preferencesLoading || preferencesLoadFailed}
+                      oninput={(event) => (defaultWorkspacePath = (event.target as HTMLInputElement).value)}
+                      onblur={commitDefaultProjectPath}
+                      onkeydown={(event) => {
+                        if (event.key === 'Enter') {
+                          event.preventDefault()
+                          commitDefaultProjectPath()
+                        }
+                      }}
+                    />
+                  </div>
                 </div>
-              </Card.Header>
-              <Card.Content class="batshit-settings-card-caption">
-                Select or create a project to edit its settings.
-              </Card.Content>
-            </Card.Root>
+              </div>
+            </SettingsAccordionCard>
           {:else}
             <SettingsAccordionCard
               name="projects-settings-cards"
@@ -1043,8 +1305,8 @@
                     <div class="batshit-settings-form-control">
                       <Input
                         id="project-depth"
-                        type="number"
-                        min="0"
+                        type="text"
+                        inputmode="decimal"
                         placeholder="10"
                         bind:value={projectForm.max_depth}
                       />

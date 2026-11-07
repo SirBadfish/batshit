@@ -6,8 +6,71 @@
  * inside code stays text. Pure; linear in the reply's length.
  */
 
-import { CodeSpanReader, readCodeLayout, type CodeLayout } from './markdownCodeRegions'
+import { CodeSpanReader, codeRegionAt, readCodeLayout, type CodeLayout, type CodeRegion } from './markdownCodeRegions'
 import { scanZipReferences, type ReferenceMatch } from './zipReferenceSafety'
+
+/** The server's Error form opens with exactly `<error>` and closes with exactly `</error>`, either case (`zipDetection.ts`). */
+const ERROR_OPEN_TAG = /<error>/gi
+const ERROR_CLOSE_TAG = /<\/error>/i
+/** The start of a fence: three backticks or three tildes. A block with neither holds no fence. */
+const FENCE_MARK = /```|~~~/
+
+/**
+ * The first exact `</error>` (either case) in `text[from, limit)`, or -1. It reads a window that
+ * doubles until it finds one, so it reads at most about twice the distance to it (never on to the
+ * text's end when `limit` is near): each stretch of a reply is read once.
+ */
+function nextErrorCloseTag(text: string, from: number, limit: number): number {
+  for (let size = 256; ; size *= 2) {
+    const end = Math.min(limit, from + size)
+    const found = text.slice(from, end).search(ERROR_CLOSE_TAG)
+    if (found >= 0) return from + found
+    if (end >= limit) return -1
+  }
+}
+
+/**
+ * BL-779 (d): the fenced code blocks of `text` as the chat's Markdown view reads them, except that
+ * each exact `<error>` tag is read as plain words: alone on its line, the tag would otherwise open
+ * an HTML block for the Markdown reader and hide every fence after it up to the next blank line.
+ * Both halves of the Error block's close rule read these (`findErrorBlockClose`).
+ */
+export function errorBlockFences(text: string): CodeRegion[] {
+  const tagsAsWords = text.replace(ERROR_OPEN_TAG, (tag) => 'x'.repeat(tag.length))
+  return readCodeLayout(tagsAsWords).blocks.filter((region) => region.kind === 'fenced')
+}
+
+/**
+ * BL-779 (d): where the Error block whose words start at `bodyStart` ends: the first exact
+ * `</error>` (either case) at or after `from` and before `limit` that is not inside a fenced code
+ * block opening after `bodyStart`; null when there is none. A fence that opens inside the block is
+ * the block's words, so a closing tag inside it is too: ended there, the fence's own closing line
+ * would stand alone after the block and turn the rest of the reply into code. A fence that opened
+ * before the block is not the block's. `fences` (the `errorBlockFences` of `text`) is read only when
+ * a fence mark lies between the block's start and a closing tag. The server's zip detector
+ * (`zipDetection.ts`) and the chat view (below) both end an Error block here, so the view never
+ * draws a card the save kept as words. Reads the text from `bodyStart` to the closing tag (or to
+ * `limit`) about twice, plus the one fence read.
+ */
+export function findErrorBlockClose(
+  text: string,
+  bodyStart: number,
+  from: number,
+  limit: number,
+  fences: () => readonly CodeRegion[]
+): { at: number; end: number } | null {
+  let blockFences: readonly CodeRegion[] | null = null
+  for (let at = nextErrorCloseTag(text, from, limit); at >= 0; at = nextErrorCloseTag(text, at + 1, limit)) {
+    const close = { at, end: at + '</error>'.length }
+    if (blockFences === null) {
+      if (!FENCE_MARK.test(text.slice(bodyStart, at))) return close
+      blockFences = fences()
+    }
+    const fence = codeRegionAt(blockFences, at)
+    if (!fence || fence.start < bodyStart) return close
+  }
+  return null
+}
 
 /**
  * The structured tags a reply may carry: `img` is standard HTML, the others are Batshit's own.
@@ -57,6 +120,70 @@ function openingTagEnd(content: string, from: number, limit: number): number {
   return -1
 }
 
+const isSpace = (char: string) => char === ' ' || char === '\t' || char === '\n' || char === '\r' || char === '\f'
+/** Characters an attribute name never holds (HTML), plus `<` and a backtick, which no tag a model writes holds. */
+const NOT_IN_NAME = new Set(['"', "'", '<', '>', '/', '=', '`'])
+
+/**
+ * Whether everything from `from` (just past an opening tag's name) to the text's end can be the
+ * rest of that opening tag still arriving over several lines (BL-780): attributes, each written
+ * whole as `name=value` except the last, which may still be arriving, with no blank line, `<`, or
+ * `>`. Words of a sentence after a tag named in prose are bare names, so they are not attributes.
+ * One pass from `from`.
+ */
+function attributesStillArriving(content: string, from: number): boolean {
+  let index = from
+  let bareName = false
+  while (index < content.length) {
+    const char = content[index]
+    if (isSpace(char)) {
+      if (char === '\n') {
+        let next = index + 1
+        while (next < content.length && content[next] !== '\n' && isSpace(content[next])) next += 1
+        if (content[next] === '\n') return false
+      }
+      index += 1
+      continue
+    }
+    if (char === '/') return content.slice(index + 1).trim() === ''
+    // Another word after a name with no value: a sentence, not attributes.
+    if (bareName || NOT_IN_NAME.has(char)) return false
+    while (index < content.length && !isSpace(content[index]) && !NOT_IN_NAME.has(content[index])) index += 1
+    let afterName = index
+    while (afterName < content.length && isSpace(content[afterName]) && content[afterName] !== '\n') afterName += 1
+    if (content[afterName] !== '=') {
+      bareName = true
+      continue
+    }
+    index = afterName + 1
+    while (index < content.length && isSpace(content[index])) index += 1
+    const quote = content[index]
+    if (quote === '"' || quote === "'") {
+      const close = content.indexOf(quote, index + 1)
+      if (close < 0) return !/[<>]|\n[ \t]*\n/.test(content.slice(index + 1))
+      index = close + 1
+      continue
+    }
+    while (index < content.length && !isSpace(content[index])) {
+      if (NOT_IN_NAME.has(content[index]) && content[index] !== '/') return false
+      index += 1
+    }
+  }
+  return true
+}
+
+/** Whether one of `elements` (in order) starts after `from` and before `to`. */
+function elementStartsBetween(elements: readonly StructuredElement[], from: number, to: number): boolean {
+  let low = 0
+  let high = elements.length
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if (elements[mid].start <= from) low = mid + 1
+    else high = mid
+  }
+  return low < elements.length && elements[low].start < to
+}
+
 /** Whether `index` lies inside one of `elements` (in order, none overlapping). */
 function insideElement(elements: readonly StructuredElement[], index: number): boolean {
   let low = 0
@@ -85,10 +212,26 @@ function attributeValue(opening: string, name: string): string | null {
 function scanStructuredElements(
   content: string,
   layout: CodeLayout,
-  isTrustedZipId?: (zipId: string) => boolean
+  errorFences: () => readonly CodeRegion[],
+  isTrustedZipId?: (zipId: string) => boolean,
+  firstScan?: readonly StructuredElement[],
+  streaming = false
 ): StructuredElement[] {
   const elements: StructuredElement[] = []
-  const spans = new CodeSpanReader(layout.runs, (start) => insideElement(elements, start))
+  /**
+   * BL-779 (d): after an exact `<error>` with no closing tag before the next zip reference, the
+   * server's zip detector holds the words to that reference (a tool card) or the reply's end and
+   * saves them as words, with every `<error>` among them: up to here an exact `<error>` is a word.
+   */
+  let errorWordsUntil = -1
+  // In the second scan, no code span reaches across a tag the first scan read (BL-813): the
+  // blanked text keeps a one- or two-line tag on lines of letters, with no blank line to stop a
+  // lone backtick before it pairing with one after it.
+  const spans = new CodeSpanReader(
+    layout.runs,
+    (start, spanEnd) =>
+      insideElement(elements, start) || (firstScan !== undefined && elementStartsBetween(firstScan, start, spanEnd))
+  )
   const blocks = layout.blocks
   let block = 0
   // A tag inside a zip reference (its label) is part of the reference, never a card (BL-489).
@@ -131,11 +274,23 @@ function scanStructuredElements(
     const limit = reference < references.length ? references[reference].start : content.length
     const openEnd = openingTagEnd(content, start + match[0].length, limit)
     if (openEnd < 0) {
-      // Still arriving at the end of a streaming reply: hidden until whole. Anywhere else it is
-      // text, and so is everything after it (reading on from each later `<` would cost the square
-      // of the reply's length).
-      if (limit === content.length && !content.includes('\n', start)) {
+      // Still arriving at the end of a streaming reply: hidden until whole, on one line or, while
+      // the reply streams, for a tag that can still become a card, over several lines of
+      // attributes (BL-780; a finished reply shows those lines, as its saved record has them). Anywhere
+      // else it is text, and so is everything after it up to the next zip reference (reading on
+      // from each later `<` would cost the square of the reply's length).
+      if (
+        limit === content.length &&
+        (!content.includes('\n', start) ||
+          (streaming && name !== 'error' && attributesStillArriving(content, start + match[0].length)))
+      ) {
         elements.push({ name, start, end: content.length, partial: true })
+      }
+      // An opening tag never reaches into a zip reference: it is text up to the reference, and the
+      // scan goes on after the reference, so the cards after it still show (BL-813).
+      if (limit < content.length) {
+        pattern.lastIndex = references[reference].end
+        continue
       }
       break
     }
@@ -147,6 +302,21 @@ function scanStructuredElements(
       const opening = content.substring(start, openEnd)
       const compiled = /\sdata-zip-id\s*=/i.test(opening)
       if (!(/^<error>$/i.test(opening) || compiled) || content[openEnd - 2] === '/') continue
+      if (!compiled) {
+        // The server's form ends where the server ends it (BL-779 d): never inside the block's own
+        // fence, and never past the next zip reference (a tool card).
+        if (start < errorWordsUntil) continue
+        const exactClose = findErrorBlockClose(content, openEnd, openEnd, limit, errorFences)
+        if (!exactClose) {
+          errorWordsUntil = limit
+          continue
+        }
+        elements.push({ name, start, end: exactClose.end, openEnd })
+        pattern.lastIndex = exactClose.end
+        continue
+      }
+      // The compiled form of an Error zip holds the zip's stored words, escaped, so its first
+      // closing tag is its own.
       const close = findClose(name, openEnd)
       if (close.at === -1) continue
       // A matched pair never spans a zip reference (a tool card), except the compiled form of a
@@ -195,10 +365,15 @@ function scanStructuredElements(
  */
 export function findStructuredElements(
   content: string,
-  isTrustedZipId?: (zipId: string) => boolean
+  isTrustedZipId?: (zipId: string) => boolean,
+  options: { streaming?: boolean } = {}
 ): StructuredElement[] {
+  const streaming = options.streaming === true
   const layout = readCodeLayout(content)
-  const first = scanStructuredElements(content, layout, isTrustedZipId)
+  // Read at most once, and only for an Error block with a fence mark before its closing tag.
+  let fences: CodeRegion[] | null = null
+  const errorFences = () => (fences ??= errorBlockFences(content))
+  const first = scanStructuredElements(content, layout, errorFences, isTrustedZipId, undefined, streaming)
   if (first.length === 0) return first
   const codeOpensInsideTag = layout.blocks.some((region) => insideElement(first, region.start))
   if (!codeOpensInsideTag) return first
@@ -217,5 +392,5 @@ export function findStructuredElements(
     from = element.end
   }
   blanked += content.substring(from)
-  return scanStructuredElements(content, readCodeLayout(blanked), isTrustedZipId)
+  return scanStructuredElements(content, readCodeLayout(blanked), errorFences, isTrustedZipId, first, streaming)
 }

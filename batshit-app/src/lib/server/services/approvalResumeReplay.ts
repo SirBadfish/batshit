@@ -3,6 +3,37 @@ import type { CurrentMessageFrom } from '$lib/utils/compiledChatTags'
 import { buildSteerInjectionText, type DeliveredSteer } from '$lib/utils/steerControl'
 import { resolveCurrentMessageFrom } from './sendRoutedHistory'
 import { isChatgptPlanConnection } from '$lib/utils/chatgptPlanConnection'
+import { resolveApiReasoningRetention, type ResolvedReasoningRetention } from '$lib/utils/reasoningRetention'
+
+export interface WhiteboardContextSnapshot {
+  schema_version: 1
+  userId: string
+  sessionId: string
+  agentId: string
+  messageId: string
+  settings: ResolvedReasoningRetention
+  dcmLines: string[]
+}
+
+/** Only the authoritative assistant record may supply an approval snapshot. */
+export function readWhiteboardContextSnapshot(value: unknown, owner: {
+  userId: string; sessionId: string; agentId: string; messageId: string
+}): WhiteboardContextSnapshot {
+  const row = value as WhiteboardContextSnapshot | null
+  const fail = () => { throw new ApprovalResumeReplayError('APPROVAL_RESUME_CONTEXT_MISSING',
+    'This approval has no valid saved Whiteboard context. It did not run. Ask the agent again.') }
+  if (!row || row.schema_version !== 1 || Object.entries(owner).some(([key, expected]) => row[key as keyof typeof owner] !== expected) ||
+      !Array.isArray(row.dcmLines) || row.dcmLines.some((line) => typeof line !== 'string') || !row.settings) return fail()
+  let settings: ResolvedReasoningRetention
+  try {
+    settings = resolveApiReasoningRetention({ api_reasoning_retention: row.settings.mode,
+      whiteboard_budget_tokens: row.settings.whiteboardBudgetTokens, show_whiteboard: row.settings.showWhiteboard })
+  } catch { return fail() }
+  const names = Object.keys(settings) as Array<keyof ResolvedReasoningRetention>
+  if (Object.keys(row.settings).length !== names.length ||
+      names.some((name) => settings[name] !== row.settings[name])) return fail()
+  return { ...owner, schema_version: 1, settings, dcmLines: [...row.dcmLines] }
+}
 
 /**
  * BL-322: an API-lane approval resume is the paused call, CONTINUED.

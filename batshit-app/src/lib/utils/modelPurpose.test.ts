@@ -2,6 +2,25 @@ import { describe, expect, it } from 'vitest'
 import { inferModelPurpose } from './modelPurpose'
 
 describe('inferModelPurpose', () => {
+  it('treats provider evaluation endpoints as utility even when their tags say chat', () => {
+    expect(inferModelPurpose({ id: 'baseten/elephant-1', modelType: 'evaluation', tags: ['chat', 'vision'] })).toBe('utility')
+    expect(inferModelPurpose({ id: 'new-provider/new-decision-id', modelType: 'evaluation' })).toBe('utility')
+  })
+
+  it('uses reviewed exact endpoint facts without guessing from elephant or mammoth names', () => {
+    for (const [connectionId, id] of [['vercel-gateway', 'baseten/elephant-1'], ['vercel-gateway', 'baseten/mammoth-1'],
+      ['direct:baseten', 'decision-models/baseten-elephant-9b-latest'], ['direct:baseten', 'decision-models/baseten-mammoth-27b-latest']]) {
+      expect(inferModelPurpose({ connectionId, id, modelType: 'chat' })).toBe('utility')
+      expect(inferModelPurpose({ connectionId: 'direct:custom_example', id, modelType: 'chat' })).toBe('chat')
+    }
+    expect(inferModelPurpose({ id: 'another-maker/elephant-chat', modelType: 'language' })).toBe('chat')
+  })
+
+  it('classifies the exact PixVerse generator without reclassifying generic video-understanding chat', () => {
+    expect(inferModelPurpose({ connectionId: 'direct:replicate', id: 'pixverse/pixverse-v6-max', tags: ['image', 'video', 'audio'] })).toBe('visual')
+    expect(inferModelPurpose({ id: 'xiaomi/mimo-v2.6-pro', modelType: 'chat', tags: ['chat', 'vision', 'video', 'audio'] })).toBe('chat')
+  })
+
   it('treats embedding models as utility', () => {
     expect(
       inferModelPurpose({

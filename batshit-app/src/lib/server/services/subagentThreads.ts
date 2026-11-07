@@ -6,14 +6,8 @@
  * *"If an agent wants resume to be used, they shouldn't use fresh, because it's going to
  * erase the ability to resume later. That's fine."*
  *
- * Two storage shapes, because two owners:
- * - **Managed API/CLI subagents** — Batshit stores the exchanges itself under
- *   `subagent_sessions:{sessionId}:subagent:{slug}`. `fresh` deletes that key.
- * - **n8n Workflow Subagents** — n8n owns the memory (its Redis Chat Memory node), so the
- *   only lever Batshit has is the KEY. Batshit issues a thread id, stores it under
- *   `subagent_thread:{sessionId}:{slug}`, and ships it in the webhook payload; the official
- *   templates append it to their session key. `fresh` mints a new id, which orphans the old
- *   n8n list to its own 7-day TTL.
+ * Batshit stores a Subagent's exchanges itself under
+ * `subagent_sessions:{sessionId}:subagent:{slug}`. `fresh` deletes that key.
  *
  * The lock exists because of F7: AI SDK v7 runs every tool call of a step through
  * `Promise.all`, so a primary agent can already call the SAME subagent twice at once. Both
@@ -21,7 +15,7 @@
  * exchange. Parallel throwaway work is what Workers (P4) are for; a named specialist is one
  * thread, so same-subagent calls serialize instead.
  *
- * Everything here is Batshit-owned Redis state and belongs to the session, so all three key
+ * Everything here is Batshit-owned Redis state and belongs to the session, so both key
  * families are enumerated by `deleteSession` (FM: Session Key Cleanup).
  */
 
@@ -38,21 +32,19 @@ export const SUBAGENT_THREAD_MODES: readonly SubagentThreadMode[] = ['fresh', 'r
 /** Josh's decision #3: fresh unless the agent asks otherwise. */
 export const DEFAULT_SUBAGENT_THREAD_MODE: SubagentThreadMode = 'fresh'
 
-/** DL-111-05: TTL = call timeout + 5 s, so a lock can never outlive one call. */
-const LOCK_TTL_GRACE_MS = 5_000
+/**
+ * Delegation limits (2026-10-24): a call has no time limit by default, so the lock cannot be
+ * sized to one call any more (it was call timeout + 5 s, DL-111-05). It lives a short TTL that
+ * the call holding it refreshes while it runs (a heartbeat). A holder that crashes stops
+ * refreshing, so its lock is gone within one TTL instead of blocking the Subagent for hours.
+ */
+export const SUBAGENT_LOCK_TTL_MS = 30_000
 
-/** Slack on top of the holder's whole TTL, so an expiry and a retry cannot cross. */
-const LOCK_WAIT_GRACE_MS = 2_000
+/** How often the holder refreshes its lock: three chances per TTL before it could lapse. */
+export const SUBAGENT_LOCK_HEARTBEAT_MS = 10_000
 
 const LOCK_POLL_MIN_MS = 50
 const LOCK_POLL_MAX_MS = 500
-
-/**
- * n8n's Redis Chat Memory gets a 7-day `sessionTTL` in the official templates. Batshit's
- * thread id ages on the same clock so the two sides do not drift into a stored id that
- * points at memory n8n already expired.
- */
-export const N8N_SUBAGENT_THREAD_TTL_SECONDS = 7 * 24 * 60 * 60
 
 /**
  * Stored exchanges for a managed API/CLI subagent. Exported since SA-111 P1 so the DCM
@@ -62,35 +54,9 @@ export function buildSubagentThreadKey(sessionId: string, slug: string) {
   return `subagent_sessions:${sessionId}:subagent:${slug}`
 }
 
-/**
- * The Batshit-issued thread id for an n8n Workflow Subagent (DL-111-06). Batshit never
- * stores the n8n conversation itself — only the id that names it.
- */
-export function buildSubagentN8nThreadIdKey(sessionId: string, slug: string) {
-  return `subagent_thread:${sessionId}:${slug}`
-}
-
 /** In-flight marker for one `(session, subagent)` pair (DL-111-05). */
 export function buildSubagentRunLockKey(sessionId: string, slug: string) {
   return `subagent_lock:${sessionId}:${slug}`
-}
-
-/**
- * The key whose existence answers "does this subagent have a thread to resume in this
- * chat?" — the `thread: none | resumable` fact on its DCM roster line.
- *
- * Two owners, two keys, and picking the wrong one is a confidently-wrong roster fact the
- * primary would act on: reading the managed exchange key for an n8n Workflow Subagent
- * reports `none` whenever n8n runs on its own Redis, even though a resumable thread exists.
- */
-export function buildSubagentThreadStateKey(
-  sessionId: string,
-  slug: string,
-  subagentType: string
-) {
-  return subagentType === 'n8n-workflow'
-    ? buildSubagentN8nThreadIdKey(sessionId, slug)
-    : buildSubagentThreadKey(sessionId, slug)
 }
 
 export function normalizeSubagentThreadMode(value: unknown): SubagentThreadMode {
@@ -98,16 +64,14 @@ export function normalizeSubagentThreadMode(value: unknown): SubagentThreadMode 
 }
 
 /**
- * Thrown when a same-subagent call could not take its turn. Callers turn this into a
- * model-readable result rather than a bare failure, so the agent can pick a different
- * specialist or try again — never a silent overwrite of the other call's thread.
+ * Thrown when a same-subagent call could not take its turn within an explicit `waitBudgetMs`.
+ * Callers turn this into a model-readable result rather than a bare failure, so the agent can
+ * pick a different specialist or try again — never a silent overwrite of the other call's
+ * thread.
  *
- * This is the safety valve, not the common path. A lock cannot outlive its own TTL and
- * `resolveSubagentLockWaitMs` gives a waiter that whole lifetime plus slack, so two calls to
- * the SAME subagent — which is the only collision that can happen — always resolve their own
- * budgets and the queued one gets its turn. It fires when a third caller repeatedly takes the
- * freed lock first, or when the stored Call Timeout changed between the holder starting and
- * the waiter arriving, making the two budgets asymmetric.
+ * The runner passes no budget since the delegation limits (2026-10-24): a queued call waits
+ * while the holder's heartbeat lives, which is exactly as long as the call ahead of it runs,
+ * and the user's Stop ends the wait. A bounded caller (a test, a future one) still gets this.
  */
 export class SubagentBusyError extends Error {
   readonly code = 'subagent_busy'
@@ -126,30 +90,23 @@ export function isSubagentBusyError(error: unknown): error is SubagentBusyError 
   return error instanceof SubagentBusyError
 }
 
-export function resolveSubagentLockTtlMs(callTimeoutMs: number): number {
-  if (!Number.isFinite(callTimeoutMs) || callTimeoutMs <= 0) {
-    throw new Error('Subagent lock TTL requires a resolved positive call timeout.')
+/**
+ * Thrown when a call ends because the Stop of the reply that made it (the run's own stop signal)
+ * fired, before the call finished or while it queued for its turn. The Stop is the user's choice,
+ * not a failure of the Subagent: `managed-execute` tells the two apart by this type, never by the
+ * message (BL-643). A Subagent deleted mid-call is `SubagentDeletedError`, a different outcome.
+ */
+export class SubagentCallCancelledError extends Error {
+  readonly code = 'subagent_call_cancelled'
+
+  constructor(message = 'Managed Subagent call was cancelled.') {
+    super(message)
+    this.name = 'SubagentCallCancelledError'
   }
-  return Math.floor(callTimeoutMs) + LOCK_TTL_GRACE_MS
 }
 
-/**
- * How long a queued call waits for its turn, as its OWN policy rather than a side effect of
- * the TTL. It resolves to a full holder lifetime plus slack ON PURPOSE: the collision this
- * lock exists for is a primary calling the same subagent twice in one AI SDK step, where
- * both calls are legitimate and the second must still get its complete run budget. A
- * shorter wait would turn that into a spurious `SubagentBusyError`, and a queued call given
- * a partial budget would turn it into a spurious timeout — both are WRONG ANSWERS, which is
- * worse than a slow one.
- *
- * The deliberate consequence: a queued call's wall clock is up to roughly TWICE its Call
- * Timeout — once waiting, once running. That is the documented contract (Agent Settings ->
- * Call Timeout, and `primary-agent-types.md`), it is pinned by `subagentThreads.test.ts`,
- * and the runner reports the wait in the call's `threadNote` so the extra time is never
- * unexplained. A caller that wants real parallelism should use Workers, which take no lock.
- */
-export function resolveSubagentLockWaitMs(callTimeoutMs: number): number {
-  return resolveSubagentLockTtlMs(callTimeoutMs) + LOCK_WAIT_GRACE_MS
+export function isSubagentCallCancelledError(error: unknown): error is SubagentCallCancelledError {
+  return error instanceof SubagentCallCancelledError
 }
 
 export interface SubagentRunLockHandle {
@@ -158,6 +115,18 @@ export interface SubagentRunLockHandle {
   ttlMs: number
   /** How long this call queued behind another call to the same subagent. */
   waitedMs: number
+  /**
+   * Set when a heartbeat found the lock no longer ours (it lapsed and another call took it).
+   * The thread commit checks the lock itself too.
+   */
+  lost: boolean
+  /**
+   * Aborts when `lost` is set. The runner stops the call on it, so two runs of one Subagent in
+   * one chat never work at once in its one CLI profile folder.
+   */
+  lostSignal: AbortSignal
+  /** Ends the heartbeat. `releaseSubagentRunLock` calls it; safe to call twice. */
+  stopHeartbeat: () => void
 }
 
 function sleep(ms: number, abortSignal?: AbortSignal): Promise<void> {
@@ -173,54 +142,145 @@ function sleep(ms: number, abortSignal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Take the `(session, slug)` turn, waiting out an earlier call rather than racing it.
- * Throws `SubagentBusyError` when the holder outlives its own TTL — an explicit result the
- * model can read, never a quiet second run over the same thread.
+ * Compare-and-refresh in ONE Redis round trip, for the same reason the release is one: a
+ * separate GET then PEXPIRE could extend a lock that lapsed and was re-taken in between, which
+ * would keep the OTHER call's lock alive on our clock.
+ */
+const REFRESH_LOCK_SCRIPT = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+`
+
+async function refreshSubagentRunLock(handle: SubagentRunLockHandle): Promise<boolean> {
+  const refreshed = await redis.execute(async (client) =>
+    client.eval(REFRESH_LOCK_SCRIPT, {
+      keys: [handle.key],
+      arguments: [handle.token, String(handle.ttlMs)],
+    })
+  )
+  return Number(refreshed) === 1
+}
+
+function startSubagentRunLockHeartbeat(
+  handle: SubagentRunLockHandle,
+  heartbeatMs: number,
+  onLost: () => void
+): () => void {
+  let stopped = false
+  let inFlight = false
+  const timer = setInterval(() => {
+    if (stopped || inFlight) return
+    inFlight = true
+    refreshSubagentRunLock(handle)
+      .then((stillOurs) => {
+        if (stillOurs || stopped) return
+        handle.lost = true
+        stopped = true
+        clearInterval(timer)
+        console.warn(
+          `[SubagentThreads] ${handle.key} lapsed while its call was still running; the call is stopped and will not save its thread over the newer one.`
+        )
+        onLost()
+      })
+      .catch((error) => {
+        // A failed refresh is retried on the next beat; three misses in a row let the lock lapse,
+        // and the thread commit then sees it is no longer ours.
+        console.warn('[SubagentThreads] Failed to refresh subagent run lock:', error)
+      })
+      .finally(() => {
+        inFlight = false
+      })
+  }, heartbeatMs)
+  // A heartbeat must never keep a stopping process alive.
+  ;(timer as { unref?: () => void }).unref?.()
+  return () => {
+    stopped = true
+    clearInterval(timer)
+  }
+}
+
+/**
+ * Take the `(session, slug)` turn, waiting out an earlier call rather than racing it. The
+ * returned handle keeps its lock alive with a heartbeat until `releaseSubagentRunLock`.
+ *
+ * A queued call waits while the holder's lock exists, which is as long as the holder runs (its
+ * heartbeat keeps it) or one TTL past a holder that crashed. Its Stop ends the wait with
+ * `SubagentCallCancelledError`. Only an explicit `waitBudgetMs` turns a long wait into
+ * `SubagentBusyError`.
  */
 export async function acquireSubagentRunLock(options: {
   sessionId: string
   slug: string
   subagentLabel: string
-  ttlMs: number
+  /** Test seams: the lock's TTL and heartbeat. Production uses the constants above. */
+  ttlMs?: number
+  heartbeatMs?: number
   /**
-   * The queue budget, passed in rather than derived from `ttlMs` here. Keeping the two
-   * apart means a change to how long a lock LIVES can never silently change how long other
-   * calls QUEUE for it — they answer different questions. Production passes
-   * `resolveSubagentLockWaitMs(callTimeoutMs)`.
+   * Optional queue budget. Absent (the runner): wait while the holder lives. When given it must
+   * be a non-negative number; `Math.floor(undefined)` is NaN and every `waitedMs >= NaN` is
+   * false, so a malformed budget would queue forever, and it is refused instead.
    */
-  waitBudgetMs: number
+  waitBudgetMs?: number
   abortSignal?: AbortSignal
 }): Promise<SubagentRunLockHandle> {
   const key = buildSubagentRunLockKey(options.sessionId, options.slug)
   const token = randomUUID()
-  const ttlMs = Math.max(1_000, Math.floor(options.ttlMs))
-  // Fail loudly rather than open: `Math.floor(undefined)` is NaN, and every `waitedMs >=
-  // NaN` comparison is false, so a caller that forgot the budget would queue FOREVER.
-  if (!Number.isFinite(options.waitBudgetMs) || options.waitBudgetMs < 0) {
+  const ttlMs = Math.max(1_000, Math.floor(options.ttlMs ?? SUBAGENT_LOCK_TTL_MS))
+  // A shorter test TTL gets a heartbeat that still beats three times per TTL.
+  const heartbeatMs = Math.max(
+    100,
+    Math.floor(options.heartbeatMs ?? Math.min(SUBAGENT_LOCK_HEARTBEAT_MS, ttlMs / 3))
+  )
+  if (heartbeatMs >= ttlMs) {
+    throw new Error('Subagent lock heartbeat must be shorter than its TTL.')
+  }
+  if (
+    options.waitBudgetMs !== undefined &&
+    (!Number.isFinite(options.waitBudgetMs) || options.waitBudgetMs < 0)
+  ) {
     throw new Error('Subagent lock acquisition requires a resolved non-negative wait budget.')
   }
-  const waitBudgetMs = Math.floor(options.waitBudgetMs)
+  const waitBudgetMs =
+    options.waitBudgetMs === undefined ? null : Math.floor(options.waitBudgetMs)
   const startedAt = Date.now()
   let pollMs = LOCK_POLL_MIN_MS
 
   for (;;) {
+    if (options.abortSignal?.aborted) {
+      throw new SubagentCallCancelledError('Subagent call was cancelled while waiting for its turn.')
+    }
+
     const acquired = await redis.execute(async (client) =>
       client.set(key, token, { NX: true, PX: ttlMs })
     )
     if (acquired) {
-      return { key, token, ttlMs, waitedMs: Date.now() - startedAt }
+      const lostController = new AbortController()
+      const handle: SubagentRunLockHandle = {
+        key,
+        token,
+        ttlMs,
+        waitedMs: Date.now() - startedAt,
+        lost: false,
+        lostSignal: lostController.signal,
+        stopHeartbeat: () => {},
+      }
+      handle.stopHeartbeat = startSubagentRunLockHeartbeat(handle, heartbeatMs, () => lostController.abort())
+      return handle
     }
 
     if (options.abortSignal?.aborted) {
-      throw new Error('Subagent call was cancelled while waiting for its turn.')
+      throw new SubagentCallCancelledError('Subagent call was cancelled while waiting for its turn.')
     }
 
     const waitedMs = Date.now() - startedAt
-    if (waitedMs >= waitBudgetMs) {
+    if (waitBudgetMs !== null && waitedMs >= waitBudgetMs) {
       throw new SubagentBusyError(options.subagentLabel, waitedMs)
     }
 
-    await sleep(Math.min(pollMs, waitBudgetMs - waitedMs), options.abortSignal)
+    const pause = waitBudgetMs === null ? pollMs : Math.min(pollMs, waitBudgetMs - waitedMs)
+    await sleep(pause, options.abortSignal)
     pollMs = Math.min(pollMs * 2, LOCK_POLL_MAX_MS)
   }
 }
@@ -248,6 +308,7 @@ export async function releaseSubagentRunLock(
   handle: SubagentRunLockHandle | null
 ): Promise<boolean> {
   if (!handle) return false
+  handle.stopHeartbeat()
   try {
     const deleted = await redis.execute(async (client) =>
       client.eval(RELEASE_LOCK_SCRIPT, {
@@ -289,64 +350,5 @@ export async function resetManagedSubagentThread(sessionId: string, slug: string
     await redis.del(buildSubagentThreadKey(sessionId, slug))
   } catch (error) {
     console.warn('[SubagentThreads] Failed to reset subagent thread:', error)
-  }
-}
-
-export interface N8nSubagentThreadSelection {
-  threadId: string
-  outcome: SubagentThreadOutcome
-}
-
-/**
- * Pick the thread id an n8n Workflow Subagent call runs under, and store it.
- *
- * `fresh` always mints a new id — the previous n8n conversation is orphaned to its own
- * `sessionTTL`, which is exactly Josh's "fresh resets" rule expressed through the only
- * lever Batshit has over n8n-owned memory. `resume` reuses the stored id, and honestly
- * reports `resumed-empty` when there was nothing to resume.
- */
-export async function selectN8nSubagentThreadId(options: {
-  sessionId: string
-  slug: string
-  mode: SubagentThreadMode
-}): Promise<N8nSubagentThreadSelection> {
-  const key = buildSubagentN8nThreadIdKey(options.sessionId, options.slug)
-
-  if (options.mode === 'resume') {
-    let existing: string | null = null
-    try {
-      const stored = await redis.get(key)
-      existing = typeof stored === 'string' && stored.trim().length > 0 ? stored.trim() : null
-    } catch (error) {
-      console.warn('[SubagentThreads] Failed to read n8n subagent thread id:', error)
-    }
-    if (existing) {
-      await touchN8nSubagentThreadId(key)
-      return { threadId: existing, outcome: 'resumed' }
-    }
-    const threadId = randomUUID()
-    await writeN8nSubagentThreadId(key, threadId)
-    return { threadId, outcome: 'resumed-empty' }
-  }
-
-  const threadId = randomUUID()
-  await writeN8nSubagentThreadId(key, threadId)
-  return { threadId, outcome: 'fresh' }
-}
-
-async function writeN8nSubagentThreadId(key: string, threadId: string) {
-  try {
-    await redis.set(key, threadId)
-    await redis.expire(key, N8N_SUBAGENT_THREAD_TTL_SECONDS)
-  } catch (error) {
-    console.warn('[SubagentThreads] Failed to store n8n subagent thread id:', error)
-  }
-}
-
-async function touchN8nSubagentThreadId(key: string) {
-  try {
-    await redis.expire(key, N8N_SUBAGENT_THREAD_TTL_SECONDS)
-  } catch (error) {
-    console.warn('[SubagentThreads] Failed to refresh n8n subagent thread id TTL:', error)
   }
 }

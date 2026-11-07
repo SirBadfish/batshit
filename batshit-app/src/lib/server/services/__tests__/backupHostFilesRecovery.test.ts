@@ -13,13 +13,14 @@ import { createHash } from 'node:crypto'
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const testHome = vi.hoisted(() => ({ current: '' }))
+const testHome = vi.hoisted(() => ({ current: '', previous: process.env.BATSHIT_HOME_DIR }))
 vi.mock('node:os', async (importOriginal) => {
   const real = await importOriginal<typeof import('node:os')>()
   const nodePath = await import('node:path')
   if (!testHome.current) {
     testHome.current = nodePath.join(real.tmpdir(), `batshit-backup-host-recovery-home-${process.pid}-${Date.now()}`)
   }
+  process.env.BATSHIT_HOME_DIR = nodePath.join(testHome.current, '.batshit')
   const homedir = () => testHome.current
   return { ...real, homedir, default: { ...real, homedir } }
 })
@@ -57,6 +58,8 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
+  if (testHome.previous === undefined) delete process.env.BATSHIT_HOME_DIR
+  else process.env.BATSHIT_HOME_DIR = testHome.previous
   await fs.rm(testHome.current, { recursive: true, force: true })
 })
 
@@ -196,7 +199,7 @@ describe('skill and voice folder recovery (journal v4)', () => {
     }
     await fs.writeFile(journalPath, JSON.stringify(journal))
     const journalBefore = await fs.readFile(journalPath, 'utf8')
-    await redis.json.set('user:target:settings', '$', { marker: 'before' })
+    await redis.json.set('user:target:settings', '$', { user_id: 'target', marker: 'before' })
     await fs.writeFile(path.join(uploads, 'unchanged.txt'), 'upload before')
 
     await expect(ensureBackupRestoreRecovery()).rejects.toThrow(/creation identities.*manual recovery/)
@@ -205,7 +208,7 @@ describe('skill and voice folder recovery (journal v4)', () => {
     expect(await fs.readFile(path.join(SKILLS(), 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# replacement kept\n')
     expect(await fs.readFile(path.join(SKILLS(), 'zc_new', 'SKILL.md'), 'utf8')).toBe('# replacement new\n')
     expect(await fs.readFile(path.join(uploads, 'unchanged.txt'), 'utf8')).toBe('upload before')
-    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'before' })
+    expect(await redis.json.get('user:target:settings')).toEqual({ user_id: 'target', marker: 'before' })
   })
 
   it.each([undefined, '0'])('refuses a journal without a positive creation timestamp (%s) before replay', async (birthtimeNs) => {
@@ -216,14 +219,14 @@ describe('skill and voice folder recovery (journal v4)', () => {
     journal.phase = 'redis-replacing'
     await fs.writeFile(journalPath, JSON.stringify(journal))
     const before = await fs.readFile(journalPath, 'utf8')
-    await redis.json.set('user:target:settings', '$', { marker: 'before' })
+    await redis.json.set('user:target:settings', '$', { user_id: 'target', marker: 'before' })
 
     await expect(ensureBackupRestoreRecovery()).rejects.toThrow(/creation inventory.*Manual recovery/)
     expect(await fs.readFile(journalPath, 'utf8')).toBe(before)
     expect(await fs.readFile(path.join(oldDir, 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# original kept\n')
     expect(await fs.readFile(path.join(SKILLS(), 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# replacement kept\n')
     expect(await fs.readFile(path.join(SKILLS(), 'zc_new', 'SKILL.md'), 'utf8')).toBe('# replacement new\n')
-    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'before' })
+    expect(await redis.json.get('user:target:settings')).toEqual({ user_id: 'target', marker: 'before' })
   })
 
   it.each([undefined, 0n])('refuses unavailable filesystem creation time (%s) before changing any copy', async (birthtimeNs) => {
@@ -232,7 +235,7 @@ describe('skill and voice folder recovery (journal v4)', () => {
     journal.phase = 'redis-replacing'
     await fs.writeFile(journalPath, JSON.stringify(journal))
     const before = await fs.readFile(journalPath, 'utf8')
-    await redis.json.set('user:target:settings', '$', { marker: 'before' })
+    await redis.json.set('user:target:settings', '$', { user_id: 'target', marker: 'before' })
     const originalPath = path.join(oldDir, 'zc_kept')
     const lstat = fs.lstat.bind(fs)
     vi.spyOn(fs, 'lstat').mockImplementation(async (target: any, options: any) => {
@@ -245,7 +248,7 @@ describe('skill and voice folder recovery (journal v4)', () => {
     expect(await fs.readFile(path.join(originalPath, 'SKILL.md'), 'utf8')).toBe('# original kept\n')
     expect(await fs.readFile(path.join(SKILLS(), 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# replacement kept\n')
     expect(await fs.readFile(path.join(SKILLS(), 'zc_new', 'SKILL.md'), 'utf8')).toBe('# replacement new\n')
-    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'before' })
+    expect(await redis.json.get('user:target:settings')).toEqual({ user_id: 'target', marker: 'before' })
   })
 
   it('accepts valid positive creation time equal to ctime and retains rename recovery', async () => {
@@ -346,7 +349,7 @@ describe('skill and voice folder recovery (journal v4)', () => {
     })
 
     it('an Inspect during a real restore’s extraction is refused and changes nothing', async () => {
-      await redis.json.set('user:target:settings', '$', { marker: 'backup' })
+      await redis.json.set('user:target:settings', '$', { user_id: 'target', marker: 'backup' })
       await fs.writeFile(path.join(uploads, 'zc-a.png'), 'a')
       await redis.json.set('upload:images:zc-a.png', '$', {
         filename: 'zc-a.png', uploadType: 'images', storage: 'filesystem', relativePath: 'zc-a.png', size: 1,
@@ -400,10 +403,10 @@ describe('skill and voice folder recovery (journal v4)', () => {
     await fs.mkdir(path.join(SKILLS(), 'zc_notes'), { recursive: true })
     await fs.writeFile(path.join(SKILLS(), 'zc_notes', 'SKILL.md'), '# from the backup\n')
     await redis.json.set('skill:target:zc_notes', '$', { id: 'zc_notes', user_id: 'target', name: 'zc_notes', source: 'custom', is_system: false })
-    await redis.json.set('user:target:settings', '$', { marker: 'backup' })
+    await redis.json.set('user:target:settings', '$', { user_id: 'target', marker: 'backup' })
     const bundle = await createBackupBundle('target')
     await fs.writeFile(path.join(SKILLS(), 'zc_notes', 'SKILL.md'), '# on this computer\n')
-    await redis.json.set('user:target:settings', '$', { marker: 'original' })
+    await redis.json.set('user:target:settings', '$', { user_id: 'target', marker: 'original' })
 
     // The final journal write fails before its rename: the persisted phase stays
     // `redis-replacing`, so the next start must undo Redis AND the skill folder.
@@ -425,7 +428,7 @@ describe('skill and voice folder recovery (journal v4)', () => {
     expect(journal.hostEntries.map((entry: { name: string }) => entry.name)).toEqual(['zc_notes'])
 
     await ensureBackupRestoreRecovery()
-    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'original' })
+    expect(await redis.json.get('user:target:settings')).toEqual({ user_id: 'target', marker: 'original' })
     expect(await fs.readFile(path.join(SKILLS(), 'zc_notes', 'SKILL.md'), 'utf8')).toBe('# on this computer\n')
     expect((await listDir(SKILLS())).filter((name) => name.startsWith('.restore-'))).toEqual([])
   })

@@ -28,6 +28,7 @@ The ordinary first-party Advanced/GLB flow is **upload, edit, and Save Goon**:
 
 - After upload, Batshit shows **Preparing** and creates the first verified runtime version automatically. The Goon is not assignable or available in the Dock until it reads **Ready**.
 - You can batch face and body edits inside **Custom Goon Builder**, then click **Save Goon** once. One saved appearance batch produces one checked internal update.
+- Long preparation, preview builds, and saves cover the editor with an animated status overlay and elapsed time. Other controls stay blocked until the work finishes. **Cancel** appears only when the current work can safely stop; the final save cannot be canceled. If an update fails, the overlay closes so you can inspect the error and recovery choices.
 - Mood, Emote, Motion, camera, Eye Contact behavior, voice, and ordinary runtime-only wardrobe/settings saves do not rebuild geometry.
 - A failed update leaves the previously working Goon usable. **Retry** resumes verified stored work; **Discard** removes only unreferenced pending work.
 - **Restore Previous Version** swaps the complete prior package, appearance, artwork, eye state, and runtime version together.

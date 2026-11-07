@@ -22,6 +22,19 @@ vi.mock('$lib/server/redis', () => ({
     del: redisDelMock
   }
 }))
+// Bundle/bootstrap projection only; physical batch/revision behavior has its real Redis owner.
+vi.mock('$lib/server/services/slashCommandRevision', async importOriginal => ({
+  ...await importOriginal<typeof import('$lib/server/services/slashCommandRevision')>(),
+  captureSlashCommandWriteBasis: vi.fn(async () => Object.freeze({})),
+  saveSlashCommandBatch: vi.fn(async (userId: string, writes: Array<{ record: { id: string } }>) => {
+    for (const write of writes) await redisJsonSetMock(`slash_command:${userId}:${write.record.id}`, '$', write.record)
+    return { records: writes.map(write => write.record), deleted: 0 }
+  }),
+  deleteSlashCommandRecord: vi.fn(async (userId: string, id: string) => (await redisDelMock(`slash_command:${userId}:${id}`)) === 1)
+}))
+
+// Migration is qualified with actual Lua in agentPlugins.redis.test; this fixture owns package projection.
+vi.mock('$lib/server/services/agentPlugins', () => ({ ensureBuiltinAgentPlugin: vi.fn() }))
 
 async function pathExists(targetPath: string): Promise<boolean> {
   try {
@@ -38,6 +51,7 @@ function toPosixPath(value: unknown): string {
 
 describe('slash command bootstrap system skills', () => {
   const originalHome = process.env.HOME
+  const originalBatshitHome = process.env.BATSHIT_HOME_DIR
   let tempHome = ''
 
   beforeEach(async () => {
@@ -51,6 +65,7 @@ describe('slash command bootstrap system skills', () => {
     redisDelMock.mockResolvedValue(1)
     tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-bootstrap-test-'))
     process.env.HOME = tempHome
+    process.env.BATSHIT_HOME_DIR = path.join(tempHome, '.batshit')
     upsertSkillMock.mockImplementation(async (input: any) => ({
       id: input.skill.id.replace(/-/g, '_'),
       source: 'system',
@@ -67,6 +82,8 @@ describe('slash command bootstrap system skills', () => {
 
   afterEach(async () => {
     process.env.HOME = originalHome
+    if (originalBatshitHome === undefined) delete process.env.BATSHIT_HOME_DIR
+    else process.env.BATSHIT_HOME_DIR = originalBatshitHome
     if (tempHome) {
       await fs.rm(tempHome, { recursive: true, force: true })
     }
@@ -88,7 +105,7 @@ describe('slash command bootstrap system skills', () => {
 
     expect(command.id).toBe('voice-engine-installer')
     expect(command.skill_id).toBe('voice_engine_installer')
-    expect(command.invocation_pattern).toBe('/voice-engine-installer')
+    expect(command.invocation_pattern).toBe('/batshit:voice-engine-installer')
     const upsertInput = upsertSkillMock.mock.calls[0]?.[0]
     expect(upsertInput).toEqual(
       expect.objectContaining({
@@ -97,7 +114,7 @@ describe('slash command bootstrap system skills', () => {
       })
     )
     expect(toPosixPath(upsertInput?.skill?.sourceRef)).toContain(
-      '/batshit-app/src/lib/server/system-skills/speech-setup'
+      '/batshit-app/src/lib/server/system-plugins/batshit/skills/voice-engine-installer'
     )
 
     expect(await pathExists(path.join(tempHome, '.batshit', 'skills', 'speech-setup'))).toBe(false)
@@ -111,17 +128,17 @@ describe('slash command bootstrap system skills', () => {
 
     expect(command.id).toBe('cli-tool-creator')
     expect(command.skill_id).toBe('cli_tool_creator')
-    expect(command.invocation_pattern).toBe('/cli-tool-creator')
+    expect(command.invocation_pattern).toBe('/batshit:cli-tool-creator')
     expect(command.is_system).toBe(true)
     const upsertInput = upsertSkillMock.mock.calls[0]?.[0]
     expect(upsertInput).toEqual(
       expect.objectContaining({
         commandId: 'cli-tool-creator',
-        skill: expect.objectContaining({ hasReferences: false })
+        skill: expect.objectContaining({ hasReferences: true })
       })
     )
     expect(toPosixPath(upsertInput?.skill?.sourceRef)).toContain(
-      '/batshit-app/src/lib/server/system-skills/cli-tools'
+      '/batshit-app/src/lib/server/system-plugins/batshit/skills/cli-tool-creator'
     )
   })
 
@@ -134,7 +151,7 @@ describe('slash command bootstrap system skills', () => {
 
     expect(command.id).toBe('goon-scene-creator')
     expect(command.skill_id).toBe('goon_scene_creator')
-    expect(command.invocation_pattern).toBe('/goon-scene-creator')
+    expect(command.invocation_pattern).toBe('/batshit:goon-scene-creator')
     expect(command.is_system).toBe(true)
     expect(command.icon_ref).toEqual({ kind: 'batshit', id: 'scenes' })
     expect(command.has_assets).toBe(true)
@@ -150,7 +167,7 @@ describe('slash command bootstrap system skills', () => {
       })
     )
     expect(toPosixPath(upsertInput?.skill?.sourceRef)).toContain(
-      '/batshit-app/src/lib/server/system-skills/goon-scene-creator'
+      '/batshit-app/src/lib/server/system-plugins/batshit/skills/goon-scene-creator'
     )
   })
 
@@ -163,7 +180,7 @@ describe('slash command bootstrap system skills', () => {
 
     expect(command.id).toBe('batshit-guide')
     expect(command.skill_id).toBe('batshit_guide')
-    expect(command.invocation_pattern).toBe('/batshit-guide')
+    expect(command.invocation_pattern).toBe('/batshit:batshit-guide')
     expect(command.is_system).toBe(true)
     expect(command.icon_ref).toEqual({ kind: 'lucide', id: 'book-open' })
     // BL-69 (Josh, 2026-09-21): a new install starts Batshit Guide on for all agents.
@@ -181,8 +198,19 @@ describe('slash command bootstrap system skills', () => {
       })
     )
     expect(toPosixPath(upsertInput?.skill?.sourceRef)).toContain(
-      '/batshit-app/src/lib/server/system-skills/batshit-guide'
+      '/batshit-app/src/lib/server/system-plugins/batshit/skills/batshit-guide'
     )
+  })
+
+  it('builds App Actions with explicit package ownership and the existing search/use allowance', async () => {
+    const { buildAppActionsSkillCommand } = await import('$lib/server/services/systemSlashCommands')
+    const command = await buildAppActionsSkillCommand('user-1', '2026-10-26T12:00:00.000Z')
+    expect(command).toMatchObject({ id: 'app-actions', skill_id: 'app_actions', plugin_id: 'batshit', is_system: true,
+      invocation_pattern: '/batshit:app-actions', enabled_for_all_agents: false, enabled_agent_ids: [] })
+    expect(upsertSkillMock).toHaveBeenCalledWith(expect.objectContaining({ builtinAppActionsSeed: true, commandId: 'app-actions',
+      skill: expect.objectContaining({ id: 'app_actions', isSystem: true, source: 'system',
+        allowedTools: ['native_batshit_tool_search', 'native_batshit_tool_use'] }) }))
+    expect(toPosixPath(upsertSkillMock.mock.calls[0]?.[0]?.skill?.sourceRef)).toContain('/system-plugins/batshit/skills/app-actions')
   })
 
   it('starts only Artifact Creator and Batshit Guide on for all agents on a new install (BL-69)', async () => {
@@ -203,7 +231,8 @@ describe('slash command bootstrap system skills', () => {
       await services.buildSkillCreatorSkillCommand('user-1', now),
       await services.buildSpeechSetupSkillCommand('user-1', now),
       await services.buildCliToolsSkillCommand('user-1', now),
-      await services.buildGoonSceneCreatorSkillCommand('user-1', now)
+      await services.buildGoonSceneCreatorSkillCommand('user-1', now),
+      await services.buildAppActionsSkillCommand('user-1', now)
     ]
     for (const command of offByDefault) {
       expect(command.enabled_for_all_agents).toBe(false)
@@ -275,8 +304,8 @@ describe('slash command bootstrap system skills', () => {
 
     await ensureSystemSlashCommands('user-1')
 
-    expect(upsertSkillMock).toHaveBeenCalledTimes(6)
-    expect(redisJsonSetMock).toHaveBeenCalledWith(
+    expect(upsertSkillMock).toHaveBeenCalledTimes(8)
+    expect(redisJsonSetMock).not.toHaveBeenCalledWith(
       'slash_command:user-1:artifact-creator',
       '$',
       expect.objectContaining({
@@ -284,8 +313,7 @@ describe('slash command bootstrap system skills', () => {
         skill_id: 'artifact_creator'
       })
     )
-    // The existing five commands above deliberately omit batshit-guide: an
-    // instance bootstrapped before SA-092 must auto-heal the sixth built-in.
+    // Existing legacy rows remain unchanged; absent plugin members are repaired.
     expect(redisJsonSetMock).toHaveBeenCalledWith(
       'slash_command:user-1:batshit-guide',
       '$',

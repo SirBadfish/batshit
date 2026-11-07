@@ -17,13 +17,14 @@ import {
   resolveDelegatedRunBrokerInputs,
 } from '$lib/utils/brokerAvailability'
 import {
-  isCliSubagentType,
-  isN8nSubnodeSubagentType,
+  isRetiredSubagentType,
   normalizeSubagentType,
   type SubagentType,
+  retiredSubagentTypeMessage,
 } from '$lib/utils/subagentType'
-import { buildCliSubagentProviderSettings } from '$lib/server/services/cliSubagentProfile'
 import { COMPILED_TAG, compiledElement } from '$lib/utils/compiledChatTags'
+import type { SubagentThreadOutcome } from '$lib/server/services/subagentThreads'
+import type { ApiUtilityScope } from './apiUtilityRuntime'
 
 function normalizeStringArray(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null
@@ -80,10 +81,8 @@ export async function resolveManagedSubagentScope(options: {
   projectPath?: string | null
 }): Promise<SubagentResolvedScope> {
   const subagentType = normalizeSubagentType(options.subagent, options.subagent.subagentType)
-  if (isN8nSubnodeSubagentType(subagentType)) {
-    throw new Error(
-      'n8n Subnode Subagents were removed from Batshit. Delete this record from Agent Settings.'
-    )
+  if (isRetiredSubagentType(subagentType)) {
+    throw new Error(retiredSubagentTypeMessage(options.subagent))
   }
   const defaultMcpGateways =
     normalizeStringArray(options.subagent.defaultMCPGateways) ??
@@ -118,14 +117,8 @@ export async function resolveManagedSubagentScope(options: {
 
   return {
     subagentType,
-    // BL-81 follow-up: a CLI Subagent or Worker runs with its CLI profile's settings (Fetch Zip
-    // and Batshit Tools off), so its DCM index and its credential's control list are built from
-    // those, the same settings its helper gets. An API Subagent keeps its own toggles.
-    nativeToolSettings: resolveNativeToolSettings(
-      isCliSubagentType(subagentType)
-        ? buildCliSubagentProviderSettings(options.subagent)
-        : options.subagent.provider_specific_settings ?? null,
-    ),
+    // A Subagent or Worker runs with its own tool toggles.
+    nativeToolSettings: resolveNativeToolSettings(options.subagent.provider_specific_settings ?? null),
     defaultMcpGateways,
     resolvedGateways: gatewayScope.resolvedGateways,
     defaultCliToolIds,
@@ -136,7 +129,23 @@ export async function resolveManagedSubagentScope(options: {
   }
 }
 
-export async function buildManagedSubagentDynamicInfo(options: {
+/**
+ * Decision 11 (Josh, 2026-10-24): the `thread:` line tells a Subagent which thread mode this call
+ * runs under, so it knows whether it remembers earlier exchanges and that its conversation is
+ * kept (its System Prompt points at this line). One line per `SubagentThreadOutcome`, the last
+ * line of the `<dynamic_info>`; every Subagent call gets one, a Worker never does (it has no
+ * thread).
+ */
+export const SUBAGENT_THREAD_DCM_LINES: Readonly<Record<SubagentThreadOutcome, string>> = {
+  fresh: 'thread: fresh. Nothing earlier is loaded. Batshit keeps this exchange, so the Primary Agent can resume it to answer a question you end with.',
+  resumed: 'thread: resumed. Your earlier exchanges with the Primary Agent in this chat come before this task.',
+  'resumed-empty': 'thread: resumed, but nothing earlier was stored, so this call starts new. Batshit keeps this exchange, so the Primary Agent can resume it.'
+}
+
+interface ManagedSubagentDynamicInfoOptions {
+  /** Actual final API registrations, supplied by that run's preparation owner. */
+  apiUtilityScope?: ApiUtilityScope
+  apiAuditAgentId?: string | null
   userId: string
   subagent: SubagentRow
   sessionId?: string | null
@@ -148,15 +157,27 @@ export async function buildManagedSubagentDynamicInfo(options: {
    */
   scope?: SubagentResolvedScope
   capabilities?: AgentSlashCapability[]
-}): Promise<string> {
+}
+
+/** The `<dynamic_info>` for one call whose thread outcome is already known (null: a Worker). */
+export async function buildManagedSubagentDynamicInfo(
+  options: ManagedSubagentDynamicInfoOptions & { thread?: SubagentThreadOutcome | null }
+): Promise<string> {
+  return (await prepareManagedSubagentDynamicInfo(options))(options.thread ?? null)
+}
+
+/**
+ * Builds everything in a delegated run's `<dynamic_info>` that does not depend on its thread
+ * (the capability index is the costly part), and returns the renderer that adds the `thread:`
+ * line. The runner prepares before it takes the run lock, as before, and each lane renders once
+ * its thread is open, because only then is the outcome known (`resume` with nothing stored is
+ * `resumed-empty`).
+ */
+export async function prepareManagedSubagentDynamicInfo(
+  options: ManagedSubagentDynamicInfoOptions
+): Promise<(thread: SubagentThreadOutcome | null) => string> {
   const scope = options.scope ?? (await resolveManagedSubagentScope(options))
   const lines: string[] = []
-
-  if (scope.projectPath) {
-    lines.push(`project_path: ${scope.projectPath}`)
-  } else {
-    lines.push('project_path: (not set)')
-  }
 
   // SA-096 P4: the capability index now covers Fabric and published artifact runtime tools
   // as well, so the subagent's own artifact block is gone. Subagents keep artifact runtime
@@ -164,11 +185,13 @@ export async function buildManagedSubagentDynamicInfo(options: {
   // (SA-113: no inbox, no identity), schedules (SA-115: nothing that outlives the run) or the
   // judgment tool (SA-120: the primary decides). `DELEGATED_RUN_BROKER_SCOPE` holds all six.
   //
-  // BL-81: the runtime, the toggles and the flags come from the same two definitions the
-  // delegated control scope is minted from (`resolveDelegatedRunAllowedControlIds`), so the
-  // tools this index offers are exactly the tools a CLI run's credential allows.
+  // BL-81: the runtime and the toggles come from the run's resolved scope, the scope its
+  // in-process broker registers from, so the tools this index offers are the tools it may use.
   const brokerInputs = resolveDelegatedRunBrokerInputs(scope)
   const mcpIndex = await buildDynamicMcpIndex({
+    apiUtilityScope: options.apiUtilityScope,
+    agentId: options.apiAuditAgentId,
+    primarySettingsActor: false,
     userId: options.userId,
     controlAgentId: options.subagent.id,
     toolSelections: scope.defaultMcpToolSelections,
@@ -193,15 +216,20 @@ export async function buildManagedSubagentDynamicInfo(options: {
     lines.push('', ...skillsLines)
   }
 
-  const content = lines.filter((line, index, all) => {
-    if (line.length > 0) return true
-    return index > 0 && index < all.length - 1 && all[index - 1].length > 0 && all[index + 1].length > 0
-  })
-
-  if (content.length === 0) return ''
-  // BL-225: the same `<dynamic_info>` element a primary's DCM is (SA-128), through the one
-  // builder that disarms this grammar's tags inside the lines.
-  return compiledElement(COMPILED_TAG.dynamicInfo, content.join('\n'))
+  const projectPathLine = scope.projectPath ? `project_path: ${scope.projectPath}` : 'project_path: (not set)'
+  return (thread) => {
+    // The thread line goes LAST (decision 11, Opie's review): it is the only line that changes
+    // between a fresh call and a resume, and a provider's prompt cache is lost from the first
+    // changed byte on, so the base prompt and the capability index above it stay cached.
+    const content = [projectPathLine, ...lines, ...(thread ? ['', SUBAGENT_THREAD_DCM_LINES[thread]] : [])]
+      .filter((line, index, all) => {
+        if (line.length > 0) return true
+        return index > 0 && index < all.length - 1 && all[index - 1].length > 0 && all[index + 1].length > 0
+      })
+    // BL-225: the same `<dynamic_info>` element a primary's DCM is (SA-128), through the one
+    // builder that disarms this grammar's tags inside the lines.
+    return compiledElement(COMPILED_TAG.dynamicInfo, content.join('\n'))
+  }
 }
 
 export function appendManagedSubagentDynamicInfo(

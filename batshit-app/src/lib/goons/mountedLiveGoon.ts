@@ -38,9 +38,6 @@ export const MOUNTED_LIVE_GOON_DEFAULT_FOV = 50
 export const MOUNTED_LIVE_GOON_MIN_FOV = 15
 export const MOUNTED_LIVE_GOON_MAX_FOV = 100
 
-const TRANSPARENT_TEXTURE_URL =
-  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII='
-
 export type MountedLiveGoonSceneMode = 'saved' | 'none'
 
 export type MountedLiveGoonLoadOptions = {
@@ -101,7 +98,7 @@ export type MountedLiveGoonLoadResult =
 export type MountedLiveGoonClosetContext = Pick<
   MountedLiveGoonLoadPlan,
   'goon' | 'goonsSettings'
->
+> & { isCurrent?: () => boolean }
 
 export function clampMountedLiveGoonFov(value: number) {
   return Math.max(MOUNTED_LIVE_GOON_MIN_FOV, Math.min(MOUNTED_LIVE_GOON_MAX_FOV, value))
@@ -281,16 +278,21 @@ export async function applyMountedLiveGoonClosetAssignments(
   context: MountedLiveGoonClosetContext
 ) {
   const { goon, goonsSettings } = context
+  const root = engine.getAvatarRootObject(), generation = engine.getGoonLoadGeneration()
+  const isCurrent = () => Boolean(root) && engine.getAvatarRootObject() === root &&
+    engine.isCurrentGoonLoad(generation) && (context.isCurrent?.() ?? true)
+  if (!isCurrent()) return
   const assignments = goon.closetAssignments ?? {}
   for (const [materialName, assignment] of Object.entries(assignments)) {
+    if (!isCurrent()) return
     const runtimeMaterialName =
       resolveClosetRuntimeMaterialName(materialName, engine.getMaterialNames()) ?? null
     if (!runtimeMaterialName) continue
 
     if (!assignment || assignment.mode === 'original') {
       const colors = resolveAppliedClosetColors()
+      engine.resetMaterialOverrides(runtimeMaterialName)
       if (colors.baseHex || colors.shadeHex) {
-        engine.resetMaterialOverrides(runtimeMaterialName)
         engine.applyMaterialColorOverride(runtimeMaterialName, colors)
       }
       continue
@@ -300,7 +302,7 @@ export async function applyMountedLiveGoonClosetAssignments(
         engine.resetMaterialOverrides(runtimeMaterialName)
         continue
       }
-      await engine.applyMaterialTexture(runtimeMaterialName, TRANSPARENT_TEXTURE_URL)
+      engine.hideClosetMaterial(runtimeMaterialName)
       const colors = resolveAppliedClosetColors()
       if (colors.baseHex || colors.shadeHex) {
         engine.applyMaterialColorOverride(runtimeMaterialName, colors)
@@ -311,12 +313,13 @@ export async function applyMountedLiveGoonClosetAssignments(
       const item = resolveMountedLiveGoonClosetItem(goon, assignment.itemId, goonsSettings)
       if (!item) continue
       if (item.xwear) {
-        await engine.applyXWearMaterial(runtimeMaterialName, item.xwear as GoonXWearData)
+        await engine.applyXWearMaterial(runtimeMaterialName, item.xwear as GoonXWearData, { isCurrent })
       } else if (item.texture?.url) {
-        await engine.applyMaterialTexture(runtimeMaterialName, item.texture.url)
+        await engine.applyMaterialTexture(runtimeMaterialName, item.texture.url, { isCurrent })
       } else if (item.originalSource) {
         engine.resetMaterialOverrides(runtimeMaterialName)
       }
+      if (!isCurrent()) return
       const colors = resolveAppliedClosetColors(item)
       if (colors.baseHex || colors.shadeHex) {
         engine.applyMaterialColorOverride(runtimeMaterialName, colors)
@@ -324,6 +327,7 @@ export async function applyMountedLiveGoonClosetAssignments(
     }
   }
 
+  if (!isCurrent()) return
   const bodyConceal = resolveActiveWearableConceal({
     closetAssignments: assignments,
     resolveClosetItem: (itemId) =>
@@ -408,10 +412,15 @@ export async function loadMountedLiveGoon(
     return { status: 'cancelled', kind: avatar.kind } satisfies MountedLiveGoonLoadResult
   }
   const { kind } = avatar
+  const root = engine.getAvatarRootObject(), generation = engine.getGoonLoadGeneration()
+  const isCurrent = () => Boolean(root) && engine.getAvatarRootObject() === root &&
+    engine.isCurrentGoonLoad(generation)
+  if (!isCurrent()) return { status: 'cancelled', kind }
   engine.setCameraFov(plan.initialFov)
 
   if (plan.sceneMode === 'saved') {
     await applyGoonSceneDefinition(engine, plan.scene, plan.stagePostures)
+    if (!isCurrent()) return { status: 'cancelled', kind }
   }
 
   engine.setMood(plan.baseLoop, plan.baseLoopDefinition)
@@ -424,8 +433,10 @@ export async function loadMountedLiveGoon(
 
   const animations = [...plan.animationPlan.eager, ...plan.animationPlan.deferred]
   await engine.syncAnimations(animations)
+  if (!isCurrent()) return { status: 'cancelled', kind }
   if (kind === 'vrm') {
-    await applyMountedLiveGoonClosetAssignments(engine, plan)
+    await applyMountedLiveGoonClosetAssignments(engine, { ...plan, isCurrent })
+    if (!isCurrent()) return { status: 'cancelled', kind }
   }
 
   if (plan.mountedState) engine.restoreMountedRuntimeState(plan.mountedState)

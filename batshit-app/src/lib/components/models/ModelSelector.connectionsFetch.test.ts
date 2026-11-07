@@ -23,7 +23,11 @@ import ModelSelector from './ModelSelector.svelte'
  */
 
 const CONNECTIONS_URL = '/api/models?include=connections'
+const channel = vi.hoisted(() => ({ listeners: new Set<(event: any) => void>() }))
+vi.mock('$lib/services/userChannel', async original => ({ ...(await original<Record<string, unknown>>()),
+  onUserChannelEvent: (listener: (event: any) => void) => { channel.listeners.add(listener); return () => channel.listeners.delete(listener) } }))
 const ERROR_TEXT = 'Failed to load model connections (500)'
+const INVALID_CONNECTIONS_TEXT = 'Connection status could not be read. Close and reopen this menu to retry.'
 const LOADING_TEXT = 'Loading connection status…'
 const PROBE_MODEL_NAME = 'Probe Model'
 /** A saved chat preset on OpenRouter: the picker locks it when the connection list says so. */
@@ -47,6 +51,7 @@ const LOCKED_CONNECTIONS = [
 ]
 
 let connectionsAnswer: 'fail' | 'ok' = 'fail'
+let connectionsPayload: unknown
 let connectionCalls = 0
 let savedModels: unknown[] = []
 let unroutedUrls: string[] = []
@@ -78,7 +83,7 @@ function installFetch() {
         connectionCalls += 1
         return connectionsAnswer === 'fail'
           ? answer({ success: false, error: 'x' }, 500)
-          : answer({ data: { connections: LOCKED_CONNECTIONS } })
+          : answer(connectionsPayload)
       }
       // The saved models the picker loads on mount. Any other URL is loud (a 404 the first test
       // asserts never happened), so a new request cannot slip in unseen.
@@ -90,7 +95,9 @@ function installFetch() {
 }
 
 beforeEach(() => {
+  channel.listeners.clear()
   connectionsAnswer = 'fail'
+  connectionsPayload = { data: { connections: LOCKED_CONNECTIONS } }
   connectionCalls = 0
   savedModels = []
   unroutedUrls = []
@@ -128,6 +135,76 @@ function probeModelItem() {
 }
 
 describe('ModelSelector asks for the connection status once per mount (BL-977 companion)', () => {
+  it.each([
+    ['missing data', {}],
+    ['missing connections', { data: {} }],
+    ['null connections', { data: { connections: null } }],
+    ['object connections', { data: { connections: {} } }],
+    ['string connections', { data: { connections: 'not an array' } }],
+    ['null row', { data: { connections: [null] } }],
+    ['array row', { data: { connections: [[]] } }],
+    ['missing identity', { data: { connections: [{ status: 'ready' }] } }],
+    ['non-string identity', { data: { connections: [{ id: 12, status: 'ready' }] } }],
+    ['blank identity', { data: { connections: [{ id: '  ', status: 'locked' }] } }],
+    ['missing status', { data: { connections: [{ id: 'openrouter' }] } }],
+    ['unknown status', { data: { connections: [{ id: 'openrouter', status: 'unknown' }] } }]
+  ])('treats HTTP 200 with %s as an unknown read and recovers once on human reopen', async (_name, payload) => {
+    connectionsAnswer = 'ok'
+    connectionsPayload = payload
+    render(ModelSelector, { props: {} })
+    await pause(600)
+    expect(connectionCalls).toBe(1)
+    await openMenu()
+    await waitFor(() => expect(connectionCalls).toBe(2))
+    expect(await screen.findByText(INVALID_CONNECTIONS_TEXT)).toBeTruthy()
+    await pause(50)
+    expect(connectionCalls).toBe(2)
+
+    connectionsPayload = { data: { connections: LOCKED_CONNECTIONS } }
+    await closeMenu()
+    await openMenu()
+    await waitFor(() => expect(connectionCalls).toBe(3))
+    await waitFor(() => expect(screen.queryByText(LOADING_TEXT)).toBeNull())
+    expect(screen.queryByText(INVALID_CONNECTIONS_TEXT)).toBeNull()
+    await closeMenu()
+    await openMenu()
+    await pause(50)
+    expect(connectionCalls).toBe(3)
+    expect(unroutedUrls).toEqual([])
+  }, 30_000)
+
+  it('accepts an empty connections array without an error or an extra reopen read', async () => {
+    connectionsAnswer = 'ok'
+    connectionsPayload = { data: { connections: [] } }
+    render(ModelSelector, { props: {} })
+    await pause(600)
+    await openMenu()
+    expect(screen.queryByText(INVALID_CONNECTIONS_TEXT)).toBeNull()
+    expect(screen.queryByText('Reopen this menu to refresh connection status.')).toBeNull()
+    await closeMenu()
+    await openMenu()
+    await pause(50)
+    expect(connectionCalls).toBe(1)
+    expect(unroutedUrls).toEqual([])
+  }, 30_000)
+
+  it.each(['fail', 'ok'] as const)('model-selection/reconnect performs no ordinary/catalog read from %s state; a human reopen still recovers', async initial => {
+    connectionsAnswer = initial
+    render(ModelSelector, { props: {} })
+    await pause(600)
+    const before = vi.mocked(fetch).mock.calls.length
+    channel.listeners.forEach(listener => listener({ type: 'agent_settings_changed', agentId: 'synthetic', family: 'model-selection' }))
+    channel.listeners.forEach(listener => listener({ type: 'reconnected' }))
+    await pause(50)
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(before)
+    expect(connectionCalls).toBe(1)
+    connectionsAnswer = 'ok'
+    await openMenu()
+    await waitFor(() => expect(connectionCalls).toBe(2))
+    await waitFor(() => expect(screen.queryByText(LOADING_TEXT)).toBeNull())
+    await closeMenu(); await openMenu(); await pause(50)
+    expect(connectionCalls).toBe(2)
+  }, 30_000)
   it('a failed answer is not retried by itself: the mount asks once and nothing more', async () => {
     render(ModelSelector, { props: {} })
     await pause(600)

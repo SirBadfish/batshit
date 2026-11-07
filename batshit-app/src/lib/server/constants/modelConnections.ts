@@ -40,9 +40,7 @@ export const CONNECTION_CREDENTIAL_MAP: Record<string, string[]> = {
   'direct:huggingface': ['huggingFaceApi'],
   'azure-openai': ['azureOpenAiApi'],
   'aws-bedrock': ['aws'],
-  'google-vertex': ['googleVertexAiOAuth2Api'],
-  'codex-cli': [],
-  'claude-cli': []
+  'google-vertex': ['googleVertexAiOAuth2Api']
 }
 
 export const N8N_ONLY_CONNECTION_IDS = new Set([

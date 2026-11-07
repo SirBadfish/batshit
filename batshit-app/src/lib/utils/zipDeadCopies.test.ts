@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { READ_COMPRESS_HINT_LAST_REPLY } from './zipActivation'
+import { readCompressHintLastReply } from './zipActivation'
 import {
-  DEAD_COPY_REASON_TEXT,
+  describeDeadCopiesCompressedThisTurn,
   describeHeldPath,
   describeToolResultFiles,
   findDeadCopies,
@@ -12,7 +12,10 @@ import {
   readFilesFromCommand,
   type DeadCopyToolResult
 } from './zipDeadCopies'
-import { HELD_BY_USER_HINT, HELD_BY_YOU_HINT } from './zipHoldWords'
+import { HELD_BY_USER_HINT, heldByUserForMessagesHint } from './zipHoldWords'
+import { ZIP_INDEX_STATUS_HEADINGS } from './compiledChatTags'
+import { buildToolGuidanceZipPromptBlock } from './toolPromptInjection'
+import { applyPromptRuntimeScope } from './promptRuntimeScope'
 import { formatToolModelTextCut } from './toolModelTextSizeGuard'
 import { guardCutNotice } from '$lib/test-utils/guard-cut-notice'
 import { limitedOutput } from '$lib/server/services/commandOutputLimit'
@@ -101,14 +104,31 @@ describe('findDeadCopies: dead copies (SA-129 DL-01)', () => {
     const first = shellRead('cat src/app.js', { message: 1 })
     const second = shellRead('cat src/app.js', { message: 3 })
     const result = dead([first, second])
-    expect(result.get(first.zipId)).toEqual({ reason: 'superseded', deadAtMessageIndex: 3 })
+    expect(result.get(first.zipId)).toEqual({
+      reason: 'superseded',
+      deadAtMessageIndex: 3,
+      files: [{ path: 'src/app.js', reason: 'superseded' }]
+    })
     expect(result.has(second.zipId)).toBe(false)
   })
 
   it('an edit of the file after a whole read makes that copy stale', () => {
     const read = shellRead('cat src/app.js', { message: 1 })
     const edit = directEdit(`${PROJECT}/src/app.js`, { message: 3 })
-    expect(dead([read, edit]).get(read.zipId)).toEqual({ reason: 'stale', deadAtMessageIndex: 3 })
+    expect(dead([read, edit]).get(read.zipId)).toEqual({
+      reason: 'stale',
+      deadAtMessageIndex: 3,
+      files: [{ path: 'src/app.js', reason: 'stale' }]
+    })
+  })
+
+  it('Refreshed File Reads has no exemption: an edit makes a copy stale in the one ledger every compile uses (Josh, 2026-11-04)', () => {
+    const read = shellRead('cat src/app.js', { message: 1 })
+    const edit = directEdit(`${PROJECT}/src/app.js`, { message: 3 })
+    // An option the ledger no longer knows changes nothing (a caller cannot keep an edited copy open).
+    expect(findDeadCopies([read, edit], { projectPath: PROJECT, staleExempt: new Set([read.zipId]) } as any).get(read.zipId)?.reason).toBe('stale')
+    const again = shellRead('cat src/app.js', { message: 5 })
+    expect(findDeadCopies([read, edit, again], { projectPath: PROJECT }).get(read.zipId)?.reason).toBe('stale')
   })
 
   it('an edit BEFORE the read leaves the read live', () => {
@@ -224,6 +244,57 @@ describe('findDeadCopies: dead copies (SA-129 DL-01)', () => {
     expect(result.has(readC.zipId)).toBe(false)
   })
 
+  it('a patch followed by commands it never runs edits only the files in the patch (BL-1915)', () => {
+    const readA = shellRead('cat pkg/a.js', { message: 1 })
+    const readT = shellRead('cat pkg/t.js', { message: 1 })
+    // The command joined by `&&` and the one on the next line were not run.
+    const patch = commandResult(
+      'edit_file',
+      "cd pkg && apply_patch <<'PATCH' && npm test\n*** Begin Patch\n*** Update File: a.js\n@@\n-x\n+y\n*** End Patch\nPATCH\ncat > t.js <<'EOF'\n*** Update File: t.js\n*** End Patch\nEOF",
+      'a.js',
+      { message: 3 }
+    )
+    const result = dead([readA, readT, patch])
+    expect(result.get(readA.zipId)?.reason).toBe('stale')
+    expect(result.has(readT.zipId)).toBe(false)
+  })
+
+  it('a failed patch edits nothing, except the paths it names as left changed (BL-1916)', () => {
+    const readA = shellRead('cat a.js', { message: 1 })
+    const readB = shellRead('cat b.js', { message: 1 })
+    const command = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: a.js\n@@\n-x\n+y\n*** Add File: b.js\n+z\n*** End Patch\nPATCH"
+    const failed = (managedApplyPatch?: Record<string, unknown>): DeadCopyToolResult => ({
+      zipId: nextId(),
+      authorId: 'agent-a',
+      messageIndex: 3,
+      operationKind: 'edit_file',
+      payload: {
+        operationKind: 'edit_file',
+        toolArgs: { filePath: 'a.js', innerCommand: command },
+        toolResult: { success: false, errorCode: 'INVALID_INPUT', reason: 'Writing "b.js" failed', ...(managedApplyPatch ? { managedApplyPatch } : {}) }
+      }
+    })
+    // Written whole or not at all: a failed patch changed nothing.
+    expect(dead([readA, readB, failed()]).size).toBe(0)
+    // A write that could not be undone names what it left changed, by absolute path.
+    const partial = dead([readA, readB, failed({ managed: true, partial: true, changedPaths: [`${PROJECT}/a.js`] })])
+    expect(partial.get(readA.zipId)?.reason).toBe('stale')
+    expect(partial.has(readB.zipId)).toBe(false)
+    // The n8n automation lane keeps it in the error's details.
+    const automation: DeadCopyToolResult = {
+      ...failed(),
+      zipId: nextId(),
+      payload: {
+        operationKind: 'edit_file',
+        toolArgs: { filePath: 'a.js', innerCommand: command },
+        toolResult: { success: false, error: { code: 'INVALID_INPUT', details: { managedApplyPatch: { managed: true, partial: true, changedPaths: [`${PROJECT}/b.js`] } } } }
+      }
+    }
+    const viaDetails = dead([readA, readB, automation])
+    expect(viaDetails.get(readB.zipId)?.reason).toBe('stale')
+    expect(viaDetails.has(readA.zipId)).toBe(false)
+  })
+
   it('patch text inside some other command is not a managed patch and edits nothing', () => {
     const read = shellRead('cat artifact.html', { message: 1 })
     const script = commandResult(
@@ -259,14 +330,29 @@ describe('findDeadCopies: dead copies (SA-129 DL-01)', () => {
     const againA = shellRead('cat a.js', { message: 3 })
     expect(dead([both, againA]).has(both.zipId)).toBe(false)
     const againB = shellRead('cat b.js', { message: 5 })
-    expect(dead([both, againA, againB]).get(both.zipId)).toEqual({ reason: 'superseded', deadAtMessageIndex: 5 })
+    expect(dead([both, againA, againB]).get(both.zipId)).toEqual({
+      reason: 'superseded',
+      deadAtMessageIndex: 5,
+      files: [
+        { path: 'a.js', reason: 'superseded' },
+        { path: 'b.js', reason: 'superseded' }
+      ]
+    })
   })
 
   it('stale wins over superseded when a copy has both, and the copy dies at its last file', () => {
     const both = shellRead('cat a.js b.js', { message: 1 })
     const editA = directEdit('a.js', { message: 3 })
     const againB = shellRead('cat b.js', { message: 5 })
-    expect(dead([both, editA, againB]).get(both.zipId)).toEqual({ reason: 'stale', deadAtMessageIndex: 5 })
+    // BL-1541: each file keeps what made it dead, for the `Current Zip State` line.
+    expect(dead([both, editA, againB]).get(both.zipId)).toEqual({
+      reason: 'stale',
+      deadAtMessageIndex: 5,
+      files: [
+        { path: 'a.js', reason: 'stale' },
+        { path: 'b.js', reason: 'superseded' }
+      ]
+    })
   })
 
   it('a result whose file set is unknown is never dead and never supersedes', () => {
@@ -401,17 +487,61 @@ describe('readFilesFromCommand: the strict read grammar', () => {
 })
 
 describe('the zip prompts teach the words the compile writes (SA-129 DL-03, DL-04)', () => {
-  for (const file of ['batshit_tool_prompt_zip_control_disabled.md', 'batshit_tool_prompt_zip_control_enabled.md']) {
-    it(file, () => {
-      const prompt = readFileSync(resolve(process.cwd(), `../docs/batshit_System_Prompts/${file}`), 'utf8')
-      expect(prompt).toContain(`\`${DEAD_COPY_REASON_TEXT.superseded}\``)
-      expect(prompt).toContain(`\`${DEAD_COPY_REASON_TEXT.stale}\``)
-      expect(prompt).toContain(`\`${READ_COMPRESS_HINT_LAST_REPLY}\``)
-      expect(prompt).toContain('`Compresses N replies after it was read.`')
-      expect(prompt).toMatch(/Fetch Zip returns the exact earlier result/)
-      // SA-129 P2: the held lines, word for word.
-      expect(prompt).toContain(`\`${HELD_BY_YOU_HINT}\``)
+  // BL-1756: the packaged prompt file holds only the guidance variable, and the compile fills it
+  // with the built block (`resolveToolZipGuidancePrompt`), so the words are checked in the prompt
+  // as each runtime receives it. Josh's text (2026-10-23) teaches two status lines by example and
+  // the Zip Index headings by name; the compile writes the same headings (`ZIP_INDEX_STATUS_HEADINGS`).
+  // SA-139 R4: the API lane (`vercel`) is the one lane a compile builds; the `claude` variants left
+  // with the CLI compile flavor.
+  const file = 'batshit_tool_prompt_zips.md'
+  const variants = [
+    ...[true, false].map((toolNotesEnabled) => ({ runtimeFlavor: 'vercel' as const, toolNotesEnabled, liveFileReads: false })),
+    { runtimeFlavor: 'vercel' as const, toolNotesEnabled: true, liveFileReads: true },
+    { runtimeFlavor: 'vercel' as const, toolNotesEnabled: false, liveFileReads: true }
+  ]
+  for (const { runtimeFlavor, toolNotesEnabled, liveFileReads } of variants) {
+    it(`${file} (${runtimeFlavor}, Tool Notes ${toolNotesEnabled ? 'on' : 'off'}, Refreshed File Reads ${liveFileReads ? 'on' : 'off'})`, () => {
+      const block = buildToolGuidanceZipPromptBlock({ toolNotesEnabled, liveFileReads })
+      const prompt = applyPromptRuntimeScope(
+        readFileSync(resolve(process.cwd(), `../docs/batshit_System_Prompts/${file}`), 'utf8'),
+        'api'
+      )
+        .replaceAll('{{ $api_tool_zip_guidance }}', block)
+      // The Zip Index's status headings, as the compile writes them (decision 5).
+      expect(prompt).toContain(`**${ZIP_INDEX_STATUS_HEADINGS.settings}**`)
+      expect(prompt).toContain(`**${ZIP_INDEX_STATUS_HEADINGS.zippedThisTurn}**`)
+      expect(prompt).not.toContain('Current Zip State')
+      // BL-1756 named Tool Notes in the last-reply line (2026-10-18); BL-1785 (Josh, 2026-10-19,
+      // option B) gives an agent with Tool Notes off its own line, never naming them.
+      expect(prompt).toContain(`\`${readCompressHintLastReply(toolNotesEnabled)}\``)
       expect(prompt).toContain(`\`${HELD_BY_USER_HINT}\``)
+      expect(heldByUserForMessagesHint(3).replace('3', 'N')).toBe('Held by the user for N messages.')
+      // The size guard's words, word for word.
+      expect(prompt).toContain('`large: hold it or fetch it`')
+      expect(prompt).toContain('`too large to open: fetch it in parts`')
+      expect(prompt).toContain('`Output cut here by Batshit`')
+      expect(prompt).not.toContain('on Codex')
+      expect(prompt.includes('REFRESHED: <file>, <range> (at the start of this turn)')).toBe(liveFileReads)
+      // Josh's order: the overview, how to operate, the notes and holds, the file copies, the size
+      // guard, the cost recap, then the sections that are not about Zips.
+      const order = [
+        "# Batshit's Unique Tool Results Compression System (Zips)",
+        '## So WHEN do Zips get Zipped or Unzipped? And WHY?',
+        '## How You Need to Operate as a Batshit Agent',
+        ...(toolNotesEnabled ? ['## More About Tool Notes', '## Tool Notes, Zip Hold and Zip Release: How to Use'] : ['## Zip Hold and Zip Release: How to Use']),
+        liveFileReads ? '## Refreshed File Reads' : '## Older Copies of a File',
+        '## Very Large Results (Size Guard)',
+        '## Your Part: Keeping Costs Down',
+        '# Messages That Reach You While You Work',
+        '# Work Modes (Plan, Agent, Dangerous)',
+        '# When an Action Fails'
+      ].map((words) => prompt.indexOf(words))
+      expect(order.every((at) => at >= 0)).toBe(true)
+      expect([...order].sort((a, b) => a - b)).toEqual(order)
+      // Decision 6: a result that is not a file comes back with Fetch Zip; nobody asks the user.
+      expect(prompt).not.toContain('ask the user to hold')
+      expect(prompt.includes('Your Tool Notes are your memory.')).toBe(toolNotesEnabled)
+      expect(prompt).not.toContain('Tool Notes are disabled for this agent/session.')
     })
   }
 })
@@ -448,5 +578,33 @@ describe('holds', () => {
     expect(newest.get('src/app.ts')).toEqual({ zipId: second.zipId, messageIndex: 2 })
     const onlyPartial = newestWholeReadsByFile([directRead('b.ts', {}, { offset: 1 })], { projectPath: PROJECT })
     expect(onlyPartial.has('b.ts')).toBe(false)
+  })
+})
+
+describe('describeDeadCopiesCompressedThisTurn: the Current Zip State line (BL-1541)', () => {
+  it('names each path once with its reason, in chat order', () => {
+    expect(
+      describeDeadCopiesCompressedThisTurn([
+        { files: [{ path: 'src/money.js', reason: 'superseded' }] },
+        { files: [{ path: 'src/cli.js', reason: 'stale' }] }
+      ])
+    ).toBe('- Older copies compressed this turn: src/money.js (was read again later), src/cli.js (was edited after the read).')
+  })
+
+  it('lists a path once when several copies of it compressed at once; the newest copy\'s reason wins', () => {
+    expect(
+      describeDeadCopiesCompressedThisTurn([
+        { files: [{ path: 'src/money.js', reason: 'superseded' }] },
+        { files: [{ path: 'src/money.js', reason: 'stale' }, { path: 'src/cli.js', reason: 'superseded' }] }
+      ])
+    ).toBe('- Older copies compressed this turn: src/money.js (was edited after the read), src/cli.js (was read again later).')
+  })
+
+  it('names a skill file the way an agent names it, and says nothing when nothing compressed', () => {
+    expect(describeDeadCopiesCompressedThisTurn([{ files: [{ path: 'skill:writer:SKILL.md', reason: 'superseded' }] }])).toBe(
+      '- Older copies compressed this turn: writer/SKILL.md (was read again later).'
+    )
+    expect(describeDeadCopiesCompressedThisTurn([])).toBeNull()
+    expect(describeDeadCopiesCompressedThisTurn([{ files: [] }])).toBeNull()
   })
 })

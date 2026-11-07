@@ -73,6 +73,32 @@ describe('finalizeReplyControl (a headless reply)', () => {
     expect(result.metadata.controlErrors).toBeUndefined()
   })
 
+  it('with Tool Notes off, keeps no notes and says so on the reply, naming the Whiteboard only when the compile offered it (BL-1785)', async () => {
+    const reply = 'All done.\n<batshit-tool-notes>{"notes":[{"toolName":"bash","summary":"tests pass"}]}</batshit-tool-notes>'
+    const agent = { ...AGENT, zip_tool_notes_enabled: false }
+    for (const [whiteboardAvailable, hint] of [
+      [true, 'Put what you still need on your Whiteboard, or hold a file you still need open; Fetch Zip shows any earlier result again.'],
+      [false, 'Hold a file you still need open; Fetch Zip shows any earlier result again.']
+    ] as const) {
+      const result = await finalize(reply, { agent, whiteboardAvailable })
+      expect(result.metadata.zipControl?.toolResultsSummary).toEqual([])
+      expect(result.metadata.controlErrors).toEqual([expect.objectContaining({
+        tag: 'batshit-tool-notes', error: 'Tool Notes are off for this agent; the notes in this reply were not saved.', hint
+      })])
+    }
+  })
+
+  it('with Tool Notes off, a refused hold\'s fix line names no notes (BL-1785 review M1)', async () => {
+    const result = await finalize('Keep it.\n<batshit-tool-notes>{"hold":["src/missing.ts"]}</batshit-tool-notes>', {
+      agent: { ...AGENT, zip_tool_notes_enabled: false }
+    })
+    expect(result.metadata.controlErrors).toEqual([expect.objectContaining({
+      hint: 'Use <batshit-tool-notes>{"hold":["path/to/file"],"release":["path/to/file"]}</batshit-tool-notes>; leave out notes.'
+    })])
+    const on = await finalize('Keep it.\n<batshit-tool-notes>{"hold":["src/missing.ts"]}</batshit-tool-notes>')
+    expect(on.metadata.controlErrors[0].hint).toContain('"notes"')
+  })
+
   it('holds the file the reply read and says the zip state changed', async () => {
     await readZip('cool_tool_1790600000000_fin01', 'src/app.ts')
     const result = await finalize(
@@ -116,74 +142,31 @@ describe('finalizeReplyControl (a headless reply)', () => {
     expect(result.metadata.controlErrors[0].error).toContain('at most 12 memory save blocks')
   })
 
-  it('says loudly that zip actions were ignored when the hidden permission is off', async () => {
-    const result = await finalize('Ok.\n<batshit-zip-control>{"unzip":["tool_result_1"]}</batshit-zip-control>')
-    expect(result.content).toBe('Ok.')
-    expect(result.metadata.controlErrors[0]).toMatchObject({
+  // Decision 7 (Josh, 2026-10-23): agent zip control is retired. The `zip_agent_control_experiment`
+  // key is retired with it and must not turn anything on, whoever carries it.
+  it('ignores a reply\'s unzip and zip actions with one loud error, changing no zip state, even with the retired experiment key set', async () => {
+    const zipId = 'cool_tool_1790600000000_fin02'
+    await readZip(zipId, 'a.ts')
+    const reply = `Ok.\n{{batshit-zip:${zipId}}}\n<batshit-zip-control>{"unzip":["tool_result_1"],"zip":["x"]}</batshit-zip-control>`
+    const expected = {
       tag: 'batshit-zip-control',
-      error: 'Zip control is off for you, so the unzip and zip actions were ignored.'
-    })
-  })
+      error: 'Agents cannot unzip or zip results, so the unzip and zip actions were ignored.',
+      hint: 'To keep a file you read open, hold it: <batshit-tool-notes>{"hold":["path/to/file"]}</batshit-tool-notes>. Use Fetch Zip to read an earlier result.'
+    }
 
-  // SA-129 DL-06 (BL-1484): only the experiment key turns the parked actions on. The older key's
-  // stored true (Josh's Mac app: global and three agents) is ignored, so the actions stay off.
-  it('ignores a stored legacy zip_agent_control_enabled true, global or agent: the actions stay off', async () => {
-    await readZip('cool_tool_1790600000000_fin03', 'b.ts')
-    const result = await finalize(
-      'Ok.\n{{batshit-zip:cool_tool_1790600000000_fin03}}\n<batshit-zip-control>{"unzip":["tool_result_1"]}</batshit-zip-control>',
-      {
-        replyZipIds: ['cool_tool_1790600000000_fin03'],
-        agent: { ...AGENT, zip_agent_control_enabled: true, zip_control_mode: 'agent' },
-        globalZipSettings: { zip_agent_control_enabled: true }
-      }
-    )
-    expect(result.metadata.controlErrors?.[0]).toMatchObject({
-      tag: 'batshit-zip-control',
-      error: 'Zip control is off for you, so the unzip and zip actions were ignored.'
-    })
-    expect(await redis.get(`unzipped_item:${SESSION}:cool_tool_1790600000000_fin03`)).toBeNull()
-  })
-
-  it('the global experiment key turns the parked actions on for an agent with no key of its own', async () => {
-    await readZip('cool_tool_1790600000000_fin04', 'c.ts')
-    const result = await finalize(
-      'Ok.\n{{batshit-zip:cool_tool_1790600000000_fin04}}\n<batshit-zip-control>{"unzip":["tool_result_1"]}</batshit-zip-control>',
-      { replyZipIds: ['cool_tool_1790600000000_fin04'], globalZipSettings: { zip_agent_control_experiment: true } }
-    )
-    expect(result.zipStateChanged).toBe('agent')
-    expect(await redis.get(`unzipped_item:${SESSION}:cool_tool_1790600000000_fin04`)).toMatchObject({ source: 'agent' })
-  })
-
-  it('applies the parked zip actions when the hidden permission is on', async () => {
-    await readZip('cool_tool_1790600000000_fin02', 'a.ts')
-    const result = await finalize(
-      'Ok.\n{{batshit-zip:cool_tool_1790600000000_fin02}}\n<batshit-zip-control>{"unzip":["tool_result_1"]}</batshit-zip-control>',
-      { replyZipIds: ['cool_tool_1790600000000_fin02'], agent: { ...AGENT, zip_agent_control_experiment: true } }
-    )
-    expect(result.zipStateChanged).toBe('agent')
-    // BL-539: the record names the agent, so deleting the agent releases it.
-    expect(await redis.get(`unzipped_item:${SESSION}:cool_tool_1790600000000_fin02`)).toMatchObject({
-      source: 'agent',
-      permanent: true,
-      agentId: AGENT.id
-    })
-  })
-
-  it('records a too-large parked unzip refusal on the reply', async () => {
-    const zipId = 'cool_tool_1790600000000_largezip'
-    await readZip(zipId, 'huge.ts')
-    const zip = await redis.getZip(zipId)
-    await redis.execute((client: any) => client.json.set(`zip:${zipId}`, '$', {
-      ...zip,
-      metadata: { ...zip.metadata, promptTokens: 25_000, tokenBasis: 'ai_expanded' }
-    }))
-    const result = await finalize(
-      `Ok.\n{{batshit-zip:${zipId}}}\n<batshit-zip-control>{"unzip":["tool_result_1"]}</batshit-zip-control>`,
-      { replyZipIds: [zipId], agent: { ...AGENT, zip_agent_control_experiment: true } }
-    )
-    expect(result.metadata.controlErrors?.[0]).toMatchObject({ tag: 'batshit-zip-control' })
-    expect(result.metadata.controlErrors?.[0].error).toContain('25,000 tokens')
-    expect(await redis.get(`unzipped_item:${SESSION}:${zipId}`)).toBeNull()
+    for (const [agent, globalZipSettings] of [
+      [AGENT, {}],
+      [{ ...AGENT, zip_agent_control_experiment: true }, { zip_agent_control_experiment: true }]
+    ] as const) {
+      const result = await finalize(reply, { replyZipIds: [zipId], agent, globalZipSettings })
+      expect(result.content).toBe(`Ok.\n{{batshit-zip:${zipId}}}`)
+      expect(result.metadata.controlErrors).toEqual([expect.objectContaining(expected)])
+      expect(result.metadata.zipHolds).toBeUndefined()
+      expect(result.zipStateChanged).toBeNull()
+      expect(await redis.get(`unzipped_item:${SESSION}:${zipId}`)).toBeNull()
+      expect(await redis.sMembers(`unzipped:${SESSION}`)).toEqual([])
+      expect(await redis.sMembers(`rezipped:${SESSION}`)).toEqual([])
+    }
   })
 
   it('counts the reply toward a temporary hold, except an approval resume (the same message)', async () => {
@@ -328,26 +311,26 @@ describe('a reply-end step that failed still tells the tabs (BL-537)', () => {
     expect(result.zipStateChanged).toBe('agent')
   })
 
-  it('a parked zip action that failed', async () => {
-    await readZip('cool_tool_1790600000000_fin22', 'src/a.ts')
-    restore = failRedisWritesTouching((key) => key === `unzipped_item:${SESSION}:cool_tool_1790600000000_fin22`)
-
-    const result = await finalize(
-      `Unzip.\n{{batshit-zip:cool_tool_1790600000000_fin22}}\n<batshit-zip-control>{"unzip":["cool_tool_1790600000000_fin22"]}</batshit-zip-control>`,
-      { replyZipIds: ['cool_tool_1790600000000_fin22'], agent: { ...AGENT, zip_agent_control_experiment: true } }
-    )
-
-    expect(result.zipStateChanged).toBe('agent')
-    expect(JSON.stringify(result.metadata.controlErrors)).toContain("could not finish this reply's zip actions")
-  })
-
   it('a countdown that failed', async () => {
     await redis.sAdd(`unzipped:${SESSION}`, 'zip_temp')
     await redis.set(`unzipped_item:${SESSION}:zip_temp`, { zipId: 'zip_temp', sessionId: SESSION, permanent: false, duration: 5, messageCount: 0, unzippedAt: 1, source: 'user' })
-    restore = failRedisWritesTouching((key) => key === `unzipped_item:${SESSION}:zip_temp`)
+    // Countdown now updates the strict JSON facade directly. Fail that actual
+    // write rather than the retired redis.set path or an unrelated hold MULTI.
+    const original = (redis.json.set as any).getMockImplementation?.() ?? redis.json.set.bind(redis.json)
+    let failed = false
+    const spy = vi.spyOn(redis.json, 'set').mockImplementation(async (key: any, ...args: any[]) => {
+      if (key === `unzipped_item:${SESSION}:zip_temp`) {
+        failed = true
+        throw new Error('Redis connection lost')
+      }
+      return original(key, ...args)
+    })
+    restore = () => spy.mockRestore()
 
     const result = await finalize('Just words.')
 
+    expect(failed).toBe(true)
+    expect(await redis.get(`unzipped_item:${SESSION}:zip_temp`)).toMatchObject({ messageCount: 0 })
     expect(result.zipStateChanged).toBe('countdown')
     expect(JSON.stringify(result.metadata.controlErrors)).toContain('could not count this reply')
   })
@@ -438,5 +421,20 @@ describe('finalizeReplyControl: what counts as a control block (BL-442)', () => 
         error: 'Unclosed <batshit-tool-notes> block (missing </batshit-tool-notes>).'
       })
     ])
+  })
+})
+
+describe('BL-695: a reply that is only an open cue block', () => {
+  it('stores no words and one loud error the next turn reads', async () => {
+    const result = await finalize('<batshit-cue>{"goon_mood":"happy"}')
+    expect(result.content).toBe('')
+    expect(result.metadata.controlErrors?.map((error: any) => error.tag)).toEqual(['batshit-cue'])
+    expect(buildControlErrorDcmLines([{ role: 'assistant', metadata: result.metadata }]).join('\n')).toContain('<batshit-cue>: Unclosed')
+  })
+
+  it('keeps the words after an open cue block, with the same error', async () => {
+    const result = await finalize('<batshit-cue>{"goon_mood":"happy"}\nThe answer is 4.')
+    expect(result.content).toBe('The answer is 4.')
+    expect(result.metadata.controlErrors?.map((error: any) => error.tag)).toEqual(['batshit-cue'])
   })
 })

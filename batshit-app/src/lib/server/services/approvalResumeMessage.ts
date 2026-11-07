@@ -414,6 +414,21 @@ export function mergeResumedMetadata(prior: unknown, resumed: Record<string, any
   const before = prior && typeof prior === 'object' ? (prior as Record<string, any>) : {}
   const merged: Record<string, any> = { ...resumed }
 
+  // Failure writers may not have reached compilation. Keep the server-frozen Whiteboard fragment; a
+  // settled reply explicitly supplies null, which must win over the paused snapshot.
+  if (!Object.prototype.hasOwnProperty.call(resumed, 'whiteboardContextSnapshot') &&
+      before.whiteboardContextSnapshot !== undefined) {
+    merged.whiteboardContextSnapshot = before.whiteboardContextSnapshot
+  }
+  // SA-137 (D7): a resume runs only after its click was recorded, and a recorded click never runs
+  // again (`approval_already_answered`), so a failed resume ends its pause: the live-file-read
+  // replay is cleared, never carried (else up to 1 MiB stays inert with no expiry to clear it). An
+  // absent field stays absent; a writer that names it wins.
+  if (!Object.prototype.hasOwnProperty.call(resumed, 'liveFileReadSnapshot') &&
+      before.liveFileReadSnapshot !== undefined && before.liveFileReadSnapshot !== null) {
+    merged.liveFileReadSnapshot = null
+  }
+
   for (const key of ['zipIds', 'imageZipIds'] as const) {
     const union = unionStrings(before[key], resumed[key])
     if (union.length > 0) merged[key] = union
@@ -507,14 +522,12 @@ export function hasUserTurnContent(content: unknown): boolean {
 /**
  * Does this send resume an approval IN PLACE — into the message the card was on? Approval
  * responses and no user turn of its own, exactly `isApprovalResumeWithoutUserTurn` in the
- * stream handler. A managed CLI control resume is a NEW turn with its own ids, so it never is.
+ * stream handler.
  */
 export function isInPlaceApprovalResume(input: {
   approvalResponseCount: number
   content: unknown
-  controlResumeContent: string | null
 }): boolean {
-  if (input.controlResumeContent !== null) return false
   if (input.approvalResponseCount <= 0) return false
   return !hasUserTurnContent(input.content)
 }

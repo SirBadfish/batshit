@@ -1,3 +1,4 @@
+import { MemoryMutationError } from '$lib/server/services/memory/memoryMutation'
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { requireUser } from '$lib/server/services/routeSecurity'
 import {
@@ -9,6 +10,7 @@ import {
 import { MEMORY_MEDIA_MAX_SOURCE_BYTES } from '$lib/server/services/memory/memoryMedia'
 
 function handleError(error: unknown, action: string): Response {
+  if (error instanceof MemoryMutationError) return json({ error: error.message, code: error.code }, { status: error.status })
   if (error instanceof MemoryManageError) return json({ error: error.message }, { status: error.status })
   console.error(`[Memory Media] ${action} failed:`, error)
   return json({ error: error instanceof Error ? error.message : `Memory media ${action} failed` }, { status: 500 })

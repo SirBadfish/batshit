@@ -22,7 +22,7 @@ function statuses(paused: boolean) {
 
 describe('/api/models connection options and paused plans', () => {
   it('locks each paused plan with its sentence even when its key is saved', () => {
-    const options = _buildConnectionOptions(access, { codex: null, pausedPlans: statuses(true) })
+    const options = _buildConnectionOptions(access, { pausedPlans: statuses(true) })
     for (const plan of PAUSED_PLANS) {
       const option = options.find((entry) => entry.id === `direct:${plan.service}`)
       expect(option).toMatchObject({ status: 'locked', lockedReason: pausedPlanSentence(plan) })
@@ -31,7 +31,7 @@ describe('/api/models connection options and paused plans', () => {
   })
 
   it('on a Dev copy that allows paused plans the plan is ready and says so', () => {
-    const options = _buildConnectionOptions(access, { codex: null, pausedPlans: statuses(false) })
+    const options = _buildConnectionOptions(access, { pausedPlans: statuses(false) })
     const zai = options.find((entry) => entry.id === 'direct:zai_coding')
     expect(zai?.status).toBe('ready')
     expect(zai?.description).toContain('paused for other copies of Batshit')

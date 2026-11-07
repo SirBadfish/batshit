@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+import { withSettingsRecordReplacement } from '../services/appActions/settings/lifecycle'
 import { spawn } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import http from 'node:http'
@@ -7,18 +9,53 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mockRedisJsonGet = vi.fn()
+const mockConfiguredRegistryEval = vi.fn()
 const mockRedisJsonSet = vi.fn()
 const mockGetUserSettings = vi.fn()
 const mockUpdateUserSettings = vi.fn()
 const mockGetAgents = vi.fn()
 const mockUpdateAgent = vi.fn()
 const mockGetVoiceProfiles = vi.fn()
+const mockRawProfileInventory = vi.fn()
+const mockRawProfileRead = vi.fn()
+const mockGetRawVoiceProfile = vi.fn()
+async function rawProfileInventoryReply(script: string, args: { keys: string[]; arguments: string[] }) {
+  const override = await mockRawProfileRead(script, args)
+  if (override !== undefined) return override
+  const rows = await mockRawProfileInventory() as Array<Record<string, any>>
+  if (script.includes('VOICE_PROFILE_RAW_INVENTORY_IDS')) {
+    return rows.length > 1024 ? ['LIMIT', String(rows.length)] : ['OK', ...rows.map(row => row.id)]
+  }
+  const ids = JSON.parse(args.arguments[0]) as string[], paths = JSON.parse(args.arguments[1]) as string[]
+  const out: string[] = ['OK', String(rows.length)]
+  let bytes = 0
+  for (const id of [...ids].sort()) {
+    const row = rows.find(row => row.id === id)
+    if (!row) return ['UNAVAILABLE']
+    const raw = JSON.stringify([row]); bytes += Buffer.byteLength(raw)
+    if (Buffer.byteLength(raw) > 65536 || bytes > 262144) return ['UNAVAILABLE']
+    out.push(id, createHash('sha1').update(raw).digest('hex'), raw)
+    for (const path of paths) out.push(row[path.slice(2)] === undefined ? '[]' : JSON.stringify([row[path.slice(2)]]))
+  }
+  return out
+}
 const mockGetVoiceProfile = vi.fn()
 const mockCreateVoiceProfile = vi.fn()
 const mockDeleteVoiceProfile = vi.fn()
 const mockResolveLiveKitRuntimeEngineRefs = vi.fn(async (_userId: string): Promise<unknown[]> => [])
 const mockRedisExecute = vi.fn(async (operation: any) =>
   operation({
+    eval: async (script: string, args: { keys: string[]; arguments: string[] }) => {
+      if (script.includes('VOICE_PROFILE_RAW_INVENTORY_')) return rawProfileInventoryReply(script, args)
+      if (args.keys[0]?.startsWith('agent:') && args.arguments[1] === 'engine-clear') {
+        const record = await mockRedisJsonGet(args.keys[0])
+        if (!record) return ['MISSING']
+        const { agentTypeSnapshotOf } = await import('$lib/test-utils/agentUpdateScriptTwin')
+        const kind = (value: unknown) => value === undefined ? '' : value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value
+        return ['OK', ...(JSON.parse(args.arguments[0]) as string[]).map(path => agentTypeSnapshotOf(record, [path])), kind(record.voice_profile), kind(record.voice_profile?.tts), agentTypeSnapshotOf(record, ['$.voice_profile'])]
+      }
+      return mockConfiguredRegistryEval(script, args)
+    },
     json: {
       get: mockRedisJsonGet,
       set: mockRedisJsonSet
@@ -41,6 +78,7 @@ vi.mock('$lib/server/redis', () => ({
     getVoiceProfile: (...args: any[]) => mockGetVoiceProfile(...args),
     createVoiceProfile: (...args: any[]) => mockCreateVoiceProfile(...args),
     deleteVoiceProfile: (...args: any[]) => mockDeleteVoiceProfile(...args),
+    json: { getRaw: (...args: any[]) => mockGetRawVoiceProfile(...args) },
     execute: (...args: any[]) => mockRedisExecute(...args)
   }
 }))
@@ -60,9 +98,297 @@ describe('voiceEngineRegistry', () => {
     mockGetAgents.mockResolvedValue([])
     mockUpdateAgent.mockResolvedValue(undefined)
     mockGetVoiceProfiles.mockResolvedValue([])
+    mockRawProfileInventory.mockReset().mockResolvedValue([])
+    mockRawProfileRead.mockReset()
+    mockGetRawVoiceProfile.mockReset().mockImplementation(async (key: string) => {
+      const row = (await mockRawProfileInventory()).find((row: any) => key === `voice_profile:${row.id}`)
+      return row ? JSON.stringify([row]) : null
+    })
     mockGetVoiceProfile.mockResolvedValue(null)
     mockCreateVoiceProfile.mockImplementation(async (profile: any) => profile)
-    mockDeleteVoiceProfile.mockResolvedValue(undefined)
+    mockDeleteVoiceProfile.mockImplementation((id: string, _user: string, beforeDelete?: () => Promise<void>) =>
+      withSettingsRecordReplacement(`voice_profile:${id}`, async () => { await beforeDelete?.() }))
+  })
+
+  describe('delete terminal configuration outcome', () => {
+    const KEY = 'voice_engine_registry:user-1'
+    let store: Record<string, any>, voice: Record<string, any>
+    beforeEach(() => {
+      store = { version: 1, records: [{ id: 'delete-proof', name: 'Delete Proof', enabled: true,
+        baseUrl: 'http://127.0.0.1:9999', requestFormat: 'openai-compatible', ttsPath: '/v1/audio/speech' }] }
+      voice = { schemaVersion: 2, tts: { providerId: 'byo:delete-proof' } }
+      mockRedisJsonGet.mockReset().mockImplementation(async () => JSON.parse(JSON.stringify(store)))
+      mockRedisJsonSet.mockReset().mockImplementation(async (_key: string, _path: string, value: any) => {
+        store = JSON.parse(JSON.stringify(value)); return 'OK'
+      })
+      mockGetUserSettings.mockReset().mockImplementation(async () => ({ id: 's', user_id: 'user-1', voice_settings: voice }))
+      mockUpdateUserSettings.mockReset().mockImplementation(async (_user: string, updates: any) => {
+        voice = updates.voice_settings; return { id: 's', user_id: 'user-1', voice_settings: voice }
+      })
+    })
+    async function failure() {
+      const { deleteVoiceEngineRecord, VoiceEngineDeleteError } = await import('../services/voiceEngineRegistry')
+      const error = await deleteVoiceEngineRecord('user-1', ' DeLeTe-PrOoF ').then(() => undefined, error => error)
+      expect(error).toMatchObject({ deleteOutcome: { contract: 'voice-engine-delete-outcome/v1', engineId: 'delete-proof' } })
+      expect(error).toBeInstanceOf(VoiceEngineDeleteError)
+      return error
+    }
+
+    it('certifies only the pre-migration registry parser refusal as no-change', async () => {
+      store.version = 999
+      expect((await failure()).deleteOutcome.configurationOutcome).toBe('known_no_change')
+      for (const fn of [mockRedisJsonSet, mockGetUserSettings, mockUpdateUserSettings, mockGetAgents]) expect(fn).not.toHaveBeenCalled()
+    })
+
+    it.each(['changed', 'invalid', 'unavailable'] as const)('certifies an actual global %s not-written refusal after acknowledged removal', async kind => {
+      const { PresetReferenceWriteError } = await import('../services/modelPresetReferenceGuard')
+      const cause = new PresetReferenceWriteError(kind)
+      mockUpdateUserSettings.mockRejectedValueOnce(cause)
+      const error = await failure()
+      expect(error.deleteOutcome.configurationOutcome).toBe('known_settled_partial')
+      expect(error.cause).toBe(cause)
+      expect(error.status).toBe(cause.status)
+      expect(store.records).toEqual([])
+      expect(voice.tts.providerId).toBe('byo:delete-proof')
+      expect(mockGetAgents).not.toHaveBeenCalled()
+      expect(mockGetVoiceProfiles).not.toHaveBeenCalled()
+      expect(mockRedisJsonSet).toHaveBeenCalledWith(KEY, '$', { version: 1, records: [] })
+    })
+
+    it('does not use the same known refusal from legacy preparation to certify partial recovery', async () => {
+      const { PresetReferenceWriteError } = await import('../services/modelPresetReferenceGuard')
+      voice.byoProviders = [{ id: 'legacy-proof', name: 'Legacy', baseUrl: 'http://127.0.0.1:9998' }]
+      mockUpdateUserSettings.mockRejectedValueOnce(new PresetReferenceWriteError('changed'))
+      expect((await failure()).deleteOutcome.configurationOutcome).toBe('unknown')
+      expect(store.records.map((r: any) => r.id)).toContain('delete-proof')
+      expect(store.records.map((r: any) => r.id)).toContain('legacy-proof')
+      expect(mockGetAgents).not.toHaveBeenCalled()
+    })
+
+    it.each(['delete', 'migration'])('requires literal OK from the %s registry write, even after a fake stored effect', async phase => {
+      if (phase === 'migration') voice.byoProviders = [{ id: 'legacy-proof', name: 'Legacy', baseUrl: 'http://127.0.0.1:9998' }]
+      mockRedisJsonSet.mockImplementationOnce(async (_key: string, _path: string, value: any) => {
+        store = JSON.parse(JSON.stringify(value)); return 'UNFAMILIAR_ACK'
+      })
+      const error = await failure()
+      expect(error.deleteOutcome.configurationOutcome).toBe('unknown')
+      expect(error.status).toBe(503)
+      expect(mockUpdateUserSettings).not.toHaveBeenCalled()
+      expect(mockGetAgents).not.toHaveBeenCalled()
+    })
+
+    it('does not whitelist an issued registry rejection even when its error resembles a known refusal', async () => {
+      const { PresetReferenceWriteError } = await import('../services/modelPresetReferenceGuard')
+      mockRedisJsonSet.mockImplementationOnce(async (_key: string, _path: string, value: any) => {
+        store = JSON.parse(JSON.stringify(value)); throw new PresetReferenceWriteError('changed')
+      })
+      expect((await failure()).deleteOutcome.configurationOutcome).toBe('unknown')
+      expect(store.records).toEqual([])
+      expect(mockUpdateUserSettings).not.toHaveBeenCalled()
+    })
+
+    it('retains unknown after a fake global effect followed by issued-write rejection', async () => {
+      const { PresetReferenceWriteError } = await import('../services/modelPresetReferenceGuard')
+      mockUpdateUserSettings.mockImplementationOnce(async (_user: string, updates: any) => {
+        voice = updates.voice_settings; throw new PresetReferenceWriteError('unknown')
+      })
+      expect((await failure()).deleteOutcome.configurationOutcome).toBe('unknown')
+      expect(voice.tts).toEqual({ providerId: 'browser' })
+      expect(mockGetAgents).not.toHaveBeenCalled()
+    })
+
+    it.each(['unfamiliar', 'lifecycle'])('keeps a global %s error unknown without a string/status whitelist', async kind => {
+      const { SettingsLifecycleRefusal } = await import('../services/appActions/settings/lifecycle')
+      mockUpdateUserSettings.mockRejectedValueOnce(kind === 'lifecycle'
+        ? new SettingsLifecycleRefusal('unknown custody remains')
+        : Object.assign(new Error('Nothing was saved'), { status: 409, outcome: 'not_written' }))
+      expect((await failure()).deleteOutcome.configurationOutcome).toBe('unknown')
+    })
+
+    it.each(['agents', 'profiles'])('keeps %s errors unknown at their owned phase', async phase => {
+      const { PresetReferenceWriteError } = await import('../services/modelPresetReferenceGuard')
+      ;(phase === 'agents' ? mockGetAgents : mockRawProfileRead).mockRejectedValueOnce(new PresetReferenceWriteError('changed'))
+      expect((await failure()).deleteOutcome.configurationOutcome).toBe('unknown')
+      // Complete profile preflight now fails before registry/default effects; agents remain later.
+      expect(voice.tts).toEqual({ providerId: phase === 'agents' ? 'browser' : 'byo:delete-proof' })
+    })
+
+    it('does not turn an absent retry into certification of the earlier operation', async () => {
+      store.records = []
+      const error = await failure()
+      expect(error.message).toMatch(/not registered/)
+      expect(error.deleteOutcome.configurationOutcome).toBe('unknown')
+      expect(mockRedisJsonSet).not.toHaveBeenCalled()
+    })
+
+    it('awaits the actual registry acknowledgement before reaching a known refused global step', async () => {
+      const { PresetReferenceWriteError } = await import('../services/modelPresetReferenceGuard')
+      let entered!: () => void, acknowledge!: (answer: string) => void
+      const started = new Promise<void>(resolve => { entered = resolve })
+      const ack = new Promise<string>(resolve => { acknowledge = resolve })
+      mockRedisJsonSet.mockImplementationOnce(async (_key: string, _path: string, value: any) => {
+        store = JSON.parse(JSON.stringify(value)); entered(); return ack
+      })
+      mockUpdateUserSettings.mockRejectedValueOnce(new PresetReferenceWriteError('changed'))
+      let finished = false
+      const flight = failure().then(error => { finished = true; return error })
+      await started
+      expect(finished).toBe(false)
+      expect(mockUpdateUserSettings).not.toHaveBeenCalled()
+      acknowledge('OK')
+      expect((await flight).deleteOutcome.configurationOutcome).toBe('known_settled_partial')
+    })
+
+    it('does not impose the delete-private acknowledgement rule on another registry writer', async () => {
+      const { upsertVoiceEngineRecord } = await import('../services/voiceEngineRegistry')
+      mockRedisJsonSet.mockResolvedValueOnce(undefined)
+      await expect(upsertVoiceEngineRecord('user-1', 'delete-proof', { name: 'New Name' })).resolves.toMatchObject({ created: false })
+    })
+  })
+
+  describe('BL-2108 complete pre-registry cleanup cohort', () => {
+    const key = 'voice_engine_registry:user-1'
+    let registry: any
+    beforeEach(() => {
+      registry = { version: 1, records: [{ id: 'cohort-engine', name: 'Cohort', enabled: true,
+        baseUrl: 'http://127.0.0.1:9999', requestFormat: 'openai-compatible', ttsPath: '/v1/audio/speech' }] }
+      mockRedisJsonGet.mockReset().mockImplementation(async () => registry)
+      mockRedisJsonSet.mockReset().mockImplementation(async (_key: string, _path: string, value: any) => { registry = value; return 'OK' })
+      mockGetUserSettings.mockReset().mockResolvedValue({ id: 's', user_id: 'user-1', voice_settings: { tts: { providerId: 'byo:cohort-engine' } } })
+      mockUpdateUserSettings.mockReset().mockResolvedValue({ id: 's', user_id: 'user-1' })
+    })
+    const row = (id = 'cohort-profile') => ({ id, user_id: 'user-1', provider: 'byo:cohort-engine' })
+    async function refused() {
+      const { deleteVoiceEngineRecord } = await import('../services/voiceEngineRegistry')
+      const error = await deleteVoiceEngineRecord('user-1', 'cohort-engine').then(() => undefined, error => error)
+      expect(registry.records.map((r: any) => r.id)).toEqual(['cohort-engine'])
+      expect(error).toMatchObject({ deleteOutcome: { engineId: 'cohort-engine', configurationOutcome: 'unknown' } })
+      for (const fn of [mockRedisJsonSet, mockUpdateUserSettings, mockGetAgents, mockDeleteVoiceProfile]) expect(fn).not.toHaveBeenCalled()
+      return error
+    }
+
+    it('refuses an incomplete required raw cohort before registry removal instead of trusting a skipped display row', async () => {
+      const readable = row('readable'), unreadable = row('unreadable')
+      mockRawProfileInventory.mockResolvedValue([readable, unreadable])
+      // The old best-effort display list omits the second required record.
+      mockGetVoiceProfiles.mockResolvedValue([readable])
+      mockRawProfileRead.mockImplementation(async (script: string) => script.includes('VOICE_PROFILE_RAW_INVENTORY_READ') ? ['UNAVAILABLE'] : undefined)
+      await refused()
+      expect(mockGetVoiceProfiles).not.toHaveBeenCalled()
+    })
+
+    it('refuses roster growth between the original inventory and raw read', async () => {
+      mockRawProfileInventory.mockResolvedValue([row()])
+      const raw = JSON.stringify([row()])
+      mockRawProfileRead.mockImplementation(async (script: string) => script.includes('VOICE_PROFILE_RAW_INVENTORY_READ')
+        ? ['OK', '2', 'cohort-profile', createHash('sha1').update(raw).digest('hex'), raw] : undefined)
+      await refused()
+    })
+
+    it.each([
+      { ...row(), provider: null }, { ...row(), user_id: 'someone-else' }
+    ])('refuses an unreadable required identity/owner/provider before any removal', async profile => {
+      mockRawProfileInventory.mockResolvedValue([profile])
+      await refused()
+    })
+
+    it('refuses an indexed ID whose raw record has a different ID', async () => {
+      mockRawProfileInventory.mockResolvedValue([row()])
+      const raw = JSON.stringify([{ ...row(), id: 'other-id' }])
+      mockRawProfileRead.mockImplementation(async (script: string) => script.includes('VOICE_PROFILE_RAW_INVENTORY_READ')
+        ? ['OK', '1', 'cohort-profile', createHash('sha1').update(raw).digest('hex'), raw] : undefined)
+      await refused()
+    })
+
+    it.each(['count', 'id-bytes', 'raw-bytes', 'cohort-bytes'] as const)('refuses the selected %s limit before registry removal', async limit => {
+      const profiles = limit === 'count' ? Array.from({ length: 1025 }, (_, i) => row(`row-${i}`))
+        : limit === 'id-bytes' ? [row('é'.repeat(129))]
+        : limit === 'raw-bytes' ? [{ ...row(), extension: 'x'.repeat(65536) }]
+        : Array.from({ length: 5 }, (_, i) => ({ ...row(`row-${i}`), extension: 'x'.repeat(60000) }))
+      mockRawProfileInventory.mockResolvedValue(profiles)
+      await refused()
+    })
+
+    it('does not import picker-only fields or their projected-field limit into cleanup', async () => {
+      mockRawProfileInventory.mockResolvedValue([{ ...row(), name: 'n'.repeat(20000), model: { future: true } }])
+      const { deleteVoiceEngineRecord } = await import('../services/voiceEngineRegistry')
+      const deleted = await deleteVoiceEngineRecord('user-1', 'cohort-engine')
+      expect(deleted.deletedVoiceProfileIds).toEqual(['cohort-profile'])
+      expect(mockDeleteVoiceProfile).toHaveBeenCalledTimes(1)
+      expect(mockGetVoiceProfiles).not.toHaveBeenCalled()
+      const calls = mockRawProfileRead.mock.calls.filter(([script]) => String(script).includes('VOICE_PROFILE_RAW_INVENTORY_READ'))
+      expect(calls).toHaveLength(1)
+      expect(JSON.parse(calls[0][1].arguments[1])).toEqual([])
+    })
+
+    it('consumes one visible/hidden-provider batch without its first deletion invalidating the next row', async () => {
+      registry.records[0].suite = { id: 'cohort-suite', role: 'primary' }
+      registry.records.push({ ...registry.records[0], id: 'cohort-hidden', name: 'Hidden', suite: { id: 'cohort-suite', role: 'clone', hidden: true } })
+      mockRawProfileInventory.mockResolvedValue([row('row-a'), { ...row('row-b'), provider: 'byo:cohort-hidden' }])
+      const { deleteVoiceEngineRecord } = await import('../services/voiceEngineRegistry')
+      expect((await deleteVoiceEngineRecord('user-1', 'cohort-engine')).deletedVoiceProfileIds).toEqual(['row-a', 'row-b'])
+      expect(mockRawProfileRead.mock.calls.filter(([script]) => String(script).includes('VOICE_PROFILE_RAW_INVENTORY_IDS'))).toHaveLength(1)
+      expect(mockRawProfileRead.mock.calls.filter(([script]) => String(script).includes('VOICE_PROFILE_RAW_INVENTORY_READ'))).toHaveLength(1)
+    })
+
+    it('refuses a byte-identical replacement before entering the next profile fence', async () => {
+      mockRawProfileInventory.mockResolvedValue([row()])
+      const { prepareVoiceProfileCleanup, deletePreparedVoiceProfiles } = await import('../services/voiceProfileRecords')
+      const prepared = await prepareVoiceProfileCleanup('user-1', ['byo:cohort-engine'])
+      await withSettingsRecordReplacement('voice_profile:cohort-profile', async () => {})
+      await expect(deletePreparedVoiceProfiles(prepared)).rejects.toMatchObject({ code: 'SETTINGS_LIFECYCLE_CHANGED' })
+      expect(mockDeleteVoiceProfile).not.toHaveBeenCalled()
+    })
+
+    it('refuses changed raw data inside the admitted fence', async () => {
+      const current = row()
+      mockRawProfileInventory.mockResolvedValue([current])
+      const { prepareVoiceProfileCleanup, deletePreparedVoiceProfiles } = await import('../services/voiceProfileRecords')
+      const prepared = await prepareVoiceProfileCleanup('user-1', ['byo:cohort-engine'])
+      mockGetRawVoiceProfile.mockResolvedValueOnce(JSON.stringify([{ ...current, provider: 'byo:other-engine' }]))
+      await expect(deletePreparedVoiceProfiles(prepared)).rejects.toThrow('changed after cleanup was prepared')
+    })
+
+    it('refuses restore beginning during the awaited raw reread before any sample removal', async () => {
+      const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'profile-restore-pre-rm-'))
+      const oldHome = process.env.BATSHIT_HOME_DIR
+      process.env.BATSHIT_HOME_DIR = tempRoot
+      const dir = path.join(tempRoot, 'voice-profiles', 'cohort-profile')
+      await mkdir(dir, { recursive: true }); const audio = path.join(dir, 'reference.wav'); await writeFile(audio, 'retained sample')
+      const current = { ...row(), settings: { batshitManagedReferenceAudioPath: audio } }
+      mockRawProfileInventory.mockResolvedValue([current])
+      try {
+        const { prepareVoiceProfileCleanup, deletePreparedVoiceProfiles } = await import('../services/voiceProfileRecords')
+        const { withSettingsRestoreFence } = await import('../services/appActions/settings/lifecycle')
+        const prepared = await prepareVoiceProfileCleanup('user-1', ['byo:cohort-engine'])
+        let entered!: () => void, release!: (raw: string) => void
+        const started = new Promise<void>(resolve => { entered = resolve })
+        const raw = new Promise<string>(resolve => { release = resolve })
+        mockGetRawVoiceProfile.mockImplementationOnce(() => { entered(); return raw })
+        const deleting = deletePreparedVoiceProfiles(prepared).then(() => undefined, error => error)
+        await started
+        const restoring = withSettingsRestoreFence(async () => {})
+        release(JSON.stringify([current]))
+        expect(await deleting).toMatchObject({ code: 'SETTINGS_LIFECYCLE_CHANGED' })
+        await restoring
+        expect(await readFile(audio, 'utf8')).toBe('retained sample')
+      } finally {
+        if (oldHome === undefined) delete process.env.BATSHIT_HOME_DIR; else process.env.BATSHIT_HOME_DIR = oldHome
+        await rm(tempRoot, { recursive: true, force: true })
+      }
+    })
+  })
+
+  it('A10 reads configured engines without migration/status and retains no raw auth or endpoint payload', async () => {
+    mockConfiguredRegistryEval.mockResolvedValue(['OK', JSON.stringify([{ version: 1, records: [{ id: 'a10-closed', name: 'Configured Closed', enabled: true, supportsTts: true, supportsStt: false,
+      baseUrl: 'http://private.example/PRIVATE_ENDPOINT', authToken: 'PRIVATE_TOKEN', ttsDefaults: { modelId: 'saved', voiceId: 'voice' } }] }])])
+    const { readConfiguredVoiceEngineSelectionSource } = await import('../services/voiceEngineRegistry')
+    const source = await readConfiguredVoiceEngineSelectionSource('user-1')
+    expect(source.engines).toMatchObject([{ id: 'byo:a10-closed', enabled: true, supportsTts: true, model: 'saved', voice: 'voice' }])
+    expect(source.guard).toMatchObject({ fingerprint: expect.stringMatching(/^[a-f0-9]{40}$/), byteLimit: 262144 })
+    expect(JSON.stringify(source)).not.toMatch(/PRIVATE_ENDPOINT|PRIVATE_TOKEN|authToken|baseUrl/)
+    for (const owner of [mockGetUserSettings, mockUpdateUserSettings, mockResolveLiveKitRuntimeEngineRefs]) expect(owner).not.toHaveBeenCalled()
+    expect(mockConfiguredRegistryEval).toHaveBeenCalledOnce()
   })
 
   it('migrates legacy byoProviders out of voice settings into the server registry', async () => {
@@ -213,6 +539,40 @@ describe('voiceEngineRegistry', () => {
       authToken: 'secret-token',
       iconRef: { kind: 'brand', slug: 'openai-mono' },
       enabled: false
+    })
+  })
+
+  it('BL-978(e): omitted defaults preserve the current registry values during an unrelated public update', async () => {
+    const jsonStore = new Map<string, any>()
+    mockRedisJsonGet.mockImplementation(async (key: string) => jsonStore.get(key) ?? null)
+    mockRedisJsonSet.mockImplementation(async (key: string, _path: string, value: any) => {
+      jsonStore.set(key, value)
+      return 'OK'
+    })
+    mockGetUserSettings.mockResolvedValue({ voice_settings: undefined })
+    const { applyVoiceEnginePublicUpdates, getVoiceEngineRecord, upsertVoiceEngineRecord } =
+      await import('../services/voiceEngineRegistry')
+    const oldTts = { modelId: 'old-tts-model', voiceId: 'old-voice' }
+    const oldStt = { modelId: 'old-stt-model', language: 'en' }
+    await upsertVoiceEngineRecord('user-1', 'ownership-test', {
+      name: 'Ownership Test', baseUrl: 'http://localhost:9999', supportsTts: true, supportsStt: true,
+      ttsDefaults: oldTts, sttDefaults: oldStt
+    })
+    const currentTts = { modelId: 'current-tts-model', voiceId: 'current-voice' }
+    const currentStt = { modelId: 'current-stt-model', language: 'fr' }
+    await upsertVoiceEngineRecord('user-1', 'ownership-test', { ttsDefaults: currentTts, sttDefaults: currentStt })
+
+    await applyVoiceEnginePublicUpdates('user-1', [{
+      id: 'ownership-test', enabled: false, iconRef: { kind: 'brand', slug: 'openai-mono' },
+      localRuntime: { startup: { autoStartOnLaunch: true, stopOnShutdown: false } }
+    }])
+
+    const stored = await getVoiceEngineRecord('user-1', 'ownership-test')
+    expect(stored).toMatchObject({ enabled: false, ttsDefaults: currentTts, sttDefaults: currentStt,
+      iconRef: { kind: 'brand', slug: 'openai-mono' },
+      localRuntime: { startup: { autoStartOnLaunch: true, stopOnShutdown: false } } })
+    expect(jsonStore.get('voice_engine_registry:user-1').records[0]).toMatchObject({
+      ttsDefaults: currentTts, sttDefaults: currentStt, baseUrl: 'http://localhost:9999'
     })
   })
 
@@ -654,6 +1014,13 @@ describe('voiceEngineRegistry', () => {
         }
       }
     ])
+    // The clear owner rereads atomically; the stale listing is not a whole-block write basis.
+    jsonStore.set('agent:agent-tts', { id: 'agent-tts', user_id: 'user-1', agentType: 'api', created_at: '2026-10-18', voice_profile: {
+      schemaVersion: 2, tts: { providerId: 'byo:cleanup-test' }, stt: { providerId: 'browser', future: [0] }, extension: { keep: true }
+    } })
+    jsonStore.set('agent:agent-stt', { id: 'agent-stt', user_id: 'user-1', agentType: 'api', created_at: '2026-10-18', voice_profile: {
+      schemaVersion: 2, tts: { providerId: 'openai', voiceId: 'alloy' }, stt: { providerId: 'byo:cleanup-test' }, realtimeStt: { providerId: 'byo:cleanup-test' }
+    } })
 
     const { deleteVoiceEngineRecord, upsertVoiceEngineRecord } = await import('../services/voiceEngineRegistry')
 
@@ -671,15 +1038,15 @@ describe('voiceEngineRegistry', () => {
     expect(mockUpdateAgent).toHaveBeenCalledWith('agent-tts', {
       voice_profile: {
         schemaVersion: 2,
-        stt: { providerId: 'browser' }
+        tts: {}, stt: { providerId: 'browser', future: [0] }, extension: { keep: true }
       }
-    })
+    }, expect.objectContaining({ expectedTtsSelection: expect.stringMatching(/^sha256:/), voiceEngineClearBasis: expect.objectContaining({ fingerprint: expect.stringMatching(/^[a-f0-9]{40}$/) }) }))
     expect(mockUpdateAgent).toHaveBeenCalledWith('agent-stt', {
       voice_profile: {
         schemaVersion: 2,
-        tts: { providerId: 'openai', voiceId: 'alloy' }
+        tts: { providerId: 'openai', voiceId: 'alloy' }, stt: {}, realtimeStt: {}
       }
-    })
+    }, expect.objectContaining({ expectedTtsSelection: expect.stringMatching(/^sha256:/) }))
   })
 
   it('deletes saved voice clone profiles that belong to a deleted BYO engine', async () => {
@@ -697,7 +1064,7 @@ describe('voiceEngineRegistry', () => {
         schemaVersion: 2
       }
     })
-    mockGetVoiceProfiles.mockResolvedValue([
+    mockRawProfileInventory.mockResolvedValue([
       {
         id: 'clone-cleanup-test',
         user_id: 'user-1',
@@ -730,8 +1097,10 @@ describe('voiceEngineRegistry', () => {
     const deleted = await deleteVoiceEngineRecord('user-1', 'cleanup-test')
 
     expect(deleted.deletedVoiceProfileIds).toEqual(['clone-cleanup-test'])
-    expect(mockDeleteVoiceProfile).toHaveBeenCalledWith('clone-cleanup-test', 'user-1')
-    expect(mockDeleteVoiceProfile).not.toHaveBeenCalledWith('clone-other', 'user-1')
+    // 7dad6626a: the record delete carries its before-delete step (owner check, managed voice files).
+    expect(mockDeleteVoiceProfile).toHaveBeenCalledWith('clone-cleanup-test', 'user-1', expect.any(Function))
+    // Exactly this engine's profile, never another engine's (any argument shape).
+    expect(mockDeleteVoiceProfile.mock.calls.map((call: unknown[]) => call.slice(0, 2))).toEqual([['clone-cleanup-test', 'user-1']])
   })
 
   it('deletes Batshit-managed local engine files only when requested', async () => {

@@ -14,7 +14,7 @@ import type { BrokerFamilyRowControls } from './brokerFamilyRowControls'
 
 function buildControls(overrides: Partial<BrokerFamilyRowControls> = {}): BrokerFamilyRowControls {
   return {
-    label: 'Fabric Controls',
+    label: 'Fabric & Utilities',
     iconRef: { kind: 'batshit', id: 'fabric' },
     visible: true,
     value: 'group-only',
@@ -68,8 +68,8 @@ describe('BrokerFamilyToolGridRow', () => {
     // as a cell count of 1.
     expect(row?.querySelectorAll('td').length).toBe(3)
     expect(screen.getByRole('switch')).toBeTruthy()
-    expect(screen.getByLabelText('Fabric Controls discoverable')).toBeTruthy()
-    expect(screen.getByLabelText('Fabric Controls display detail')).toBeTruthy()
+    expect(screen.getByLabelText('Fabric & Utilities discoverable')).toBeTruthy()
+    expect(screen.getByLabelText('Fabric & Utilities display detail')).toBeTruthy()
   })
 
   it('keeps the Discoverable cell but drops the detail select when the family is hidden', () => {
@@ -77,15 +77,15 @@ describe('BrokerFamilyToolGridRow', () => {
 
     const row = document.querySelector('tr')
     expect(row?.querySelectorAll('td').length).toBe(3)
-    expect(screen.getByLabelText('Fabric Controls discoverable')).toBeTruthy()
-    expect(screen.queryByLabelText('Fabric Controls display detail')).toBeNull()
+    expect(screen.getByLabelText('Fabric & Utilities discoverable')).toBeTruthy()
+    expect(screen.queryByLabelText('Fabric & Utilities display detail')).toBeNull()
   })
 
   it('reports discoverability changes to the caller', async () => {
     const onVisibleChange = vi.fn()
     renderRow(buildControls({ onVisibleChange }))
 
-    const toggle = screen.getByLabelText('Fabric Controls discoverable') as HTMLElement
+    const toggle = screen.getByLabelText('Fabric & Utilities discoverable') as HTMLElement
     toggle.click()
 
     expect(onVisibleChange).toHaveBeenCalledWith(false)

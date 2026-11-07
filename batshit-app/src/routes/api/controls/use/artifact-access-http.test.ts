@@ -10,12 +10,7 @@ vi.mock('$lib/server/redis', async () =>
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import { ArtifactsService } from '$lib/server/artifacts/artifactsService'
-import {
-  AGENT_RUN_CREDENTIAL_HEADER,
-  mintRunCredential,
-  revokeRunCredential
-} from '$lib/server/services/agentRunCredentials'
-import { findControls } from '$lib/server/services/fabricRegistry'
+import { findControls, useControl } from '$lib/server/services/fabricRegistry'
 import { POST } from './+server'
 
 const REAL_REDIS_LANE = process.env.VITEST_USE_REAL_REDIS === 'true'
@@ -32,8 +27,7 @@ describe.runIf(REAL_REDIS_LANE)('BL-829 artifact access over the authenticated F
     const agentKey = `agent:${agentId}`
     const service = new ArtifactsService()
     let artifactId: string | null = null
-    let credentialId: string | null = null
-    const server = createServer(async (incoming, outgoing) => {
+        const server = createServer(async (incoming, outgoing) => {
       try {
         const chunks: Buffer[] = []
         for await (const chunk of incoming) chunks.push(Buffer.from(chunk))
@@ -66,8 +60,6 @@ describe.runIf(REAL_REDIS_LANE)('BL-829 artifact access over the authenticated F
         metadata: { enforce_batshit_artifact_structure: false }
       })
       artifactId = artifact.id
-      const credential = await mintRunCredential({ userId, agentId, sessionId, runtime: 'codex' })
-      credentialId = credential.credentialId
       await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
       const address = server.address()
       if (!address || typeof address === 'string') throw new Error('Artifact HTTP fixture has no port')
@@ -90,7 +82,7 @@ describe.runIf(REAL_REDIS_LANE)('BL-829 artifact access over the authenticated F
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          [AGENT_RUN_CREDENTIAL_HEADER]: credential.token
+          'x-batshit-agent-token': 'arc_retired.bsac_secret'
         },
         body: JSON.stringify({
           controlId: 'sys.artifact.update',
@@ -103,16 +95,17 @@ describe.runIf(REAL_REDIS_LANE)('BL-829 artifact access over the authenticated F
       })
       const body = await response.json()
 
-      expect(response.status).toBe(403)
-      expect(body).toMatchObject({
-        auth: 'agent',
-        actingAgentId: agentId,
-        success: false,
-        error: {
-          code: 'CONTROL_NOT_ALLOWED',
-          details: { status: 403, code: 'ARTIFACT_ACCESS_USER_ONLY' }
+      expect(response.status).toBe(401)
+      expect(body).toMatchObject({ success: false })
+      const api = await useControl({
+        userId, agentId, sessionId, actorType: 'in-process', runtimeMode: 'mode3',
+        controlId: 'sys.artifact.update', input: {
+          artifactId: artifact.id, content: '<div>Unauthorized replacement</div>', agent_access_scope: 'all'
         }
       })
+      expect(api).toMatchObject({ success: false, error: {
+        code: 'CONTROL_NOT_ALLOWED', details: { status: 403, code: 'ARTIFACT_ACCESS_USER_ONLY' }
+      } })
       expect(await service.getOwned(artifact.id, userId)).toMatchObject({
         content: artifact.content,
         version: artifact.version,
@@ -125,7 +118,6 @@ describe.runIf(REAL_REDIS_LANE)('BL-829 artifact access over the authenticated F
     } finally {
       server.closeAllConnections()
       if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()))
-      if (credentialId) await revokeRunCredential(credentialId, { agentId })
       if (artifactId) await service.delete(artifactId, userId)
       await redis.del(agentKey)
       await redis.execute(async (client) => {

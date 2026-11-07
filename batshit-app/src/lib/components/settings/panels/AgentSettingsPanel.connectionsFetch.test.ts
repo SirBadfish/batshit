@@ -23,19 +23,19 @@ import {
  * error text and does not retry by itself; a different Primary Agent type asks again once; the
  * explicit reloads (Local AI saved, the refresh of the model picker's data) stay as they were.
  *
+ * SA-139 R4: only the API type is a live Primary type, and only it asks. A leftover of the retired
+ * `cli` type asks nothing; switching back from it to an API agent is the type change that asks.
+ *
  * Renders the REAL panel. The loop is in the client, so the connections URL is a stub that answers
  * after a macrotask, the way a network does (an answer made only of microtasks would starve the
  * test's own timers and hang instead of failing); `/api/agents/<id>` goes to the REAL route handler
- * on the default lane's Redis fake, as in `AgentSettingsPanel.codexClampOnOpen.test.ts`.
+ * on the default lane's Redis fake, as in `AgentSettingsPanel.basicSaveInFlight.test.ts`.
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
-  syncAgentClaudeProfiles: vi.fn(async () => {}),
   deleteAgentClaudeConfig: vi.fn(async () => {}),
   agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
 }))
@@ -47,30 +47,13 @@ useRedisTestServer()
 
 const USER = 'ss977c_user'
 const AGENT = 'ss977c_agent'
-const NAME = 'Connections probe (Codex)'
+const NAME = 'Connections probe (API)'
 const OTHER = 'ss977c_other'
-const OTHER_NAME = 'Connections probe (API)'
+const OTHER_NAME = 'Connections probe (retired CLI)'
 const CONNECTIONS_URL = '/api/models?include=connections'
 // The route's own error text: the panel shows what the answer says (`extractError`).
 const ERROR_TEXT = 'Connections unreadable (probe)'
-
-const CODEX_BASE = {
-  permissionMode: 'chat',
-  includeProjectInstructions: true,
-  model: 'gpt-6-astra',
-  streamingEffect: true,
-  unifiedExec: true,
-  search: true,
-  sandbox: 'read-only',
-  approval: 'never',
-  configScope: 'managed',
-  addDirs: [] as string[],
-  enableFeatures: [] as string[],
-  disableFeatures: [] as string[],
-  configOverrides: [] as unknown[],
-  workingDirectoryMode: 'project',
-  historyPersistence: 'none'
-}
+const INVALID_CONNECTIONS_TEXT = 'Connection status could not be read. Refresh Saved Models to retry.'
 
 function ensureBrowserStubs() {
   if (typeof Element !== 'undefined' && typeof Element.prototype.animate !== 'function') {
@@ -103,6 +86,7 @@ function ensureBrowserStubs() {
 let routeModule: Awaited<ReturnType<typeof loadAgentRoute>>
 let connectionCalls = 0
 let connectionsAnswer: 'fail' | 'ok' = 'fail'
+let connectionsPayload: unknown
 let agentReads = 0
 let rendered: ReturnType<typeof render> | null = null
 const originalFetch = global.fetch
@@ -119,6 +103,7 @@ beforeEach(() => {
   ensureBrowserStubs()
   connectionCalls = 0
   connectionsAnswer = 'fail'
+  connectionsPayload = { data: { connections: [] } }
   agentReads = 0
   rendered = null
   vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -136,9 +121,10 @@ afterEach(() => {
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /**
- * A correct mount makes up to THREE requests: the default form's type (API) asks when the panel
- * mounts, `onMount`'s `refreshModelPickerData` asks with `force`, and the agent's own type (CLI)
- * asks when the agent's record lands. Which of them merge into one depends on timing, so the tests
+ * A correct mount makes a few requests: the default form's type (API) asks when the panel mounts and
+ * `onMount`'s `refreshModelPickerData` asks with `force` (before SA-139 R4, a CLI agent's own type
+ * asked a third time when its record landed; the bound below is unchanged). Which of them merge
+ * into one depends on timing, so the tests
  * never rely on the exact number of a mount: they wait until the loading has settled, bound it
  * here, and then assert what the count does from that point on. The old loop sent hundreds.
  */
@@ -165,7 +151,7 @@ function connectionsAnswerAfterMacrotask() {
         resolve(
           connectionsAnswer === 'fail'
             ? jsonResponse({ success: false, error: ERROR_TEXT }, 500)
-            : jsonResponse({ data: { connections: [] } })
+            : jsonResponse(connectionsPayload)
         ),
       2
     )
@@ -173,25 +159,24 @@ function connectionsAnswerAfterMacrotask() {
 }
 
 /**
- * Creates the Codex agent (a managed CLI type) and an API agent (another managed type), installs
- * the routes, and renders the panel on the Codex agent past the autosave debounces.
+ * Creates the API agent and a stored leftover of the retired `cli` Primary type, installs the
+ * routes, and renders the panel on the API agent past the autosave debounces.
  */
 async function openPanel() {
   await redis.createAgent({
     id: OTHER,
     user_id: USER,
     displayName: OTHER_NAME,
-    agentType: 'api'
+    agentType: 'cli',
+    primary_model_provider: 'claude-cli',
+    primary_model_name: 'claude-cli',
+    primary_model_connection: { type: 'cli', service: 'claude-cli' }
   } as any)
   await redis.createAgent({
     id: AGENT,
     user_id: USER,
     displayName: NAME,
-    agentType: 'cli',
-    primary_model_provider: 'codex',
-    primary_model_name: 'gpt-6-astra',
-    primary_model_connection: { type: 'cli', service: 'codex' },
-    codex_settings: CODEX_BASE
+    agentType: 'api'
   } as any)
   const routes = installAgentRoutes({
     agentId: AGENT,
@@ -215,7 +200,7 @@ async function openPanel() {
       if (path === '/api/subagents' && method === 'GET') return jsonResponse({ subagents: [] })
       if (path === '/api/user/saved-models') return jsonResponse({ models: [] })
       if (path === '/api/settings/api-keys') return jsonResponse({ keys: {} })
-      if (path === '/api/goons') return jsonResponse({ goons: [] })
+      if (path === '/api/goons') return jsonResponse({ ownerId: 'josh', goons: [] })
       if (path === '/api/mcp/gateways') return jsonResponse({ gateways: [] })
       if (path === '/api/cli-tools') return jsonResponse({ tools: [] })
       if (path === '/api/icons/library') return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
@@ -261,6 +246,37 @@ async function switchTo(name: string) {
 }
 
 describe('Agent Settings asks for the connection status only when the agent type asks for it (BL-977 companion)', () => {
+  it.each([
+    ['missing data', {}],
+    ['missing connections', { data: {} }],
+    ['null connections', { data: { connections: null } }],
+    ['object connections', { data: { connections: {} } }],
+    ['string connections', { data: { connections: 'not an array' } }],
+    ['null row', { data: { connections: [null] } }],
+    ['array row', { data: { connections: [[]] } }],
+    ['missing identity', { data: { connections: [{ status: 'ready' }] } }],
+    ['non-string identity', { data: { connections: [{ id: 12, status: 'ready' }] } }],
+    ['blank identity', { data: { connections: [{ id: ' ', status: 'locked' }] } }],
+    ['missing status', { data: { connections: [{ id: 'claude-cli' }] } }],
+    ['unknown status', { data: { connections: [{ id: 'claude-cli', status: 'unknown' }] } }]
+  ])('shows an unknown read for HTTP 200 with %s and recovers once on explicit Refresh', async (_name, payload) => {
+    await openPanel()
+    const before = connectionCalls
+    connectionsAnswer = 'ok'
+    connectionsPayload = payload
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh Saved Models' }))
+    expect(await screen.findByText(INVALID_CONNECTIONS_TEXT)).toBeTruthy()
+    expect(await settledConnectionCalls()).toBe(before + 1)
+    expect(nameInput().value).toBe(NAME)
+
+    connectionsPayload = { data: { connections: [] } }
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh Saved Models' }))
+    await waitFor(() => expect(screen.queryByText(INVALID_CONNECTIONS_TEXT)).toBeNull())
+    expect(await settledConnectionCalls()).toBe(before + 2)
+    expect(screen.queryByText(ERROR_TEXT)).toBeNull()
+    expect(nameInput().value).toBe(NAME)
+  }, 90_000)
+
   it('a failed answer shows its error text and does not ask again by itself', async () => {
     await openPanel()
 
@@ -273,15 +289,21 @@ describe('Agent Settings asks for the connection status only when the agent type
     expect(connectionCalls).toBe(settled)
   }, 90_000)
 
-  it('another agent of another managed type asks once, and its failed answer stops there', async () => {
+  it('a retired-type leftover asks nothing; the type change back to API asks once, and its failed answer stops there', async () => {
     await openPanel()
     const before = connectionCalls
 
+    // SA-139 R4: a stored `cli` Primary is a retired type; it never asks for connection status.
     await switchTo(OTHER_NAME)
     await waitFor(() => expect(nameInput().value).toBe(OTHER_NAME), { timeout: 15_000 })
+    expect(await settledConnectionCalls()).toBe(before)
+    expect(screen.queryByText(ERROR_TEXT)).toBeNull()
+
+    await switchTo(NAME)
+    await waitFor(() => expect(nameInput().value).toBe(NAME), { timeout: 15_000 })
     const after = await settledConnectionCalls()
 
-    // One more request for the new type (old code: hundreds more).
+    // One more request for the type change (old code: hundreds more).
     expect(after).toBe(before + 1)
     expect(await screen.findByText(ERROR_TEXT)).toBeTruthy()
   }, 90_000)

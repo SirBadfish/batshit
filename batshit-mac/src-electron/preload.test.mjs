@@ -24,7 +24,7 @@ class FakePort extends EventEmitter {
   receive(value) { this.emit('message', { data: value }); }
 }
 
-function loadPreload(role) {
+function loadPreload(role, { args = [], document, MutationObserver } = {}) {
   const ipcRenderer = new EventEmitter();
   ipcRenderer.invoke = async (...args) => args;
   let exposed = null;
@@ -40,8 +40,14 @@ function loadPreload(role) {
       return { contextBridge, ipcRenderer };
     },
     process: {
-      argv: role === 'main' ? ['electron'] : ['electron', `--batshit-window-role=${role}`]
+      argv: [
+        'electron',
+        ...(role === 'main' ? [] : [`--batshit-window-role=${role}`]),
+        ...args
+      ]
     },
+    document,
+    MutationObserver,
     Promise,
     Object,
     Set,
@@ -53,6 +59,59 @@ function loadPreload(role) {
   });
   return { zero: exposed, ipcRenderer };
 }
+
+class FakeHtml {
+  constructor() { this.attributes = new Map(); }
+  setAttribute(name, value) { this.attributes.set(name, value); }
+}
+
+class FakeMutationObserver {
+  static instances = [];
+  constructor(callback) {
+    this.callback = callback;
+    this.observed = null;
+    this.disconnected = false;
+    FakeMutationObserver.instances.push(this);
+  }
+  observe(target, options) { this.observed = { target, options }; }
+  disconnect() { this.disconnected = true; }
+}
+
+test('main preload marks the document when the window draws no title bar', () => {
+  const document = { documentElement: new FakeHtml() };
+  loadPreload('main', { args: ['--batshit-title-bar=hidden'], document });
+  assert.equal(document.documentElement.attributes.get('data-batshit-mac-titlebar'), 'hidden');
+});
+
+test('main preload waits for <html> before marking, so the first paint is already laid out', () => {
+  FakeMutationObserver.instances.length = 0;
+  const document = { documentElement: null };
+  loadPreload('main', {
+    args: ['--batshit-title-bar=hidden'],
+    document,
+    MutationObserver: FakeMutationObserver
+  });
+  const [observer] = FakeMutationObserver.instances;
+  assert.equal(observer.observed.target, document);
+  assert.equal(observer.observed.options.childList, true);
+
+  observer.callback();
+  assert.equal(observer.disconnected, false, 'nothing to mark until the parser makes <html>');
+
+  document.documentElement = new FakeHtml();
+  observer.callback();
+  assert.equal(observer.disconnected, true);
+  assert.equal(document.documentElement.attributes.get('data-batshit-mac-titlebar'), 'hidden');
+});
+
+test('only the main window with the hidden-title-bar argument touches the document', () => {
+  const untouched = () => ({
+    get documentElement() { throw new Error('the document must not be read'); }
+  });
+  loadPreload('main', { document: untouched() });
+  loadPreload('desktop', { args: ['--batshit-title-bar=hidden'], document: untouched() });
+  loadPreload('controls', { args: ['--batshit-title-bar=hidden'], document: untouched() });
+});
 
 test('desktop preload exposes only the frozen versioned Desktop Goon API', async () => {
   const { zero } = loadPreload('desktop');

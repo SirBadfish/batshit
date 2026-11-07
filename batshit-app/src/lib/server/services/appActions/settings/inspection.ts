@@ -19,7 +19,7 @@ export type SettingsInspection = {
 export type SettingsInspectionSources = {
   userSettings?: unknown
   entityCount?: number
-  agent?: { displayName: string; agentType: 'api' | 'cli' }
+  agent?: { displayName: string; agentType: 'api' }
   memory?: SettingsRead<MemoryPreferenceValues>
   unavailableFields?: readonly string[]
 }
@@ -52,7 +52,7 @@ export function projectSettingsInspection(tab: SettingsTab, sources: SettingsIns
     case 'agents':
       basis = 'effective_agent_settings'
       assign('displayName', sources.agent?.displayName, 'string')
-      assign('agentType', sources.agent?.agentType, 'string', ['api', 'cli'])
+      assign('agentType', sources.agent?.agentType, 'string', ['api'])
       break
     case 'memory':
       basis = 'effective_agent_settings'
@@ -71,9 +71,10 @@ export function projectSettingsInspection(tab: SettingsTab, sources: SettingsIns
       assign('dockOpen', savedObject(user.goons_settings, ['dockOpen']).dockOpen, 'boolean')
       break
     case 'tools': {
-      const zip = savedObject(user.global_zip_settings, ['zipViewMode', 'toolNotes'])
+      const zip = savedObject(user.global_zip_settings, ['zipViewMode', 'toolNotes', 'liveFileReads'])
       assign('zipViewMode', zip.zip_ai_view_mode, 'string', ['inline', 'appended'])
       assign('toolNotes', zip.zip_tool_notes_enabled, 'boolean')
+      assign('liveFileReads', zip.live_file_reads, 'boolean')
       break
     }
     case 'voice': {
@@ -121,7 +122,7 @@ export function projectSettingsInspection(tab: SettingsTab, sources: SettingsIns
 export type SettingsInspectionStore = {
   readUserSettings(userId: string): Promise<unknown>
   countEntities(tab: 'groups' | 'models' | 'projects' | 'artifacts' | '3d-goons', userId: string): Promise<number>
-  readAgent(subjectAgentId: string, userId: string): Promise<{ displayName: string; agentType: 'api' | 'cli' }>
+  readAgent(subjectAgentId: string, userId: string): Promise<{ displayName: string; agentType: 'api' }>
   readMemory(args: unknown, context: SettingsOwnerContext): Promise<SettingsRead<MemoryPreferenceValues>>
 }
 export function createSettingsInspector(store: SettingsInspectionStore) {

@@ -8,7 +8,7 @@ export type BrokerFamilyGroupIconMode = 'group-only' | 'group+tools+names' | 'gr
  *
  * SA-096. These controls render in two places and must behave identically in both:
  *
- * - Inside the `Batshit Tools` accordion, on the existing `Fabric Controls` /
+ * - Inside the `Batshit Tools` accordion, on the existing `Fabric & Utilities` /
  *   `Artifact Tools` zip rows, wherever the grid shows zip columns (Global and Agent).
  * - As a standalone top-level row on the discoverability-only surfaces (Subagent
  *   Settings, Chatbar dropdown), which do not render the `Batshit Tools` section at all.

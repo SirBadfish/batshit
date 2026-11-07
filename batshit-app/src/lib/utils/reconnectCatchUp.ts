@@ -22,6 +22,19 @@ export function resolveRepliesEndedWhileAway(params: {
 }
 
 /**
+ * BL-814: a catch-up whose read of the chat failed learned nothing (the tab keeps its own copy,
+ * which still shows each reply as running), so it reads the chat again after these waits while
+ * the chat still needs it. Then it stops; the chat on screen has shown the load's error, and the
+ * next read of the chat (opening it, or the next return of the connection) catches it up.
+ */
+export const CATCH_UP_RETRY_DELAYS_MS: readonly number[] = [2_000, 5_000, 15_000]
+
+/** The wait before the next read after this many reads of a catch-up failed (0-based), or null. */
+export function resolveCatchUpRetryDelay(failedReads: number): number | null {
+  return CATCH_UP_RETRY_DELAYS_MS[failedReads] ?? null
+}
+
+/**
  * A chat subscription came back: catch up the chat on screen (read it again) and any chat still
  * streaming a reply in this tab. A busy background chat keeps its live subscription, so it is
  * exactly the one that reconnects; an idle background chat is read when it is opened.

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { committedColorInput } from '$lib/utils/committedColorInput'
   import { ImagePlus } from '@lucide/svelte'
   import * as Select from '$lib/components/ui/select'
   import { Button } from '$lib/components/ui/button'
@@ -96,9 +97,13 @@
     baseColor: {
       label: 'Base Color Artwork',
       short: 'Base Color',
-      format: `${definition.canvas.width} × ${definition.canvas.height} · sRGB PNG`,
+      format: definition.canvas.width === 2048 && definition.canvas.height === 2048
+        ? '2048 × 2048 or 4096 × 4096 · sRGB PNG'
+        : `${definition.canvas.width} × ${definition.canvas.height} · sRGB PNG`,
       info: [
         'Base Color carries pigment and painted variation, not scene lighting or surface depth.',
+        ...(definition.canvas.width === 2048 && definition.canvas.height === 2048
+          ? ['A 4096 × 4096 master is prepared at this Goon’s 2048 × 2048 canvas size.'] : []),
         'Artwork Tint is the one overall skin-color control. White artwork becomes the selected tint exactly.',
         'Package restores the artwork embedded in the installed Goon. Custom uses your validated full UV atlas.'
       ]
@@ -437,8 +442,12 @@
               value={skinAppearanceRgbToHex(valueState.surface.baseColor.tint)}
               aria-label="Artwork Tint"
               {disabled}
-              oninput={(event) =>
-                updateTint((event.currentTarget as HTMLInputElement).value)}
+              use:committedColorInput={{
+                value: skinAppearanceRgbToHex(valueState.surface.baseColor.tint),
+                resetKey: valueState,
+                disabled: disabled,
+                onCommit: (color) => updateTint(color)
+              }}
             />
           </label>
         {:else if role === 'normal' && slot.mode !== 'none'}

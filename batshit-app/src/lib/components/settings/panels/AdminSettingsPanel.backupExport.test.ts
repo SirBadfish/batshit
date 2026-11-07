@@ -17,10 +17,10 @@ import AdminSettingsPanel from './AdminSettingsPanel.svelte'
  *
  * Only the platform edges are stand-ins: the confirmation dialog, the Mac export bridge and the
  * download's save chooser (`window.zero`), the export route's answer and the check route's
- * answer. `$app/environment` says "browser" so the panel's real download code runs.
+ * answer. `$app/env` says "browser" so the panel's real download code runs.
  */
 
-vi.mock('$app/environment', () => ({ browser: true, building: false, dev: false, version: 'test' }))
+vi.mock('$app/env', () => ({ browser: true, building: false, dev: false, version: 'test' }))
 vi.mock('$lib/stores/confirmDialog', () => ({
   confirmDialog: vi.fn(async () => false),
   confirmDialogWithCheckbox: vi.fn(async () => ({ confirmed: false, checked: false }))
@@ -74,13 +74,18 @@ function audit(): BackupUploadCheck {
 /** Lets a check that would start after the export's answer start, so "no check" is real. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 50))
 
-async function openBackupCard(exportAnswer: () => Response) {
+async function openBackupCard(exportAnswer: () => Response, otherRoutes?: (path: string, method: string, init: RequestInit) => Response | undefined) {
   const exportPosts: Array<Record<string, unknown>> = []
   let checks = 0
   installUserSettingsRoutes({
     userId: USER,
     route: await loadUserSettingsRoute(),
     extra: (path, method, init) => {
+      const other = otherRoutes?.(path, method, init)
+      if (other !== undefined) return other
+      if (path === '/api/admin/backup/automatic' && method === 'GET') {
+        return jsonResponse({ error: 'Automatic settings are covered by their owning suite.' }, 503)
+      }
       if (path === '/api/admin/backup/export' && method === 'POST') {
         exportPosts.push(JSON.parse(String(init.body)))
         return exportAnswer()
@@ -118,6 +123,68 @@ beforeEach(() => {
 })
 
 describe('Admin Backup export outcome reaches the card (BL-1381)', () => {
+  it('reports a committed restore warning with kept-folder information for six seconds, then reloads without restoring again', async () => {
+    const warning = 'Your restored data was kept; built-in skills are unavailable.'
+    let restores = 0
+    class OwnedUpload {
+      upload = { onprogress: undefined }
+      status = 200
+      responseText = '{}'
+      onload?: () => void
+      open(method: string, url: string) { expect(method).toBe('PUT'); expect(url).toBe('http://owned.invalid/upload') }
+      setRequestHeader() {}
+      send() { queueMicrotask(() => this.onload?.()) }
+    }
+    vi.stubGlobal('XMLHttpRequest', OwnedUpload)
+    const success = vi.spyOn(toast, 'success').mockImplementation(() => 0)
+    const warn = vi.spyOn(toast, 'warning').mockImplementation(() => 0)
+    const failure = vi.spyOn(toast, 'error').mockImplementation(() => 0)
+    const view = await openBackupCard(() => jsonResponse({}), (path, method) => {
+      if (path === '/api/admin/system-prompts' && method === 'GET') return jsonResponse({ prompts: [] })
+      if (path === '/api/admin/backup/stage' && method === 'POST') return jsonResponse({ stageId: 'owned-stage', ticket: 'owned-ticket', uploadUrl: 'http://owned.invalid/upload' })
+      if (path === '/api/admin/backup/preflight' && method === 'POST') return jsonResponse({
+        ok: true, manifest: { schemaVersion: 1, createdAt: '2026-11-05T00:00:00Z', app: { name: 'Batshit', version: 'test' },
+          options: { includeSecrets: false }, contents: { redisRecordCount: 1, fileAssetCount: 0, fileAssetBytes: 0, groups: [] },
+          secrets: { included: false, excludedRecordCount: 0, redactedFieldCount: 0, warning: '' }, externalReferences: [] },
+        redisRecordCount: 1, fileAssetCount: 0, fileAssetBytes: 0, hostFileCount: 0, hostFileBytes: 0,
+        requiresDestructiveConfirmation: false, currentRecordCount: 0, sourceUserId: USER, targetUserId: USER, userRemapRequired: false, warnings: [],
+        stage: { id: 'owned-stage', filename: 'owned.zip', archiveBytes: 3, sha256: 'a'.repeat(64), expiresAt: '2026-11-06T00:00:00Z' },
+        disk: { requiredBytes: 1, availableBytes: 2, sufficient: true, restoredFileBytes: 0, rollbackBytes: 0, restorePlanBytes: 1 }
+      })
+      if (path === '/api/admin/backup/restore' && method === 'POST') {
+        restores++
+        return jsonResponse({ restored: true, warnings: [warning], keptHostFolders: [{ root: 'skills', folder: 'owned', path: '/test-owned/skills/.replaced-owned' }] })
+      }
+      return undefined
+    })
+    const input = view.card.querySelector('input[type="file"]') as HTMLInputElement
+    await fireEvent.change(input, { target: { files: [new File(['zip'], 'owned.zip', { type: 'application/zip' })] } })
+    await waitFor(() => expect(view.button('Restore')).not.toBeDisabled())
+    success.mockClear()
+    const originalWindow = window
+    const reload = vi.fn()
+    const schedule = window.setTimeout.bind(window)
+    let afterDisplay: (() => void) | undefined
+    vi.spyOn(window, 'setTimeout').mockImplementation(((callback: TimerHandler, delay?: number, ...args: any[]) => {
+      if (delay === 6000 && typeof callback === 'function') { afterDisplay = () => callback(); return 0 }
+      return schedule(callback, delay, ...args)
+    }) as typeof window.setTimeout)
+    await fireEvent.click(view.button('Restore'))
+    await waitFor(() => expect(warn).toHaveBeenCalledOnce())
+    expect(warn.mock.calls[0][0]).toContain('Backup restored.')
+    expect(warn.mock.calls[0][0]).toContain(warning)
+    expect(warn.mock.calls[0][0]).toContain('/test-owned/skills')
+    expect(success).not.toHaveBeenCalled()
+    expect(failure).not.toHaveBeenCalled()
+    expect(afterDisplay).toBeTypeOf('function')
+    expect(reload).not.toHaveBeenCalled()
+    // Location.reload is nonconfigurable in the browser harness. Replace only
+    // this platform edge while invoking the actual captured reload callback.
+    vi.stubGlobal('window', { location: { reload } })
+    try { afterDisplay!() } finally { vi.stubGlobal('window', originalWindow) }
+    expect(reload).toHaveBeenCalledOnce()
+    expect(restores).toBe(1)
+  })
   it('a cancelled With Secrets confirmation under an old export error starts no check; a confirmed one still asks and checks', async () => {
     const view = await openBackupCard(() => jsonResponse({ error: STOPPED }, 409))
 

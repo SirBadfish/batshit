@@ -33,6 +33,18 @@ describe('GoonLiveActivationGate', () => {
     expect(gate.isAccepted('goon::revision-new')).toBe(true)
   })
 
+  it('supersedes pending B when the already-visible A is selected again', () => {
+    const gate = new GoonLiveActivationGate()
+    const firstA = gate.request('goon-a')!
+    expect(gate.accept(firstA)).toBe(true)
+    const pendingB = gate.request('goon-b')!
+    const nextA = gate.request('goon-a')!
+    expect(nextA).not.toBeNull()
+    expect(gate.accept(pendingB)).toBe(false)
+    expect(gate.accept(nextA)).toBe(true)
+    expect(gate.isAccepted('goon-a')).toBe(true)
+  })
+
   it('releases a cancelled activation without accepting or failing its key', () => {
     const gate = new GoonLiveActivationGate()
     const cancelled = gate.request('goon::revision-cancelled')!

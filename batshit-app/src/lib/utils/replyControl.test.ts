@@ -2,12 +2,15 @@ import { describe, expect, it } from 'vitest'
 import {
   REPLY_CONTROL_FINALIZED_FLAG,
   buildReplyControlMetadata,
+  TOOL_NOTES_OFF_NOT_SAVED,
+  TOOL_NOTES_BLOCK_HINT,
   extractReplyControl,
   resolveZipToolNotesEnabled,
   stripReplyControlBlocks
 } from './replyControl'
 import { CONTROL_TAGS } from './controlTags'
 import { stripZipControlBlocks, TOOL_NOTES_BLOCK_LIMIT } from './zipControl'
+import { parseLeadingGroupControlFromBuffer } from '$lib/server/services/groupChatUtils'
 
 // SA-129 P2 (DL-08): a finished reply's control blocks, read in one place for the server's
 // reply-end step and for `/api/sse`'s `end` rebuild.
@@ -114,10 +117,50 @@ describe('buildReplyControlMetadata', () => {
     expect(metadata.controlErrors).toEqual([])
   })
 
-  it('drops the notes when Tool Notes are off for the agent, and keeps the holds', () => {
+  it('drops the notes when Tool Notes are off for the agent, says so loudly, and keeps the holds (BL-1785)', () => {
     const metadata = buildReplyControlMetadata(extractReplyControl(`Ok.\n${NOTES}`), { toolNotesEnabled: false })
     expect(metadata.zipControl?.toolResultsSummary).toEqual([])
     expect(metadata.zipControl?.hold).toEqual(['src/app.ts'])
+    expect(metadata.zipControl?.release).toEqual(['docs/old.md'])
+    expect(metadata.controlErrors.map(({ tag, error, hint }) => ({ tag, error, hint }))).toEqual([
+      { tag: 'batshit-tool-notes', error: TOOL_NOTES_OFF_NOT_SAVED, hint: 'Hold a file you still need open; Fetch Zip shows any earlier result again.' }
+    ])
+    expect(TOOL_NOTES_OFF_NOT_SAVED).toBe('Tool Notes are off for this agent; the notes in this reply were not saved.')
+    // Named only when the compile offered the agent its board.
+    expect(buildReplyControlMetadata(extractReplyControl(`Ok.\n${NOTES}`), { toolNotesEnabled: false, whiteboardAvailable: true })
+      .controlErrors[0]?.hint).toBe('Put what you still need on your Whiteboard, or hold a file you still need open; Fetch Zip shows any earlier result again.')
+  })
+
+  it('with Tool Notes off, no fix line on the reply names notes (BL-1785 review M1)', () => {
+    const reply = [
+      'Ok.',
+      '<batshit-tool-notes>{"notes":[{"toolName":"bash","summary":"x"}],"hold":[""],"pin":["a"]}</batshit-tool-notes>',
+      '<batshit-tool-notes>{"hold":["src/a.ts"]}</batshit-tool-notes>',
+      '<batshit-tool-notes>{}</batshit-tool-notes>'
+    ].join('\n')
+    const off = buildReplyControlMetadata(extractReplyControl(reply), { toolNotesEnabled: false })
+    expect(off.controlErrors.length).toBeGreaterThanOrEqual(4)
+    for (const entry of off.controlErrors) {
+      expect([entry.error, entry.hint]).not.toEqual(expect.arrayContaining([expect.stringContaining('"notes"')]))
+      expect(entry.error).not.toMatch(/notes are kept/)
+    }
+    expect(off.controlErrors.map((entry) => entry.error)).toEqual(expect.arrayContaining([
+      expect.stringContaining('The <batshit-tool-notes> block must be a JSON object with "hold" or "release".')
+    ]))
+    // With Tool Notes on, the same reply keeps the original words.
+    const on = buildReplyControlMetadata(extractReplyControl(reply), { toolNotesEnabled: true })
+    expect(on.controlErrors.map((entry) => entry.error)).toEqual(expect.arrayContaining([
+      expect.stringContaining('Tool Notes block must be a JSON object like {"notes":[{"toolName":"...","summary":"..."}]}.')
+    ]))
+    expect(on.controlErrors.map((entry) => entry.hint)).toContain(`Write one Tool Notes block, at the end of the reply. ${TOOL_NOTES_BLOCK_HINT}`)
+  })
+
+  it('is silent for a hold-only block with Tool Notes off, and for notes with Tool Notes on (BL-1785)', () => {
+    const holdOnly = '<batshit-tool-notes>\n{"hold":["src/app.ts"]}\n</batshit-tool-notes>'
+    const off = buildReplyControlMetadata(extractReplyControl(`Ok.\n${holdOnly}`), { toolNotesEnabled: false, whiteboardAvailable: true })
+    expect(off.controlErrors).toEqual([])
+    expect(off.zipControl?.hold).toEqual(['src/app.ts'])
+    expect(buildReplyControlMetadata(extractReplyControl(`Ok.\n${NOTES}`), { toolNotesEnabled: true }).controlErrors).toEqual([])
   })
 
   it('turns every malformed part into a loud control error', () => {
@@ -290,6 +333,106 @@ describe('BL-442: what the reply end saves', () => {
     )
     expect(extraction.unzip).toEqual(['tool_result_1'])
     expect(extraction.cleaned).toBe('Hi.')
+  })
+
+  const cueErrors = (content: string) =>
+    buildReplyControlMetadata(extractReplyControl(content), { toolNotesEnabled: true }).controlErrors
+
+  it('removes only the tag and payload of a cue left open mid-reply, keeps the rest and its tool card, and says so (BL-695)', () => {
+    const zip = '{{batshit-zip:cool_tool_1790500000000_abcde:::Tool execution: read}}'
+    const reply = `Sure! <batshit-cue>{"goon_mood":"happy"} Here is the whole long answer.\n\nParagraph two reads ${zip} and ends.`
+    const extraction = extractReplyControl(reply)
+    // The words after the closed payload on its line stay, with one space between (review S-c).
+    expect(extraction.cleaned).toBe(`Sure! Here is the whole long answer.\n\nParagraph two reads ${zip} and ends.`)
+    expect(extraction.unclosedPresentationTags).toEqual(['batshit-cue'])
+    const errors = cueErrors(reply)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatchObject({ tag: 'batshit-cue' })
+    expect(errors[0].error).toContain('Unclosed <batshit-cue> block')
+    // A payload over several lines goes whole; one that never closes takes the rest of its first line.
+    expect(stripReplyControlBlocks('A\n<batshit-cue>\n{\n  "goon_mood": "happy"\n}\nB')).toBe('A\n\nB')
+    expect(stripReplyControlBlocks('A <batshit-cue>{"goon_mood":"happy" B\nC')).toBe('A\nC')
+    expect(stripReplyControlBlocks('A <batshit-cue>goon_mood: happy\nC')).toBe('A\nC')
+    expect(stripReplyControlBlocks('A <batshit-cue>"hap\\"py" more\nC')).toBe('A more\nC')
+    expect(stripReplyControlBlocks('A <batshit-cue>{"goon_mood":"happy"}\nC')).toBe('A\nC')
+  })
+
+  it('never takes later prose for the rest of a broken payload (BL-695, review M1a)', () => {
+    const objectProbe = '<batshit-cue>{"goon_mood":"happy"\nLine two.\nA closing brace } here.\nLine four.'
+    expect(stripReplyControlBlocks(objectProbe)).toBe('Line two.\nA closing brace } here.\nLine four.')
+    expect(cueErrors(objectProbe).map((error) => error.tag)).toEqual(['batshit-cue'])
+    const stringProbe = '<batshit-cue>"happy\nShe said "yes".\nEnd.'
+    expect(stripReplyControlBlocks(stringProbe)).toBe('She said "yes".\nEnd.')
+    expect(cueErrors(stringProbe).map((error) => error.tag)).toEqual(['batshit-cue'])
+  })
+
+  it('removes every open cue or group block, one error each, and strips to the same bytes twice (BL-695, review S-a)', () => {
+    const twoCues = 'One. <batshit-cue>{"goon_mood":"happy"} Two.\n<batshit-cue>{"goon_mood":"sad"}\nThree.'
+    expect(stripReplyControlBlocks(twoCues)).toBe('One. Two.\n\nThree.')
+    expect(cueErrors(twoCues).map((error) => error.tag)).toEqual(['batshit-cue', 'batshit-cue'])
+    const groupAndCue = '<batshit-group>{"mode":"responding"}\nHello.\n<batshit-cue>{"goon_mood":"happy"\nBye.'
+    expect(stripReplyControlBlocks(groupAndCue)).toBe('Hello.\n\nBye.')
+    expect(cueErrors(groupAndCue).map((error) => error.tag).sort()).toEqual(['batshit-cue', 'batshit-group'])
+    for (const reply of [
+      twoCues,
+      groupAndCue,
+      'Sure! <batshit-cue>{"goon_mood":"happy"} Here.\n\nMore.',
+      '<batshit-cue>{"goon_mood":"happy"\nLine two.\nA closing brace } here.',
+      `Hi.\n<batshit-cue>{"goon_mood":"sad"}\n${MEMORY}\nBye.`,
+      `${'x <batshit-cue>{"a":1} '.repeat(40)}end`
+    ]) {
+      const once = stripReplyControlBlocks(reply)
+      expect(stripReplyControlBlocks(once), reply).toBe(once)
+    }
+  })
+
+  it('cuts a reply with more open cue blocks than it reads, loudly and in bounded time (BL-695)', () => {
+    const reply = `Start.\n${'x <batshit-cue>{"a":1} '.repeat(50_000)}end`
+    const started = performance.now()
+    const extraction = extractReplyControl(reply)
+    expect(performance.now() - started).toBeLessThan(3_000)
+    expect(extraction.unclosedPresentationTags).toHaveLength(21)
+    expect(extraction.openPresentationCutTag).toBe('batshit-cue')
+    expect(extraction.cleaned.startsWith('Start.')).toBe(true)
+    expect(extraction.cleaned).not.toContain('<batshit-cue>')
+    const errors = cueErrors(reply)
+    expect(errors.at(-1)?.error).toContain('cut the reply')
+  })
+
+  it('removes a cue or group block cut off at the end, with one error (BL-695)', () => {
+    for (const tag of ['batshit-cue', 'batshit-group']) {
+      expect(extractReplyControl(`Hi there.\n<${tag}>{"goon_mood":"happy"`).cleaned).toBe('Hi there.')
+      const errors = cueErrors(`Hi there.\n<${tag}>{"goon_mood":"happy"`)
+      expect(errors.map((error) => error.tag)).toEqual([tag])
+    }
+  })
+
+  it('keeps a closed cue block and a cue named in a sentence, with no error (BL-695)', () => {
+    const cue = '<batshit-cue>{"goon_mood":"happy"}</batshit-cue>'
+    expect(stripReplyControlBlocks(`${cue} Hi.`)).toBe(`${cue} Hi.`)
+    expect(cueErrors(`${cue} Hi.`)).toEqual([])
+    expect(stripReplyControlBlocks('The <batshit-cue> tag sets a mood.')).toBe('The <batshit-cue> tag sets a mood.')
+    expect(cueErrors('The <batshit-cue> tag sets a mood.')).toEqual([])
+    // A memory save after an open cue is still read and removed.
+    const extraction = extractReplyControl(`Hi.\n<batshit-cue>{"goon_mood":"sad"}\n${MEMORY}\nBye.`)
+    expect(extraction.cleaned).toBe('Hi.\n\nBye.')
+    expect(extraction.memoryBlocks).toHaveLength(1)
+  })
+
+  it('keeps a group reply whose lead tag never closed, past the group buffer, without its tag line (BL-695)', () => {
+    const answer = `Hello all, here is my answer. ${'More words. '.repeat(200)}`.trim()
+    const buffered = parseLeadingGroupControlFromBuffer(`<batshit-group>{"mode":"responding"}\n${answer}`)
+    expect(buffered.kind).toBe('passthrough')
+    const content = (buffered as { content: string }).content
+    const extraction = extractReplyControl(content)
+    expect(extraction.cleaned).toBe(answer)
+    expect(cueErrors(content).map((error) => error.tag)).toEqual(['batshit-group'])
+  })
+
+  it('cleans a reply that is only an open cue block to nothing, with one error (BL-695)', () => {
+    const extraction = extractReplyControl('<batshit-cue>{"goon_mood":"happy"}')
+    expect(extraction.cleaned).toBe('')
+    expect(cueErrors('<batshit-cue>{"goon_mood":"happy"}').map((error) => error.tag)).toEqual(['batshit-cue'])
   })
 
   it.each(CONTROL_TAGS.map((spec) => [spec.tag] as const))(

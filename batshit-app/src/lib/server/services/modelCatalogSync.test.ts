@@ -23,6 +23,227 @@ import {
   buildCatalogFromSnapshot
 } from './modelCatalogSync'
 import { resolveCatalogConnectionLimits } from '$lib/utils/catalogConnectionLimits'
+import { resolveCatalogConnectionPricing } from '$lib/utils/catalogConnectionLimits'
+import { projectCatalogReasoningEvidence } from '$lib/utils/catalogReasoningEvidence'
+import { reviewedPublicReasoningEvidence } from '$lib/data/reviewed-public-reasoning-facts'
+import mistralCollision from './__fixtures__/mistral-catalog-collision.json'
+
+describe('November 5 Artificial Analysis migration boundaries', () => {
+  it('preserves the published Fable selector with AA and refuses retargeting when AA is unavailable', () => {
+    const gateway = _mapGatewayModelToCatalogEntryForTest({ id: 'anthropic/claude-fable-5.1', name: 'Claude Fable 5.1', type: 'language', context_window: 1_000_000,
+      pricing: { input: '0.00001', output: '0.00005' } })!
+    const direct = _mapDirectProviderEntriesForTest('anthropic', _mapAnthropicModelsForTest([
+      { id: 'claude-fable-5-1', display_name: 'Claude Fable 5.1', max_input_tokens: 1_000_000, max_tokens: 128_000 }
+    ]))
+    const previous = { ...gateway, idVariants: {
+      'vercel-gateway': { developerId: 'anthropic', modelId: 'claude-fable-5.1', effectiveId: 'anthropic/claude-fable-5.1', source: 'vercel' },
+      'direct:anthropic': { developerId: 'anthropic', modelId: 'claude-fable-5-1', effectiveId: 'claude-fable-5-1', source: 'direct' }
+    } }
+    const args = { gatewayEntries: [gateway], openRouterEntries: [], directEntriesByProvider: { anthropic: direct }, previousModels: [previous] }
+    expect(() => _assembleCatalogModelsForTest({ ...args, aaMap: new Map() })).toThrow(/cannot preserve catalog selector anthropic\/claude-fable-5.1/i)
+    const result = _assembleCatalogModelsForTest({ ...args, aaMap: new Map([['claudefable51', { slug: 'claude-fable-5-1', pricing: { price_1m_input_tokens: 20, price_1m_output_tokens: 100 } }]]) })
+    expect(result.models).toHaveLength(1)
+    expect(result.models[0].idVariants?.['direct:anthropic']?.effectiveId).toBe('claude-fable-5-1')
+    expect(result.models[0].pricing).toEqual({ input: 10, output: 50 })
+  })
+
+  it('never treats Pro blended pricing as an input token price', () => {
+    const gateway = _mapGatewayModelToCatalogEntryForTest({ id: 'maker/unpriced', name: 'Unpriced', type: 'language' })!
+    const result = _assembleCatalogModelsForTest({ gatewayEntries: [gateway], openRouterEntries: [], directEntriesByProvider: {},
+      aaMap: new Map([['unpriced', { slug: 'unpriced', pricing: { price_1m_blended_3_to_1: 8, price_1m_output_tokens: 20 } }]]) })
+    expect(result.models[0].pricing?.input).toBeUndefined()
+    expect(result.models[0].pricing?.output).toBe(20)
+  })
+})
+
+describe('BL-2077 exact Mistral identities', () => {
+  it.each([false, true])('replays both published spellings without changing selector keys or targets (reverse=%s)', reverse => {
+    const original = structuredClone(mistralCollision)
+    const input = structuredClone(original)
+    if (reverse) input.models.reverse()
+    const result = buildCatalogFromSnapshot(input)
+    expect(result.payload.models.map(model => model.canonicalId).sort()).toEqual(original.models.map(model => model.canonicalId).sort())
+    for (const row of original.models) {
+      const rebuilt = result.payload.models.find(model => model.canonicalId === row.canonicalId)!
+      expect(rebuilt.idVariants?.['direct:mistral']?.effectiveId).toBe(row.idVariants['direct:mistral'].effectiveId)
+      expect(rebuilt.pricing).toEqual(row.pricing)
+    }
+    expect(result.variantCollisions).toEqual([expect.objectContaining({ kept: 'mistral-medium-3.5', split: ['mistral-medium-3-5'], dropped: [] })])
+    expect(buildCatalogFromSnapshot(result.payload).payload.models.map(row => row.canonicalId)).toEqual(result.payload.models.map(row => row.canonicalId))
+    expect(mistralCollision).toEqual(original)
+  })
+
+  it('refuses a pair of unrepresentable exact IDs before returning a lossy replay', () => {
+    const row = mistralCollision.models[1]
+    const broken = { ...mistralCollision, models: ['first', 'second'].map(id => ({ ...row, id,
+      idVariants: { 'direct:mistral': { ...row.idVariants['direct:mistral'], effectiveId: id } }
+    })) }
+    expect(() => buildCatalogFromSnapshot(broken)).toThrow(/cannot preserve catalog identity/i)
+  })
+
+  it('refuses distinct AA groups which would produce the same selector key', () => {
+    const row: any = _buildFallbackEntriesFromExistingForTest({ existing: mistralCollision,
+      connectionId: 'direct:mistral', source: 'direct', transport: 'direct' })[0]
+    expect(() => _mergeCatalogEntriesForTest([{ ...row, aaSlug: 'first-group' }, { ...row, id: 'another-exact-id', aaSlug: 'second-group' }]))
+      .toThrow(/canonical.*collision/i)
+  })
+
+  it('refuses a new exact-canonical alias when splitting it would retarget the published base selector', () => {
+    const gateway = _buildFallbackEntriesFromExistingForTest({ existing: mistralCollision,
+      connectionId: 'vercel-gateway', source: 'vercel', transport: 'vercel-gateway' })
+    const direct = _buildFallbackEntriesFromExistingForTest({ existing: mistralCollision,
+      connectionId: 'direct:mistral', source: 'direct', transport: 'direct' })
+    // An earlier published base still selected the dashed provider target. A new
+    // dotted target cannot silently take over that same catalog selector key.
+    const previous = structuredClone(mistralCollision.models[0])
+    previous.idVariants['direct:mistral'] = { ...previous.idVariants['direct:mistral'], modelId: 'mistral-medium-3-5', effectiveId: 'mistral-medium-3-5' }
+    expect(() => _assembleCatalogModelsForTest({ gatewayEntries: gateway, openRouterEntries: [],
+      directEntriesByProvider: { mistral: direct }, aaMap: new Map([['mistralmedium35', { slug: 'mistral-medium-3-5' }]]), previousModels: [previous]
+    })).toThrow(/cannot preserve catalog identity/i)
+  })
+
+  it('refuses a changed published selector even when AA is absent and no same-connection group collision occurs', () => {
+    const gateway = _buildFallbackEntriesFromExistingForTest({ existing: mistralCollision,
+      connectionId: 'vercel-gateway', source: 'vercel', transport: 'vercel-gateway' })
+    const direct = _buildFallbackEntriesFromExistingForTest({ existing: mistralCollision,
+      connectionId: 'direct:mistral', source: 'direct', transport: 'direct' })
+    const previous = structuredClone(mistralCollision.models[0])
+    previous.idVariants['direct:mistral'] = { ...previous.idVariants['direct:mistral'], modelId: 'mistral-medium-3-5', effectiveId: 'mistral-medium-3-5' }
+    const args = { gatewayEntries: gateway, openRouterEntries: [], directEntriesByProvider: { mistral: direct }, aaMap: new Map(), previousModels: [previous] }
+    expect(() => _assembleCatalogModelsForTest(args)).toThrow(/cannot preserve catalog selector/i)
+    // If the prior target is genuinely absent after the existing policy owner,
+    // it cannot pin the current route or be resurrected by this guard.
+    const withoutPrior = _assembleCatalogModelsForTest({ ...args, directEntriesByProvider: { mistral: direct.filter(entry => entry.id !== 'mistral-medium-3-5') } })
+    expect(withoutPrior.models.flatMap(model => Object.values(model.idVariants ?? {}).map(variant => variant.effectiveId))).not.toContain('mistral-medium-3-5')
+  })
+})
+
+describe('reviewed endpoint purpose', () => {
+  it('never prices MiMo subscription Credits with gateway or AA dollars, including replay of an old merged snapshot', () => {
+    const plan = _mapDirectProviderEntriesForTest('mimo_token_plan', _getManualDirectModelsForTest('mimo_token_plan'))
+    const gateway = _mapGatewayModelToCatalogEntryForTest({ id: 'xiaomi/mimo-v2.6-pro', name: 'MiMo V2.6 Pro', type: 'language',
+      pricing: { input: '0.000000435', output: '0.00000087' } })!
+    const aa = { mimov26pro: { slug: 'mimo-v2-6-pro', pricing: { price_1m_input_tokens: 0.435, price_1m_output_tokens: 0.87 } } }
+    const merged = assembleBatch([gateway], { mimo_token_plan: plan }, aa).models
+    const row = merged.find(model => model.name === 'mimo-v2.6-pro')!
+    expect(resolveCatalogConnectionPricing(row, 'vercel-gateway').pricing).toEqual({ input: 0.435, output: 0.87 })
+    expect(resolveCatalogConnectionPricing(row, 'direct:mimo_token_plan')).toMatchObject({ pricing: {}, perConnection: true })
+    const alone = assembleBatch([], { mimo_token_plan: plan }, aa).models.find(model => model.name === 'mimo-v2.6-pro')!
+    expect(resolveCatalogConnectionPricing(alone, 'direct:mimo_token_plan').pricing).toEqual({})
+    const stale = structuredClone(row)
+    delete stale.idVariants!['direct:mimo_token_plan'].pricing
+    const replayed = buildCatalogFromSnapshot({ models: [stale], fetchedAt: '2026-10-22', version: 2 } as any).payload.models[0]
+    expect(resolveCatalogConnectionPricing(replayed, 'direct:mimo_token_plan').pricing).toEqual({})
+    expect(resolveCatalogConnectionPricing(replayed, 'vercel-gateway').pricing).toEqual({ input: 0.435, output: 0.87 })
+  })
+
+  it('imports Baseten decision endpoints as Utility while preserving exact IDs, prices and ordinary chat', () => {
+    const ids = ['decision-models/baseten-elephant-9b-latest', 'decision-models/baseten-mammoth-27b-latest']
+    const mapped = _mapBasetenModelsForTest([...ids, 'deepseek-ai/DeepSeek-V4.1'].map(id => ({
+      id, name: id, input_modalities: ['text', 'image'], output_modalities: ['text'],
+      context_length: 32768, max_completion_tokens: 0, pricing: { input: '0.0000001', output: '0.0000002' }
+    })))
+    const catalog = _mapDirectProviderEntriesForTest('baseten', mapped)
+    expect(catalog.map(model => model.id)).toEqual([...ids, 'deepseek-ai/DeepSeek-V4.1'])
+    expect(catalog.map(model => model.purpose)).toEqual(['utility', 'utility', 'chat'])
+    expect(mapped[0].tags).not.toContain('chat')
+    expect(catalog[0]).toMatchObject({ modelType: 'evaluation', contextWindow: 32768, pricing: { input: 0.1, output: 0.2 } })
+  })
+
+  it('corrects stale purpose through repeated replay without removing or changing any exact connection identity', () => {
+    const entries: Array<[string, string, string, string]> = [
+      ['vercel-gateway', 'baseten/elephant-1', 'utility', 'vercel'],
+      ['vercel-gateway', 'baseten/mammoth-1', 'utility', 'vercel'],
+      ['direct:baseten', 'decision-models/baseten-elephant-9b-latest', 'utility', 'direct'],
+      ['direct:baseten', 'decision-models/baseten-mammoth-27b-latest', 'utility', 'direct'],
+      ['direct:replicate', 'pixverse/pixverse-v6-max', 'visual', 'direct']
+    ]
+    const snapshot: any = { version: 2, fetchedAt: '2026-10-22', models: entries.map(([connectionId, id, , source]) => ({
+      id, canonicalId: id, name: id.split('/').slice(1).join('/'), provider: id.split('/')[0], displayName: id,
+      source, connectionId, transport: connectionId === 'vercel-gateway' ? connectionId : 'direct',
+      purpose: 'chat', availableConnections: [connectionId], tags: ['image', 'video', 'audio'], pricing: { input: 0.1 },
+      idVariants: { [connectionId]: { developerId: id.split('/')[0], modelId: id.split('/').slice(1).join('/'), effectiveId: id, source } }
+    })) }
+    const before = structuredClone(snapshot)
+    const first = buildCatalogFromSnapshot(snapshot).payload
+    expect(first.models).toHaveLength(5)
+    for (const [connectionId, id, purpose] of entries) {
+      const row = first.models.find(model => model.idVariants?.[connectionId]?.effectiveId === id)!
+      expect(row.purpose).toBe(purpose)
+      expect(row.pricing).toMatchObject({ input: 0.1 })
+    }
+    expect(buildCatalogFromSnapshot(first).payload.models).toEqual(first.models)
+    expect(snapshot).toEqual(before)
+  })
+})
+
+describe('Alibaba Cloud and StepFun source metadata', () => {
+  it('preserves StepFun exact IDs and maker while applying documented purposes only to fetched IDs', () => {
+    const chat = ['step-3.5-flash', 'step-3.5-flash-2603', 'step-3.7-flash', 'step-5-preview', 'stepaudio-2.5-chat']
+    const audio = ['stepaudio-2.5-tts', 'stepaudio-2.5-asr', 'stepaudio-2.5-asr-stream', 'stepaudio-2.5-realtime', 'stepaudio-3-realtime-preview', 'stepaudio-3-asr-max', 'stepaudio-3-music-preview', 'stepaudio-3-chat-preview', 'stepaudio-3-gen-preview', 'stepaudio-3-tts']
+    const direct = _mapDirectProviderEntriesForTest('stepfun', _mapOpenAICompatibleCatalogModelsForTest('stepfun',
+      [...chat, ...audio].map(id => ({ id, owned_by: 'stepai' }))))
+    const entries = assembleBatch([], { stepfun: direct }).models
+    expect(entries).toHaveLength(15)
+    for (const entry of entries) {
+      expect(entry.purpose).toBe(chat.includes(entry.name) ? 'chat' : 'audio')
+      expect(entry.idVariants?.['direct:stepfun']).toMatchObject({ developerId: 'stepai', modelId: entry.name, effectiveId: entry.name })
+    }
+    expect(_mapOpenAICompatibleCatalogModelsForTest('stepfun', [])).toEqual([])
+  })
+
+  it('uses the reviewed Model Studio maker rules without borrowing another connection identity', () => {
+    const direct = _mapDirectProviderEntriesForTest('alibaba', _mapOpenAICompatibleCatalogModelsForTest('alibaba', [
+      { id: 'qwen-plus', owned_by: 'system' }, { id: 'glm-5.3', owned_by: 'system' }, { id: 'kimi/kimi-k3', owned_by: 'system' }, { id: 'qwen-tts', owned_by: 'system' }
+    ]))
+    expect(direct.map(entry => entry.provider)).toEqual(['qwen', 'zai', 'moonshotai', 'qwen'])
+    const entries = assembleBatch([], { alibaba: direct }).models
+    for (const entry of entries) expect(Object.keys(entry.idVariants ?? {})).toEqual(['direct:alibaba'])
+    expect(entries.find(entry => entry.name === 'kimi/kimi-k3')?.idVariants?.['direct:alibaba'].effectiveId).toBe('kimi/kimi-k3')
+    expect(entries.find(entry => entry.name === 'qwen-tts')?.purpose).toBe('audio')
+  })
+})
+
+describe('reasoning evidence snapshot conservation', () => {
+  it('admits reviewed exact API facts through replay and selected-connection projection, including reviewed default changes', () => {
+    const saved: any = { version: 2, fetchedAt: '2026-10-13', models: [{ id: 'gpt-6.1-sol', provider: 'openai', name: 'gpt-6.1-sol',
+      displayName: 'Sol', source: 'direct', transport: 'direct', connectionId: 'direct:openai', availableConnections: ['direct:openai'],
+      pricing: { input: 2, output: 8 }, contextWindow: 400000, tags: [], features: { streaming: true, tools: true },
+      idVariants: { 'direct:openai': { developerId: 'openai', modelId: 'gpt-6.1-sol', effectiveId: 'gpt-6.1-sol', source: 'direct' } } }] }
+    const old = structuredClone(reviewedPublicReasoningEvidence('direct:openai', 'gpt-6.1-sol')!)
+    old.lastGood!.controls = [{ id: 'effort', kind: 'effort', values: ['low', 'medium', 'high', 'xhigh', 'max', 'old-value'], defaultValue: 'high' }]
+    old.lastGood!.lastVerified = '2026-10-13'
+    old.lastAttempt.at = '2026-10-13'
+    saved.models[0].idVariants['direct:openai'].reasoningEvidence = old
+    const before = structuredClone(saved)
+    const first = buildCatalogFromSnapshot(saved).payload
+    const output = first.models.find(model => model.idVariants?.['direct:openai']?.effectiveId === 'gpt-6.1-sol')!
+    expect(projectCatalogReasoningEvidence(output, 'direct:openai', 'gpt-6.1-sol')).toEqual({ status: 'supported',
+      evidence: reviewedPublicReasoningEvidence('direct:openai', 'gpt-6.1-sol') })
+    expect(projectCatalogReasoningEvidence(output, 'vercel-gateway', 'gpt-6.1-sol')).toEqual({ status: 'unknown' })
+    expect(output.pricing).toEqual(saved.models[0].pricing)
+    expect(output.contextWindow).toBe(saved.models[0].contextWindow)
+    expect(buildCatalogFromSnapshot(first).payload.models).toEqual(first.models)
+    expect(saved).toEqual(before)
+  })
+  it('keeps exact variant evidence and its failed attempt through fallback and repeated replay', () => {
+    const reasoningEvidence = { lastGood: { version: 1, scope: 'public', support: 'supported', connection: 'direct:openai',
+      effectiveModelId: 'exact-model', endpoint: 'responses', controls: [{ id: 'effort', kind: 'effort', values: ['low', 'high'], defaultValue: 'low' }],
+      evidence: [{ url: 'https://developers.openai.com/api/docs/models/exact-model', checkedAt: '2026-10-14' }], lastVerified: '2026-10-14' },
+      lastAttempt: { at: '2026-10-14T13:00:00Z', outcome: 'unavailable' } }
+    const snapshot: any = { version: 2, fetchedAt: '2026-10-14T13:00:00Z', models: [{ id: 'exact-model', canonicalId: 'openai/exact-model',
+      provider: 'openai', name: 'exact-model', displayName: 'Exact model', source: 'direct', transport: 'direct', connectionId: 'direct:openai',
+      availableConnections: ['direct:openai'], features: { streaming: true, tools: true, vision: false }, tags: [], purpose: 'chat',
+      idVariants: { 'direct:openai': { developerId: 'openai', modelId: 'exact-model', effectiveId: 'exact-model', source: 'direct', reasoningEvidence } } }] }
+    const first = buildCatalogFromSnapshot(snapshot).payload
+    const second = buildCatalogFromSnapshot(first).payload
+    expect(first.models[0].idVariants?.['direct:openai'].reasoningEvidence).toEqual(reasoningEvidence)
+    expect(second.models[0].idVariants?.['direct:openai'].reasoningEvidence).toEqual(reasoningEvidence)
+    expect(first.models[0]).not.toHaveProperty('ownReasoningEvidence')
+    expect(first.models[0]).not.toHaveProperty('reasoningEvidence')
+    expect(snapshot.models[0].idVariants['direct:openai'].reasoningEvidence).toEqual(reasoningEvidence)
+  })
+})
 
 describe('modelCatalogSync merge', () => {
   it('requires an exact identity variant for every advertised catalog connection', () => {
@@ -438,8 +659,8 @@ describe('modelCatalogSync merge', () => {
     const directEntries = _mapDirectProviderEntriesForTest('mimo_token_plan', curated)
 
     expect(curated.map((model) => model.id)).toEqual([
-      'mimo-v2.5-pro',
-      'mimo-v2.5',
+      'mimo-v2.6-pro',
+      'mimo-v2.6-flash',
       'mimo-v2.5-asr',
       'mimo-v2.5-tts',
       'mimo-v2.5-tts-voicedesign',
@@ -448,7 +669,7 @@ describe('modelCatalogSync merge', () => {
     expect(directEntries).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          id: 'mimo-v2.5-pro',
+          id: 'mimo-v2.6-pro',
           purpose: 'chat',
           connectionId: 'direct:mimo_token_plan'
         }),
@@ -951,7 +1172,7 @@ describe('BL-68 reviewed identity, connection limits, and merge guard', () => {
     ])
   })
 
-  it('reports, and does not publish, a split entry whose id another row already uses', () => {
+  it('keeps an exact base-row variant and splits the differently named alias instead of dropping the base identity', () => {
     const { models, variantCollisions } = assemble({
       gateway: [gatewayEntry('mistral', 'mistral-small')],
       direct: {
@@ -965,7 +1186,7 @@ describe('BL-68 reviewed identity, connection limits, and merge guard', () => {
 
     expect(models.filter((model) => model.canonicalId === 'mistral/mistral-small')).toHaveLength(1)
     expect(variantCollisions).toEqual([
-      expect.objectContaining({ kept: 'mistral-small-latest', split: [], dropped: ['mistral-small'] })
+      expect.objectContaining({ kept: 'mistral-small', split: ['mistral-small-latest'], dropped: [] })
     ])
   })
 
@@ -1506,13 +1727,13 @@ describe('BL-199 direct Anthropic limits come from Anthropic\'s own model list',
 
 describe('BL-241 the MiMo Token Plan joins the MiMo rows instead of publishing each id twice', () => {
   it('merges the plan\'s fallback list into the rows Xiaomi\'s own feed publishes', () => {
-    // Xiaomi's /models (2026-09-25) owns every MiMo model as `xiaomi`.
+    // Xiaomi's namespace stays `xiaomi`; current plan chat IDs are V2.6.
     const mimo = _mapDirectProviderEntriesForTest(
       'mimo',
       _mapOpenAICompatibleCatalogModelsForTest('mimo', [
-        { id: 'mimo-v2.5', owned_by: 'xiaomi' },
+        { id: 'mimo-v2.6-flash', owned_by: 'xiaomi' },
         { id: 'mimo-v2.5-asr', owned_by: 'xiaomi' },
-        { id: 'mimo-v2.5-pro', owned_by: 'xiaomi' },
+        { id: 'mimo-v2.6-pro', owned_by: 'xiaomi' },
         { id: 'mimo-v2.5-tts', owned_by: 'xiaomi' },
         { id: 'mimo-v2.5-tts-voiceclone', owned_by: 'xiaomi' },
         { id: 'mimo-v2.5-tts-voicedesign', owned_by: 'xiaomi' }

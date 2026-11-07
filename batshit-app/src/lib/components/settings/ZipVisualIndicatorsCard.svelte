@@ -151,7 +151,12 @@
       }
 
       const result = await response.json()
-      const remoteSettings: UserSettingsRow | null = result?.settings ?? null
+      if (!result || typeof result !== 'object' || Array.isArray(result) || result.success === false ||
+        !Object.hasOwn(result, 'settings') || result.settings !== null &&
+        (typeof result.settings !== 'object' || Array.isArray(result.settings))) {
+        throw new Error('Visual indicator settings response did not include a valid settings record.')
+      }
+      const remoteSettings: UserSettingsRow | null = result.settings
       // The read is the only source: a read that succeeded and found no record opens with the
       // defaults, never with the page's older copy.
       applySettings(remoteSettings)
@@ -160,8 +165,9 @@
         setUserSettings(remoteSettings)
       }
       untrack(() => {
-        // Set in the same synchronous run that resets the signature in `finally`, so the
-        // autosave effect that wakes on this flag finds nothing changed.
+        // Only a validated successful read supplies a persisted baseline. Failed reads keep
+        // the last confirmed values/signature and cannot make a draft look saved.
+        persistedSignature = makeSignature(visualSettings)
         settingsLoaded = true
       })
     } catch (error) {
@@ -176,7 +182,6 @@
       untrack(() => {
         isLoading = false
         settingsLoadBusy = false
-        persistedSignature = makeSignature(visualSettings)
       })
     }
   }

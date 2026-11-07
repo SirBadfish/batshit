@@ -28,11 +28,14 @@
     apiProviders: string[]
     /** Saved model presets for the preset picker (utility-purpose presets first). */
     presets?: MemoryPresetOption[]
+    presetsState?: 'loading' | 'ready' | 'unavailable'
     saving?: boolean
     reindexing?: boolean
     errorText?: string | null
     /** True when the saved config no longer matches the built index (re-index owed). */
     indexMismatch?: boolean
+    indexStatusCurrent?: boolean
+    statusLoading?: boolean
     onDraftChange: (draft: MemoryEmbeddingDraft) => void
     onSave: () => void | Promise<void>
     onReindex: () => void | Promise<void>
@@ -44,10 +47,13 @@
     builtinModels,
     apiProviders,
     presets = [],
+    presetsState = 'loading',
     saving = false,
     reindexing = false,
     errorText = null,
     indexMismatch = false,
+    indexStatusCurrent = false,
+    statusLoading = false,
     onDraftChange,
     onSave,
     onReindex
@@ -80,7 +86,7 @@
     selectedPreset
       ? `${selectedPreset.modelName} — ${selectedPreset.provider}`
       : draft.preset.presetId
-        ? `${draft.preset.modelName || draft.preset.presetId} — ${draft.preset.provider || '?'} (preset missing)`
+        ? `${draft.preset.modelName || draft.preset.presetId} — ${draft.preset.provider || '?'} (${presetsState === 'ready' ? 'preset missing' : 'preset status unavailable'})`
         : 'Choose a model preset'
   )
 </script>
@@ -201,7 +207,7 @@
               <Select.Content>
                 {#if presetOptions.length === 0}
                   <Select.Item value="" disabled>
-                    No model presets yet — create one in Settings → Models
+                    {presetsState === 'ready' ? 'No model presets yet — create one in Settings → Models' : 'Model preset list unavailable.'}
                   </Select.Item>
                 {/if}
                 {#each presetOptions as option (option.id)}
@@ -246,6 +252,11 @@
                 })}
             />
           </div>
+          {#if presetsState === 'unavailable'}
+            <p class="batshit-settings-form-meta is-warning">Model presets could not be read. The saved choice is kept.</p>
+          {:else if presetsState === 'loading'}
+            <p class="batshit-settings-form-meta">Reading model presets…</p>
+          {/if}
           {#if utilityPresets.length === 0 && presets.length > 0}
             <p class="batshit-settings-form-meta">
               Tip: set a preset's Purpose to Utility in Settings → Models to keep this
@@ -333,7 +344,13 @@
         </div>
       </div>
       <div class="batshit-settings-form-control">
-        {#if indexMeta}
+        {#if !indexStatusCurrent}
+          {#if statusLoading}
+            <p class="batshit-settings-form-meta">Reading current index status…</p>
+          {:else}
+            <p class="batshit-settings-form-meta is-warning">Current index status is unavailable. Reopen Memory Settings to check it.</p>
+          {/if}
+        {:else if indexMeta}
           <p class="batshit-settings-form-meta">
             {indexMeta.embedding_model} · {indexMeta.dims}d · last rebuilt
             {new Date(indexMeta.last_rebuilt_at).toLocaleString()}

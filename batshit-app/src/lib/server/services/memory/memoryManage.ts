@@ -1,3 +1,6 @@
+import { captureSettingsLifecycle } from '../appActions/settings/lifecycle'
+import { memoryMutationUnknown, readMemoryMutationSnapshot } from './memoryMutation'
+import { effectiveMemoryRecord, memoryIsDeleted, memoryIsEligible, memoryIsExpired, requireActiveMemory } from './memoryState'
 /**
  * SA-104 P5 — the Memory Panel's management operations.
  *
@@ -11,6 +14,8 @@
 import { redis } from '$lib/server/redis'
 import {
   deleteMemory,
+  restoreMemory,
+  emptyDeletedMemories,
   fetchMemoriesByKeys,
   fetchMemorySegmentsByIds,
   getMemory,
@@ -68,7 +73,7 @@ export async function requireOwnedAgent(
   if (!normalized) {
     throw new MemoryManageError('agentId is required.', 400)
   }
-  const agent = (await redis.get(`agent:${normalized}`)) as Record<string, any> | null
+  const agent = (await redis.get(`agent:${normalized}`, { throwOnError: true })) as Record<string, any> | null
   if (!agent) {
     throw new MemoryManageError(`Agent "${normalized}" was not found.`, 404)
   }
@@ -100,12 +105,13 @@ function parseIsoMs(value: unknown, field: string): number | undefined {
 export type MemoryRecordView = Omit<MemoryRecord, 'embedding'>
 
 function toRecordView(record: MemoryRecord): MemoryRecordView {
-  const { embedding: _embedding, ...view } = record
+  const { embedding: _embedding, ...view } = effectiveMemoryRecord(record)
   return view
 }
 
 export interface MemoryManageListInput {
   lane?: string
+  includeExpired?: boolean
   includeSuperseded?: boolean
   limit?: number
   savedFrom?: string
@@ -126,7 +132,7 @@ export async function listManagedMemories(
   const limitRaw = typeof input.limit === 'number' ? Math.floor(input.limit) : LIST_DEFAULT_LIMIT
   const limit = Math.min(Math.max(limitRaw, 1), LIST_MAX_LIMIT)
 
-  let records = await listMemories(context.agentId)
+  let records = (await listMemories(context.agentId)).filter(record => memoryIsEligible(record, input.includeExpired === true)).map(record => effectiveMemoryRecord(record))
   if (lane) records = records.filter((record) => record.lane === lane)
   if (input.includeSuperseded === false) {
     records = records.filter((record) => record.is_superseded !== 'y')
@@ -153,7 +159,7 @@ export async function searchManagedMemories(
   if (query.length < 2) {
     throw new MemoryManageError('query must be at least 2 characters.', 400)
   }
-  const filters: MemorySearchFilters = {}
+  const filters: MemorySearchFilters = { includeExpired: input.includeExpired === true }
   const lane = parseLane(input.lane)
   if (lane) filters.lane = lane
   if (input.includeSuperseded === false) filters.superseded = 'n'
@@ -176,7 +182,7 @@ export async function searchManagedMemories(
     limit,
     filters
   })
-  const records = await fetchMemoriesByKeys(hits.map((hit) => hit.key))
+  const records = (await fetchMemoriesByKeys(hits.map((hit) => hit.key))).filter(record => memoryIsEligible(record, input.includeExpired === true))
   return { results: records.map(toMemorySummary) }
 }
 
@@ -248,7 +254,7 @@ export async function getManagedMemoryDetail(
   const standingMediaCount = allRecords
     .filter(
       (entry) =>
-        entry.lane === 'awareness' &&
+        !memoryIsDeleted(entry) && entry.lane === 'awareness' &&
         entry.media_mode === 'always' &&
         entry.is_superseded !== 'y' &&
         !(typeof entry.expires_ts === 'number' && entry.expires_ts <= Date.now())
@@ -258,8 +264,8 @@ export async function getManagedMemoryDetail(
     record: { ...toRecordView(record), provenance: await withDeletedChatMarks(record.provenance) },
     standingMediaCount,
     chain: {
-      predecessors: chain.predecessors.map(toMemorySummary),
-      successors: chain.successors.map(toMemorySummary)
+      predecessors: chain.predecessors.filter(entry => memoryIsEligible(entry, memoryIsExpired(record))).map(toMemorySummary),
+      successors: chain.successors.filter(entry => memoryIsEligible(entry, memoryIsExpired(record))).map(toMemorySummary)
     }
   }
 }
@@ -267,43 +273,39 @@ export async function getManagedMemoryDetail(
 export async function updateManagedMemory(
   context: MemoryManageContext,
   memoryId: string,
-  updates: UpdateMemoryInput
+  updates: UpdateMemoryInput,
+  options: { deliberateLaneMove?: boolean } = {}
 ): Promise<MemoryRecordView> {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
   await requireOwnedAgent(context.userId, context.agentId)
   const normalized = typeof memoryId === 'string' ? memoryId.trim() : ''
   if (!normalized) throw new MemoryManageError('memoryId is required.', 400)
   if (!updates || Object.keys(updates).length === 0) {
     throw new MemoryManageError('At least one field to update is required.', 400)
   }
-  const existing = await getMemory(context.agentId, normalized)
+  const snapshot = await readMemoryMutationSnapshot(context.agentId, { lifecycle, targetIds: [normalized] })
+  const existing = snapshot.records.find(record => record.id === normalized)
+  if (existing) requireActiveMemory(existing)
   if (!existing) throw new MemoryManageError(`Memory "${normalized}" was not found for this agent.`, 404)
   if (updates.media_mode !== undefined || updates.lane !== undefined) {
-    const mode = (updates.media_mode ?? existing.media_mode ?? 'on_recall') as MemoryMediaMode
+    const effective = effectiveMemoryRecord(existing, snapshot.observedTs)
+    const mode = (updates.media_mode === null ? 'on_recall' : updates.media_mode ?? effective.media_mode ?? 'on_recall') as MemoryMediaMode
     if (mode !== 'on_recall' && mode !== 'always') {
       throw new MemoryManageError('media_mode must be "on_recall" or "always".', 400)
     }
-    const lane = updates.lane ?? existing.lane
+    const lane = memoryIsExpired(existing, snapshot.observedTs) && !options.deliberateLaneMove ? effective.lane : updates.lane ?? effective.lane
     if (mode === 'always' && lane !== 'awareness') {
       throw new MemoryManageError(
         'Turn off "Show this image every message" before moving this memory out of Awareness.',
         400
       )
     }
-    try {
-      await assertStandingMediaCapacity({
-        agentId: context.agentId,
-        mode,
-        mediaCount: existing.media?.length ?? 0,
-        excludeMemoryId: existing.id
-      })
-    } catch (error) {
-      throw new MemoryManageError(error instanceof Error ? error.message : 'Standing media cap exceeded.', 400)
-    }
+
   }
   const embedder = await createMemoryEmbedderAsync((await getMemoryConfig()).embedding, {
     userId: context.userId
   })
-  const record = await updateMemory(context.agentId, normalized, updates, { embedder })
+  const record = await updateMemory(context.agentId, normalized, updates, { embedder, lifecycle, snapshot, deliberateLaneMove: options.deliberateLaneMove })
   return toRecordView(record)
 }
 
@@ -321,7 +323,7 @@ export async function loadManagedMemoryMedia(
   await requireOwnedAgent(context.userId, context.agentId)
   const record = await getMemory(context.agentId, memoryId)
   if (!record) throw new MemoryManageError(`Memory "${memoryId}" was not found for this agent.`, 404)
-  return loadMemoryMedia(context.agentId, memoryId, requireOwnedMedia(record, mediaId))
+  return loadMemoryMedia(context.agentId, memoryId, requireOwnedMedia(record, mediaId), { audience: 'user', userId: context.userId })
 }
 
 export async function replaceManagedMemoryMedia(
@@ -330,9 +332,12 @@ export async function replaceManagedMemoryMedia(
   mediaId: string,
   input: { bytes: Uint8Array; mimeType: string; filename?: string }
 ): Promise<MemoryRecordView> {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
   await requireOwnedAgent(context.userId, context.agentId)
-  const record = await getMemory(context.agentId, memoryId)
+  const snapshot = await readMemoryMutationSnapshot(context.agentId, { lifecycle, targetIds: [memoryId] })
+  const record = snapshot.records.find(entry => entry.id === memoryId)
   if (!record) throw new MemoryManageError(`Memory "${memoryId}" was not found for this agent.`, 404)
+  requireActiveMemory(record)
   const oldMedia = requireOwnedMedia(record, mediaId)
   let replacement: MemoryMediaRecord
   try {
@@ -342,17 +347,19 @@ export async function replaceManagedMemoryMedia(
       bytes: input.bytes,
       mimeType: input.mimeType,
       filename: input.filename,
-      source: { kind: 'upload', label: 'memory-panel-replacement' }
+      source: { kind: 'upload', label: 'memory-panel-replacement' },
+      lifecycle
     })
   } catch (error) {
+    if (memoryMutationUnknown(error)) throw error
     throw new MemoryManageError(error instanceof Error ? error.message : 'Replacement image failed.', 400)
   }
   const media = (record.media ?? []).map((entry) => (entry.id === mediaId ? replacement : entry))
   let updated: MemoryRecord
   try {
-    updated = await updateMemory(context.agentId, memoryId, { media })
+    updated = await updateMemory(context.agentId, memoryId, { media }, { lifecycle, snapshot })
   } catch (error) {
-    await deleteMemoryMedia(replacement).catch(() => {})
+    if (!memoryMutationUnknown(error)) await deleteMemoryMedia(replacement).catch(() => {})
     throw error
   }
   // The memory now owns the replacement. A failure cleaning the retired file
@@ -366,12 +373,15 @@ export async function deleteManagedMemoryMedia(
   memoryId: string,
   mediaId: string
 ): Promise<MemoryRecordView> {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
   await requireOwnedAgent(context.userId, context.agentId)
-  const record = await getMemory(context.agentId, memoryId)
+  const snapshot = await readMemoryMutationSnapshot(context.agentId, { lifecycle, targetIds: [memoryId] })
+  const record = snapshot.records.find(entry => entry.id === memoryId)
   if (!record) throw new MemoryManageError(`Memory "${memoryId}" was not found for this agent.`, 404)
+  requireActiveMemory(record)
   const oldMedia = requireOwnedMedia(record, mediaId)
   const media = (record.media ?? []).filter((entry) => entry.id !== mediaId)
-  const updated = await updateMemory(context.agentId, memoryId, { media })
+  const updated = await updateMemory(context.agentId, memoryId, { media }, { lifecycle, snapshot })
   await deleteMemoryMedia(oldMedia)
   return toRecordView(updated)
 }
@@ -380,6 +390,7 @@ export async function deleteManagedMemory(
   context: MemoryManageContext,
   memoryId: string
 ): Promise<{ deleted: boolean }> {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
   await requireOwnedAgent(context.userId, context.agentId)
   const normalized = typeof memoryId === 'string' ? memoryId.trim() : ''
   if (!normalized) throw new MemoryManageError('memoryId is required.', 400)
@@ -387,13 +398,34 @@ export async function deleteManagedMemory(
   if (!existing) {
     throw new MemoryManageError(`Memory "${normalized}" was not found for this agent.`, 404)
   }
-  const deleted = await deleteMemory(context.agentId, normalized)
+  const deleted = await deleteMemory(context.agentId, normalized, { lifecycle })
   if (deleted) {
     // SA-110 P2 (DL-110-05): panel deletion is as destructive as the tool's — the
     // same immediate re-fold rule applies so the SP never shows deleted content.
     await refoldAwarenessAfterDelete(context.agentId, normalized, existing.lane)
   }
   return { deleted }
+}
+
+/** Human-only management. The broker has no trash, restore or purge control. */
+export async function listDeletedManagedMemories(context: MemoryManageContext, limit = 100) {
+  await requireOwnedAgent(context.userId, context.agentId)
+  const records = (await listMemories(context.agentId)).filter(memoryIsDeleted)
+    .sort((a, b) => (b.deleted_ts ?? 0) - (a.deleted_ts ?? 0) || a.id.localeCompare(b.id))
+  return { results: records.slice(0, Math.min(500, Math.max(1, limit))).map(record => ({ ...toMemorySummary(record), deleted_at: record.deleted_at, purge_pending: record.purge_pending === true })), total: records.length }
+}
+
+export async function restoreManagedMemory(context: MemoryManageContext, memoryId: string) {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
+  await requireOwnedAgent(context.userId, context.agentId)
+  const record = await restoreMemory(context.agentId, memoryId, { lifecycle })
+  return { record: toRecordView(record) }
+}
+
+export async function emptyDeletedManagedMemories(context: MemoryManageContext) {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
+  await requireOwnedAgent(context.userId, context.agentId)
+  return emptyDeletedMemories(context.agentId, { lifecycle })
 }
 
 /**
@@ -409,7 +441,7 @@ export async function getManagedAwareness(
   await requireOwnedAgent(context.userId, context.agentId)
   const nowTs = Date.now()
   const records = (await listMemories(context.agentId)).filter(
-    (record) => record.lane === 'awareness' && record.is_superseded !== 'y'
+    (record) => memoryIsEligible(record) && record.lane === 'awareness' && record.is_superseded !== 'y'
   )
   records.sort(
     (a, b) =>

@@ -7,14 +7,13 @@
  */
 
 import { json, type RequestHandler } from '@sveltejs/kit'
+import { mergeCatalogVariantEvidence } from '$lib/utils/catalogReasoningEvidence'
 import { apiFailure } from '$lib/server/services/apiResponses'
-import { env } from '$env/dynamic/private'
 import { logger } from '$lib/utils/logger'
 import {
   ProviderManager,
   resolveProviderAccess,
-  type ProviderAccessResolution,
-  type KnownProviderId
+  type ProviderAccessResolution
 } from '$lib/server/services/providers'
 import { fetchVercelModelCatalog } from '$lib/server/services/vercelModelCatalog'
 import type {
@@ -24,26 +23,18 @@ import type {
 } from '$lib/types/modelCatalog'
 import { CONNECTION_CREDENTIAL_MAP, gatherCredentialTypes } from '$lib/server/constants/modelConnections'
 import { getN8NCredentialStatuses, type N8NCredentialStatusResult } from '$lib/server/services/n8nCredentials'
-import { detectCodexCliStatus, type CodexCliStatus } from '$lib/server/services/codexCliStatus'
-import { detectClaudeCliStatus, type ClaudeCliStatus } from '$lib/server/services/claudeCliStatus'
 import { listCustomProviders } from '$lib/server/services/customProviders'
-import { CUSTOM_PROVIDER_KEY_NOT_USABLE, type CustomProviderSummary } from '$lib/types/customProviders'
 import { listLocalAiServers, resolveLocalAiRuntimeBaseUrl } from '$lib/server/services/localAiServers'
 import { readKoboldCppServing } from '$lib/server/services/localRuntimeContext'
 import type { LocalAiServerSummary } from '$lib/types/localAi'
-import { isManualEntryDirectProvider } from '$lib/utils/modelCatalogConnectionMode'
-import { pausedPlanStatuses, type PausedPlanStatus } from '$lib/server/services/pausedPlans'
+import { buildConnectionOptions as projectConnectionOptions } from '$lib/server/services/modelConnectionOptions'
+import { pausedPlanStatuses } from '$lib/server/services/pausedPlans'
 import { chatgptPlanConnectionOptions, chatgptPlanCatalogModels } from '$lib/server/services/chatgptPlanCatalog'
+import { claudePlanConnectionOptions, claudePlanCatalogModels } from '$lib/server/services/claudePlanCatalog'
+import { readClaudePlanDisplayStatus } from '$lib/server/services/claudePlanReadiness'
+import { isClaudePlanConnection } from '$lib/utils/claudePlanConnection'
+import { isChatgptPlanConnection } from '$lib/utils/chatgptPlanConnection'
 import { readOllamaModelCapabilities } from '$lib/utils/ollamaModelCapabilities'
-
-const CODEX_PROVIDER_ENABLED = env.BATSHIT_CODEX_PROVIDER_ENABLED !== 'false'
-const CODEX_PROVIDER_ID = 'openai-codex'
-const CODEX_CONNECTION_ID = 'codex-cli'
-const CODEX_DISPLAY_NAME = 'Codex CLI (GPT Plus/Pro)'
-const CLAUDE_PROVIDER_ENABLED = env.BATSHIT_CLAUDE_PROVIDER_ENABLED !== 'false'
-const CLAUDE_PROVIDER_ID = 'anthropic-claude-cli'
-const CLAUDE_CONNECTION_ID = 'claude-cli'
-const CLAUDE_DISPLAY_NAME = 'Claude Code CLI (Pro/Max)'
 
 /**
  * GET /api/models - List available AI models
@@ -63,13 +54,8 @@ export const GET: RequestHandler = async ({ locals, url }) => {
       const access = await resolveProviderAccess(locals.user?.id)
       const customProviders = await listCustomProviders(locals.user?.id)
       const localServers = await listLocalAiServers(locals.user?.id)
-      const [codexStatus, claudeStatus] = await Promise.all([
-        CODEX_PROVIDER_ENABLED ? detectCodexCliStatus() : Promise.resolve(null),
-        CLAUDE_PROVIDER_ENABLED ? detectClaudeCliStatus() : Promise.resolve(null)
-      ])
+      const claudePlanStatus = await readClaudePlanDisplayStatus()
       const baseConnectionOptions = buildConnectionOptions(access, {
-        codex: CODEX_PROVIDER_ENABLED ? codexStatus : null,
-        claude: CLAUDE_PROVIDER_ENABLED ? claudeStatus : null,
         customProviders,
         localServers,
         pausedPlans: await pausedPlanStatuses()
@@ -78,7 +64,8 @@ export const GET: RequestHandler = async ({ locals, url }) => {
       const n8nStatusResult = await getN8NCredentialStatuses(credentialTypes, {
         userId: locals.user?.id
       })
-      const connectionOptions = [...applyN8NStatuses(baseConnectionOptions, n8nStatusResult), ...chatgptPlanConnectionOptions(locals.user.id)]
+      const connectionOptions = [...applyN8NStatuses(baseConnectionOptions, n8nStatusResult), ...chatgptPlanConnectionOptions(locals.user.id),
+        ...claudePlanConnectionOptions(claudePlanStatus)]
 
       return json({
         data: {
@@ -104,23 +91,16 @@ export const GET: RequestHandler = async ({ locals, url }) => {
       localProviders: enabledLocalServers
     })
 
-    const [codexStatus, claudeStatus] = await Promise.all([
-      CODEX_PROVIDER_ENABLED ? detectCodexCliStatus() : Promise.resolve(null),
-      CLAUDE_PROVIDER_ENABLED ? detectClaudeCliStatus() : Promise.resolve(null)
-    ])
+    const claudePlanReadiness = await readClaudePlanDisplayStatus()
     const supplementalModels: CatalogModel[] = []
     const localModels = await buildLocalCatalogModels(enabledLocalServers)
     supplementalModels.push(...localModels)
 
-    if (CODEX_PROVIDER_ENABLED) {
-      supplementalModels.push(...buildCodexCatalogModels())
-    }
-    if (CLAUDE_PROVIDER_ENABLED) {
-      supplementalModels.push(...buildClaudeCliCatalogModels())
-    }
-
     // Merge catalogs, preferring Vercel entries when duplicates exist
-    const mergedModels = [...mergeCatalogs(catalog.models, supplementalModels), ...await chatgptPlanCatalogModels(locals.user.id)]
+    // SA-139: the Claude plan's status is its own check (the qualified executable and a Claude plan
+    // sign-in), shared for a short while with the card and the saved presets (`readClaudePlanDisplayStatus`).
+    const mergedModels = [...mergeCatalogs(catalog.models, supplementalModels), ...await chatgptPlanCatalogModels(locals.user.id),
+      ...claudePlanCatalogModels(claudePlanReadiness)]
 
     const category = url.searchParams.get('category')
     const filteredModels = category ? mergedModels.filter((m) => m.category === category) : mergedModels
@@ -133,50 +113,7 @@ export const GET: RequestHandler = async ({ locals, url }) => {
       info: providerManager.getProviderInfo(provider)
     }))
 
-    if (CODEX_PROVIDER_ENABLED) {
-      providerSummary.push({
-        name: 'codex',
-        configured: Boolean(codexStatus?.available),
-        info: {
-          models: ['codex/codex-cli'],
-          features: {
-            streaming: true,
-            tools: true,
-            reasoning: true,
-            code: true,
-            fast: true,
-            vision: false,
-            maxTokens: 200000
-          },
-        displayName: CODEX_DISPLAY_NAME,
-          priority: 50
-        }
-      })
-    }
-    if (CLAUDE_PROVIDER_ENABLED) {
-      providerSummary.push({
-        name: 'claude-cli',
-        configured: Boolean(claudeStatus?.available),
-        info: {
-          models: ['claude/claude-cli'],
-          features: {
-            streaming: true,
-            tools: true,
-            reasoning: true,
-            code: true,
-            fast: true,
-            vision: false,
-            maxTokens: 200000
-          },
-          displayName: CLAUDE_DISPLAY_NAME,
-          priority: 50
-        }
-      })
-    }
-
     const baseConnectionOptions = buildConnectionOptions(access, {
-      codex: CODEX_PROVIDER_ENABLED ? codexStatus : null,
-      claude: CLAUDE_PROVIDER_ENABLED ? claudeStatus : null,
       customProviders,
       localServers,
       pausedPlans: await pausedPlanStatuses()
@@ -185,7 +122,8 @@ export const GET: RequestHandler = async ({ locals, url }) => {
     const n8nStatusResult = await getN8NCredentialStatuses(credentialTypes, {
       userId: locals.user?.id
     })
-    const connectionOptions = [...applyN8NStatuses(baseConnectionOptions, n8nStatusResult), ...chatgptPlanConnectionOptions(locals.user.id)]
+    const connectionOptions = [...applyN8NStatuses(baseConnectionOptions, n8nStatusResult), ...chatgptPlanConnectionOptions(locals.user.id),
+      ...claudePlanConnectionOptions(claudePlanReadiness)]
 
     // Return successful response
     // SECURITY: No API keys in response, only metadata
@@ -266,9 +204,9 @@ function mergeCatalogs(vercelModels: CatalogModel[], supplementalModels: Catalog
       return
     }
 
-    const combinedVariants = {
-      ...(existing.idVariants ?? {}),
-      ...(normalized.idVariants ?? {})
+    const combinedVariants = { ...(existing.idVariants ?? {}) }
+    for (const [connection, variant] of Object.entries(normalized.idVariants ?? {})) {
+      combinedVariants[connection] = mergeCatalogVariantEvidence(combinedVariants[connection], variant, connection)
     }
     const combinedConnections = new Set([
       ...(existing.availableConnections ?? []),
@@ -761,323 +699,8 @@ async function buildLocalCatalogModels(servers: LocalAiServerSummary[]): Promise
   return entries.flat()
 }
 
-function buildCodexCatalogModels(): CatalogModel[] {
-  return [
-    {
-      id: 'codex/codex-cli',
-      canonicalId: 'codex/codex-cli',
-      provider: CODEX_PROVIDER_ID,
-      upstreamProvider: 'openai',
-      name: 'codex-cli',
-      displayName: CODEX_DISPLAY_NAME,
-      description:
-        'Bridge CLI-agent chats through your logged-in Codex CLI session. Choose the actual GPT-5 variant in the Codex defaults panel.',
-      tags: ['batshit-only', 'codex', 'openai'],
-      features: {
-        streaming: true,
-        tools: true,
-        reasoning: true,
-        code: true,
-        fast: true
-      },
-      category: 'code',
-      purpose: 'chat',
-      source: 'codex',
-      transport: 'direct',
-      connectionId: CODEX_CONNECTION_ID,
-      availableConnections: [CODEX_CONNECTION_ID]
-    }
-  ]
-}
-
-function buildClaudeCliCatalogModels(): CatalogModel[] {
-  return [
-    {
-      id: 'claude/claude-cli',
-      canonicalId: 'claude/claude-cli',
-      provider: CLAUDE_PROVIDER_ID,
-      upstreamProvider: 'anthropic',
-      name: 'claude-cli',
-      displayName: CLAUDE_DISPLAY_NAME,
-      description:
-        'Bridge CLI-agent chats through your logged-in Claude Code CLI session. Choose the actual model in the Claude defaults panel.',
-      tags: ['batshit-only', 'claude', 'anthropic'],
-      features: {
-        streaming: true,
-        tools: true,
-        reasoning: true,
-        code: true,
-        fast: true
-      },
-      category: 'code',
-      purpose: 'chat',
-      source: 'claude-cli',
-      transport: 'direct',
-      connectionId: CLAUDE_CONNECTION_ID,
-      availableConnections: [CLAUDE_CONNECTION_ID]
-    }
-  ]
-}
-
-function buildConnectionOptions(
-  access: ProviderAccessResolution,
-  extras?: {
-    codex: CodexCliStatus | null
-    claude?: ClaudeCliStatus | null
-    customProviders?: CustomProviderSummary[]
-    localServers?: LocalAiServerSummary[]
-    /** Plan pause: the server's words for each paused plan on this copy. */
-    pausedPlans?: Record<string, PausedPlanStatus>
-  }
-): CatalogConnectionOption[] {
-  const options: CatalogConnectionOption[] = []
-  const n8nHint = 'Manage credentials in n8n for Modes 1 & 2 plus subagents.'
-
-  const addOption = (option: CatalogConnectionOption) => {
-    options.push(option)
-  }
-
-  const gatewayStatus = access.gateway.availability
-  addOption({
-    id: 'vercel-gateway',
-    label: 'Vercel AI Gateway',
-    transport: 'vercel-gateway',
-    service: 'vercel',
-    providers: null,
-    description: 'Use the hosted Vercel catalog with routing and caching.',
-    status: gatewayStatus.hasKey ? 'ready' : 'locked',
-    lockedReason: gatewayStatus.hasKey ? undefined : 'Add an AI Gateway key under Settings → API Keys.',
-    n8nStatus: 'unknown',
-    n8nDescription: n8nHint,
-    requiredN8NCredentials: CONNECTION_CREDENTIAL_MAP['vercel-gateway']
-  })
-
-  const titleCase = (value: string) => value.charAt(0).toUpperCase() + value.slice(1)
-  const directProviders: KnownProviderId[] = [
-    'anthropic',
-    'openai',
-    'google',
-    'mistral',
-    'groq',
-    'xai',
-    'deepseek',
-    'moonshot',
-    'kimi_code',
-    'minimax',
-    'minimax_token_plan',
-    'mimo',
-    'mimo_token_plan',
-    'qwencloud',
-    'qwen_token_plan',
-    'alibaba',
-    'stepfun',
-    'zai',
-    'zai_coding',
-    'fal',
-    'luma',
-    'replicate',
-    'elevenlabs',
-    'deepgram',
-    'assemblyai',
-    'cohere',
-    'deepinfra',
-    'togetherai',
-    'fireworks',
-    'baseten',
-    'cerebras'
-  ]
-  const DIRECT_PROVIDER_LABELS: Partial<Record<KnownProviderId, string>> = {
-    openai: 'OpenAI',
-    deepseek: 'DeepSeek',
-    zai: 'Z.ai General',
-    zai_coding: 'Z.ai Coding Plan',
-    xai: 'xAI',
-    moonshot: 'Moonshot AI',
-    kimi_code: 'Kimi Code Membership',
-    minimax: 'MiniMax',
-    minimax_token_plan: 'MiniMax Token Plan',
-    mimo: 'MiMo',
-    mimo_token_plan: 'MiMo Token Plan',
-    qwencloud: 'Qwen Cloud',
-    qwen_token_plan: 'Qwen Token Plan',
-    alibaba: 'Alibaba Cloud',
-    stepfun: 'StepFun',
-    fal: 'fal.ai',
-    luma: 'Luma',
-    replicate: 'Replicate',
-    elevenlabs: 'ElevenLabs',
-    deepgram: 'Deepgram',
-    assemblyai: 'AssemblyAI',
-    cohere: 'Cohere',
-    deepinfra: 'DeepInfra',
-    togetherai: 'Together.ai',
-    fireworks: 'Fireworks AI',
-    baseten: 'Baseten',
-    cerebras: 'Cerebras'
-  }
-  const DIRECT_PROVIDER_DESCRIPTIONS: Partial<Record<KnownProviderId, string>> = {
-    zai_coding: 'Use current Z.ai Coding Plan models, including GLM-5.3 and GLM-5.3-Flash, through the OpenAI-compatible coding endpoint.',
-    xai: 'Use xAI Grok models through the OpenAI-compatible xAI API.',
-    moonshot: 'Use Moonshot AI Kimi models through the OpenAI-compatible Kimi API.',
-    kimi_code:
-      'Use Kimi Code membership quota and its separate coding endpoint. This connection does not spend Moonshot pay-as-you-go balance.',
-    minimax: 'Use MiniMax M-series models through the OpenAI-compatible MiniMax API.',
-    minimax_token_plan:
-      'Use the separate MiniMax sk-cp subscription key for interactive M3 and M2.7 work. MiniMax recommends pay-as-you-go for production use.',
-    mimo: 'Use Xiaomi MiMo V2.5 models through the OpenAI-compatible MiMo API.',
-    mimo_token_plan:
-      'Use the separate Xiaomi MiMo tp- subscription key for the V2.5 chat and speech model family.',
-    qwencloud: 'Use Qwen and other DashScope-hosted models through Qwen Cloud.',
-    qwen_token_plan:
-      'Use the Alibaba Token Plan subscription route for interactive Batshit chats and agents. Alibaba excludes workflow, batch, and generic backend use.',
-    alibaba: 'Use Alibaba Cloud Model Studio Qwen models through DashScope OpenAI-compatible mode.',
-    stepfun: 'Use StepFun chat models through the OpenAI-compatible StepFun API.',
-    zai: 'Use Z.ai GLM models via the OpenAI-compatible general endpoint.',
-    fal: 'Use fal.ai image + audio models (Flux, Minimax TTS) with your API key.',
-    luma: 'Use Luma Photon image/video models with your API key.',
-    replicate: 'Use Replicate hosted models (Flux, etc.) with your API key.',
-    elevenlabs: 'Use ElevenLabs speech + transcription models with your API key.',
-    deepgram: 'Use Deepgram transcription models with your API key.',
-    assemblyai: 'Use AssemblyAI transcription models with your API key.',
-    cohere: 'Use Cohere chat, embeddings, rerank, and transcription models with your API key.',
-    deepinfra: 'Use DeepInfra hosted chat models through the built-in live model catalog.'
-  }
-  for (const provider of directProviders) {
-    const status = access.availability[provider]
-    const manualEntry = isManualEntryDirectProvider(provider)
-    const providerLabel = DIRECT_PROVIDER_LABELS[provider] ?? titleCase(provider)
-    const providerDescription =
-      DIRECT_PROVIDER_DESCRIPTIONS[provider] ??
-      (manualEntry
-        ? `${providerLabel} requires manual model entry (catalog sync coming later).`
-        : `Call ${providerLabel} with your own API key for lowest latency.`)
-    const lockedReason = `Add a ${providerLabel} API key under Settings → API Keys.`
-    // Plan pause: a paused plan is locked with its plain words; on a Dev copy
-    // that allows paused plans its description says so.
-    const pausedPlan = extras?.pausedPlans?.[provider]
-    const planLocked = pausedPlan?.paused === true
-    addOption({
-      id: `direct:${provider}`,
-      label: `${providerLabel} (Direct)`,
-      transport: 'direct',
-      service: provider,
-      providers: [provider],
-      description: pausedPlan ? `${pausedPlan.message} ${providerDescription}` : providerDescription,
-      status: status?.hasKey && !planLocked ? 'ready' : 'locked',
-      lockedReason: planLocked ? pausedPlan.message : status?.hasKey ? undefined : lockedReason,
-      n8nStatus: 'unknown',
-      n8nDescription: n8nHint,
-      requiredN8NCredentials: CONNECTION_CREDENTIAL_MAP[`direct:${provider}`]
-    })
-  }
-
-  const openrouterStatus = access.availability.openrouter
-  addOption({
-    id: 'openrouter',
-    label: 'OpenRouter',
-    transport: 'openrouter',
-    service: 'openrouter',
-    providers: ['anthropic', 'openai', 'google', 'mistral', 'meta', 'meta-llama', 'groq', 'xai', 'qwen', 'deepseek', 'cohere', 'ai21'],
-    description: 'Route through OpenRouter to access hundreds of hosted models.',
-    status: openrouterStatus?.hasKey ? 'ready' : 'locked',
-    lockedReason: openrouterStatus?.hasKey
-      ? undefined
-      : 'Add an OpenRouter API key under Settings → API Keys.',
-    n8nStatus: 'unknown',
-    n8nDescription: n8nHint,
-    requiredN8NCredentials: CONNECTION_CREDENTIAL_MAP['openrouter']
-  })
-
-  if (extras?.customProviders?.length) {
-    for (const provider of extras.customProviders) {
-      addOption({
-        id: `direct:${provider.id}`,
-        label: `${provider.label} (Custom)`,
-        transport: 'direct',
-        service: provider.id,
-        providers: [provider.id],
-        description: 'Custom OpenAI-compatible provider (manual model entry required).',
-        // Packet 5 finding 1: a provider whose saved key is missing (restored
-        // without secrets) or cannot be read is never registered at run time.
-        status: provider.apiKeyUsable ? 'ready' : 'locked',
-        lockedReason: provider.apiKeyUsable ? undefined : CUSTOM_PROVIDER_KEY_NOT_USABLE,
-        n8nStatus: 'locked',
-        n8nDescription: 'Custom providers are only available in Batshit direct mode.',
-        requiredN8NCredentials: []
-      })
-    }
-  }
-
-  if (extras?.localServers?.length) {
-    for (const server of extras.localServers) {
-      const enabled = server.enabled !== false
-      addOption({
-        id: `direct:${server.id}`,
-        label: `${server.label} (Local)`,
-        transport: 'direct',
-        service: server.id,
-        providers: [server.id],
-        description: `OpenAI-compatible local endpoint at ${server.baseUrl}${server.openaiPath}.`,
-        status: enabled ? 'ready' : 'locked',
-        lockedReason: enabled ? undefined : 'Enable this runtime in Settings → Local AI.',
-        n8nStatus: 'unknown',
-        n8nDescription: enabled ? n8nHint : 'Enable this runtime in Settings → Local AI.',
-        requiredN8NCredentials: CONNECTION_CREDENTIAL_MAP[`direct:${server.id}`] ?? []
-      })
-    }
-  }
-
-  if (CODEX_PROVIDER_ENABLED) {
-    const codexStatus = extras?.codex
-    addOption({
-      id: CODEX_CONNECTION_ID,
-      label: CODEX_DISPLAY_NAME,
-      transport: 'direct',
-      service: CODEX_PROVIDER_ID,
-      providers: [CODEX_PROVIDER_ID],
-      description:
-        'Use the Codex CLI tied to your ChatGPT Plus/Pro login for CLI agents. Supports CLI `--model` overrides (for example `gpt-5.1-codex`).',
-      status: codexStatus?.available ? 'ready' : 'locked',
-      lockedReason:
-        codexStatus?.available
-          ? undefined
-          : codexStatus?.error ?? 'Codex CLI is not installed. Use the one-click install in Agent Settings, then run `codex login`.',
-      setupCommand: codexStatus?.available ? undefined : codexStatus?.setupCommand,
-      statusCommand: codexStatus?.statusCommand,
-      setupContext: codexStatus?.setupContext,
-      setupWorkingDirectory: codexStatus?.setupWorkingDirectory,
-      n8nStatus: 'locked',
-      n8nDescription: 'Codex CLI is only available for CLI primary agents.',
-      requiredN8NCredentials: []
-    })
-  }
-
-  if (CLAUDE_PROVIDER_ENABLED) {
-    const claudeStatus = extras?.claude
-    addOption({
-      id: CLAUDE_CONNECTION_ID,
-      label: CLAUDE_DISPLAY_NAME,
-      transport: 'direct',
-      service: CLAUDE_PROVIDER_ID,
-      providers: [CLAUDE_PROVIDER_ID],
-      description:
-        'Use the Claude Code CLI tied to your Claude Pro/Max login for CLI agents.',
-      status: claudeStatus?.available ? 'ready' : 'locked',
-      lockedReason:
-        claudeStatus?.available
-          ? undefined
-          : claudeStatus?.error ?? 'Claude Code CLI is not installed. Use the one-click install in Agent Settings, then run `claude auth login`.',
-      setupCommand: claudeStatus?.available ? undefined : claudeStatus?.setupCommand,
-      statusCommand: claudeStatus?.statusCommand,
-      setupContext: claudeStatus?.setupContext,
-      setupWorkingDirectory: claudeStatus?.setupWorkingDirectory,
-      n8nStatus: 'locked',
-      n8nDescription: 'Claude Code CLI is only available for CLI primary agents.',
-      requiredN8NCredentials: []
-    })
-  }
-
-  return options
+function buildConnectionOptions(access: ProviderAccessResolution, extras?: Parameters<typeof projectConnectionOptions>[1]) {
+  return projectConnectionOptions(access, extras)
 }
 
 function applyN8NStatuses(
@@ -1154,6 +777,14 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         { error: 'Model ID required', success: false },
         { status: 400 }
       )
+    }
+
+    // SA-139: a plan model (ChatGPT or Claude) runs only through its own connection and never falls
+    // back, so ProviderManager is not asked about it; the connection's status says whether it can run.
+    const connectionId = String(modelId).split('/')[0]
+    if (isClaudePlanConnection(connectionId) || isChatgptPlanConnection(connectionId)) {
+      return json({ data: { available: false, modelId,
+        message: 'Plan models are not checked here: they run only through their own connection and never fall back to another one. See that connection in Settings → Models.' }, success: true })
     }
 
     // Try to get the model

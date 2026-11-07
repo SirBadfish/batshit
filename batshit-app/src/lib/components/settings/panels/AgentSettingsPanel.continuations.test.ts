@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { untrack } from 'svelte'
 import { resolveAgentDeleteChatCountOutcome } from '$lib/utils/agentDeleteChatCount'
 import { uploadAvatarFile } from '$lib/appActions/imports/avatars'
+import { isCliSubagentType } from '$lib/utils/subagentType'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -113,10 +114,28 @@ describe('Agent Settings awaited continuations (BL-1026, BL-1027)', () => {
       subagentStore: { delete: vi.fn() }, toast: { error: vi.fn(), success: vi.fn() },
       untrack, loadAgents: vi.fn(async () => { scope.agents = [] }), hydrateAgent: vi.fn(async () => {}),
       makeSubagentSignature: vi.fn(() => '[]'), updateAgentCollections: vi.fn(), selectSubagent: vi.fn(),
-      agentDeleteState: 'idle', agentDeleteError: null, subagentDeleteState: 'idle', subagentDeleteError: null
+      agentDeleteState: 'idle', agentDeleteError: null, subagentDeleteState: 'idle', subagentDeleteError: null,
+      // SA-139 R5: the Subagent delete names a leftover CLI Subagent's managed settings folder.
+      isCliSubagentType
     }
     return { scope, confirmation }
   }
+
+  // SA-139 R5: a leftover CLI Subagent stays deletable; its confirmation says its managed CLI
+  // settings folder goes with it (the server's delete removes it), and an API one says nothing of it.
+  it.each([['cli', true], ['api', false]] as const)('a %s Subagent delete confirmation names the managed CLI settings folder only for a leftover', async (subagentType, namesFolder) => {
+    const { scope, confirmation } = deleteContext('subagent')
+    scope.subagentForm = { displayName: 'Subagent A', subagentType }
+    const result = callback('handleDeleteSubagent', scope)()
+    for (let turn = 0; turn < 12 && scope.confirmDialog.mock.calls.length === 0; turn++) await Promise.resolve()
+    expect(scope.confirmDialog).toHaveBeenCalledOnce()
+    const { title, description } = scope.confirmDialog.mock.calls[0][0]
+    expect(title).toBe('Delete Subagent A?')
+    expect(description.includes('managed CLI settings folder')).toBe(namesFolder)
+    confirmation.resolve(true)
+    await result
+    expect(scope.subagentStore.delete).toHaveBeenCalledWith('A')
+  })
 
   it('a failed Primary chat-count read refuses before opening any deletion dialog', async () => {
     const { scope } = deleteContext('agent')

@@ -209,6 +209,19 @@ describe('SessionItem delete refusals', () => {
     expect(shown).toBe(`Failed to delete session: ${sentence}`)
   })
 
+  // Re-review of BL-1798: a chat delete whose read failed deleted nothing, and says so.
+  it('shows the sweep’s sentence when a failed read deleted nothing', async () => {
+    const sentence =
+      "This chat's messages or zips could not be read, so nothing was deleted. Try again in a moment."
+
+    const shown = await deleteWhenTheServerAnswers({
+      status: 500,
+      body: { error: sentence, code: 'session_delete_read_failed' }
+    })
+
+    expect(shown).toBe(`Failed to delete session: ${sentence}`)
+  })
+
   it('does not say "Failed to delete session" twice when that is the server’s sentence', async () => {
     const shown = await deleteWhenTheServerAnswers({
       status: 500,

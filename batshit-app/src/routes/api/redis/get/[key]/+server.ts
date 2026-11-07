@@ -14,12 +14,14 @@ export const GET: RequestHandler = async ({ params, locals }) => {
         const allowedKeys = [
             // Primary-agent prompts
             'batshit:batshit_mode3_system_prompt',
-            'batshit:batshit_mode4_system_prompt',
             // Base SA prompts
             'batshit:sub_system_prompt',
             'batshit:worker_prompt',
             'batshit:subagent_guidance',
             // Tool + zip guidance prompts
+            'batshit:tool_guidance_zip_prompt',
+            // BL-1777: read-only, so an admin can read an older zip tool prompt edit that
+            // "Tool Prompt: Zips" could not take (Batshit keeps it until the one record holds it).
             'batshit:tool_guidance_zip_enabled_prompt',
             'batshit:tool_guidance_zip_disabled_prompt',
             'batshit:tool_guidance_memory_prompt',

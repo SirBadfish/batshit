@@ -1,4 +1,5 @@
 import { slugToolName } from './toolNameNormalization'
+import { API_UTILITY_CONTROL_IDS, isApiUtilityControlId } from './apiUtilityControls'
 
 const TOOL_DISPLAY_ALIASES: Record<string, string> = {
   batshit_server_read_file: 'Read File',
@@ -90,7 +91,7 @@ const TOOL_DISPLAY_ALIAS_ENTRIES = Object.entries(TOOL_DISPLAY_ALIASES).sort(
   ([left], [right]) => right.length - left.length
 )
 
-const BATSHIT_TOOL_REF_FAMILIES = new Set(['mcp', 'cli', 'artifact', 'fabric', 'agent_browser'])
+const BATSHIT_TOOL_REF_FAMILIES = new Set(['mcp', 'cli', 'artifact', 'fabric', 'batshit', 'agent_browser'])
 
 /**
  * Fabric control ids whose display name the derivation below gets WRONG.
@@ -107,6 +108,11 @@ const BATSHIT_TOOL_REF_FAMILIES = new Set(['mcp', 'cli', 'artifact', 'fabric', '
  * derived name is wrong, never to make a new family visible — it already is.
  */
 const FABRIC_CONTROL_DISPLAY_ALIASES: Record<string, string> = {
+  [API_UTILITY_CONTROL_IDS.webSearch]: 'Web Search',
+  [API_UTILITY_CONTROL_IDS.workers]: 'Workers',
+  [API_UTILITY_CONTROL_IDS.skill]: 'Skill Reference',
+  [API_UTILITY_CONTROL_IDS.subagent]: 'Subagent',
+  'sys.whiteboard.update': 'Update Whiteboard',
   'sys.ui.settings_open': 'Open Settings',
   'sys.ui.settings_close': 'Close Settings',
   'sys.ui.goon_show': 'Show Goon Dock',
@@ -230,6 +236,9 @@ export function formatBatshitToolTargetDisplayName(rawName: string | undefined):
 
   const normalizedTarget = target.trim().toLowerCase()
   if (!normalizedTarget) return null
+
+  if (isApiUtilityControlId(normalizedTarget) &&
+      rawName.includes(':') && !rawName.startsWith('batshit:')) return null
 
   const directAlias = FABRIC_CONTROL_DISPLAY_ALIASES[normalizedTarget]
   if (directAlias) return directAlias

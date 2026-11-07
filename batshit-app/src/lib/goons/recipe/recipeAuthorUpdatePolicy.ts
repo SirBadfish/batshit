@@ -2,7 +2,40 @@ import type { RecipeMigrationPlan } from './migrationPlanContracts'
 
 export const RECIPE_AUTHOR_UPDATE_POLICY_CONTRACT = 'recipe-author-update-policy/v1' as const
 
+// Recognition protects a durable Source's identity; it does not grant product
+// preparation, author-update, export or creation eligibility.
+export const RECOGNIZED_FIRST_PARTY_RECIPE_SOURCE_PAIRS = [
+  { baseId: 'batshit-base-f-v1', fitFamily: 'batshit-base-f-v1' },
+  { baseId: 'batshit-base-m-v1', fitFamily: 'batshit-base-m-v1' }
+] as const
+
 export const SUPPORTED_FIRST_PARTY_RECIPE_BASE_IDS = ['batshit-base-f-v1'] as const
+
+// Initial preparation is distinct from author updates, Clothing and other
+// capabilities, which keep their own narrower qualification.
+export const FIRST_PARTY_RECIPE_PREPARATION_BASE_IDS = [
+  'batshit-base-f-v1', 'batshit-base-m-v1'
+] as const
+
+export function isFirstPartyRecipePreparationBase(baseId: string | null | undefined): boolean {
+  return FIRST_PARTY_RECIPE_PREPARATION_BASE_IDS.some((id) => id === baseId)
+}
+
+/** A reserved Male declaration stays unavailable while its old or incomplete
+ * summary is verified; recognition alone does not make it eligible or ready. */
+export function requiresFirstPartyRecipePreparation(summary: { baseId?: string; recipeReady?: boolean } | null | undefined) {
+  return summary?.baseId === 'batshit-base-m-v1' ||
+    (summary?.recipeReady === true && isFirstPartyRecipePreparationBase(summary.baseId))
+}
+
+export function isRecognizedFirstPartyRecipeSourcePair(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const source = value as Record<string, unknown>
+  return Object.hasOwn(source, 'baseId') && Object.hasOwn(source, 'fitFamily') &&
+    RECOGNIZED_FIRST_PARTY_RECIPE_SOURCE_PAIRS.some(
+      ({ baseId, fitFamily }) => source.baseId === baseId && source.fitFamily === fitFamily
+    )
+}
 
 export const RECIPE_AUTHOR_UPDATE_CLASSIFICATIONS = [
   'automatic-appearance-preserving',

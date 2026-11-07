@@ -1,16 +1,23 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   mergeToolSelections,
   resolveDynamicMcpGatewayScope,
+  resolveMCPSelections,
   __testUtils
 } from '$lib/server/services/mcpSelectionResolver'
 import type { MCPToolSelections } from '$lib/types/database'
 import { redis } from '$lib/server/redis'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
+import { mcpGatewayDiscovery } from '$lib/server/services/mcpGatewayDiscovery'
+import { captureP5OriginalLookup, prepareP5OriginalTask, recordP5ResolvedApiScope, bindP5ApiReplyPart, sealP5OriginalPreparation, retireP5OriginalPreparation, type P5OriginalPreparation } from '$lib/server/services/appActions/mcp/originalTask'
+import { withSettingsRecordReplacement } from '$lib/server/services/appActions/settings/lifecycle'
+import { registerSessionTurn, stopSessionTurn, __resetStreamAbortRegistryForTests } from '$lib/server/services/streamAbortRegistry'
+vi.mock('$lib/services/apiKey.server', () => ({ apiKeyService: { retrieve: vi.fn(async () => null) } }))
 
 vi.mock('$lib/server/redis', () => ({
   redis: {
-    get: vi.fn()
+    get: vi.fn(),
+    execute: vi.fn(async (operation: (client: any) => Promise<unknown>) => operation({ get: async () => 'existing-migration-marker' }))
   }
 }))
 
@@ -21,6 +28,85 @@ vi.mock('$lib/server/services/mcpGatewayService', () => ({
 }))
 
 const { sanitizeStringArray, normalizeToolSelectionsInput } = __testUtils
+
+describe('real resolver original tool ceiling before discovery', () => {
+  let apiPreparation: P5OriginalPreparation | undefined
+  const owner = { userId: 'ceiling-user', agentId: 'ceiling-agent', sessionId: 'ceiling-chat' }
+  beforeEach(() => {
+    __resetStreamAbortRegistryForTests()
+    vi.mocked(mcpGatewayService.listEnabled).mockResolvedValue([{ id: 'A', name: 'Synthetic A', type: 'custom', enabled: true } as any])
+  })
+  afterEach(async () => {
+    if (apiPreparation) { await sealP5OriginalPreparation(apiPreparation); retireP5OriginalPreparation(apiPreparation); apiPreparation = undefined }
+    __resetStreamAbortRegistryForTests(); vi.restoreAllMocks()
+  })
+  function apiOriginal(tools: string[]) {
+    const registration = registerSessionTurn(owner.sessionId, 'single', 'reply')
+    if (!registration.ok) throw new Error('API registration refused')
+    const agent = { id: owner.agentId, user_id: owner.userId, agentType: 'api' }
+    apiPreparation = prepareP5OriginalTask(captureP5OriginalLookup(owner), { ...owner, agent,
+      session: { id: owner.sessionId, user_id: owner.userId }, turn: registration.entry })
+    if (!apiPreparation) throw new Error('API preparation refused')
+    recordP5ResolvedApiScope(apiPreparation, { gateways: ['A'], tools })
+    expect(bindP5ApiReplyPart(apiPreparation, { replyId: 'reply', version: 0 })).toBeDefined()
+    return apiPreparation // Actual owner DATA; no SDK/run/known-save certificate.
+  }
+  function lowLevel() {
+    return vi.spyOn(mcpGatewayDiscovery, 'discoverFromMultipleGateways').mockResolvedValue([
+      { gatewayId: 'A', success: true, tools: [{ name: 'old-tool' }, { name: 'fresh-tool' }] } as any
+    ])
+  }
+  const options = () => ({ ...owner, agent: { id: owner.agentId, user_id: owner.userId, agentType: 'cli',
+    defaultMCPToolSelections: ['fresh-tool'] } as any, selectedGateways: ['A'], toolSelections: [], includeGatewayToolMap: true })
+
+  it('keeps absent-bound ordinary empty-override/default semantics unchanged', async () => {
+    const discover = lowLevel()
+    const result = await resolveMCPSelections(options())
+    expect(result.resolvedToolSelections).toEqual(['fresh-tool'])
+    expect(result.gatewayToolMap).toEqual({ A: ['fresh-tool'] })
+    expect(discover).toHaveBeenCalledOnce()
+  })
+  it('preserves the genuine API original[] after ordinary normalization and before discovery', async () => {
+    const discover = lowLevel(), input = options()
+    input.agent.agentType = 'api'
+    const result = await resolveMCPSelections({ ...input, mcpOriginalPreparation: apiOriginal([]) })
+    expect(result.resolvedToolSelections).toEqual([])
+    expect(result.gatewayToolMap).toEqual({})
+    expect(discover).not.toHaveBeenCalled()
+  })
+  it('intersects the genuine nonempty API owner before the actual gateway map', async () => {
+    const discover = lowLevel(), input = options(), map = vi.spyOn(mcpGatewayDiscovery, 'buildGatewayToolMap')
+    input.agent.agentType = 'api'; input.agent.defaultMCPToolSelections = ['old-tool', 'fresh-tool']
+    const result = await resolveMCPSelections({ ...input, toolSelections: undefined, mcpOriginalPreparation: apiOriginal(['old-tool']) })
+    expect(result.resolvedToolSelections).toEqual(['old-tool'])
+    expect(map.mock.calls[0][0].toolSelections).toEqual(['old-tool'])
+    expect(result.gatewayToolMap).toEqual({ A: ['old-tool'] })
+    expect(discover).toHaveBeenCalledOnce()
+  })
+  it.each(['forged', 'retired', 'Stop', 'replacement', 'foreign-user', 'foreign-agent'] as const)(
+    'refuses a present %s API owner before map or discovery', async boundary => {
+      const discover = lowLevel(), map = vi.spyOn(mcpGatewayDiscovery, 'buildGatewayToolMap'), input = options()
+      input.agent.agentType = 'api'
+      const bound = boundary === 'forged' ? {} as P5OriginalPreparation : apiOriginal([])
+      if (boundary === 'retired') retireP5OriginalPreparation(bound)
+      if (boundary === 'Stop') expect(stopSessionTurn(owner.sessionId, 'Actual owner Stop before discovery')).toBe(true)
+      if (boundary === 'replacement') await withSettingsRecordReplacement(`agent:${owner.agentId}`, async () => {})
+      if (boundary === 'foreign-user') { input.userId = 'other-user'; input.agent.user_id = 'other-user' }
+      if (boundary === 'foreign-agent') { input.agentId = 'other-agent'; input.agent.id = 'other-agent' }
+      await expect(resolveMCPSelections({ ...input, mcpOriginalPreparation: bound })).rejects.toMatchObject({
+        code: boundary === 'replacement' ? 'SETTINGS_LIFECYCLE_CHANGED' : 'P5_ORIGINAL_BOOT_READ_REFUSED'
+      })
+      expect(map).not.toHaveBeenCalled(); expect(discover).not.toHaveBeenCalled()
+    }
+  )
+  it('keeps absent API-owner ordinary results byte-identical', async () => {
+    lowLevel()
+    const ordinary = await resolveMCPSelections(options())
+    const absent = await resolveMCPSelections({ ...options(), mcpOriginalPreparation: undefined })
+    expect(JSON.stringify(absent)).toBe(JSON.stringify(ordinary))
+    expect(absent.resolvedToolSelections).toEqual(['fresh-tool'])
+  })
+})
 
 describe('mcpSelectionResolver utils', () => {
   beforeEach(() => {

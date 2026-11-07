@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as agentStore from '$lib/stores/agents.svelte'
+import { MCP_SETTINGS_REVISION_HEADER } from '$lib/utils/agentSettingsSectionSaves'
+import { makeMcpSettingsSnapshot, mcpSettingsReadPaths } from '$lib/server/agentRecordUpdate'
+import { captureSettingsLifecycle } from '$lib/server/services/appActions/settings/lifecycle'
+import { agentTypeSnapshotOf } from '$lib/test-utils/agentUpdateScriptTwin'
 
 /**
  * BL-514: the agents store lays a save over its own copy the way the server does, so the chat bar
  * (Work mode, never-allow list) shows what was saved: a model pick keeps the agent's own keys.
- * BL-848, BL-855: the Codex and Claude settings and the Tool Grid display settings are laid over
+ * BL-848, BL-855: the Claude settings and the Tool Grid display settings are laid over
  * the copy key by key (and, for the Tool Grid, entry by entry), as the server writes them.
  */
 
@@ -47,25 +51,24 @@ describe('agents store: a save keeps the agent keys in its copy (BL-514)', () =>
     })
   })
 
-  const CODEX = { model: 'gpt-5', permissionMode: 'chat', sandbox: 'workspace-write', addDirs: ['/a'] }
   const CLAUDE = { model: 'sonnet', permissionMode: 'default', addDirs: [] }
+  const CLAUDE_FULL = { model: 'sonnet', permissionMode: 'default', chrome: true, addDirs: ['/a'] }
   const DCM = { version: 1, groups: { gw_a: 'group-only' }, tools: { 'gw_a::read': 'name-only' }, groupDisplayPreferences: {}, toolDisplayPreferences: {} }
 
-  it('a codex_settings save lays over the copy key by key and sends only the keys it names (BL-848)', async () => {
+  it('a claude_settings save lays over the copy key by key and sends only the keys it names (BL-848)', async () => {
     const fetchMock = vi.fn(async () => Response.json({ success: true }))
     vi.stubGlobal('fetch', fetchMock)
-    agentStore.setAgents([{ id: 'ssblk_store_agent', codex_settings: CODEX, claude_settings: CLAUDE, dcmDisplaySettings: DCM } as any])
+    agentStore.setAgents([{ id: 'ssblk_store_agent', claude_settings: CLAUDE_FULL, dcmDisplaySettings: DCM } as any])
 
     await agentStore.updateAgentSettings('ssblk_store_agent', {
-      codex_settings: { reasoningEffort: 'high', sandbox: null, addDirs: ['/b'] }
+      claude_settings: { permissionMode: 'plan', chrome: null, addDirs: ['/b'] }
     })
 
     const agent = agentStore.getAgentById('ssblk_store_agent')
-    expect(agent?.codex_settings).toEqual({ model: 'gpt-5', permissionMode: 'chat', reasoningEffort: 'high', addDirs: ['/b'] })
-    expect(agent?.claude_settings).toEqual(CLAUDE)
+    expect(agent?.claude_settings).toEqual({ model: 'sonnet', permissionMode: 'plan', addDirs: ['/b'] })
     expect(agent?.dcmDisplaySettings).toEqual(DCM)
     expect(JSON.parse(String((fetchMock.mock.calls[0] as any[])[1].body))).toEqual({
-      codex_settings: { reasoningEffort: 'high', sandbox: null, addDirs: ['/b'] }
+      claude_settings: { permissionMode: 'plan', chrome: null, addDirs: ['/b'] }
     })
   })
 
@@ -87,13 +90,35 @@ describe('agents store: a save keeps the agent keys in its copy (BL-514)', () =>
   })
 
   it('a dcmDisplaySettings save lays over the copy entry by entry, an entry named null removed (BL-855)', async () => {
-    const fetchMock = vi.fn(async () => Response.json({ success: true }))
+    let record = { id: 'ssblk_dcm', user_id: 'ssblk_user', agentType: 'api', created_at: '2026-10-23T00:00:00.000Z',
+      dcmDisplaySettings: DCM, defaultMCPGateways: ['gw_a'] }
+    const snapshot = () => {
+      const paths = mcpSettingsReadPaths()
+      return makeMcpSettingsSnapshot(record.id, paths, paths.map(path => agentTypeSnapshotOf(record, [path])),
+        captureSettingsLifecycle([`agent:${record.id}`]))
+    }
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'PUT') {
+        const body = JSON.parse(String(init.body))
+        expect(body.expectedMcpSettings).toEqual(snapshot().revisions)
+        record = { ...record, defaultMCPGateways: body.defaultMCPGateways }
+        const saved = snapshot()
+        return Response.json({ success: true, mcpSettings: {
+          values: { defaultMCPGateways: record.defaultMCPGateways },
+          revisions: { defaultMCPGateways: saved.revisions.defaultMCPGateways }
+        } })
+      }
+      return Response.json(record, { headers: { [MCP_SETTINGS_REVISION_HEADER]: JSON.stringify(snapshot().revisions) } })
+    })
     vi.stubGlobal('fetch', fetchMock)
-    agentStore.setAgents([{ id: 'ssblk_dcm', dcmDisplaySettings: DCM, defaultMCPGateways: ['gw_a'] } as any])
+    agentStore.setAgents([record as any])
+    const original = await agentStore.loadAgentMcpSettingsDetail(record.id)
+    expect(original).toBeTruthy()
 
     await agentStore.updateAgentSettings('ssblk_dcm', {
       dcmDisplaySettings: { groups: { gw_a: null, gw_b: 'hidden' }, tools: { 'gw_a::write': 'hidden' } },
-      defaultMCPGateways: ['gw_b']
+      defaultMCPGateways: ['gw_b'],
+      expectedMcpSettings: original!.revisions
     })
 
     const agent = agentStore.getAgentById('ssblk_dcm')
@@ -103,7 +128,9 @@ describe('agents store: a save keeps the agent keys in its copy (BL-514)', () =>
       tools: { 'gw_a::read': 'name-only', 'gw_a::write': 'hidden' }
     })
     expect(agent?.defaultMCPGateways).toEqual(['gw_b'])
-    expect(JSON.parse(String((fetchMock.mock.calls[0] as any[])[1].body)).dcmDisplaySettings).toEqual({
+    const issued = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')
+    expect(issued).toHaveLength(1)
+    expect(JSON.parse(String(issued[0][1]!.body)).dcmDisplaySettings).toEqual({
       groups: { gw_a: null, gw_b: 'hidden' },
       tools: { 'gw_a::write': 'hidden' }
     })
@@ -111,44 +138,44 @@ describe('agents store: a save keeps the agent keys in its copy (BL-514)', () =>
 
   it('a save that names none of the three blocks leaves the copy of them alone', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({ success: true })))
-    agentStore.setAgents([{ id: 'ssblk_other', codex_settings: CODEX, dcmDisplaySettings: DCM } as any])
+    agentStore.setAgents([{ id: 'ssblk_other', claude_settings: CLAUDE_FULL, dcmDisplaySettings: DCM } as any])
 
     await agentStore.updateAgentSettings('ssblk_other', { displayName: 'Renamed' })
 
     const agent = agentStore.getAgentById('ssblk_other')
     expect(agent?.displayName).toBe('Renamed')
-    expect(agent?.codex_settings).toEqual(CODEX)
+    expect(agent?.claude_settings).toEqual(CLAUDE_FULL)
     expect(agent?.dcmDisplaySettings).toEqual(DCM)
   })
 
   it('a refused save of these blocks puts the copy back as it was (BL-848, BL-855)', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 500 })))
     vi.spyOn(console, 'error').mockImplementation(() => {})
-    agentStore.setAgents([{ id: 'ssblk_refused', codex_settings: CODEX, dcmDisplaySettings: DCM } as any])
+    agentStore.setAgents([{ id: 'ssblk_refused', claude_settings: CLAUDE_FULL, dcmDisplaySettings: DCM } as any])
 
     await expect(
       agentStore.updateAgentSettings('ssblk_refused', {
-        codex_settings: { model: 'gpt-6' },
+        claude_settings: { model: 'opus' },
         dcmDisplaySettings: { groups: { gw_a: 'hidden' } }
       })
     ).rejects.toThrow()
 
     const agent = agentStore.getAgentById('ssblk_refused')
-    expect(agent?.codex_settings).toEqual(CODEX)
+    expect(agent?.claude_settings).toEqual(CLAUDE_FULL)
     expect(agent?.dcmDisplaySettings).toEqual(DCM)
   })
 
   it('a block that is neither an object nor null is refused before anything is sent or changed', async () => {
     const fetchMock = vi.fn(async () => Response.json({ success: true }))
     vi.stubGlobal('fetch', fetchMock)
-    agentStore.setAgents([{ id: 'ssblk_bad', codex_settings: CODEX } as any])
+    agentStore.setAgents([{ id: 'ssblk_bad', claude_settings: CLAUDE_FULL } as any])
 
-    await expect(agentStore.updateAgentSettings('ssblk_bad', { codex_settings: 'gpt-6' as any })).rejects.toThrow(
+    await expect(agentStore.updateAgentSettings('ssblk_bad', { claude_settings: 'opus' as any })).rejects.toThrow(
       'must be an object or null'
     )
 
     expect(fetchMock).not.toHaveBeenCalled()
-    expect(agentStore.getAgentById('ssblk_bad')?.codex_settings).toEqual(CODEX)
+    expect(agentStore.getAgentById('ssblk_bad')?.claude_settings).toEqual(CLAUDE_FULL)
   })
 
   it('a refused save puts the copy back as it was', async () => {

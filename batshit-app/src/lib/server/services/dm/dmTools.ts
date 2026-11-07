@@ -1,10 +1,10 @@
 /**
  * SA-113 P2 (DL-113-03, DL-113-16) — the `sys.dm.*` operations layer.
  *
- * One implementation behind the Fabric family, so the API lane and the managed CLI lanes
- * cannot drift. The shape follows `memoryTools.ts` deliberately: a server-side enablement
- * re-check in front of every operation (belt and suspenders under the broker allow-list),
- * summary-first results, and readable errors with a fix hint.
+ * One implementation behind the Fabric family. The shape follows `memoryTools.ts`
+ * deliberately: a server-side enablement re-check in front of every operation (belt and
+ * suspenders under the broker allow-list), summary-first results, and readable errors with
+ * a fix hint.
  *
  * Two rules are worth stating out loud because they are easy to lose in a refactor:
  *
@@ -32,16 +32,17 @@ import {
 } from '$lib/server/services/streamAbortRegistry'
 import {
   enqueueSteer,
-  flushPendingSteersToTransport,
   getSteerRun
 } from '$lib/server/services/steerInboxRegistry'
 import { waitForStreamRegistration } from '$lib/server/services/steerSetupWait'
-import { STEER_DM_ALREADY_PENDING_REASON } from '$lib/utils/steerControl'
+import { STEER_DM_ALREADY_PENDING_REASON, formatSteerForModel, type SteerEntry } from '$lib/utils/steerControl'
 import {
   DM_DELIVERY_MODES,
   MAX_WAKE_CHAIN_DEPTH,
   STEER_NO_ACTIVE_TURN_REASON,
+  steerDmTooLongReason,
   isDeliverableNow,
+  agentDmsOffHint,
   resolveAgentDmsEnabled,
   resolveAgentWakeEnabled,
   resolveDmSenderAllowed,
@@ -50,7 +51,11 @@ import {
   type DmDeliveryMode,
   type DmSteerFallback
 } from '$lib/utils/dmControl'
-import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import {
+  isApiPrimaryAgentType,
+  normalizePrimaryAgentType,
+  retiredPrimaryAgentRefusal
+} from '$lib/utils/primaryAgentType'
 import { describeDmFires } from '$lib/utils/dmRoster'
 import { SCHEDULE_TICK_MS, describeNextRun } from '$lib/utils/scheduleControl'
 import type { ScheduleRecord } from '$lib/types/schedule'
@@ -140,7 +145,7 @@ export async function requireDmEnabledAgent(
   if (!resolveAgentDmsEnabled(agent)) {
     throw new DmToolError(
       `Agent DMs are not turned on for "${agentDisplayName(agent)}".`,
-      'Turn on Agent DMs for this agent in Agent Settings first.'
+      agentDmsOffHint(agent)
     )
   }
   return agent
@@ -282,8 +287,7 @@ export async function listDmAgentsOp(context: DmToolContext): Promise<{
   for (const agent of agents) {
     const record = agent as unknown as Record<string, any>
     if (!resolveAgentDmsEnabled(record)) continue
-    const agentType = normalizePrimaryAgentType(record as any)
-    if (agentType !== 'api' && agentType !== 'cli') continue
+    if (!isApiPrimaryAgentType(normalizePrimaryAgentType(record as any))) continue
 
     const running =
       runningByAgent.get(record.id) ??
@@ -696,7 +700,7 @@ async function deliverBySteer(
       continue
     }
 
-    const enqueued = enqueueSteer(sessionId, {
+    const entry: SteerEntry = {
       steerId: record.id,
       messageId: activeStream.messageId,
       text: buildSteeredDmContent(record),
@@ -704,7 +708,18 @@ async function deliverBySteer(
       source: 'dm',
       dmId: record.id,
       label: record.from.name
-    })
+    }
+    // SA-139 BL-2358: a DM longer than the run can hand in whole is not steered in; it stays an
+    // ordinary DM, and the sender is told why. The model connection's own refusal stays the backstop.
+    if (typeof steerRun.dmSteerLimit === 'number') {
+      const wrapped = formatSteerForModel(entry).length
+      if (wrapped > steerRun.dmSteerLimit) {
+        lastReason = steerDmTooLongReason(wrapped, steerRun.dmSteerLimit)
+        continue
+      }
+    }
+
+    const enqueued = enqueueSteer(sessionId, entry)
 
     if (!enqueued.ok) {
       lastReason =
@@ -714,19 +729,6 @@ async function deliverBySteer(
       continue
     }
 
-    // Fire-and-forget for the same reason the route does it (a `turn/steer` round trip has a
-    // 120-second ceiling): the server already owns the text, and a refused write returns it
-    // to the inbox where the end of the turn degrades it to `wait`.
-    void flushPendingSteersToTransport(sessionId, activeStream.messageId).then((result) => {
-      if (result.reason === 'refused') {
-        console.warn('[SA-114] A managed CLI refused a DM steer; it will degrade to wait', {
-          sessionId,
-          dmId: record.id,
-          error: result.error ?? null
-        })
-      }
-    })
-
     return { ok: true, sessionId }
   }
 
@@ -735,7 +737,7 @@ async function deliverBySteer(
 
 /**
  * F-P2-4 / DL-113-02: `to: 'all'` — one note, one `messageId`, one record per DM-enabled
- * API/CLI primary that accepts this sender, the sender excluded.
+ * API primary that accepts this sender, the sender excluded.
  *
  * Three deliberate limits, all from the lock:
  *
@@ -781,8 +783,7 @@ async function broadcastDmOp(
     const record = candidate as unknown as Record<string, any>
     if (record.id === sender.id) continue
     if (!resolveAgentDmsEnabled(record)) continue
-    const agentType = normalizePrimaryAgentType(record as any)
-    if (agentType !== 'api' && agentType !== 'cli') continue
+    if (!isApiPrimaryAgentType(normalizePrimaryAgentType(record as any))) continue
     if (!resolveDmSenderAllowed(record, sender.id)) {
       skipped.push({
         to: record.id,
@@ -840,7 +841,8 @@ async function broadcastDmOp(
 
 /**
  * Load an agent that must be able to RECEIVE a DM: it exists, belongs to this user, is an
- * API or CLI primary, and has Agent DMs turned on.
+ * API primary (SA-139 R4: a stored retired type is refused before any inbox write), and has
+ * Agent DMs turned on.
  *
  * `field` names which input the id came from, because F-P2-2 uses this for
  * `report_back_to` as well as `to`, and a refusal that says "recipient" when the typo was
@@ -866,16 +868,17 @@ async function loadDmAddressableAgent(
       'Use sys.dm.agents to see who can receive DMs.'
     )
   }
-  const agentType = normalizePrimaryAgentType(agent as any)
-  if (agentType !== 'api' && agentType !== 'cli') {
+  const retired = retiredPrimaryAgentRefusal(agent as any)
+  if (retired) {
     throw new DmToolError(
-      `${agentDisplayName(agent)} is not an API or CLI primary agent, so it cannot receive DMs (${field}).`
+      `${agentDisplayName(agent)} cannot receive DMs (${field}). ${retired.error}`,
+      'Use sys.dm.agents to see who can receive DMs.'
     )
   }
   if (!resolveAgentDmsEnabled(agent)) {
     throw new DmToolError(
       `${agentDisplayName(agent)} does not have Agent DMs turned on (${field}).`,
-      'The user turns that on per agent in Agent Settings.'
+      agentDmsOffHint(agent)
     )
   }
   return agent
@@ -1298,16 +1301,17 @@ export async function deliverWebhookDm(options: {
       'Delete this webhook, or create a new one pointing at an agent that exists.'
     )
   }
-  const agentType = normalizePrimaryAgentType(recipient as any)
-  if (agentType !== 'api' && agentType !== 'cli') {
+  const retired = retiredPrimaryAgentRefusal(recipient as any)
+  if (retired) {
     throw new DmToolError(
-      `${agentDisplayName(recipient)} is not an API or CLI primary agent, so a webhook cannot write to it.`
+      `${agentDisplayName(recipient)} cannot receive DMs, so a webhook cannot write to it. ${retired.error}`,
+      retired.details
     )
   }
   if (!resolveAgentDmsEnabled(recipient)) {
     throw new DmToolError(
       `${agentDisplayName(recipient)} does not have Agent DMs turned on, so it would never see this.`,
-      'Turn on Agent DMs for that agent in Agent Settings.'
+      agentDmsOffHint(recipient)
     )
   }
 
@@ -1457,16 +1461,17 @@ export async function deliverScheduledDm(
       'Delete this schedule, or point it at an agent that exists.'
     )
   }
-  const agentType = normalizePrimaryAgentType(recipient as any)
-  if (agentType !== 'api' && agentType !== 'cli') {
+  const retired = retiredPrimaryAgentRefusal(recipient as any)
+  if (retired) {
     throw new DmToolError(
-      `${agentDisplayName(recipient)} is not an API or CLI primary agent, so a schedule cannot write to it.`
+      `${agentDisplayName(recipient)} cannot receive DMs, so a schedule cannot write to it. ${retired.error}`,
+      retired.details
     )
   }
   if (!resolveAgentDmsEnabled(recipient)) {
     throw new DmToolError(
       `${agentDisplayName(recipient)} does not have Agent DMs turned on, so it would never see this.`,
-      'Turn on Agent DMs for that agent in Agent Settings.'
+      agentDmsOffHint(recipient)
     )
   }
 

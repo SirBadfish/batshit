@@ -1,3 +1,4 @@
+import { withoutServerReplayFields } from '$lib/utils/serverReplayFields'
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { apiFailure } from '$lib/server/services/apiResponses'
 
@@ -15,6 +16,7 @@ import { wasMessageDeleted } from '$lib/server/services/deletedMessageRegistry'
 import { publishUserEvent } from '$lib/server/ssePublisher'
 import type { ChatMessage } from '$lib/types/database'
 import { generateMessageId } from '$lib/utils/messageId'
+import { retiredPrimaryAgentRefusal } from '$lib/utils/primaryAgentType'
 
 type LiveKitTurnPayload = {
   kind?:
@@ -223,6 +225,13 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
     return json({ success: false, error: 'Transcript is required' }, { status: 400 })
   }
 
+  // SA-139 R4 (D14): a retired Primary type never runs, so its transcript is refused before
+  // anything is saved, not saved and then refused by send-routed.
+  const retired = retiredPrimaryAgentRefusal(agent, payload.agentType ?? undefined)
+  if (retired) {
+    return json({ success: false, ...retired }, { status: 409 })
+  }
+
   const now = new Date().toISOString()
   const speechToSpeechTranscript =
     kind === 'speech_to_speech_user_transcript' ||
@@ -372,7 +381,8 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
   // `lRange(key, 0, limit - 1)`, so on a voice chat longer than the window this handed the
   // model the chat's OPENING exchanges and left out the sentence just transcribed two lines
   // above. Same fix as the wake primitive, `artifacts/share` and `liveKitVoiceRuntime`.
-  const messages = await redis.getRecentMessages(sessionId, 300)
+  // SA-137: a paused reply's server-only replay fields never ride a history post.
+  const messages = (await redis.getRecentMessages(sessionId, 300)).map(withoutServerReplayFields)
   // SA-113 F-P1-1 — own this turn's session-turn lock. send-routed registers AND releases
   // the lock under the `messageId` the caller sends, and an unowned release deletes
   // whatever lock it finds. A voice turn that unwinds late would otherwise cancel the lock

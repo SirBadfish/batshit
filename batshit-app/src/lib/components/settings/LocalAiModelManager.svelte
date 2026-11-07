@@ -631,7 +631,7 @@
       <p class="batshit-settings-caption">{management.reason ?? 'No models found.'}</p>
     {:else}
       <div class="space-y-2">
-        {#each management.models as model (model.id)}
+        {#each management.models as model (JSON.stringify([model.loaded, model.id]))}
           <div class="batshit-settings-model-row flex items-center justify-between gap-3">
             <div class="min-w-0">
               <div class="batshit-settings-form-label batshit-model-id truncate">{model.label}</div>

@@ -33,6 +33,7 @@ export const actions = {
 			})
 		}
 
+		let authenticated = false
 		try {
 			// Authenticate user
 			const user = await authService.authenticate(email, password)
@@ -45,6 +46,7 @@ export const actions = {
 			}
 
 			// Create session
+			authenticated = true
 			const session = await authService.createSession(user, rememberMe)
 
 			// Set session cookie
@@ -63,8 +65,10 @@ export const actions = {
 			if (error && typeof error === 'object' && 'status' in error && 'location' in error) {
 				throw error; // Re-throw the redirect
 			}
-			return fail(401, { 
-				error: error instanceof Error ? error.message : 'Login failed',
+			return fail(authenticated ? 503 : 401, {
+				error: authenticated
+					? 'Your account was authenticated and kept, but Batshit could not finish signing you in safely. Check the app logs and repair the problem, then sign in again. Your saved access was not reset.'
+					: error instanceof Error ? error.message : 'Login failed',
 				email 
 			})
 		}

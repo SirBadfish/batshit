@@ -11,7 +11,9 @@ const GRADIO_PREFIXES = ['gradio_api/', 'call/', 'file=', 'run/']
 /** Which app paths a kind of Pinokio app artifact may reach; `null` means allowed. */
 export function pinokioProxyPathProblem(kind: PinokioArtifactKind, requestPath: string): string | null {
   if (!requestPath) return 'A path on the app is required, for example /api/artifacts/pinokio/system_stats?artifactId=…'
-  if (requestPath.split('/').some((segment) => segment === '..' || segment === '.')) {
+  let decoded: string
+  try { decoded = decodeURIComponent(requestPath) } catch { return 'The app path contains invalid escaping.' }
+  if (decoded.startsWith('/') || decoded.includes('\\') || decoded.includes('://') || /[\u0000-\u001f\u007f]/.test(decoded) || decoded.split('/').some((segment) => segment === '..' || segment === '.')) {
     return 'The app path may not contain "." or ".." segments.'
   }
   const lower = requestPath.toLowerCase()

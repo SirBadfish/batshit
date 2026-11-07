@@ -1,6 +1,5 @@
 // Database types for Redis storage
 import type { ModelCapabilities, ModelConnectionInfo } from '$lib/types/savedModels'
-import type { CodexAgentSettings } from '$lib/types/codex'
 import type { ClaudeAgentSettings } from '$lib/types/claude'
 import type { GroupChatAgentSettings, GroupChatZipSettings } from '$lib/types/groupChat'
 import type { AgentVoiceProfile, VoiceSettings } from '$lib/types/voice'
@@ -8,11 +7,14 @@ import type { GoonsSettings, GoonRecord } from '$lib/types/goons'
 import type { AvatarIconFit, IconRef } from '$lib/icons/iconTypes'
 import type { StoredPrimaryAgentType } from '$lib/utils/primaryAgentType'
 import type { StoredSubagentType } from '$lib/utils/subagentType'
+import type { AppearanceSettings } from '$lib/appearance/appLook'
+import type { AppActionsNativePolicyRecord } from '$lib/appActions/settings/managementContract'
 import type {
   AgentAutoCompactSettings,
   GlobalAutoCompactSettings
 } from '$lib/utils/contextCompaction'
 import type { GlobalChatSettings } from '$lib/utils/steerControl'
+import type { StoredJevSkillSessionMode } from '$lib/utils/jevJuiceControl'
 
 export interface ChatFolderRow {
   id: string
@@ -107,6 +109,7 @@ export interface AgentRow {
   id: string
   user_id: string
   displayName: string
+  app_action_policy?: AppActionsNativePolicyRecord | null
   description?: string
   webhook_url?: string
   webhookUrl?: string  // Backward compatibility - same as webhook_url
@@ -145,14 +148,10 @@ export interface AgentRow {
   zip_disabled_error?: boolean
   zip_disabled_image?: boolean
   zip_disabled_subagent?: boolean
-  /**
-   * SA-129 DL-06 (BL-1484): the parked zip control permission, ON only when exactly `true`; no
-   * Settings surface reads or writes it. The older `zip_agent_control_enabled` and
-   * `zip_control_mode` are ignored, and startup removes them (`retiredZipControlFields.ts`).
-   */
-  zip_agent_control_experiment?: boolean | null
   zip_ai_view_mode?: 'inline' | 'appended' | null
   zip_tool_notes_enabled?: boolean | null
+  /** SA-137: live file reads for this agent; absent or null inherits the global Tool Grid value. */
+  live_file_reads?: boolean | null
   zip_threshold_error?: number
   zip_threshold_image?: number
   // Per-type buffer settings
@@ -176,16 +175,18 @@ export interface AgentRow {
   // opt-in per agent. `dm_senders` is the recipient-side policy: 'all' (the default) or
   // 'selected', in which case `dm_sender_agent_ids` is the list, and an EMPTY list means
   // nobody. Resolved ONLY through `resolveAgentDmsEnabled` / `resolveDmSenderPolicy` /
-  // `resolveDmSenderAllowed` in `$lib/utils/dmControl.ts`.
+  // `resolveDmSenderAllowed` in `$lib/utils/dmControl.ts`; the rule is also off while the
+  // agent's Fabric & Utilities switch is off (Josh, 2026-10-24), and only the Settings form
+  // reads the saved switch itself (`readAgentDmsSwitch`).
   dms_enabled?: boolean | null
   dm_senders?: 'all' | 'selected' | null
   dm_sender_agent_ids?: string[] | null
-  // SA-120 P1 (DL-120-01): the per-agent Judge Juice switch for skill and tool hints.
-  // Absent means OFF. Resolved ONLY through `resolveAgentJevSkillToolHintsEnabled` in
-  // `$lib/utils/jevJuiceControl.ts`.
-  jev_juice_skill_tool_hints?: boolean | null
+  // Judge Juice Skills and Tools mode. Legacy true stays Suggest; only explicit manage
+  // permits inferred session closure. Absent/false/null is Off. One shared normalizer.
+  jev_juice_skill_tool_hints?: StoredJevSkillSessionMode
   // SA-120 P2: the per-agent switch that hands the agent the `sys.judge.ask` tool.
-  // Absent means OFF. Resolved ONLY through `resolveAgentJevJudgeToolEnabled`.
+  // Absent means OFF. Resolved ONLY through `resolveAgentJevJudgeToolEnabled`, which is also
+  // off while Fabric & Utilities is off; the Settings form reads `readAgentJevJudgeToolSwitch`.
   jev_juice_judge_tool?: boolean | null
   // SA-120 P4a: the per-agent switch that adds a Jev relevance term to `sys.memory.search`
   // ranking. Absent means OFF. Resolved ONLY through `resolveAgentJevMemoryRerankEnabled`.
@@ -205,6 +206,9 @@ export interface AgentRow {
   // Reasoning / thinking rendering (SA-018)
   show_reasoning?: boolean
   preserve_reasoning?: boolean
+  api_reasoning_retention?: import('$lib/utils/reasoningRetention').ApiReasoningRetentionMode | null
+  whiteboard_budget_tokens?: number | null
+  show_whiteboard?: boolean | null
 
   // Tool approval gating for API/CLI primary agents
   tool_approval_mode?: 'off' | 'all'
@@ -282,11 +286,11 @@ export interface AgentRow {
   primary_model_seed?: number
   primary_model_stop_sequences?: string[]
   primary_model_reasoning_effort?: string
+  model_reasoning_overrides?: import('./reasoningControls').AgentReasoningOverrides
   provider_specific_settings?: Record<string, any>
   custom_model_settings?: string  // Advanced key=value pairs for power users
   ai_permissions?: any  // JSONB
   assigned_subagent_ids?: string[]  // Track which subagents are assigned to this agent
-  codex_settings?: CodexAgentSettings | null
   claude_settings?: ClaudeAgentSettings | null
   created_at: string
   updated_at: string
@@ -340,6 +344,7 @@ export interface UserSettingsRow {
     dcm_schema_hint_required_limit?: number
     dcm_schema_hint_optional_limit?: number
     dcm_schema_hint_max_chars?: number
+    dcm_schema_hint_total_tokens?: number
     dcm_tool_name_threshold?: number
     goon_lip_sync_lab_enabled?: boolean
     /** SA-113 P1 (DL-113-01): instance-wide wake-up master switch. Absent means ON. */
@@ -347,6 +352,7 @@ export interface UserSettingsRow {
     web_search_default_provider?: 'duckduckgo-html' | 'exa' | 'perplexity'
     web_search_exa_type?: 'auto' | 'fast' | 'neural' | 'deep'
     web_search_perplexity_max_tokens_per_page?: number
+    agent_browser?: Partial<import('$lib/utils/toolOperationalSettings').AgentBrowserOperationalSettings>
   }
   onboarding_settings?: {
     setup_completed_at?: string | null
@@ -374,14 +380,13 @@ export interface UserSettingsRow {
     buffer_size?: number
     zip_threshold?: number
 
-    // The parked agent zip control permission (BL-1484): ON only when exactly true; no UI.
-    zip_agent_control_experiment?: boolean
-
     // AI zip layout (inline vs appended)
     zip_ai_view_mode?: 'inline' | 'appended'
 
     // Tool Notes enable/disable
     zip_tool_notes_enabled?: boolean
+    /** SA-137: live file reads for every agent without its own value; absent means off. */
+    live_file_reads?: boolean
 
     // SA-120 P5 (LS-054): "Judge Juice: Smart Zip". Absent means OFF.
     jev_juice_smart_zip?: boolean
@@ -443,6 +448,8 @@ export interface UserSettingsRow {
 
   /** SA-114 P3 (DL-114-01): what a send does while the agent is still replying. */
   global_chat_settings?: GlobalChatSettings
+  /** The app's look (Cave, Minimal or OG), chosen in Settings -> Themes (2026-10-29). */
+  appearance_settings?: AppearanceSettings
   voice_settings?: VoiceSettings
   goons_settings?: GoonsSettings
   created_at: string
@@ -470,9 +477,11 @@ export interface SubagentRow {
   // DEPRECATED: Remove after migration complete (Story 6.8e cleanup)
   type?: 'ai' | 'claude_cli' | 'artifacts' | 'n8n_specialist'  // DEPRECATED - Use specialty instead
 
-  workflowName?: string  // n8n workflow name for workflow-backed subagents
-  webhook_url?: string  // Production webhook URL for n8n workflow subagents
-  webhookUrl?: string  // Backward compatibility - same as webhook_url
+  // The removed n8n Workflow Subagent's fields (SA-139 R2): a leftover record may still carry them,
+  // and they mark it retired (`normalizeSubagentType`); no live Subagent writes them.
+  workflowName?: string
+  webhook_url?: string
+  webhookUrl?: string
   system_prompt?: string
   model?: string
   avatar?: string | null  // URL to avatar image
@@ -496,8 +505,13 @@ export interface SubagentRow {
    */
   primary_model_preset_id?: string | null
   primary_model_connection?: ModelConnectionInfo | null
-  /** Optional per-call timeout override. Blank uses the type default. */
+  /** Optional per-call time limit, 10 s to 24 h (`subagentTimeout.ts`). Blank means no limit. */
   timeout_seconds?: number
+  /**
+   * Optional tool-step limit per call, 1 to 10,000 tool calls (`subagentToolSteps.ts`). Blank
+   * means no limit; at a set limit the call returns its work so far marked partial.
+   */
+  max_tool_steps?: number
   primary_model_temperature?: number
   primary_model_max_tokens?: number
   primary_model_top_p?: number
@@ -509,7 +523,6 @@ export interface SubagentRow {
   seed?: number
   stop_sequences?: string[]
   provider_specific_settings?: Record<string, any>
-  codex_settings?: CodexAgentSettings | null
   claude_settings?: ClaudeAgentSettings | null
   credential_source?: string
   created_at: string
@@ -526,6 +539,8 @@ export interface AgentSubagentRow {
 
 // Slash command types for reusable prompt expansions
 export interface SlashCommandRow {
+  /** Grouped plugin access owns this command when present. */
+  plugin_id?: string
   id: string
   user_id: string
   name: string
@@ -762,6 +777,8 @@ export interface GlobalToolGridSettings {
   cli?: GlobalCliToolGridSettings
   fabric?: GlobalBrokerFamilyToolGridSettings
   artifact?: GlobalBrokerFamilyToolGridSettings
+  /** SA-136 D1: the typed file tools' global grant; absent or null follows the factory value. */
+  typed_file_tools?: boolean | null
 }
 
 export interface AgentDcmDisplaySettings {

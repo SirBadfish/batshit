@@ -7,17 +7,22 @@
  * this route aborts the chat's Compacts there. Their summary call ends, and the Compact route
  * writes nothing and answers `ended_early` with `reason: 'stopped'`. Only the owner of the chat
  * may stop its Compact, and only that chat's Compact stops.
+ *
+ * BL-795: the Stop names the Compact it was pressed for (`compactId`, the page's id for that
+ * Compact's plan and summary), so a Stop that comes before that Compact registered waits for it
+ * alone, never for another tab's Compact of the same chat.
  */
 
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
 import { stopCompactRuns } from '$lib/server/services/compactRunRegistry'
+import { readCompactId } from '$lib/utils/compactRunId'
 
 export const POST: RequestHandler = async ({ request, locals }) => {
   const user = requireUser(locals)
   if (!user.ok) return user.response
 
-  let body: { sessionId?: unknown }
+  let body: { sessionId?: unknown; compactId?: unknown }
   try {
     body = await request.json()
   } catch {
@@ -25,9 +30,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   }
   const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
   if (!sessionId) return json({ error: 'sessionId is required' }, { status: 400 })
+  const compactId = readCompactId(body?.compactId)
+  if (!compactId) return json({ error: 'compactId is required' }, { status: 400 })
 
   const sessionCheck = await requireOwnedSession(sessionId, user.value.id)
   if (!sessionCheck.ok) return sessionCheck.response
 
-  return json({ success: true, stopped: stopCompactRuns(sessionId, 'stopped') })
+  return json({ success: true, stopped: stopCompactRuns(sessionId, 'stopped', compactId) })
 }

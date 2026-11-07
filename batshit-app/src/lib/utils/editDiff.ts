@@ -287,8 +287,8 @@ export function extractManagedPatchFromSources(sources: Array<string | undefined
  * run that shows no changed line.
  *
  * Only for copies that bracket the command (`nativeBashExecute` reads them around the run): the
- * Codex adapter's copy can be older than the command, so identical copies there prove nothing,
- * and that lane keeps `buildCompactEditPreview`.
+ * removed Codex adapter's copy could be older than the command, so identical copies there proved
+ * nothing, and a source like that keeps `buildCompactEditPreview`.
  */
 export function buildSnapshotEditPreview(options: {
   filePath?: string;

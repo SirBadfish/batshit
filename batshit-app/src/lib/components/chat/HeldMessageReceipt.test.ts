@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import HeldMessageReceipt from './HeldMessageReceipt.svelte'
 import { HELD_STOPPED_SENTENCE, WAITS_FOR_APPROVAL_SENTENCE } from '$lib/utils/heldForApproval'
+import { resolveKeptSendReceipts } from '$lib/utils/keptSendReceipt'
 
 /**
  * BL-455 — the receipt under a message held for an approval card: its line, and Send now, which
@@ -32,6 +33,20 @@ describe('HeldMessageReceipt (BL-455)', () => {
     expect(screen.getByText(HELD_STOPPED_SENTENCE)).toBeTruthy()
     screen.getByTestId('held-send-now').click()
     expect(onSendNow).toHaveBeenCalledWith('msg-held')
+  })
+
+  it('draws a kept send\'s plain receipt from its record, with Send now (BL-903 c)', () => {
+    const [receipt] = resolveKeptSendReceipts({
+      messages: [{ id: 'msg-kept', role: 'user', metadata: { keptSend: { reason: 'shutdown' } } }],
+      busy: false
+    })
+    const onSendNow = vi.fn()
+    render(HeldMessageReceipt, { props: { receipt, onSendNow } })
+    expect(screen.getByTestId('held-message-receipt').getAttribute('data-held-state')).toBe('not_sent')
+    expect(screen.getByTestId('held-message-receipt').textContent).toContain('Not sent')
+    expect(screen.getByTestId('held-message-receipt').textContent).not.toContain('the reply ended')
+    screen.getByTestId('held-send-now').click()
+    expect(onSendNow).toHaveBeenCalledWith('msg-kept')
   })
 
   it('offers no Send now when the page gives it nothing to send with', () => {

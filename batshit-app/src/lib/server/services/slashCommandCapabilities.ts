@@ -1,5 +1,8 @@
+import { builtinPluginSkill, listAgentPlugins, projectPluginCommand } from './agentPlugins'
+import { assertBuiltinCommandCatalogue, ensureSystemSlashCommands } from './systemSlashCommands'
 import { redis } from '$lib/server/redis'
 import type { SlashCommandRow } from '$lib/types/database'
+import { isExactSavedAccessAgentId } from '$lib/utils/agentAccessIds'
 import { sanitizeId } from '$lib/utils/idSanitizer'
 import { appendSkillsCommandsUsageLines } from '$lib/utils/skillsCommandsDcm'
 
@@ -20,12 +23,8 @@ function normalizeInvocation(value: string) {
   return trimmed.startsWith('/') ? trimmed : `/${trimmed}`
 }
 
-function sanitizeAgentIds(input: unknown): string[] {
-  if (!Array.isArray(input)) return []
-  const normalized = input
-    .map((value) => String(value ?? '').trim())
-    .filter((value) => value.length > 0)
-  return Array.from(new Set(normalized))
+function readExactAgentIds(input: unknown): string[] {
+  return Array.isArray(input) ? [...new Set(input.filter(isExactSavedAccessAgentId))] : []
 }
 
 /**
@@ -40,7 +39,7 @@ export function commandEnabledForAgent(command: SlashCommandRow, agentId: string
   if (!Object.prototype.hasOwnProperty.call(command, 'enabled_agent_ids')) {
     return true
   }
-  const enabledAgentIds = sanitizeAgentIds(command.enabled_agent_ids)
+  const enabledAgentIds = readExactAgentIds(command.enabled_agent_ids)
   if (enabledAgentIds.length === 0) return false
   return enabledAgentIds.includes(agentId)
 }
@@ -82,12 +81,17 @@ export function isSkillAccessRefusalCode(value: unknown): value is SkillAccessRe
  * The returned `skillId` is the normalized id the caller must load, so the skill that loads is
  * always the one that passed.
  */
+/** The access owner's canonical ID spelling; pure and carries no permission. */
+export const canonicalSkillAccessId = (requestedSkillId: string): string =>
+  builtinPluginSkill(requestedSkillId)?.skillId ?? sanitizeId(String(requestedSkillId ?? '').trim())
+
 export async function resolveSkillAccessForActor(
   userId: string,
   requestedSkillId: string,
-  actor: SkillRuntimeActor
+  actor: SkillRuntimeActor,
+  options: { readOnly?: boolean; read?: (key: string) => Promise<unknown> } = {}
 ): Promise<SkillAccessResult> {
-  const skillId = sanitizeId(String(requestedSkillId ?? '').trim())
+  const skillId = canonicalSkillAccessId(requestedSkillId)
 
   if (actor.kind !== 'agent' || !actor.agentId.trim()) {
     return {
@@ -101,7 +105,7 @@ export async function resolveSkillAccessForActor(
   }
 
   const commands = skillId
-    ? (await loadSlashCommands(userId)).filter(
+    ? (await loadSlashCommands(userId, options)).filter(
         (command) => command.type === 'skill' && command.skill_id === skillId
       )
     : []
@@ -115,7 +119,7 @@ export async function resolveSkillAccessForActor(
       message:
         `No skill with id "${skillId || String(requestedSkillId ?? '')}" is set up on this instance, so it cannot be loaded. ` +
         `Load only a skill that is listed in your skills_commands. If the user wants another skill, ` +
-        `tell them to add it and turn it on for you in Settings -> Skills & Prompts.`
+        `tell them to add it and turn it on for you in Settings -> Plugins & shit.`
     }
   }
 
@@ -128,8 +132,9 @@ export async function resolveSkillAccessForActor(
       skillId,
       message:
         `Skill "${label}" (${skillId}) is not enabled for this ${noun}, so it cannot be loaded. ` +
-        `Ask the user to turn it on for you in Settings -> Agents -> Access, or for every agent with ` +
-        `Enable For All Agents in Settings -> Skills & Prompts. Then try again.`
+        (commands[0].plugin_id
+          ? `Ask the user to enable its "${commands[0].plugin_id}" plugin for you in Settings -> Agents -> Access, or for every agent in Settings -> Plugins & shit -> Plugins. Then try again.`
+          : `Ask the user to turn it on for you in Settings -> Agents -> Access, or for every agent with Enable For All Agents in Settings -> Plugins & shit. Then try again.`)
     }
   }
 
@@ -148,27 +153,36 @@ export async function listAllSlashCapabilities(userId: string): Promise<AgentSla
   )
 }
 
-async function loadSlashCommands(userId: string): Promise<SlashCommandRow[]> {
-  const keys = await redis.keys(`slash_command:${userId}:*`)
-  const commands: SlashCommandRow[] = []
+async function loadSlashCommands(userId: string, options: { readOnly?: boolean; read?: (key: string) => Promise<unknown>; requireBuiltinCatalogue?: boolean } = {}): Promise<SlashCommandRow[]> {
+  if (!options.readOnly) await ensureSystemSlashCommands(userId)
+  const plugins = await listAgentPlugins(userId, options)
+  const keys = await redis.execute(client => client.keys(`slash_command:${userId}:*`))
+  const commands = new Map<string, SlashCommandRow>()
   for (const key of keys) {
-    const command = (await redis.json.get(key)) as SlashCommandRow | null
-    if (command) commands.push(command)
+    const command = (await (options.read ? options.read(key) : redis.json.get(key))) as SlashCommandRow | null
+    if (!command) throw new Error('The skill catalogue changed during its read. Reload before continuing.')
+    commands.set(key, command)
   }
-  return commands
+  if (options.requireBuiltinCatalogue) assertBuiltinCommandCatalogue(userId, plugins, commands)
+  return Promise.all([...commands.values()].map(command => projectPluginCommand(userId, command, plugins)))
 }
 
 async function listSlashCapabilities(
   userId: string,
   include: (command: SlashCommandRow) => boolean
 ): Promise<AgentSlashCapability[]> {
-  const commands = await loadSlashCommands(userId)
+  const commands = await loadSlashCommands(userId, { readOnly: true, requireBuiltinCatalogue: true })
   if (commands.length === 0) return []
 
   const capabilities: AgentSlashCapability[] = []
+  const groupedSkills = new Set<string>()
 
   for (const command of commands) {
     if (!include(command)) continue
+    if (command.plugin_id && command.skill_id) {
+      if (groupedSkills.has(command.skill_id)) continue
+      groupedSkills.add(command.skill_id)
+    }
 
     const invocation = normalizeInvocation(command.invocation_pattern || `/${command.id}`)
     if (!invocation) continue
@@ -199,25 +213,18 @@ async function listSlashCapabilities(
 }
 
 export function buildSkillsCommandsDcmLines(capabilities: AgentSlashCapability[]): string[] {
+  if (capabilities.length === 0) return []
   const lines: string[] = []
   lines.push('skills_commands:')
 
-  if (capabilities.length === 0) {
-    lines.push('- (none enabled for this agent)')
-  } else {
-    const maxEntries = 16
-    const visible = capabilities.slice(0, maxEntries)
-    for (const capability of visible) {
-      const typeLabel = capability.type === 'skill' ? 'skill' : 'prompt'
-      const suffix = capability.type === 'skill' && capability.skillId ? ` | skillId=${capability.skillId}` : ''
-      // One line per entry: a literal (`|`) SKILL.md description keeps its line breaks (BL-469).
-      const description = capability.description?.replace(/\s+/g, ' ').trim()
-      const summary = description ? ` — ${description}` : ''
-      lines.push(`- ${capability.invocation} | ${typeLabel}${suffix}${summary}`)
-    }
-    if (capabilities.length > maxEntries) {
-      lines.push(`- ...and ${capabilities.length - maxEntries} more`)
-    }
+  for (const capability of capabilities) {
+    const typeLabel = capability.type === 'skill' ? 'skill' : 'prompt'
+    const suffix = capability.type === 'skill' && capability.skillId ? ` | skillId=${capability.skillId}` : ''
+    // One line per entry: a literal (`|`) SKILL.md description keeps its line breaks (BL-469).
+    const rawDescription = capability.description?.replace(/\s+/g, ' ').trim() ?? ''
+    const description = rawDescription.length > 240 ? `${rawDescription.slice(0, 239)}…` : rawDescription
+    const summary = description ? ` — ${description}` : ''
+    lines.push(`- ${capability.invocation} | ${typeLabel}${suffix}${summary}`)
   }
 
   appendSkillsCommandsUsageLines(lines)

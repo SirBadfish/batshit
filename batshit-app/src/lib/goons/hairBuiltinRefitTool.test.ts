@@ -1,10 +1,17 @@
 import { describe, expect, it } from 'vitest'
+import { mkdtemp, mkdir, rm, symlink } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   assertCanonicalInventory,
+  assertNewBuiltinHairOutput,
+  assertSafeBuiltinHairOutput,
   assertDeterministicAuthoringRuns,
   assertGenuineRefitEvidence,
+  buildR2Asset,
   buildV2Catalog,
+  isPathWithin,
   verifyExplicitRecipeSource
 } from '../../../scripts/refit-builtin-hair-v38'
 import {
@@ -15,9 +22,17 @@ import {
 } from './hairAssets'
 import type { HairImportAuthoringResult } from './hairImportAuthoring'
 import type { HairImportCanonicalizationV1 } from './hairImportIntake'
+import { hairFollowerDefinitionSha256 } from './hairFollowers'
+import { secondaryMotionDefinitionSha256 } from './secondaryMotion'
+import { sha256Hex } from './recipe/recipeCanonical'
 import {
   createHairAssetFixture,
-  createRigidHairGlbFixture
+  createRigidHairGlbFixture,
+  createRootWeightedFollowerHairGlbFixture,
+  createHairFollowerDefinitionFixture,
+  createHairSecondaryMotionDefinitionFixture,
+  HAIR_NEUTRAL_VALUE_PNG_FIXTURE,
+  HAIR_HIGHLIGHT_MASK_PNG_FIXTURE
 } from './recipe/fixtures/hairAssetFixture'
 import { createRecipePhysicalMigrationFixture } from './recipe/fixtures/recipePhysicalMigrationPair'
 import type { RecipeSource } from './recipe/recipeContracts'
@@ -58,6 +73,74 @@ async function reseal(
 }
 
 describe('deterministic built-in Hair r2 refit publication tool', () => {
+  it('builds a new source-bound revision without changing the default r2 path or artwork', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    let source = await createHairAssetFixture({ recipeSource: fixture.source.recipeSource,
+      mainBytes: createRigidHairGlbFixture(), headNode: 'HeadAnchor' })
+    const acceptedReceipt = new TextEncoder().encode('{"fixture":"accepted"}\n')
+    const preview = HAIR_NEUTRAL_VALUE_PNG_FIXTURE
+    source.display.previewImage = { ref: '/goon-assets/hair/v1/h1-test-fixture/preview.png',
+      sha256: await sha256Hex(preview), bytes: preview.length, mimeType: 'image/png' }
+    source.receiptRefs = [{ ref: '/goon-assets/hair/v1/h1-test-fixture/accepted-source-receipt.json',
+      sha256: await sha256Hex(acceptedReceipt), bytes: acceptedReceipt.length, mimeType: 'application/json' }]
+    source = await reseal(source, { assetId: source.assetId, revision: 1 })
+    const geometry = createRootWeightedFollowerHairGlbFixture()
+    const geometrySha256 = await sha256Hex(geometry)
+    const makeResult = async (revision: number) => {
+      const follower = createHairFollowerDefinitionFixture({ recipeSource: fixture.target.recipeSource, geometrySha256, headNode: 'HeadAnchor' })
+      follower.assetId = source.assetId; follower.revisionId = `${source.assetId}-r${revision}`
+      const physics = createHairSecondaryMotionDefinitionFixture({ recipeSource: fixture.target.recipeSource, geometrySha256, motionNode: 'HairMotionRoot', colliderNode: 'HeadAnchor' })
+      physics.owner.assetId = source.assetId; physics.owner.revisionId = `${source.assetId}-r${revision}`
+      return { geometryGlb: geometry, followerDefinition: follower, secondaryMotionDefinition: physics, proposal: {},
+        evidence: { recipeSourceSha256: fixture.target.identity.modelSha256, appearanceDefinitionSha256: fixture.target.identity.definitionSha256,
+          outputGeometrySha256: geometrySha256, followerDefinitionSha256: await hairFollowerDefinitionSha256(follower),
+          secondaryMotionDefinitionSha256: await secondaryMotionDefinitionSha256(physics), meshCount: 1, vertexCount: 3 } } as HairImportAuthoringResult
+    }
+    const copied = { preview, neutralValue: HAIR_NEUTRAL_VALUE_PNG_FIXTURE,
+      highlightMask: HAIR_HIGHLIGHT_MASK_PNG_FIXTURE, acceptedSourceReceipt: acceptedReceipt }
+    const r2Input = { sourceAsset: source, targetDirectory: 'fixture-r2', recipeSource: fixture.target.identity,
+      authoredRootMatrix: source.attachment.authoredRootMatrix, result: await makeResult(2),
+      topology: { meshCount: 1, vertexCount: 3, triangleCount: 1 }, copied, refitReceiptBytes: acceptedReceipt }
+    expect(await buildR2Asset(r2Input)).toEqual(await buildR2Asset({ ...r2Input, targetRevision: 2 }))
+    const r3 = await buildR2Asset({ ...r2Input, targetDirectory: 'fixture-r3', targetRevision: 3, result: await makeResult(3) })
+    expect(r3).toMatchObject({ assetId: source.assetId, revisionId: `${source.assetId}-r3`, revision: 3,
+      compatibility: { baseId: fixture.target.identity.baseId, fitFamily: fixture.target.identity.fitFamily } })
+    expect(r3.material.layout).toEqual(source.material.layout)
+    expect(r3.material.defaults).toEqual(source.material.defaults)
+    expect(r3.material.neutralValueTexture?.sha256).toBe(source.material.neutralValueTexture?.sha256)
+    expect(r3.material.highlightMask?.sha256).toBe(source.material.highlightMask?.sha256)
+    await expect(buildR2Asset({ ...r2Input, targetDirectory: 'fixture-r3', targetRevision: 3 })).rejects.toThrow(/different Hair revision|different Hair Asset/)
+    await expect(buildR2Asset({ ...r2Input, copied: { ...copied, neutralValue: new Uint8Array([1]) } })).rejects.toThrow('accepted artwork or source receipt')
+    await expect(buildR2Asset({ ...r2Input, targetRevision: 0 })).rejects.toThrow('new stable identity')
+  })
+  it('recognizes equal and descendant paths without treating siblings as contained', () => {
+    expect(isPathWithin('/workspace/hair/v1', '/workspace/hair/v1')).toBe(true)
+    expect(isPathWithin('/workspace/hair/v1', '/workspace/hair/v1/new-candidate')).toBe(true)
+    expect(isPathWithin('/workspace/hair', '/workspace/hair/v1')).toBe(true)
+    expect(isPathWithin('/workspace/hair/v1', '/workspace/hair/v10')).toBe(false)
+    expect(isPathWithin('/workspace/hair/v1', '/workspace/other')).toBe(false)
+  })
+
+  it('refuses protected-tree ancestors, descendants and symlink aliases before staging', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'batshit-hair-stage-'))
+    try {
+      const protectedRoot = join(root, 'hair', 'v1')
+      await mkdir(protectedRoot, { recursive: true })
+      await symlink(protectedRoot, join(root, 'alias'), 'dir')
+      await symlink(join(root, 'missing-target'), join(root, 'dangling'), 'dir')
+      await expect(assertSafeBuiltinHairOutput(protectedRoot, protectedRoot)).rejects.toThrow('overlap')
+      await expect(assertSafeBuiltinHairOutput(join(protectedRoot, 'candidate'), protectedRoot)).rejects.toThrow('overlap')
+      await expect(assertSafeBuiltinHairOutput(join(root, 'hair'), protectedRoot)).rejects.toThrow('overlap')
+      await expect(assertSafeBuiltinHairOutput(join(root, 'alias', 'candidate'), protectedRoot)).rejects.toThrow('overlap')
+      await expect(assertSafeBuiltinHairOutput(join(root, 'dangling'), protectedRoot)).rejects.toThrow('unresolved existing entry')
+      await expect(assertSafeBuiltinHairOutput(join(root, 'dangling', 'candidate'), protectedRoot)).rejects.toThrow('unresolved existing entry')
+      await expect(assertNewBuiltinHairOutput(join(root, 'dangling'))).rejects.toThrow('already exists')
+      await expect(assertNewBuiltinHairOutput(join(root, 'new-candidate'))).resolves.toBeUndefined()
+      await expect(assertSafeBuiltinHairOutput(join(root, 'hair', 'v10', 'candidate'), protectedRoot)).resolves.toBeUndefined()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
   it('accepts only a byte-identical explicit Recipe Source archive/model/manifest with pinned identity', async () => {
     const fixture = await createRecipePhysicalMigrationFixture({ hairImportCompatible: true })
     const target = fixture.target

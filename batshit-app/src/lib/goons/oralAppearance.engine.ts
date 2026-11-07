@@ -104,6 +104,11 @@ export class OralAppearanceEngineRuntime {
     return structuredClone(this.state)
   }
 
+  /** Exact materials this presentation owner can mutate. */
+  getMotionMaterials(): readonly THREE.Material[] | null {
+    return this.disposed ? null : Object.freeze([...new Set(Object.values(this.families).map(family => family.material))])
+  }
+
   setState(value: OralAppearanceStateV1 | null | undefined) {
     if (this.disposed) fail('cannot apply state after disposal')
     this.state = resolveOralAppearanceState(this.definition, value)

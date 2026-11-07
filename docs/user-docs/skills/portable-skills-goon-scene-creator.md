@@ -8,10 +8,10 @@ Use it when you want a coding agent outside Batshit to help design a scene, prod
 
 - Batshit running locally.
 - A Portable Skill Token with the `Goon Scenes` scope.
-- The downloaded `goon-scene-creator` Portable Skill bundle.
+- The `goon-scene-creator` skill from the current complete Batshit plugin.
 - A scene idea or reference direction.
 
-Download links are listed in [Portable Skill downloads](../reference/portable-skills.md).
+Download the current package from **Settings → Plugins & shit → Plugins → Batshit → Download Plugin**; see [outside-agent setup](portable-skills.md).
 
 ## What the skill is allowed to do
 

@@ -1,8 +1,10 @@
 <script lang="ts">
   import { Badge } from '$lib/components/ui/badge'
+  import { Button } from '$lib/components/ui/button'
   import * as Switch from '$lib/components/ui/switch'
   import SettingsAccordionCard from '$lib/components/settings/SettingsAccordionCard.svelte'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
+  import PluginAccessAssignments from './PluginAccessAssignments.svelte'
   import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
   import type { SlashCommandRow } from '$lib/types/database'
   import type { ArtifactRow } from '$lib/services/artifactService'
@@ -19,6 +21,7 @@
     accessResourcesLoading: boolean
     accessResourcesLoaded: boolean
     accessResourcesError: string | null
+    onAccessRetry: () => void
     accessSlashCommands: SlashCommandRow[]
     accessArtifacts: ArtifactRow[]
     getSlashCommandEnabledForEntity: (command: SlashCommandRow, entityId: string | null) => boolean
@@ -49,6 +52,7 @@
     accessResourcesLoading,
     accessResourcesLoaded,
     accessResourcesError,
+    onAccessRetry,
     accessSlashCommands,
     accessArtifacts,
     getSlashCommandEnabledForEntity,
@@ -60,6 +64,8 @@
     onAccessSaveScopeChange
   }: Props = $props()
 </script>
+
+<PluginAccessAssignments entityId={selectedSubagentId} {sectionClass} />
 
 <SettingsAccordionCard
   name="subagent-access-cards"
@@ -74,7 +80,7 @@
     <SettingsInfoMenu ariaLabel="About Subagent Skills And Prompts">
       Manage which reusable skills and prompts this subagent is assigned to. These assignments also
       feed the subagent's compiled Skills &amp; Prompts guidance, so it knows which Batshit commands
-      it can invoke while running. Global “All agents” stays in Skills &amp; Prompts settings.
+      it can invoke while running. Global “All agents” stays in Plugins &amp; shit settings.
       Individual access lives here.
     </SettingsInfoMenu>
   {/snippet}
@@ -91,12 +97,17 @@
   {#if accessResourcesLoading && !accessResourcesLoaded}
     <div class="batshit-settings-inline-alert is-dashed">Loading skills and prompts…</div>
   {:else if accessResourcesError}
-    <div class="batshit-settings-inline-alert is-danger">{accessResourcesError}</div>
-  {:else if accessSlashCommands.length === 0}
+    <div class="batshit-settings-inline-alert is-danger">
+      <div class="flex items-center justify-between gap-2">
+        <span>{accessResourcesError}</span>
+        <Button variant="outline" size="sm" disabled={accessResourcesLoading || accessSaveState === 'saving'} onclick={onAccessRetry}>Retry</Button>
+      </div>
+    </div>
+  {:else if accessSlashCommands.filter(command => !command.plugin_id).length === 0}
     <div class="batshit-settings-inline-alert is-dashed">No skills or prompts found yet.</div>
   {:else}
     <div class="batshit-settings-form-stack">
-      {#each accessSlashCommands as command (command.id)}
+      {#each accessSlashCommands.filter(command => !command.plugin_id) as command (command.id)}
         <div class="batshit-settings-toggle-row is-spine-with-badges">
           <div class="batshit-settings-form-label-line">
             <span class="batshit-settings-parent-label truncate">
@@ -166,7 +177,12 @@
   {#if accessResourcesLoading && !accessResourcesLoaded}
     <div class="batshit-settings-inline-alert is-dashed">Loading artifacts…</div>
   {:else if accessResourcesError}
-    <div class="batshit-settings-inline-alert is-danger">{accessResourcesError}</div>
+    <div class="batshit-settings-inline-alert is-danger">
+      <div class="flex items-center justify-between gap-2">
+        <span>{accessResourcesError}</span>
+        <Button variant="outline" size="sm" disabled={accessResourcesLoading || accessSaveState === 'saving'} onclick={onAccessRetry}>Retry</Button>
+      </div>
+    </div>
   {:else if accessArtifacts.length === 0}
     <div class="batshit-settings-inline-alert is-dashed">No agent-usable artifacts found yet.</div>
   {:else}

@@ -199,7 +199,7 @@ async function signAppBundle(appPath, identity) {
     preAutoEntitlements: false,
     preEmbedProvisioningProfile: false,
     strictVerify: true,
-    version: '43.7.10',
+    version: '43.8.3',
     optionsForFile(filePath) {
       if (filePath === appPath || filePath === mainExecutable) {
         return { entitlements: entitlementsPath, hardenedRuntime: true };

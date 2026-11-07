@@ -13,9 +13,11 @@ export type ResolvedSessionZipForHold =
  */
 export async function resolveSessionZipForHold(
   sessionId: string,
-  suppliedZipId: string
+  suppliedZipId: string,
+  options: { strict?: boolean } = {}
 ): Promise<ResolvedSessionZipForHold> {
-  const exact = await redis.getZip(suppliedZipId)
+  const load = (rawId: string) => options.strict ? redis.json.get(`zip:${rawId}`) : redis.getZip(rawId)
+  const exact = await load(suppliedZipId)
   if (exact) {
     const stateZipId = normalizeId(suppliedZipId)
     const siblings = ((await redis.sMembers(`session:${sessionId}:zips`)) ?? []).filter((rawZipId) => normalizeId(rawZipId) === stateZipId)
@@ -29,7 +31,7 @@ export async function resolveSessionZipForHold(
   if (matches.length > 1) return { status: 'ambiguous' }
 
   const rawZipId = matches[0]
-  const zipData = await redis.getZip(rawZipId)
+  const zipData = await load(rawZipId)
   if (!zipData) return { status: 'missing' }
   return { status: 'found', rawZipId, stateZipId: suppliedZipId, zipData }
 }

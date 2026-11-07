@@ -95,6 +95,55 @@ const turn = {
       { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 5 } },
       { type: 'message_stop' }
     ]),
+  /** The same step, from a provider that reports `end_turn` even though it called a tool. */
+  toolCallSaysStop: (n: number) =>
+    sseResponse([
+      messageStart(`msg_${n}`),
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: `Partial ${n}. ` } },
+      { type: 'content_block_stop', index: 0 },
+      {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'tool_use', id: `toolu_${n}`, name: 'work', input: {} }
+      },
+      {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'input_json_delta', partial_json: JSON.stringify({ value: `step-${n}` }) }
+      },
+      { type: 'content_block_stop', index: 1 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 5 } },
+      { type: 'message_stop' }
+    ]),
+  /** BL-2356: an answer the provider cut at the output limit (`max_tokens`, finish reason `length`). */
+  answerCutAtLimit: () =>
+    sseResponse([
+      messageStart('msg_cut'),
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'The report so f' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'max_tokens', stop_sequence: null }, usage: { output_tokens: 9 } },
+      { type: 'message_stop' }
+    ]),
+  /** BL-2356 review: a step cut at the output limit in the middle of a tool call. */
+  toolCallCutAtLimit: (n: number) =>
+    sseResponse([
+      messageStart(`msg_${n}`),
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: `toolu_${n}`, name: 'work', input: {} }
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: JSON.stringify({ value: `step-${n}` }) }
+      },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'max_tokens', stop_sequence: null }, usage: { output_tokens: 5 } },
+      { type: 'message_stop' }
+    ]),
   answer: () =>
     sseResponse([
       messageStart('msg_final'),
@@ -193,6 +242,8 @@ async function runDelegated(options: {
   script: Array<() => Response>
   execute?: WorkExecute
   abortSignal?: AbortSignal
+  delegatedMaxToolSteps?: number | null
+  delegatedProgress?: NativeModeRequest['delegatedProgress']
 }): Promise<{ bodies: Body[]; outcome: Promise<Awaited<ReturnType<VercelAIBrain['processNativeMode']>>> }> {
   const bodies: Body[] = []
   slot.model = createAnthropic({ apiKey: 'test-key', fetch: scriptedFetch(bodies, options.script) })(
@@ -214,7 +265,9 @@ async function runDelegated(options: {
     userId: 'user-1',
     agentId: 'agent-1',
     maxToolRounds: 10,
-    ...(options.abortSignal ? { abortSignal: options.abortSignal } : {})
+    ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
+    ...(options.delegatedMaxToolSteps !== undefined ? { delegatedMaxToolSteps: options.delegatedMaxToolSteps } : {}),
+    ...(options.delegatedProgress ? { delegatedProgress: options.delegatedProgress } : {})
   }
   const outcome = brain.processNativeMode(request)
   // Keep an early rejection from surfacing as unhandled before the test awaits it.
@@ -417,5 +470,113 @@ describe('BL-611 a delegated API run keeps its failed tool calls', () => {
         toolOutput: expect.objectContaining({ success: false, error: expect.stringContaining('no_such_tool') })
       })
     ])
+  })
+})
+
+/**
+ * Delegation limits (Josh, 2026-10-24) through the real SDK loop: a delegated run has no tool-step
+ * limit unless its Subagent sets one (it stopped at 10 rounds before, and `maxToolRounds` no
+ * longer reaches this method), a set limit counts tool calls and comes back flagged, and the
+ * stall guard hears every stream part with a tool call open from its start to its result.
+ */
+describe('delegation limits on the delegated API loop', () => {
+  beforeEach(() => {
+    slot.model = null
+  })
+
+  it('has no tool-step limit by default: twelve tool rounds run, then the answer', async () => {
+    const script = [...Array.from({ length: 12 }, (_, i) => () => turn.toolCall(i + 1)), () => turn.answer()]
+    const { bodies, outcome } = await runDelegated({ script })
+    const result = await outcome
+    expect(bodies).toHaveLength(13)
+    expect(result.content.endsWith('Done.')).toBe(true)
+    expect(result.intermediateSteps).toHaveLength(12)
+    expect(result.delegatedStepLimitReached).toBeUndefined()
+  })
+
+  it('a set limit stops the loop at the step that reaches it, and says so', async () => {
+    const script = Array.from({ length: 5 }, (_, i) => () => turn.toolCall(i + 1))
+    const { bodies, outcome } = await runDelegated({ script, delegatedMaxToolSteps: 2 })
+    const result = await outcome
+    expect(bodies).toHaveLength(2)
+    expect(result.content).toBe('Partial 1. Partial 2. ')
+    expect(result.intermediateSteps).toHaveLength(2)
+    expect(result.delegatedStepLimitReached).toEqual({ limit: 2, toolCalls: 2 })
+  })
+
+  it('a provider that reports a plain stop on a step that called tools is still marked partial at the limit', async () => {
+    const script = Array.from({ length: 4 }, (_, i) => () => turn.toolCallSaysStop(i + 1))
+    const { bodies, outcome } = await runDelegated({ script, delegatedMaxToolSteps: 2 })
+    const result = await outcome
+    expect(bodies).toHaveLength(2)
+    expect(result.delegatedStepLimitReached).toEqual({ limit: 2, toolCalls: 2 })
+  })
+
+  it('a run that answers within its limit finished on its own and is not flagged', async () => {
+    const { outcome } = await runDelegated({
+      script: [() => turn.toolCall(1), () => turn.answer()],
+      delegatedMaxToolSteps: 2
+    })
+    const result = await outcome
+    expect(result.content).toBe('Partial 1. Done.')
+    expect(result.delegatedStepLimitReached).toBeUndefined()
+    expect(result.delegatedOutputLimitReached).toBeUndefined()
+  })
+
+  it('BL-2356: a last model call cut at its output limit comes back flagged, with its words so far', async () => {
+    const { bodies, outcome } = await runDelegated({ script: [() => turn.toolCall(1), () => turn.answerCutAtLimit()] })
+    const result = await outcome
+    expect(bodies).toHaveLength(2)
+    expect(result.content).toBe('Partial 1. The report so f')
+    expect(result.delegatedOutputLimitReached).toBe(true)
+    expect(result.delegatedStepLimitReached).toBeUndefined()
+  })
+
+  it('BL-2356 review: a step cut at the limit in the middle of a tool call runs no tool, ends the loop and is flagged', async () => {
+    // The SDK runs no call of a step that stopped at the limit (`isToolExecutionAllowedFinishReason`
+    // allows only `stop` and `tool-calls`), so the cut call never runs, the loop ends, and the run
+    // comes back flagged, not as finished.
+    const executed: unknown[] = []
+    const { bodies, outcome } = await runDelegated({ script: [() => turn.toolCallCutAtLimit(1), () => turn.answer()],
+      execute: async (input: unknown) => { executed.push(input); return { worked: true } } })
+    const result = await outcome
+    expect(bodies).toHaveLength(1)
+    expect(executed).toEqual([])
+    expect(result.delegatedOutputLimitReached).toBe(true)
+  })
+
+  it('BL-2356 delta: with a step limit set, a cut call that never ran is not blamed on the step limit', async () => {
+    const { bodies, outcome } = await runDelegated({ script: [() => turn.toolCall(1), () => turn.toolCallCutAtLimit(2)], delegatedMaxToolSteps: 2 })
+    const result = await outcome
+    expect(bodies).toHaveLength(2)
+    expect(result.intermediateSteps).toHaveLength(1)
+    expect(result.delegatedOutputLimitReached).toBe(true)
+    expect(result.delegatedStepLimitReached).toBeUndefined()
+  })
+
+  it('reports progress: activity for every part, and a tool call open from its start to its result', async () => {
+    const events: string[] = []
+    const { outcome } = await runDelegated({
+      script: [() => turn.toolCall(1), () => turn.answer()],
+      delegatedProgress: {
+        activity: () => {
+          if (events.at(-1) !== 'activity') events.push('activity')
+        },
+        toolStarted: (id) => events.push(`start:${id}`),
+        toolEnded: (id) => events.push(`end:${id}`)
+      },
+      execute: async ({ value }) => {
+        events.push('tool ran')
+        return { worked: value }
+      }
+    })
+    await outcome
+    const start = events.indexOf('start:toolu_1')
+    const ran = events.indexOf('tool ran')
+    const end = events.indexOf('end:toolu_1')
+    expect(start).toBeGreaterThan(-1)
+    expect(start).toBeLessThan(ran)
+    expect(ran).toBeLessThan(end)
+    expect(events.slice(end + 1)).toContain('activity')
   })
 })

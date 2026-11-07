@@ -13,7 +13,6 @@ import {
   acknowledgeInfoDm,
   claimDm,
   clearDmNeedsUser,
-  clearDmNeedsUserStamp,
   clearNeedsUserForHumanReply,
   closeDm,
   closeUnreadScheduleDms,
@@ -512,36 +511,14 @@ describe('F-SEC-1b — telling the user a woken chat is stuck on them', () => {
     expect((await getDm(record.id))?.delivery.needsUser).toEqual(first)
   })
 
-  /**
-   * BL-496 (A4): a Claude approval card in a woken turn marks the DM while it waits and takes
-   * the mark back when it ends. It may only take back its OWN mark: another holdup's, or a later
-   * one after the user replied, must stay.
-   */
-  it('reports whether this stamp set the mark, and takes back only a mark it set', async () => {
+  // BL-496 (A4): the stamp reports whether it set the mark. (Taking a mark back by its stamp
+  // served the Claude Code CLI Primary's approval card only; SA-139 R4 removed both.)
+  it('reports whether this stamp set the mark', async () => {
     const record = await seedAssignment({ deliver: 'wake' })
-    const mine = await stampDmNeedsUser(record.id, 'Waiting on a Claude card.')
+    const mine = await stampDmNeedsUser(record.id, 'Waiting on a risky control.')
     expect(mine).toBe((await getDm(record.id))?.delivery.needsUser?.at)
     // A second holdup keeps the first mark and says it set nothing.
-    expect(await stampDmNeedsUser(record.id, 'Waiting on a risky control.')).toBeNull()
-
-    expect(await clearDmNeedsUserStamp(record.id, 'another-holdup-time')).toBe(false)
-    expect((await getDm(record.id))?.delivery.needsUser).toBeDefined()
-
-    expect(await clearDmNeedsUserStamp(record.id, mine!)).toBe(true)
-    expect((await getDm(record.id))?.delivery.needsUser).toBeUndefined()
-    expect(lastInboxEvent()?.needsUserCount).toBe(0)
-  })
-
-  it('does not take back a mark that another holdup set after its own was cleared', async () => {
-    const record = await seedAssignment({ deliver: 'wake' })
-    const mine = await stampDmNeedsUser(record.id, 'Waiting on a Claude card.')
-    await clearDmNeedsUser(record.id)
-    await new Promise((resolve) => setTimeout(resolve, 2))
-    const theirs = await stampDmNeedsUser(record.id, 'Waiting on a risky control.')
-    expect(theirs).not.toBe(mine)
-
-    expect(await clearDmNeedsUserStamp(record.id, mine!)).toBe(false)
-    expect((await getDm(record.id))?.delivery.needsUser?.reason).toBe('Waiting on a risky control.')
+    expect(await stampDmNeedsUser(record.id, 'Waiting on another risky control.')).toBeNull()
   })
 
   it('clears on a human reply, and the count goes back to zero', async () => {

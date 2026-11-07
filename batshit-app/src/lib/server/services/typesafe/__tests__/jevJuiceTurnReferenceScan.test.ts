@@ -9,37 +9,38 @@ import {
 import { CONTROL_TAGS, findControlBlocks, removeControlBlocks } from '$lib/utils/controlTags'
 import { stripZipControlBlocks } from '$lib/utils/zipControl'
 import { POST_TURN_CHECK_LIMITS } from '../../postTurnCheck.jev'
+import { replaceZipReferences, scanZipReferences } from '$lib/utils/zipReferenceSafety'
 import { collectEarlierToolLabels, replyProseForJudgment } from '../jevJuiceTurn'
 
 /**
  * BL-707: Judge Juice reads a finished reply as prose (each zip reference becomes the tool result
  * it stands for) and reads the tool labels of earlier replies from their zip references. Both ran
  * a whole-text pattern whose description part searched to the first `}` again from every opener:
- * seconds of the one Node process after a reply of openers that never close. Each is one scan
- * now, with its own rules.
+ * seconds of the one Node process after a reply of openers that never close. Each is one scan.
+ *
+ * BL-609: both read references with the trust reader's shape (`scanZipReferences` /
+ * `replaceZipReferences`), so Jev reads a reference exactly where the chat view shows a card. The
+ * shape is the oracle here.
  */
 
-/** The two readers as they were, with their literal patterns, kept here only as oracles. */
 const RENDER_HIDDEN_TAG_IDS = new Set(CONTROL_TAGS.filter((spec) => spec.hideFromRender).map((spec) => spec.id))
-function oldReplyProseForJudgment(raw: string): string {
+function expectedReplyProse(raw: string): string {
   const stripped = stripZipControlBlocks(typeof raw === 'string' ? raw : '')
   const hidden = findControlBlocks(stripped, { final: true }).filter((block) => RENDER_HIDDEN_TAG_IDS.has(block.id))
-  return removeControlBlocks(stripped, hidden)
-    .replace(/\{\{batshit-zip:[^:}]+(?::::([^}]*))?\}\}/g, (_match, description: string | undefined) =>
-      description && description.trim() ? `[tool result: ${description.trim()}]` : '[tool result]'
-    )
+  return replaceZipReferences(removeControlBlocks(stripped, hidden), (_match, _id, description) =>
+    description && description.trim() ? `[tool result: ${description.trim()}]` : '[tool result]'
+  )
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 }
 
-const OLD_ZIP_REFERENCE_DESCRIPTION = /\{\{batshit-zip:[^:}]+:::([^}]*)\}\}/g
-function oldCollectEarlierToolLabels(history: Array<{ role: string; content: unknown }>): string[] {
+function expectedEarlierToolLabels(history: Array<{ role: string; content: unknown }>): string[] {
   const labels: string[] = []
   for (const message of history) {
     if (message.role !== 'assistant') continue
     const text = typeof message.content === 'string' ? message.content : ''
-    for (const match of text.matchAll(OLD_ZIP_REFERENCE_DESCRIPTION)) {
-      const label = (match[1] ?? '').trim()
+    for (const reference of scanZipReferences(text)) {
+      const label = (reference.description ?? '').trim()
       if (label && !labels.includes(label)) labels.push(label)
     }
   }
@@ -48,23 +49,37 @@ function oldCollectEarlierToolLabels(history: Array<{ role: string; content: unk
 
 const assistant = (content: string) => ({ role: 'assistant' as const, content })
 
-describe('Judge Juice reads zip references once (BL-707)', () => {
+describe('Judge Juice reads zip references once, with the trust reader\'s shape (BL-707, BL-609)', () => {
   const texts = [...REFERENCE_SCAN_HAND_CASES, ...generateReferenceScanTexts(5_000, 2_707)]
 
-  it('reads a reply as the same prose the old pattern made', () => {
+  it('reads an odd reference exactly where the trust reader reads one', () => {
+    const ZIP = 'cool_tool_1790500000000_abcde'
+    const long = `cool_tool_${'1'.repeat(150)}_abcde`
+    // An empty description and a spaced id are references; a `{`, a line break, or more than 160
+    // characters in the id are not, so they stay as written.
+    expect(replyProseForJudgment(`A {{batshit-zip:${ZIP}:::}} B`)).toBe('A [tool result] B')
+    expect(replyProseForJudgment('A {{batshit-zip:x y:::Read: a.ts}} B')).toBe('A [tool result: Read: a.ts] B')
+    for (const odd of ['{{batshit-zip:a{b:::Read: a.ts}}', '{{batshit-zip:a\nb:::Read: a.ts}}', `{{batshit-zip:${long}:::Read: a.ts}}`]) {
+      expect(replyProseForJudgment(`A ${odd} B`), JSON.stringify(odd)).toBe(`A ${odd} B`)
+      expect(collectEarlierToolLabels([assistant(odd)] as any), JSON.stringify(odd)).toEqual([])
+    }
+    expect(collectEarlierToolLabels([assistant('{{batshit-zip:x y:::Read: a.ts}}')] as any)).toEqual(['Read: a.ts'])
+  })
+
+  it('reads a reply as the prose the trust reader\'s shape makes', () => {
     let changed = 0
     for (const text of texts) {
-      const prose = oldReplyProseForJudgment(text)
+      const prose = expectedReplyProse(text)
       expect(replyProseForJudgment(text), JSON.stringify(text)).toBe(prose)
       if (prose.includes('[tool result')) changed++
     }
     expect(changed).toBeGreaterThan(1_000)
   })
 
-  it('reads the same earlier tool labels, one reply at a time and across a history', () => {
+  it('reads the earlier tool labels the trust reader\'s shape reads, one reply at a time and across a history', () => {
     let labelled = 0
     for (const text of texts) {
-      const labels = oldCollectEarlierToolLabels([assistant(text)])
+      const labels = expectedEarlierToolLabels([assistant(text)])
       expect(collectEarlierToolLabels([assistant(text)] as any), JSON.stringify(text)).toEqual(labels)
       if (labels.length > 0) labelled++
     }
@@ -73,7 +88,7 @@ describe('Judge Juice reads zip references once (BL-707)', () => {
       const history = texts.slice(from, from + 50).map((content, index) =>
         index % 7 === 3 ? { role: 'user', content } : assistant(content)
       )
-      expect(collectEarlierToolLabels(history as any)).toEqual(oldCollectEarlierToolLabels(history))
+      expect(collectEarlierToolLabels(history as any)).toEqual(expectedEarlierToolLabels(history))
     }
   })
 

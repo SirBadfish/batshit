@@ -209,9 +209,9 @@ describe('buildAgentSettingsSavePatch', () => {
       avatar_icon_fit: 'fill'
     })
     expect(buildAgentSettingsSavePatch(payload(), payload({ show_reasoning: false }))).toEqual({
-      show_reasoning: false,
-      preserve_reasoning: false
+      show_reasoning: false
     })
+    expect(buildAgentSettingsSavePatch(payload({ agentType: 'cli' }), payload({ agentType: 'cli', show_reasoning: false }))).toEqual({ show_reasoning: false, preserve_reasoning: false })
   })
 
   it('a field the builder adds later is compared on its own', () => {

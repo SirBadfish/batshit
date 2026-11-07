@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/svelte'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MCPGateway, MCPToolGrouping } from '$lib/types/database'
@@ -24,7 +25,7 @@ const ARGS_B = '-y\n@modelcontextprotocol/server-filesystem\n/Users/example/b'
 const T0 = '2026-10-11T15:00:00.000Z'
 
 function stdio(id: string, name: string, args: string, extra: Partial<MCPGateway> = {}): MCPGateway {
-  return {
+  return presentFixture({
     id,
     name,
     type: 'stdio',
@@ -40,12 +41,15 @@ function stdio(id: string, name: string, args: string, extra: Partial<MCPGateway
       lastTestStatus: 'never'
     },
     ...extra
-  }
+  })
 }
 
+function presentFixture(value: MCPGateway): MCPGateway & { sourceRevision: string } {
+  return { ...value, sourceRevision: `source1:${createHash('sha256').update(JSON.stringify({ id: value.id, name: value.name, type: value.type, url: value.url, authKeyName: value.authKeyName, stdioConfig: value.stdioConfig, metadata: value.metadata })).digest('hex')}` }
+}
 const FILESYSTEM = () => stdio('gw-a', 'Filesystem', ARGS_A)
 const OTHER = () => stdio('gw-x', 'Other', '-y\nother-server')
-const CUSTOM = (): MCPGateway => ({
+const CUSTOM = (): MCPGateway => presentFixture({
   id: 'gw-c',
   name: 'Remote Search',
   type: 'custom',
@@ -55,7 +59,7 @@ const CUSTOM = (): MCPGateway => ({
   created_at: '2026-10-01T00:00:00.000Z',
   updated_at: T0
 })
-const DOCKER = (): MCPGateway => ({
+const DOCKER = (): MCPGateway => presentFixture({
   id: 'gw-d',
   name: 'Docker MCP Gateway',
   type: 'docker-catalog',
@@ -65,7 +69,7 @@ const DOCKER = (): MCPGateway => ({
   updated_at: T0,
   metadata: { dockerProfile: 'default', catalogNote: 'kept' }
 })
-const N8N_CLIENT = (): MCPGateway => ({
+const N8N_CLIENT = (): MCPGateway => presentFixture({
   id: 'gw-n',
   name: 'n8n Workflows',
   type: 'n8n-mcp-client',
@@ -101,12 +105,14 @@ function applyPut(request: PutRequest): MCPGateway {
       : {}),
     updated_at: new Date(Date.parse(T0) + stamp * 1000).toISOString()
   }
-  stored.set(request.id, next)
-  return next
+  const acknowledged = presentFixture(next)
+  stored.set(request.id, acknowledged)
+  return acknowledged
 }
 
 function saved(request: PutRequest): PutAnswer {
-  return { status: 200, body: { success: true, gateway: applyPut(request) } }
+  const gateway = applyPut(request) as MCPGateway & { sourceRevision: string }
+  return { status: 200, body: { success: true, gateway, sourceAcknowledgement: { id: gateway.id, sourceRevision: gateway.sourceRevision } } }
 }
 
 const NOT_STORED: PutAnswer = { status: 409, body: { error: 'nothing was saved' } }
@@ -125,7 +131,11 @@ function held() {
 }
 
 function jsonResponse(status: number, body: unknown) {
-  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+  const value = body as { gateway?: MCPGateway; sourceAcknowledgement?: unknown }
+  const gateway = value?.gateway ? presentFixture(value.gateway) : undefined
+  const answer = gateway && status >= 200 && status < 300 ? { ...value, gateway,
+    sourceAcknowledgement: value.sourceAcknowledgement ?? { id: gateway.id, sourceRevision: gateway.sourceRevision } } : body
+  return new Response(JSON.stringify(answer), { status, headers: { 'Content-Type': 'application/json' } })
 }
 
 beforeEach(() => {

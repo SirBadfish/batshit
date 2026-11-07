@@ -8,6 +8,7 @@ import {
   WAITS_FOR_APPROVAL_SENTENCE,
   approvalSummaryIsPending,
   findHeldMessageAwaitingAnswer,
+  findUnansweredBesideHeldAnswer,
   isExpiryOnlyAnswer,
   isHeldForApprovalCard,
   readWaitsForApproval,
@@ -155,6 +156,19 @@ describe('BL-455: only the user\u2019s click releases the held words (Faye, 2026
     expect(HELD_CARD_EXPIRED_SENTENCE).toBe('Not sent — the approval card expired')
   })
 
+  it('derives an actionable receipt from confirmed retired-card settlement without rewriting the held message', () => {
+    const retired = card({ retiredApprovalSettled: true, toolApprovals: { approvals: [{ approvalId: 'old', status: 'expired', control: { lane: 'cli' } }] } })
+    for (const busy of [false, true]) expect(resolveHeldMessageReceipt({ messages: [question, retired, held], busy })).toEqual({
+      messageId: 'msg-held', state: 'expired', label: HELD_CARD_EXPIRED_SENTENCE
+    })
+    const mixed = card({ retiredApprovalSettled: true, toolApprovals: { approvals: [
+      { approvalId: 'old', status: 'expired', control: { lane: 'cli' } }, { approvalId: 'live', status: 'pending', control: { lane: 'api' } }
+    ] } })
+    expect(resolveHeldMessageReceipt({ messages: [question, mixed, held], busy: false })).toMatchObject({ state: 'waiting' })
+    expect(resolveHeldMessageReceipt({ messages: [question, { ...retired, role: 'user' }, held], busy: false })).toBeNull()
+    expect(resolveHeldMessageReceipt({ messages: [question, retired, held, { id: 'later', role: 'assistant' }], busy: false })).toBeNull()
+  })
+
   it('a failed reply leaves the held message with its receipt, once nothing runs', () => {
     const failed = card({ toolApprovals: null, response_failed: true })
     expect(resolveHeldMessageReceipt({ messages: [question, failed, held], busy: false })).toEqual({
@@ -176,7 +190,7 @@ describe('BL-455: only the user\u2019s click releases the held words (Faye, 2026
   it('a send the chat\u2019s line kept at an approval card says it in the held message\u2019s words (BL-713)', () => {
     const approvalWait = { state: 'dropped', dropReason: 'approval_wait' } as SteerBubbleEntry
     expect(steerBubbleStatusLabel(approvalWait)).toBe(
-      'Not sent — the approval card is still waiting for your answer. Send it when you are ready.'
+      'Not sent — it stopped waiting for the approval card. Send it when you are ready.'
     )
     const expired = { state: 'dropped', dropReason: 'approval_expired' } as SteerBubbleEntry
     expect(steerBubbleStatusLabel(expired)).toBe(HELD_CARD_EXPIRED_SENTENCE)
@@ -242,5 +256,36 @@ describe('BL-905: held words and a kept send at the same card', () => {
   it('a reply after the kept send (its Send now) ends the held receipt: that turn read the held words', () => {
     const keptReply = { id: 'msg-kept-reply', role: 'assistant', metadata: {} }
     expect(resolveHeldMessageReceipt({ messages: [question, card(), held, kept, keptReply], busy: false })).toBeNull()
+  })
+})
+
+/** BL-921: what moves behind the answer to held words once it is saved. */
+describe('the unanswered messages beside the held words (BL-921)', () => {
+  const user = (id: string, metadata: Record<string, unknown> = {}) => ({ id, role: 'user', metadata })
+  const reply = (id: string) => ({ id, role: 'assistant', metadata: {} })
+  const held = (id: string, card = 'card') => user(id, { waitsForApproval: { messageId: card } })
+
+  it('a send the line kept after the held words (the click\'s answer)', () => {
+    expect(
+      findUnansweredBesideHeldAnswer([user('q'), reply('card'), held('held'), user('kept-1'), user('kept-2'), reply('answer')], 'held', 'answer')
+    ).toEqual(['kept-1', 'kept-2'])
+  })
+
+  it('a kept send the Send now of the held words left before them', () => {
+    expect(
+      findUnansweredBesideHeldAnswer([user('q'), reply('card'), user('kept'), held('held'), reply('answer')], 'held', 'answer')
+    ).toEqual(['kept'])
+  })
+
+  it('never held words: earlier holds the same answer reads, or another card\'s', () => {
+    expect(
+      findUnansweredBesideHeldAnswer([reply('card'), held('held-1'), held('held-2'), held('other', 'card-2'), reply('answer')], 'held-2', 'answer')
+    ).toEqual([])
+  })
+
+  it('nothing when a reply stands between the words and the answer, or the answer is not after them', () => {
+    expect(findUnansweredBesideHeldAnswer([held('held'), user('kept'), reply('kept-reply'), reply('answer')], 'held', 'answer')).toEqual([])
+    expect(findUnansweredBesideHeldAnswer([reply('answer'), held('held'), user('kept')], 'held', 'answer')).toEqual([])
+    expect(findUnansweredBesideHeldAnswer([held('held'), user('kept')], 'held', 'answer')).toEqual([])
   })
 })

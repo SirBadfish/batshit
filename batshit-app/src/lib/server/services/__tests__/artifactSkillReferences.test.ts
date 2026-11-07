@@ -13,18 +13,21 @@ import { describe, expect, it } from 'vitest'
  */
 
 const REPO_ROOT = path.resolve(__dirname, '../../../../../..')
-const SKILL_ROOT = path.join(REPO_ROOT, 'batshit-app/src/lib/server/system-skills/artifacts')
+const SKILL_ROOT = path.join(REPO_ROOT, 'batshit-app/src/lib/server/system-plugins/batshit/skills/artifact-creator')
 const REFERENCE_DIR = path.join(SKILL_ROOT, 'references')
 const PORTABLE_SKILL = path.join(REPO_ROOT, 'batshit-portable-skills/artifact-creator/SKILL.md')
 const MANIFEST = path.join(REPO_ROOT, 'batshit-portable-skills/portable-skills.manifest.json')
 
 const read = (file: string) => fs.readFileSync(file, 'utf8')
 const skill = () => read(path.join(SKILL_ROOT, 'SKILL.md'))
+const nativeGuide = () => read(path.join(REFERENCE_DIR, 'native.md'))
+const LANE_REFERENCES = ['native.md', 'outside.md'] as const
 const referenceNames = () =>
   fs
     .readdirSync(REFERENCE_DIR)
     .filter((name) => name.endsWith('.md'))
     .sort()
+const sharedReferenceNames = () => referenceNames().filter(name => !LANE_REFERENCES.some(lane => lane === name))
 
 /** The characters a `native_skill` read returns when the agent passes no `maxChars`. */
 function defaultReadLimit(): number {
@@ -48,30 +51,34 @@ describe('Artifact Creator skill fits the read limit (BL-77)', () => {
     expect(skill().length).toBeLessThanOrEqual(defaultReadLimit())
   })
 
-  it.each(referenceNames())('references/%s says when to load it', (name) => {
+  it.each(sharedReferenceNames())('references/%s says when to load it', (name) => {
     const opening = read(path.join(REFERENCE_DIR, name)).split('\n').slice(0, 5).join('\n')
     expect(opening).toMatch(/^\*\*Load when:\*\* \S/m)
   })
 
-  it('SKILL.md lists every reference, and every reference it names exists', () => {
-    const text = skill()
-    for (const name of referenceNames()) {
-      expect(text, `SKILL.md does not list ${name}`).toMatch(new RegExp('\\| `' + name.replace('.', '\\.') + '` \\|'))
+  it.each(LANE_REFERENCES)('SKILL.md links the mandatory operating guide references/%s', name => {
+    expect(skill()).toContain(`](references/${name})`)
+  })
+
+  it('the native operating guide lists every shared reference, and every reference it names exists', () => {
+    const text = nativeGuide()
+    for (const name of sharedReferenceNames()) {
+      expect(text, `Native operating guide does not list ${name}`).toMatch(new RegExp('\\| `' + name.replace('.', '\\.') + '` \\|'))
     }
     const named = new Set(Array.from(text.matchAll(/`([a-z0-9-]+\.md)`/g), (match) => match[1]))
     named.delete('SKILL.md')
     for (const name of named) {
-      expect(referenceNames(), `SKILL.md names missing reference ${name}`).toContain(name)
+      expect(referenceNames(), `Native operating guide names missing reference ${name}`).toContain(name)
     }
   })
 
-  it('the portable manifest ships exactly the references folder', () => {
+  it('the held portable manifest ships exactly the shared references, with lane guides remaining native-package-only', () => {
     const manifest = JSON.parse(read(MANIFEST)) as {
       bundles: Array<{ id: string; sharedReferences: string[] }>
     }
     const bundle = manifest.bundles.find((entry) => entry.id === 'artifact-creator')
     expect(bundle).toBeDefined()
-    expect([...bundle!.sharedReferences].sort()).toEqual(referenceNames().map((name) => `references/${name}`))
+    expect([...bundle!.sharedReferences].sort()).toEqual(sharedReferenceNames().map((name) => `references/${name}`))
   })
 })
 
@@ -99,12 +106,12 @@ describe('Artifact Creator guidance matches what saves do (BL-77)', () => {
     }
   })
 
-  it('SKILL.md keeps validate_structure as the check without saving', () => {
-    expect(skill()).toMatch(/`sys\.artifact\.validate_structure` gives the same verdict without saving/)
+  it('the native operating guide keeps validate_structure as the check without saving', () => {
+    expect(nativeGuide()).toMatch(/`sys\.artifact\.validate_structure` gives the same verdict without saving/)
   })
 
-  it('SKILL.md gives the exact refs and their inputs, so no search is needed to build', () => {
-    const text = skill()
+  it('the native operating guide gives the exact refs and their inputs, so no search is needed to build', () => {
+    const text = nativeGuide()
     for (const ref of [
       'fabric:sys.artifact.create',
       'fabric:sys.artifact.update',
@@ -118,8 +125,8 @@ describe('Artifact Creator guidance matches what saves do (BL-77)', () => {
     }
   })
 
-  it('SKILL.md asks for get only when the write summary does not show the change', () => {
-    expect(skill()).toMatch(/call `sys\.artifact\.get` only when you need the current HTML to edit, or after an update whose summary does not show the change you made/)
+  it('the native operating guide asks for get only when the write summary does not show the change', () => {
+    expect(nativeGuide()).toMatch(/call `sys\.artifact\.get` only when you need the current HTML to edit, or after an update whose summary does not show the change you made/)
   })
 
   // BL-818: `expectedVersion` comes from a result that loaded the WHOLE page or wrote the agent's
@@ -130,7 +137,7 @@ describe('Artifact Creator guidance matches what saves do (BL-77)', () => {
   // user's newer save and have it accepted. Every shipped text that says where the version comes
   // from says so.
   it.each([
-    ['SKILL.md', () => skill()],
+    ['native operating guide', () => nativeGuide()],
     ['references/editing.md', () => read(path.join(REFERENCE_DIR, 'editing.md'))],
     ['portable SKILL.md', () => read(PORTABLE_SKILL)],
     ['portable references/editing.md', () => read(path.join(path.dirname(PORTABLE_SKILL), 'references/editing.md'))]
@@ -151,7 +158,7 @@ describe('Artifact Creator guidance matches what saves do (BL-77)', () => {
   })
 
   it('static tools are user-run, never agent tools', () => {
-    expect(skill()).toMatch(/Static \/ No AI[^\n]*never an agent tool/)
+    expect(nativeGuide()).toMatch(/Static \/ No AI[^\n]*never an agent tool/)
   })
 })
 

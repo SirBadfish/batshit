@@ -12,9 +12,9 @@ const {
  * `POST /api/upload/avatar` stores one picture per upload and names it after its owner:
  * `<entityType>_<entityId>_<Date.now()>.jpg`, recorded under
  * `upload:avatars:<entityType>:<file>` with the bytes at `<uploadsDir>/avatars/<file>`.
- * A replaced picture is deleted only when the browser names it (`oldAvatarUrl`), so clearing
- * an avatar, switching to an icon, or leaving an edit unsaved leaves pictures behind, and an
- * agent collects several over time (Bob had three). Before 2025-08-12 the route wrote
+ * Uploads do not delete replaced pictures; saved-owner tidy and owner deletion clean them
+ * up under the rules below. Leaving an edit unsaved can leave pictures behind. Before
+ * 2025-08-12 the route wrote
  * `avatar_<Date.now()>.jpg` under the flat key `upload:avatars:<file>`; that name says
  * nothing about its owner, so only the owner's record, which still points at it, can.
  *
@@ -35,10 +35,10 @@ const {
  * (BL-145; the user and Group panels too since BL-281): a refused save kept pointing at a
  * picture the upload had deleted. A user is tidied but never deleted through here.
  *
- * A tidy never deletes a picture that may still be on its way to a save (BL-288): with a kept
- * picture, only pictures uploaded BEFORE it go (a later one is in no saved record yet); with
- * none (the picture was cleared, or an icon chosen), the picture the save replaced and older
- * ones, or with no replaced picture named only pictures older than ten minutes. An
+ * Ordinary tidy candidates must pass BOTH chronology and the ten-minute grace (BL-288/634):
+ * before the newest kept picture, or with none kept no newer than the named replacement,
+ * or with neither only the age cutoff. Only the exact replaced filename may bypass those
+ * cutoffs; the owner's kept pictures always stay. An
  * upload and a sweep of one owner take turns (`avatarOwnerLock.js`), so an upload is either
  * wholly before the sweep's reads or wholly after them, and its name is later than any
  * picture the owner had.
@@ -50,9 +50,9 @@ const AVATAR_OWNER_DELETE_TYPES = new Set(['agent', 'subagent', 'group']);
 // Every owner a picture can be uploaded for (BL-143), and so every owner a settings save can
 // tidy (the user since BL-281). The upload names the picture after it.
 const AVATAR_UPLOAD_OWNER_TYPES = new Set(['user', ...AVATAR_OWNER_DELETE_TYPES]);
-// BL-288: with no kept picture and no replaced one named, a tidy leaves pictures younger than
-// this alone. A picture on its way to a save waits for the form's autosave (a second or so);
-// ten minutes is room to spare, and a picture it leaves goes at the owner's next tidy or delete.
+// BL-288/634: every ordinary tidy candidate gets this grace, even with a newer kept picture.
+// Only the exact replaced filename can bypass it; keep always wins. Expired pictures still
+// require chronological eligibility at a later tidy; owner deletion retains its own rule.
 const TIDY_RECENT_UPLOAD_GRACE_MS = 10 * 60 * 1000;
 // The rule `redis.deleteAgent` already enforces (its memory-media sweep refuses anything
 // else), with no length cap on purpose: a stricter rule here would make a deletable agent
@@ -181,21 +181,20 @@ function avatarFilenameTimestamp(filename) {
 }
 
 /**
- * BL-288: which of an owner's pictures a tidy may delete (those uploaded before the cutoff).
- * With a picture the saved record shows: pictures uploaded before the newest one of them. With
- * none shown (a cleared picture, or an icon): the picture the save replaced and every older
- * one, since a later picture is in no saved record yet; with no replaced picture named, only
- * pictures older than `TIDY_RECENT_UPLOAD_GRACE_MS`. An owner delete (no tidy) takes them all.
- * The replaced name comes from the browser; it is checked to be the owner's own picture, so,
- * like every tidy, it reaches only the owner's own pictures (before BL-288 a tidy deleted all
- * of them but the kept ones).
+ * BL-288/634: ordinary tidy candidates must be older than BOTH the existing chronological
+ * cutoff and the ten-minute grace. An earlier upload may still be unsaved in another tab.
+ * With saved pictures, preserve anything newer than the newest kept one; without them,
+ * preserve anything newer than the replaced one. Only the exact replaced filename may
+ * bypass those cutoffs, in mayGo below, and keep/owner guards still apply to it.
+ * An owner delete (no tidy) keeps its existing eligibility.
  */
 function tidyDeletionCutoff({ tidy, keepFilenames, replacedFilename, nowMs }) {
   if (!tidy) return Number.POSITIVE_INFINITY;
+  const graceCutoff = Number.isFinite(nowMs) ? nowMs - TIDY_RECENT_UPLOAD_GRACE_MS : Number.NaN;
   const kept = keepFilenames.map(avatarFilenameTimestamp).filter(Number.isFinite);
-  if (kept.length > 0) return Math.max(...kept);
+  if (kept.length > 0) return Math.min(Math.max(...kept), graceCutoff);
   const replaced = replacedFilename ? avatarFilenameTimestamp(replacedFilename) : Number.NaN;
-  return Number.isFinite(replaced) ? replaced + 1 : nowMs - TIDY_RECENT_UPLOAD_GRACE_MS;
+  return Number.isFinite(replaced) ? Math.min(replaced + 1, graceCutoff) : graceCutoff;
 }
 
 async function scanKeys(client, match) {
@@ -252,7 +251,8 @@ async function sweepOwnedAvatars({
   // BL-288: and a tidy leaves every picture that may still be on its way to a save.
   const cutoff = tidyDeletionCutoff({ tidy, keepFilenames, replacedFilename, nowMs });
   const mayGo = (filename) =>
-    owned.test(filename) && !keep.has(filename) && avatarFilenameTimestamp(filename) < cutoff;
+    owned.test(filename) && !keep.has(filename) &&
+    ((tidy && filename === replacedFilename) || avatarFilenameTimestamp(filename) < cutoff);
   const candidates = new Map();
   for (const prefix of [`upload:${AVATAR_UPLOAD_TYPE}:${entityType}:`, `upload:${AVATAR_UPLOAD_TYPE}:`]) {
     for (const key of await scanKeys(client, `${prefix}${entityType}_${entityId}_*`)) {

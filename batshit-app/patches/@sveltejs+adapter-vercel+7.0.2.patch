@@ -1,0 +1,35 @@
+diff --git a/node_modules/@sveltejs/adapter-vercel/index.js b/node_modules/@sveltejs/adapter-vercel/index.js
+--- a/node_modules/@sveltejs/adapter-vercel/index.js
++++ b/node_modules/@sveltejs/adapter-vercel/index.js
+@@ -541,8 +541,7 @@
+ async function create_function_bundle(builder, entry, dir, config) {
+ 	fs.rmSync(dir, { force: true, recursive: true });
+ 
+-	let base = entry;
+-	while (base !== (base = path.dirname(base)));
++	const base = `${process.cwd()}${path.sep}`;
+ 
+ 	const traced = await nodeFileTrace([entry], {
+ 		base,
+@@ -609,10 +608,10 @@
+ 		}
+ 	}
+ 
+-	const ancestor = base + common_parts.join(path.sep);
++	const ancestor = common_parts.length ? path.join(base, ...common_parts) : base;
+ 
+ 	for (const file of traced.fileList) {
+-		const source = base + file;
++		const source = path.join(base, file);
+ 		const dest = path.join(dir, path.relative(ancestor, source));
+ 
+ 		const stats = fs.statSync(source);
+@@ -648,7 +647,7 @@
+ 				regions: config.regions,
+ 				memory: config.memory,
+ 				maxDuration: config.maxDuration,
+-				handler: path.relative(base + ancestor, entry),
++				handler: path.relative(ancestor, entry),
+ 				launcherType: 'Nodejs',
+ 				experimentalResponseStreaming: !config.isr,
+ 				framework: {

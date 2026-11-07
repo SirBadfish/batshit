@@ -4,10 +4,12 @@ import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import {
   installUserSettingsRoutes,
+  jsonResponse,
   loadUserSettingsRoute,
   storedUserSettings
 } from '$lib/test-utils/userSettingsRoute'
 import UserSettingsPanel from './UserSettingsPanel.svelte'
+import { getUserSettingsReadState, resetUserSettings } from '$lib/stores/userSettings.svelte'
 
 /**
  * BL-962 (the class of BL-939 and BL-487): when `GET /api/user/settings` failed, the User panel
@@ -127,12 +129,12 @@ async function seedStored() {
   return (await stored()) as Record<string, any>
 }
 
-function installRoutes() {
+function installRoutes(overrideGet?: (response: Response) => Response | Promise<Response>) {
   failGetsWith = null
   holdGets = null
   const installed = installUserSettingsRoutes({
     userId: USER,
-    route,
+    route: overrideGet ? { ...route, GET: async (event: any) => overrideGet(await route.GET(event) as Response) } : route,
     failGetsWith: () => failGetsWith,
     holdGets: () => holdGets
   })
@@ -218,6 +220,93 @@ describe('User Settings never turns a failed load into a save (BL-962)', () => {
     vi.restoreAllMocks()
     global.fetch = originalFetch
   })
+
+  it.each([
+    ['missing settings', {}], ['null envelope', null], ['array envelope', []],
+    ['array record', { settings: [] }], ['scalar record', { settings: 42 }],
+    ['declared failure', { success: false, settings: SAVED }]
+  ])('BL-978(i): %s grants no read/save authority; Retry reads the real saved record', async (_name, payload) => {
+    resetUserSettings()
+    const before = await seedStored()
+    let healthy = false
+    installRoutes(response => healthy ? response : jsonResponse(payload))
+    renderPanel(PAGE_COPY)
+    const notice = await screen.findByTestId('user-settings-load-error')
+    expect(nameInput()).toBeNull()
+    expect(promptButton()).toBeNull()
+    expect(busyTrigger()).toBeNull()
+    expect(getUserSettingsReadState()).toBe('unread')
+    await pause(700)
+    expect(posts).toEqual([])
+    expect(await stored()).toEqual(before)
+    healthy = true
+    await fireEvent.click(within(notice).getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(nameInput()?.value).toBe('Josh'))
+    expect(loadNotice()).toBeNull()
+    expect(getUserSettingsReadState()).toBe('confirmed')
+    await pause(700)
+    expect(posts).toEqual([])
+    await tryToRename('Joshua')
+    expect(posts).toHaveLength(1)
+    expect(await storedKeysOf(before)).toEqual({ ...before, displayName: 'Joshua' })
+  }, 60_000)
+
+  it('BL-978(i): Retry may confirm genuine no-record defaults without a hydration save or stale page values', async () => {
+    resetUserSettings()
+    let healthy = false
+    installRoutes(response => healthy ? response : jsonResponse({}))
+    renderPanel(PAGE_COPY)
+    const notice = await screen.findByTestId('user-settings-load-error')
+    healthy = true
+    await fireEvent.click(within(notice).getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(nameInput()).not.toBeNull())
+    expect(nameInput()?.value).toBe('')
+    expect(promptButton()?.textContent).toContain('Create Global System Prompt')
+    expect((busyTrigger()?.textContent ?? '').trim()).toBe('Steer')
+    expect(getUserSettingsReadState()).toBe('confirmed')
+    await pause(700)
+    expect(posts).toEqual([])
+    expect(await stored()).toBeNull()
+    await tryToRename('First name')
+    expect(posts).toHaveLength(1)
+    expect(await stored()).toMatchObject({ displayName: 'First name', global_custom_system_prompt: '', global_chat_settings: { busy_send_mode: 'steer' } })
+  }, 60_000)
+
+  it('BL-978(i): a later malformed Retry answer preserves the last good form and its save baseline', async () => {
+    resetUserSettings()
+    const before = await seedStored()
+    let attempts = 0
+    let release = () => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+    installRoutes(async response => {
+      attempts += 1
+      if (attempts === 1) return response
+      await gate
+      return jsonResponse({})
+    })
+    failGetsWith = 500
+    renderPanel(PAGE_COPY)
+    const notice = await screen.findByTestId('user-settings-load-error')
+    failGetsWith = null
+    const retry = within(notice).getByRole('button', { name: 'Retry' })
+    try {
+      // Exercise two already-admitted Retry answers before the disabled state flushes.
+      const first = fireEvent.click(retry)
+      const second = fireEvent.click(retry)
+      await Promise.all([first, second])
+      await waitFor(() => expect(attempts).toBe(2))
+      await waitFor(() => expect(nameInput()?.value).toBe('Josh'))
+      release()
+      await pause(700)
+      expect(nameInput()?.value).toBe('Josh')
+      expect(getUserSettingsReadState()).toBe('confirmed')
+      expect(posts).toEqual([])
+      expect(await stored()).toEqual(before)
+      await tryToRename('Joshua')
+      expect(posts).toHaveLength(1)
+      expect(await storedKeysOf(before)).toEqual({ ...before, displayName: 'Joshua' })
+    } finally { release() }
+  }, 60_000)
 
   // Every writer of the record, each with the read failing: nothing leaves, nothing is stored.
   describe.each([

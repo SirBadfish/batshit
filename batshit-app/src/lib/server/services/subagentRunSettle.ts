@@ -6,19 +6,20 @@
  * `subagentRunRegistry.ts` keeps a run registered until its call ended AND the work it tracks
  * has settled. The runner hands it `settleSubagentRunWork`: the lane's work (a stopped lane
  * unwinds after the call has already answered) and then the exit of every CLI process the lane
- * started. A lane's work ends when its CLI's stream ends, which on Codex's app-server lane is
- * the moment Batshit SENDS the process its SIGTERM, not the moment it exits; the exit is what
- * the delete has to wait for.
+ * started. A lane's work ends when its CLI's stream ends, which can come before the process
+ * exits; the exit is what the delete has to wait for.
  *
- * From the stop (or the lane's own end, if that comes first), non-Codex CLI children keep their
- * 15 s SIGKILL grace. Codex uses its run process controller to verify the wrapper and owned
- * command groups. At 25 s an unproven exit rejects rather than silently ending registration;
- * delete retains the Subagent's record/profile and a later delete retries cleanup. Both bounds
- * fit within the delete's 30 s wait.
+ * From the stop (or the lane's own end, if that comes first), CLI children get a 15 s SIGKILL
+ * grace. At 25 s an unproven exit rejects rather than silently ending registration; delete
+ * retains the Subagent's record/profile and a later delete retries cleanup. Both bounds fit
+ * within the delete's 30 s wait.
+ *
+ * SA-139 R5: the CLI Subagent lane is gone, and the API lane the runner still starts hands over
+ * no CLI process (`cliProcesses: []`), so a registration now waits for the lane's work alone.
+ * `waitForProcessExit` also serves the Claude plan run (`claudePlanRun.ts`).
  */
 
 import type { ChildProcess } from 'node:child_process'
-import { getCodexRunProcesses } from './codexRunProcesses'
 
 /** From the stop: a CLI process still running then is killed (SIGKILL). */
 export const SUBAGENT_CLI_KILL_GRACE_MS = 15_000
@@ -33,9 +34,9 @@ function hasExited(child: ChildProcess): boolean {
 }
 
 /**
- * Settles once the process has exited. The bridges' cleanups call `child.removeAllListeners()`,
- * which takes an `exit` listener away with the rest, so the exit is also read from the process
- * itself (Node sets `exitCode` / `signalCode` whatever listens).
+ * Settles once the process has exited. The removed CLI bridge's cleanup called
+ * `child.removeAllListeners()`, which takes an `exit` listener away with the rest, so the exit is
+ * also read from the process itself (Node sets `exitCode` / `signalCode` whatever listens).
  */
 export function waitForProcessExit(child: ChildProcess, signal?: AbortSignal): Promise<void> {
   if (hasExited(child)) return Promise.resolve()
@@ -118,7 +119,6 @@ export function settleSubagentRunWork(options: {
       clockStarted = true
       killTimer = setTimeout(() => {
         for (const child of cliProcesses) {
-          if (getCodexRunProcesses(child)) continue
           if (forceKill(child)) {
             console.warn(
               `[subagents] ${label}'s CLI (pid ${child.pid}) had not exited ${killGraceMs} ms after its run was stopped or ended; killed it (SIGKILL)`
@@ -139,10 +139,7 @@ export function settleSubagentRunWork(options: {
     else stopSignal.addEventListener('abort', startClock, { once: true })
     void settled.then(async () => {
       startClock()
-      await Promise.all(cliProcesses.map((child) => {
-        const codex = getCodexRunProcesses(child)
-        return codex ? (retry ? codex.retryEnd() : codex.end()) : waitForProcessExit(child, waitAbort.signal)
-      }))
+      await Promise.all(cliProcesses.map((child) => waitForProcessExit(child, waitAbort.signal)))
       finish()
     }).catch(finish)
   })

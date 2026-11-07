@@ -12,7 +12,7 @@ import {
   resolveDockerComposeWorkingDirectory,
   type CliExecutableResolution,
   type CliResolutionSource
-} from '$lib/server/services/codexCliStatus'
+} from '$lib/server/services/cliExecutableResolution'
 import {
   buildClaudeChildEnv,
   buildClaudeChildProcessOptions,
@@ -56,7 +56,7 @@ export interface ClaudeLoginCommands {
 }
 
 /**
- * Resolution order matches Codex: explicit env override → Batshit-managed
+ * Resolution order: explicit env override → Batshit-managed
  * install → PATH → well-known locations.
  */
 export function resolveClaudeCliExecutableDetailed(
@@ -385,7 +385,7 @@ function buildNotLoggedInMessage(command: string, detail?: string) {
 }
 
 const CLAUDE_NOT_DETECTED_MESSAGE =
-  'Claude Code CLI not detected. Use the one-click install in Agent Settings, or install it yourself, then run `claude auth login`.'
+  'Claude Code CLI not detected. Use the one-click install on the Claude Plan card in Settings, API Keys, or install it yourself, then run `claude auth login`.'
 
 function normalizeClaudeError(error: any): string {
   if (!error) {

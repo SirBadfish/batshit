@@ -1045,18 +1045,31 @@ export function createHairState(
   })
 }
 
+export type HairRecipeFitSource = Pick<RecipeSourceIdentity,
+  'baseId' | 'fitFamily' | 'definitionSha256' | 'physicalBasisSha256' | 'topologySha256' | 'skeletonHierarchySha256'>
+
+function hairAssetFitDimensions(asset: HairAssetV1): readonly string[] {
+  const fit = asset.attachment.fitReceipt
+  return [asset.compatibility.baseId, asset.compatibility.fitFamily, fit.appearanceDefinitionSha256,
+    fit.physicalBasisSha256, fit.topologySha256, fit.skeletonHierarchySha256]
+}
+
+/** Fit identity is independent of material readiness, motion capability and discovery labels. */
+export function hairAssetMatchesRecipeFit(asset: HairAssetV1, source: HairRecipeFitSource): boolean {
+  const expected = [source.baseId, source.fitFamily, source.definitionSha256,
+    source.physicalBasisSha256, source.topologySha256, source.skeletonHierarchySha256]
+  return hairAssetFitDimensions(asset).every((value, index) => value === expected[index])
+}
+
+/** Ambiguity is per style; different styles may target the same exact Recipe fit. */
+export function hairAssetStyleFitKey(asset: HairAssetV1): string {
+  return JSON.stringify([asset.assetId, ...hairAssetFitDimensions(asset)])
+}
+
 export async function validateHairStateBinding(input: {
   asset: unknown
   state: unknown
-  recipeSource: Pick<
-    RecipeSourceIdentity,
-    | 'baseId'
-    | 'fitFamily'
-    | 'definitionSha256'
-    | 'physicalBasisSha256'
-    | 'topologySha256'
-    | 'skeletonHierarchySha256'
-  >
+  recipeSource: HairRecipeFitSource
 }): Promise<{ asset: HairAssetV1; state: HairStateV2 }> {
   const [asset, fitReceipt] = await Promise.all([
     verifyHairAsset(input.asset),
@@ -1081,12 +1094,7 @@ export async function validateHairStateBinding(input: {
   ) {
     fail('Hair Asset is incompatible with this Recipe base or fit family')
   }
-  if (
-    fitReceipt.appearanceDefinitionSha256 !== input.recipeSource.definitionSha256 ||
-    fitReceipt.physicalBasisSha256 !== input.recipeSource.physicalBasisSha256 ||
-    fitReceipt.topologySha256 !== input.recipeSource.topologySha256 ||
-    fitReceipt.skeletonHierarchySha256 !== input.recipeSource.skeletonHierarchySha256
-  ) {
+  if (!hairAssetMatchesRecipeFit(asset, input.recipeSource)) {
     fail('Hair fit receipt is stale for this Recipe head and Appearance contract')
   }
   if (

@@ -3,7 +3,7 @@ import {
   composeHairIntoAvatarGlb,
   HAIR_AVATAR_GLB_COMPOSER_CONTRACT
 } from './hairAvatarGlbComposer'
-import { parseSemanticGlb } from './semanticGlb'
+import { decodeSemanticGlbAccessor, parseSemanticGlb } from './semanticGlb'
 import {
   createEmbeddedSecondaryMotion,
   HAIR_MOTION_DEFAULT_ANCHORED_LENGTH,
@@ -305,6 +305,35 @@ function compose(
 }
 
 describe('composeHairIntoAvatarGlb', () => {
+  it('retains the exact extras-owned artwork index and concealed-face accessors', () => {
+    const source = sourceFixture(), binary = new Uint8Array(48); binary.set(source.binary)
+    const data = new DataView(binary.buffer); data.setUint16(36, 0, true); data.setUint16(38, 1, true); data.setUint16(40, 2, true); data.setUint32(44, 0, true)
+    ;(source.gltf.buffers as JsonRecord[])[0].byteLength = binary.length
+    ;(source.gltf.bufferViews as JsonRecord[]).push({ buffer: 0, byteOffset: 36, byteLength: 6 }, { buffer: 0, byteOffset: 44, byteLength: 4 })
+    ;(source.gltf.accessors as JsonRecord[]).push({ bufferView: 1, componentType: 5123, count: 3, type: 'SCALAR' },
+      { bufferView: 2, componentType: 5125, count: 1, type: 'SCALAR' })
+    const lineage = { contract: 'skin-artwork-conceal-lineage/v1', nodeName: 'Body', primitiveIndex: 0, sourceIndexAccessor: 2, concealedFacesAccessor: 3 }
+    ;(source.gltf.extras as JsonRecord).batshitSkinArtworkConceal = lineage
+    const parsed = parseSemanticGlb(compose(makeGlb(source.gltf, binary), hairFixture().bytes))
+    expect((parsed.gltf.extras as JsonRecord).batshitSkinArtworkConceal).toEqual(lineage)
+    expect([...decodeSemanticGlbAccessor(parsed, 2).values]).toEqual([0, 1, 2])
+    expect([...decodeSemanticGlbAccessor(parsed, 3).values]).toEqual([0])
+  })
+
+  it('refuses an avatar node outside the active scene hierarchy', () => {
+    const source = sourceFixture()
+    ;(source.gltf.nodes as JsonRecord[]).push({ name: 'UnownedNode' })
+    expect(() => compose(makeGlb(source.gltf, source.binary), hairFixture().bytes))
+      .toThrow('source avatar GLB contains nodes outside its sole scene hierarchy')
+  })
+
+  it('refuses an orphan that also claims an already owned child', () => {
+    const source = sourceFixture()
+    ;(source.gltf.nodes as JsonRecord[]).push({ name: 'UnownedNode', children: [1] })
+    expect(() => compose(makeGlb(source.gltf, source.binary), hairFixture().bytes))
+      .toThrow(/invalid or ambiguous parent/)
+  })
+
   it('deterministically appends polygon Hair resources beneath the declared head', () => {
     const source = sourceFixture()
     const hair = hairFixture()
@@ -547,7 +576,7 @@ describe('composeHairIntoAvatarGlb', () => {
     const externalBuffer = cloneRecord(hair.gltf)
     ;(externalBuffer.buffers as JsonRecord[])[0]!.uri = 'hair.bin'
     expect(() => compose(source.bytes, makeGlb(externalBuffer, hair.binary))).toThrow(
-      'Hair GLB may not declare an external buffer URI'
+      'GLB embedded buffer must not declare a URI'
     )
 
     const remoteImage = cloneRecord(hair.gltf)

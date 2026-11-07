@@ -145,9 +145,17 @@
         throw new Error(message)
       }
       const result = await response.json()
-      const remoteSettings: UserSettingsRow | null = result?.settings ?? null
+      if (!result || typeof result !== 'object' || Array.isArray(result) || !Object.hasOwn(result, 'settings') ||
+        result.settings !== null && (typeof result.settings !== 'object' || Array.isArray(result.settings))) {
+        throw new Error('Saved Auto Compact settings could not be read.')
+      }
+      const remoteSettings: UserSettingsRow | null = result.settings
+      const compactSettings = remoteSettings?.global_auto_compact_settings
+      if (compactSettings != null && (typeof compactSettings !== 'object' || Array.isArray(compactSettings))) {
+        throw new Error('Saved Auto Compact settings could not be read.')
+      }
       const next = normalizeGlobalAutoCompactSettings(
-        remoteSettings?.global_auto_compact_settings ?? data?.userSettings?.global_auto_compact_settings
+        compactSettings
       )
       untrack(() => {
         settings = next

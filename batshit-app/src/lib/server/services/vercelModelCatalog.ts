@@ -3,7 +3,7 @@ import { redis } from '$lib/server/redis'
 import type { ProviderFeatures } from '$lib/server/services/providers'
 import type { ModelPurpose } from '$lib/types/savedModels'
 import type { CatalogModelIdVariant } from '$lib/types/modelCatalog'
-import { inferModelPurpose } from '$lib/utils/modelPurpose'
+import { inferModelPurpose, reviewedModelPurpose } from '$lib/utils/modelPurpose'
 import { normalizePositiveInteger, sanitizeCatalogMaxOutputTokens } from '$lib/utils/modelOutputTokens'
 import {
   buildListedPricing,
@@ -14,12 +14,32 @@ import {
   type ZeroPriceContext
 } from '$lib/utils/catalogPricing'
 import { upstashKvGet } from '$lib/server/services/upstashKv'
+import { assertCatalogReasoningConservation, retainCatalogReasoningRows } from '$lib/utils/catalogReasoningEvidence'
 
 const GATEWAY_FALLBACK_ENDPOINT = 'https://ai-gateway.vercel.sh/v1/models'
 const PUBLIC_REGISTRY_FALLBACK = 'https://api.batshit.ai/registry/catalog.json'
 const LEGACY_REGISTRY_FALLBACK = 'https://registry.batshit.ai/registry/catalog.json'
 const CACHE_KEY = 'vercel:model_catalog:v1'
-const CACHE_TTL_SECONDS = 60 * 60 // 1 hour
+const CACHE_FRESH_SECONDS = 60 * 60 // freshness, never expiry of last-good facts
+
+/** Same-key raw CAS; STRING caches keep their type, with no delete/recreate conversion. */
+export const CATALOG_CACHE_COMPARE_SCRIPT = `
+local kind = redis.call('TYPE', KEYS[1]).ok
+if kind == 'ReJSON-RL' or kind == 'JSON' then kind = 'json' end
+if kind ~= ARGV[1] then return 'CHANGED' end
+local current = ''
+if kind == 'json' then current = redis.call('JSON.GET', KEYS[1], '$')
+elseif kind == 'string' then current = redis.call('GET', KEYS[1]) end
+if current ~= ARGV[2] then return 'CHANGED' end
+if ARGV[3] == 'SET' then
+  local written
+  if kind == 'string' then written = redis.call('SET', KEYS[1], ARGV[4])
+  else written = redis.call('JSON.SET', KEYS[1], '$', ARGV[4]) end
+  if type(written) ~= 'table' or written.ok ~= 'OK' then return 'UNWRITTEN' end
+end
+redis.call('PERSIST', KEYS[1])
+return 'OK'
+`
 
 export type CatalogSource = 'vercel' | 'legacy' | 'openrouter' | 'n8n-only'
 export type CatalogTransport = 'vercel-gateway' | 'openrouter' | 'local'
@@ -71,6 +91,14 @@ interface CatalogCachePayload {
   version?: number
   counts?: Record<string, number>
 }
+
+interface CatalogCacheSnapshot {
+  kind: 'none' | 'json' | 'string'
+  raw: string
+  payload: CatalogCachePayload | null
+}
+
+class CatalogLoadUnavailableError extends Error {}
 
 async function fetchCatalogFromUrl(url?: string | null): Promise<CatalogCachePayload | null> {
   if (!url) return null
@@ -158,7 +186,17 @@ async function fetchGatewayFallback(): Promise<CatalogCachePayload | null> {
  * is cached or it carries no stamp. Never the network.
  */
 export async function readCachedVercelModelCatalogStamp(): Promise<string | null> {
-  const answer = await redis.execute(async (client) => client.json.get(CACHE_KEY, { path: '$.fetchedAt' }))
+  const answer = await redis.execute(async client => {
+    const kind = await client.type(CACHE_KEY)
+    if (kind === 'none') return null
+    if (kind === 'string') {
+      const raw = await client.get(CACHE_KEY)
+      if (raw === null) throw new Error('The legacy catalog cache disappeared while reading its stamp.')
+      return [admitCatalogCache(JSON.parse(raw)).fetchedAt]
+    }
+    if (!['ReJSON-RL', 'json', 'JSON'].includes(kind)) throw new Error('The catalog cache has an unsupported storage type.')
+    return client.json.get(CACHE_KEY, { path: '$.fetchedAt' })
+  })
   const stamp = Array.isArray(answer) ? answer[0] : null
   return typeof stamp === 'string' && stamp.length > 0 ? stamp : null
 }
@@ -171,24 +209,30 @@ export async function readCachedVercelModelCatalogStamp(): Promise<string | null
  */
 export async function readCachedVercelModelCatalog(): Promise<CatalogCachePayload | null> {
   const cached = (await redis.get(CACHE_KEY)) as CatalogCachePayload | null
-  return cached?.models?.length ? cached : null
+  // Preserve the send reader's best-effort behavior, including admitted legacy STRING caches.
+  try {
+    const value = typeof cached === 'string' ? admitCatalogCache(JSON.parse(cached)) : cached
+    return value?.models?.length ? correctReviewedMetadata(value) : null
+  } catch { return null }
 }
 
 export async function fetchVercelModelCatalog(forceRefresh = false): Promise<CatalogCachePayload> {
+  const snapshot = await readCatalogCacheForRefresh()
+  const cached = snapshot.payload
   if (!forceRefresh) {
-    const cached = (await redis.get(CACHE_KEY)) as CatalogCachePayload | null
     if (cached?.models?.length) {
       const fetchedAt = cached.fetchedAt ? new Date(cached.fetchedAt).getTime() : 0
       const ageMs = Date.now() - fetchedAt
-      const stale = !fetchedAt || ageMs > CACHE_TTL_SECONDS * 1000
+      const stale = !fetchedAt || ageMs > CACHE_FRESH_SECONDS * 1000
       if (!stale) {
         return cached
       }
       // Try to refresh; if it fails, fall back to cached
       try {
-        const refreshed = await loadCatalogAndCache()
+        const refreshed = await loadCatalogAndCache(snapshot)
         if (refreshed?.models?.length) return refreshed
       } catch (err) {
+        if (!(err instanceof CatalogLoadUnavailableError)) throw err
         console.warn(
           `[modelCatalog] Refresh failed, falling back to cached copy: ${formatLoaderError(err)}`
         )
@@ -197,10 +241,76 @@ export async function fetchVercelModelCatalog(forceRefresh = false): Promise<Cat
     }
   }
 
-  return await loadCatalogAndCache()
+  return await loadCatalogAndCache(snapshot)
 }
 
-async function loadCatalogAndCache(): Promise<CatalogCachePayload> {
+/** A failed prior read must never masquerade as an empty cache before replacement. */
+export async function readCatalogCacheSnapshot(): Promise<CatalogCacheSnapshot> {
+  return redis.execute(async client => {
+    const type = await client.type(CACHE_KEY)
+    if (type === 'none') return { kind: 'none', raw: '', payload: null }
+    let raw: unknown
+    let kind: CatalogCacheSnapshot['kind']
+    if (type === 'ReJSON-RL' || type === 'json' || type === 'JSON') {
+      kind = 'json'
+      raw = await client.sendCommand(['JSON.GET', CACHE_KEY, '$'])
+    } else if (type === 'string') {
+      kind = 'string'
+      raw = await client.get(CACHE_KEY)
+    } else throw new Error('The prior model catalog cache has an unsupported storage type; refresh was refused.')
+    if (typeof raw !== 'string') throw new Error('The prior model catalog cache raw read failed; refresh was refused.')
+    // Parse actual raw text, never an already-decoded RedisJSON object or facade get.
+    const decoded = JSON.parse(raw)
+    if (kind === 'json' && (!Array.isArray(decoded) || decoded.length !== 1)) throw new Error('The prior model catalog cache root is malformed.')
+    return { kind, raw, payload: admitCatalogCache(kind === 'json' ? decoded[0] : decoded) }
+  })
+}
+
+function admitCatalogCache(value: unknown): CatalogCachePayload {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !Array.isArray((value as CatalogCachePayload).models)) {
+    throw new Error('The prior model catalog cache is malformed; refresh was refused.')
+  }
+  const payload = value as CatalogCachePayload
+  assertCatalogReasoningConservation(payload.models, payload.models)
+  return correctReviewedMetadata(payload)
+}
+
+/** Read projection only; the original raw snapshot remains the CAS authority. */
+function correctReviewedMetadata(payload: CatalogCachePayload): CatalogCachePayload {
+  return { ...payload, models: payload.models.map(entry => {
+    const connectionId = entry.connectionId ?? inferConnectionId(entry.transport ?? inferTransport(entry.source), normalize(entry.provider))
+    const purpose = reviewedModelPurpose({ connectionId,
+      id: entry.idVariants?.[connectionId]?.effectiveId ?? entry.id, modelType: entry.modelType })
+    const corrected = purpose && purpose !== entry.purpose ? { ...entry, purpose } : entry
+    // The plan uses subscription Credits. A gateway/AA USD price cannot price
+    // this connection, including on a retained snapshot made before this rule.
+    const planVariant = corrected.idVariants?.['direct:mimo_token_plan']
+    if (!planVariant && connectionId !== 'direct:mimo_token_plan') return corrected
+    return { ...corrected,
+      ...(connectionId === 'direct:mimo_token_plan' ? { pricing: {} } : {}),
+      ...(planVariant ? { idVariants: { ...corrected.idVariants,
+        'direct:mimo_token_plan': { ...planVariant, pricing: {} } } } : {}) }
+  }) }
+}
+
+async function compareCatalogCache(snapshot: CatalogCacheSnapshot, value?: CatalogCachePayload): Promise<boolean> {
+  const answer = await redis.execute(client => client.eval(CATALOG_CACHE_COMPARE_SCRIPT, { keys: [CACHE_KEY],
+    arguments: [snapshot.kind, snapshot.raw, value ? 'SET' : 'PERSIST', value ? JSON.stringify(value) : ''] }))
+  if (answer === 'OK') return true
+  if (answer === 'CHANGED') return false
+  throw new Error('The model catalog cache write was not confirmed; the refresh was refused.')
+}
+
+async function readCatalogCacheForRefresh(): Promise<CatalogCacheSnapshot> {
+  const snapshot = await readCatalogCacheSnapshot()
+  // Remove a surviving old TTL before network requests can fail. Never extend user data keys.
+  if (snapshot.payload && !await compareCatalogCache(snapshot)) {
+    throw new Error('The model catalog cache changed while being admitted; refresh was refused.')
+  }
+  return snapshot
+}
+
+async function loadCatalogAndCache(previous: CatalogCacheSnapshot): Promise<CatalogCachePayload> {
   const registryUrls = buildRegistryUrlCandidates()
   const loaders = [
     ...registryUrls.map((url) => ({
@@ -219,23 +329,34 @@ async function loadCatalogAndCache(): Promise<CatalogCachePayload> {
 
   const failures: string[] = []
   for (const loader of loaders) {
+    let result: CatalogCachePayload | null
     try {
-      const result = await loader.run()
+      result = await loader.run()
       if (result?.models?.length) {
-        await redis.set(CACHE_KEY, result)
-        await redis.expire(CACHE_KEY, CACHE_TTL_SECONDS)
-        return result
-      }
+        if (loader.name === 'vercel-gateway') {
+          console.warn('[modelCatalog] Shared catalog unavailable; using Gateway discovery and retaining cached provider identities when available.')
+        }
+        result.models = retainCatalogReasoningRows(previous.payload?.models ?? [], result.models, {
+          retainMissing: loader.name === 'vercel-gateway', authoritative: loader.name !== 'vercel-gateway'
+        })
+        result = correctReviewedMetadata(result)
+      } else continue
     } catch (error) {
       failures.push(`${loader.name}: ${formatLoaderError(error)}`)
+      continue
     }
+    // Publication errors must not become another loader/fallback attempt.
+    if (await compareCatalogCache(previous, result)) return result
+    const winner = await readCatalogCacheForRefresh()
+    if (!winner.payload?.models.length) throw new Error('The winning model catalog cache is missing; the losing refresh was not written.')
+    return winner.payload
   }
 
   if (failures.length) {
     console.warn(`[modelCatalog] All loaders failed: ${failures.join(' | ')}`)
   }
 
-  throw new Error('Unable to load model catalog from registry, Upstash, or Vercel gateway fallback')
+  throw new CatalogLoadUnavailableError('Unable to load model catalog from registry, Upstash, or Vercel gateway fallback')
 }
 
 function buildRegistryUrlCandidates(): string[] {
@@ -383,8 +504,9 @@ function finalizeCatalogEntry(entry: VercelCatalogEntry): VercelCatalogEntry {
   )
 
   const purpose: ModelPurpose =
+    reviewedModelPurpose({ connectionId, id: idVariants[connectionId]?.effectiveId ?? entry.id, modelType: entry.modelType }) ??
     normalizePurpose(entry.purpose) ??
-    inferModelPurpose({ modelType: entry.modelType, id: entry.id || canonicalId, name, tags: entry.tags })
+    inferModelPurpose({ connectionId, modelType: entry.modelType, id: entry.id || canonicalId, name, tags: entry.tags })
   const displayName = entry.source === 'openrouter' ? normalizeOpenRouterDisplayName(rawDisplayName, provider) : rawDisplayName
   // A window of 0 is unknown, never kept as 0: the gateway fallback lists some
   // (mistral-embed), and a registry published before the sync fix still does.

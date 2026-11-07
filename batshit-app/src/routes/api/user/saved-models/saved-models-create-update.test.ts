@@ -1,3 +1,4 @@
+import './presetStorageScriptDouble'
 /**
  * BL-516: a create never replaces a saved preset.
  *
@@ -10,6 +11,7 @@
  * Runs the real route and the real catalog module; only Redis is faked.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { CLAUDE_CLI_PRESET_REFUSAL } from '$lib/utils/cliRuntimeIdentity'
 
 const store = new Map<string, any>()
 const sets = new Map<string, Set<string>>()
@@ -17,6 +19,15 @@ const clone = (value: unknown) => (value === undefined ? null : JSON.parse(JSON.
 
 vi.mock('$lib/server/redis', () => ({
   redis: {
+    execute: vi.fn(async (operation: (client: any) => Promise<any>) => operation({
+      type: async (key: string) => store.has(key) ? 'ReJSON-RL' : 'none',
+      sendCommand: async ([, key]: string[]) => store.has(key) ? JSON.stringify([store.get(key)]) : null,
+      eval: async (_script: string, { keys, arguments: args }: { keys: string[]; arguments: string[] }) => {
+        if (args[2] !== 'PERSIST') throw new Error('This fixture admits only cache retention, never refresh writes.')
+        return store.has(keys[0]) && JSON.stringify([store.get(keys[0])]) === args[1] ? 'OK' : 'CHANGED'
+      },
+      json: { get: async (key: string) => store.has(key) ? clone(store.get(key)) : null }
+    })),
     get: vi.fn(async (key: string) => (store.has(key) ? clone(store.get(key)) : null)),
     set: vi.fn(async (key: string, value: unknown) => {
       store.set(key, clone(value))
@@ -56,10 +67,10 @@ vi.mock('$lib/server/services/providers', () => ({
 }))
 
 const SONNET_ROW = {
-  id: 'anthropic/claude-sonnet-5',
-  canonicalId: 'anthropic/claude-sonnet-5',
+  id: 'anthropic/claude-sonnet-4-6',
+  canonicalId: 'anthropic/claude-sonnet-4-6',
   provider: 'anthropic',
-  name: 'claude-sonnet-5',
+  name: 'claude-sonnet-4-6',
   displayName: 'Claude Sonnet 5',
   tags: [],
   features: { streaming: true, tools: true },
@@ -71,8 +82,8 @@ const SONNET_ROW = {
   idVariants: {
     'vercel-gateway': {
       developerId: 'anthropic',
-      modelId: 'claude-sonnet-5',
-      effectiveId: 'anthropic/claude-sonnet-5',
+      modelId: 'claude-sonnet-4-6',
+      effectiveId: 'anthropic/claude-sonnet-4-6',
       source: 'vercel'
     }
   }
@@ -84,11 +95,11 @@ function catalogCreatePayload(overrides: Record<string, unknown> = {}) {
     id: '',
     modelName: 'Claude Sonnet 5',
     provider: 'anthropic',
-    modelId: 'claude-sonnet-5',
-    catalogModelId: 'anthropic/claude-sonnet-5',
-    effectiveModelId: 'anthropic/claude-sonnet-5',
+    modelId: 'claude-sonnet-4-6',
+    catalogModelId: 'anthropic/claude-sonnet-4-6',
+    effectiveModelId: 'anthropic/claude-sonnet-4-6',
     isVercelImport: true,
-    vercelSourceId: 'anthropic/claude-sonnet-5',
+    vercelSourceId: 'anthropic/claude-sonnet-4-6',
     pricing: { input: 3, output: 15 },
     settings: { temperature: 1 },
     connection: { type: 'vercel-gateway', service: 'vercel' },
@@ -199,5 +210,21 @@ describe('BL-516: a create never replaces a saved preset', () => {
     const response = await post({ ...first.body.model, settings: { temperature: 0.5 } })
     expect(response.status).toBe(404)
     expect(store.has(`model:${id}`)).toBe(false)
+  })
+})
+
+describe('SA-139 R5: no new Claude Code CLI preset is saved', () => {
+  it.each([
+    ['provider', { provider: 'claude-cli', modelId: 'sonnet', connection: { type: 'direct', service: 'anthropic' } }],
+    ['model', { provider: 'anthropic', modelId: 'claude-cli', connection: { type: 'direct', service: 'anthropic' } }],
+    ['connection id', { provider: 'anthropic', modelId: 'sonnet', connection: { type: 'direct', id: 'claude-cli', service: 'anthropic' } }],
+    ['connection service', { provider: 'anthropic', modelId: 'sonnet', connection: { type: 'direct', service: 'anthropic-claude-cli' } }]
+  ])('a create that names a Claude Code CLI %s is refused 400, and nothing is written', async (_name, fields) => {
+    const before = new Map(store)
+    const response = await post(catalogCreatePayload({ modelName: 'Claude Code CLI', catalogModelId: '', effectiveModelId: '',
+      isVercelImport: false, vercelSourceId: '', ...fields }))
+    expect(response).toEqual({ status: 400, body: { error: CLAUDE_CLI_PRESET_REFUSAL } })
+    expect(store).toEqual(before)
+    expect(sets.get('user:josh:models')).toBeUndefined()
   })
 })

@@ -33,11 +33,17 @@ export interface UnzippedItem {
   path?: string
   /** SA-129 P2: which agent holds it (a `source: 'agent'` hold), so every surface can name it. */
   agentId?: string
+  /** Skill lifecycle hold; automatic is weaker than an explicit agent or user pin. */
+  skillSession?: import('$lib/utils/skillSessions').SkillReadHold
+  /** Server-owned binding for user-scheduled expiry; a request body cannot provide it. */
+  skillSessionUserHold?: import('$lib/utils/skillSessions').SkillSessionUserHold
+  /** Read-only current lifecycle projection, supplied by the server. */
+  skillSessionContext?: import('$lib/utils/skillSessions').SkillSessionZipContext
 }
 
 /**
  * One chat's zip state, read-only: what `compileForAI` reads to decide zip activation, and
- * what the DCM's `Current Zip State` lists. The browser singleton below is one (the tab's
+ * what the Zip Index lists. The browser singleton below is one (the tab's
  * current chat). A server compile builds its own with `createZipStateView`, because two
  * compiles can run at once in one process and a module-level object holds one chat.
  */
@@ -231,9 +237,11 @@ class ZippingService implements ZipStateView {
       return false
     }
     
+    const targetSessionId = this.currentSessionId
+    const previousItem = this.sessionUnzipped.get(zipId)
     const item: UnzippedItem = {
       zipId,
-      sessionId: this.currentSessionId,
+      sessionId: targetSessionId,
       permanent,
       duration: permanent ? undefined : duration,
       unzippedAt: Date.now(),
@@ -241,7 +249,8 @@ class ZippingService implements ZipStateView {
       description,
       tokens,
       messageCount: 0,
-      source
+      source,
+      ...(previousItem?.skillSessionContext ? { skillSessionContext: previousItem.skillSessionContext } : {})
     }
     
     // Update cache immediately for responsiveness
@@ -267,12 +276,20 @@ class ZippingService implements ZipStateView {
         throw new Error(reason)
       }
       
+      const saved = await response.json().catch(() => null)
+      if (this.currentSessionId === targetSessionId && saved?.item?.zipId === zipId) {
+        this.sessionUnzipped.set(zipId, saved.item)
+        this.notifyStateChanged()
+      }
       logger.debug(`[Unzipping] Unzipped ${zipId} via API`)
       return true
     } catch (error) {
       this.lastUnzipError = error instanceof Error ? error.message : String(error)
       console.error('[Unzipping] Failed to save unzipped item to API:', error)
-      this.sessionUnzipped.delete(zipId) // Rollback on error
+      if (this.currentSessionId === targetSessionId) {
+        if (previousItem) this.sessionUnzipped.set(zipId, previousItem)
+        else this.sessionUnzipped.delete(zipId)
+      }
       this.notifyStateChanged()
       return false
     }
@@ -284,6 +301,7 @@ class ZippingService implements ZipStateView {
       return false
     }
     const source: ZipControlSource = typeof sourceOrFetcher === 'string' ? sourceOrFetcher : 'user'
+    const targetSessionId = this.currentSessionId
     const fetchImpl = this.resolveFetch(typeof sourceOrFetcher === 'function' ? sourceOrFetcher : fetcher)
     if (!fetchImpl) {
       console.error('[Unzipping] No fetch implementation available for rezip')
@@ -299,7 +317,7 @@ class ZippingService implements ZipStateView {
     // Delete from API
     try {
       const params = new URLSearchParams({
-        sessionId: this.currentSessionId,
+        sessionId: targetSessionId,
         source
       })
       const response = await fetchImpl(`${this.apiUrl}/${zipId}?${params.toString()}`, {
@@ -311,6 +329,8 @@ class ZippingService implements ZipStateView {
         throw new Error(`HTTP ${response.status}`)
       }
       
+      const receipt = await response.json().catch(() => null)
+      if (receipt?.skillClosure && this.currentSessionId === targetSessionId) await this.refreshFromServer(targetSessionId)
       logger.debug(`[Unzipping] Rezipped ${zipId} via API`)
       return true
     } catch (error) {
@@ -324,6 +344,7 @@ class ZippingService implements ZipStateView {
       console.error('[Unzipping] No current session')
       return false
     }
+    const targetSessionId = this.currentSessionId
     const fetchImpl = this.resolveFetch(fetcher)
     if (!fetchImpl) {
       console.error('[Unzipping] No fetch implementation available for returnToAutomatic')
@@ -341,7 +362,7 @@ class ZippingService implements ZipStateView {
 
     try {
       const params = new URLSearchParams({
-        sessionId: this.currentSessionId,
+        sessionId: targetSessionId,
         mode: 'automatic'
       })
       const response = await fetchImpl(`${this.apiUrl}/${zipId}?${params.toString()}`, {
@@ -353,6 +374,8 @@ class ZippingService implements ZipStateView {
         throw new Error(`HTTP ${response.status}`)
       }
 
+      const receipt = await response.json().catch(() => null)
+      if (receipt?.skillClosure && this.currentSessionId === targetSessionId) await this.refreshFromServer(targetSessionId)
       logger.debug(`[Unzipping] Returned ${zipId} to automatic zip behavior via API`)
       return true
     } catch (error) {

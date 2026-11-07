@@ -44,11 +44,12 @@ vi.mock('$lib/server/redis', () => ({
   }
 }))
 
-import { createGateway } from 'ai'
+import { createGateway, streamText } from 'ai'
 import { createAnthropic } from '@ai-sdk/anthropic'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
 import { VercelAIBrain, type NativeModeRequest } from '../vercelBrain'
 import { buildRuntimeModelSettings } from '$lib/utils/modelSettingsMapper'
+import { resolveModelReasoningControls, reasoningOverrideKey } from '$lib/utils/modelReasoningControls'
 import { withReasoningProviderOptions } from '$lib/utils/reasoningDisplay'
 import type { ParameterValue } from '$lib/data/parameter-schemas'
 
@@ -243,6 +244,22 @@ async function send(options: {
 }
 
 describe('BL-866 direct Anthropic: what a Claude Sonnet 5.5 send carries', () => {
+  it('BL-1521 projects dormant unsupported values before the real direct SDK without changing supported zero or output limit', async () => {
+    const bodies: Body[] = []
+    useDoor('direct', 'claude-sonnet-4-5', bodies)
+    const settings = { presencePenalty: 0, frequencyPenalty: 0.35, seed: 0, temperature: 0, maxTokens: 32 }
+    const runtime = buildRuntimeModelSettings({ provider: 'anthropic', modelId: 'claude-sonnet-4-5', connection: DIRECT, settings })
+    const result = streamText({ model: slot.model, prompt: 'Fixture', maxOutputTokens: runtime.standard.maxTokens,
+      temperature: runtime.standard.temperature, presencePenalty: runtime.standard.presencePenalty,
+      frequencyPenalty: runtime.standard.frequencyPenalty, seed: runtime.standard.seed })
+    await result.text
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0]).toMatchObject({ temperature: 0, max_tokens: 32 })
+    for (const key of ['presence_penalty', 'frequency_penalty', 'seed']) expect(bodies[0]).not.toHaveProperty(key)
+    expect(sdkWarnings).toEqual([])
+    expect(settings).toEqual({ presencePenalty: 0, frequencyPenalty: 0.35, seed: 0, temperature: 0, maxTokens: 32 })
+  })
+
   it.each<Lane>(['primary', 'delegated'])('blank sends no thinking and no effort (%s)', async (lane) => {
     const [body, ...rest] = await send({ lane, modelId: SONNET_5_5, settings: {} })
     expect(rest).toEqual([])
@@ -303,17 +320,37 @@ describe('BL-866 direct Anthropic: what a Claude Sonnet 5.5 send carries', () =>
     expect(sdkWarnings).toEqual([])
   })
 
-  it('a Custom Parameter effort is the user\'s own: xhigh beside between_tools is lowered by the SDK and reported only as a warning', async () => {
-    // Batshit has no effort setting. A user who types `anthropic.effort` as a Custom Parameter
-    // reaches the wire; the API refuses xhigh and max beside between_tools, so the SDK lowers
-    // it to high. Pinned so a change in the SDK's rule shows up here.
-    const [body] = await send({
-      modelId: SONNET_5_5,
-      settings: { thinkingMode: 'between_tools', 'anthropic.effort': 'xhigh' }
+  it.each(['xhigh', 'max'])('refuses incompatible Custom Parameter effort %s before the SDK can lower it', async effort => {
+    await expect(send({ modelId: SONNET_5_5,
+      settings: { thinkingMode: 'between_tools', 'anthropic.effort': effort } })).rejects.toThrow(/cannot use/)
+    expect(wire).toEqual([])
+    expect(sdkWarnings).toEqual([])
+  })
+
+  it.each(['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5', 'claude-fable-5-1'])(
+    'serializes all reviewed effort literals unchanged for %s adaptive mode', async modelId => {
+      for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+        const [body] = await send({ modelId, settings: { anthropicEffort: effort, thinkingMode: 'adaptive' } })
+        expect(body.thinking).toEqual({ type: 'adaptive' })
+        expect(body.output_config).toEqual({ effort })
+      }
+      expect(sdkWarnings).toEqual(modelId === 'claude-haiku-5-5' ? Array(5).fill('The model \"claude-haiku-5-5\" is unknown. The max output tokens have been limited to 128000. Set maxOutputTokens explicitly to override this limit.') : [])
     })
-    expect(body.thinking).toEqual({ type: 'between_tools' })
-    expect(body.output_config).toEqual({ effort: 'high' })
-    expect(sdkWarnings.join('\n')).toContain("effort 'xhigh' is not supported with 'between_tools'")
+
+  it('preserves nested display with the explicit adaptive mode', async () => {
+    const [body] = await send({ modelId: SONNET_5_5,
+      settings: resolveModelReasoningControls({ identity: { presetId: 'nested', connection: DIRECT, effectiveModelId: SONNET_5_5 },
+        settings: { 'anthropic.thinking': { type: 'between_tools', display: 'summarized' }, anthropicEffort: 'max' },
+        overrides: { [reasoningOverrideKey({ presetId: 'nested', connection: DIRECT, effectiveModelId: SONNET_5_5 }, 'mode')]: { mode: 'value', value: 'adaptive' } } }).settings! })
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config.effort).toBe('max')
+    expect(sdkWarnings).toEqual([])
+  })
+
+  it('keeps Haiku disabled distinct from adaptive and refuses high effort when disabled', async () => {
+    const [body] = await send({ modelId: 'claude-haiku-5-5', settings: { thinkingMode: 'disabled', anthropicEffort: 'high' } })
+    expect(body.thinking).toEqual({ type: 'disabled' })
+    await expect(send({ modelId: 'claude-haiku-5-5', settings: { thinkingMode: 'disabled', anthropicEffort: 'max' } })).rejects.toThrow(/cannot use/)
   })
 })
 

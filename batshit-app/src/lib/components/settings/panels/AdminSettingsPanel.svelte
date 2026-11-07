@@ -27,7 +27,7 @@
   import AdminJevJuiceCard from '$lib/components/settings/admin/AdminJevJuiceCard.svelte'
   import AdminPinokioRuntimeRow from '$lib/components/settings/admin/AdminPinokioRuntimeRow.svelte'
   import { resolveInstanceWakeupsEnabled } from '$lib/utils/dmControl'
-  import AdminWebSearchCard from '$lib/components/settings/admin/AdminWebSearchCard.svelte'
+  import AdminToolOperationsSettings from '$lib/components/settings/admin/AdminToolOperationsSettings.svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
   import { confirmDialog } from '$lib/stores/confirmDialog'
   import {
@@ -58,6 +58,7 @@
     clampNumber,
     formatBackupBytes,
     normalizeExaSearchType,
+    normalizeTotalHintTokens,
     normalizeWebSearchProvider,
     type AdminSettingsState,
     type BackupExportOutcome,
@@ -81,7 +82,7 @@
     { value: 'darwin-arm64', label: 'macOS (Apple Silicon/arm64)' },
     { value: 'darwin-x64', label: 'macOS (Intel/x64)' },
     { value: 'windows-x64', label: 'Windows (x64)' },
-    { value: 'linux-x64', label: 'Linux (x64)' }
+    { value: 'linux-x64', label: 'Linux x64 (Windows Pinokio)' }
   ]
 
   type FbxInstallPlatform = 'darwin-x64' | 'linux-x64' | 'windows-x64'
@@ -195,6 +196,7 @@
     label: string
     macApp: boolean
     containerized: boolean
+    windowsWsl: boolean
     runtimeOwner: string | null
     runtimeEnv: string | null
     adminCards: {
@@ -277,7 +279,7 @@
     )
   }
 
-  type RuntimeStatusTone = 'ok' | 'warning' | 'bad' | 'checking'
+  type RuntimeStatusTone = 'ok' | 'warning' | 'bad' | 'checking' | 'neutral'
 
   const macRuntimeCommands: Record<MacRuntimeAction, string> = {
     doctor: 'batshit.runtime.doctor',
@@ -427,44 +429,12 @@
   let selectedCorePrompt = $state<CoreSystemPromptDetail | null>(null)
   let corePromptDraft = $state('')
   let corePromptBusyId = $state<string | null>(null)
-  /**
-   * BL-909: a saved Exa or Perplexity default is unavailable only when the key status has loaded
-   * and names no ready key. While it loads, or when it could not be loaded (that failure shows
-   * under the picker), the panel does not know, so it does not call the choice unavailable.
-   */
-  function isWebSearchProviderKeyMissing(provider: NativeWebSearchProvider): boolean {
-    if (provider === 'duckduckgo-html') return false
-    if (!hasLoadedWebSearchProviderAvailability || webSearchProvidersError) return false
-    return !availableWebSearchProviders[provider]
-  }
-
-  function webSearchProviderLabel(provider: NativeWebSearchProvider): string {
-    const label = WEB_SEARCH_PROVIDER_LABELS[provider]
-    // The words of the Agent Settings picker (BL-835).
-    return isWebSearchProviderKeyMissing(provider) ? `${label} (Missing API key)` : label
-  }
-
-  const webSearchProviderOptions = $derived.by<
-    Array<{ value: NativeWebSearchProvider; label: string }>
-  >(() => {
-    const options: Array<{ value: NativeWebSearchProvider; label: string }> = [
-      { value: 'duckduckgo-html', label: WEB_SEARCH_PROVIDER_LABELS['duckduckgo-html'] }
-    ]
-    if (availableWebSearchProviders.exa) {
-      options.push({ value: 'exa', label: WEB_SEARCH_PROVIDER_LABELS.exa })
-    }
-    if (availableWebSearchProviders.perplexity) {
-      options.push({ value: 'perplexity', label: WEB_SEARCH_PROVIDER_LABELS.perplexity })
-    }
-    // The saved choice stays listed (and selected) when its key is not ready: opening the
-    // panel never clears it, the user's own pick does.
-    const saved = adminSettings.webSearchDefaultProvider
-    if (saved !== 'duckduckgo-html' && !availableWebSearchProviders[saved]) {
-      options.push({ value: saved, label: webSearchProviderLabel(saved) })
-    }
-    return options
-  })
-
+  // Josh (2026-10-23): the text Batshit builds in code for a prompt, shown read-only.
+  let builtInViewerOpen = $state(false)
+  let builtInViewerTitle = $state('')
+  let builtInViewerDescription = $state('')
+  let builtInViewerText = $state('')
+  let builtInBusyId = $state<string | null>(null)
   onMount(async () => {
     await loadSettings()
     const context = await loadRuntimeContext()
@@ -533,6 +503,31 @@
       toast.error(error instanceof Error ? error.message : 'Failed to load core system prompt')
     } finally {
       corePromptBusyId = null
+    }
+  }
+
+  async function openBuiltInText(id: string) {
+    if (corePromptBusyId || builtInBusyId) return
+    builtInBusyId = id
+    try {
+      const response = await fetch(`/api/admin/system-prompts/${encodeURIComponent(id)}`)
+      const result = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(result?.error || 'Failed to load built-in text')
+      }
+      const prompt = result.prompt as CoreSystemPromptDetail
+      const text = prompt.readOnly ? prompt.value : prompt.builtInText
+      if (!text) throw new Error('This prompt has no built-in text.')
+      builtInViewerTitle = prompt.readOnly ? prompt.label : `${prompt.label}: Built-in Text`
+      builtInViewerDescription = prompt.readOnly
+        ? prompt.description
+        : 'The text Batshit fills this prompt’s placeholders with when it sends it. Read-only.'
+      builtInViewerText = text
+      builtInViewerOpen = true
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to load built-in text')
+    } finally {
+      builtInBusyId = null
     }
   }
 
@@ -658,13 +653,10 @@
         dcm_schema_hint_required_limit: adminSettings.dcmSchemaHintRequiredLimit,
         dcm_schema_hint_optional_limit: adminSettings.dcmSchemaHintOptionalLimit,
         dcm_schema_hint_max_chars: adminSettings.dcmSchemaHintMaxChars,
+        dcm_schema_hint_total_tokens: adminSettings.dcmSchemaHintTotalTokens,
         dcm_tool_name_threshold: adminSettings.dcmToolNameThreshold,
         goon_lip_sync_lab_enabled: adminSettings.goonLipSyncLabEnabled,
       agent_wakeups_enabled: adminSettings.agentWakeupsEnabled,
-        web_search_default_provider: adminSettings.webSearchDefaultProvider,
-        web_search_exa_type: adminSettings.webSearchExaType,
-        web_search_perplexity_max_tokens_per_page:
-          adminSettings.webSearchPerplexityMaxTokensPerPage
       },
       updated_at: new Date().toISOString()
     })
@@ -680,9 +672,17 @@
       }
 
       const result = await response.json()
-      const remoteSettings: UserSettingsRow | null = result?.settings ?? null
+      if (!result || typeof result !== 'object' || Array.isArray(result) || !Object.hasOwn(result, 'settings') ||
+        result.settings !== null && (typeof result.settings !== 'object' || Array.isArray(result.settings))) {
+        throw new Error('Saved Admin settings could not be read.')
+      }
+      const remoteSettings: UserSettingsRow | null = result.settings
+      const savedAdminSettings = remoteSettings?.admin_settings
+      if (savedAdminSettings != null && (typeof savedAdminSettings !== 'object' || Array.isArray(savedAdminSettings))) {
+        throw new Error('Saved Admin settings could not be read.')
+      }
 
-      applySettings(remoteSettings ?? data?.userSettings ?? null)
+      applySettings(remoteSettings)
 
       if (remoteSettings || result?.settings === null) {
         setUserSettings(remoteSettings)
@@ -1709,10 +1709,18 @@
       }
       const result = (await response.json().catch(() => null)) as {
         keptHostFolders?: Array<{ root?: string; folder?: string; path?: string }>
+        warnings?: string[]
       } | null
       // BL-373 review: a replaced skill or voice folder is kept, never deleted; say where.
       const kept = Array.isArray(result?.keptHostFolders) ? result.keptHostFolders : []
-      if (kept.length > 0) {
+      const warnings = Array.isArray(result?.warnings) ? result.warnings.filter(warning => typeof warning === 'string' && warning.trim()) : []
+      if (warnings.length > 0) {
+        const where = kept[0]?.path ? ` in ${kept[0].path.replace(/\/[^/]+$/, '')}` : ''
+        const previous = kept.length > 0
+          ? `Batshit kept your previous copy of ${kept.length === 1 ? 'the skill or voice folder it replaced' : `the ${kept.length} skill and voice folders it replaced`}${where}. `
+          : ''
+        toast.warning(`Backup restored. ${previous}${warnings.join(' ')} Reloading Batshit...`)
+      } else if (kept.length > 0) {
         const where = kept[0]?.path ? ` in ${kept[0].path.replace(/\/[^/]+$/, '')}` : ''
         toast.success(
           `Backup restored. Batshit kept your previous copy of ${kept.length === 1 ? 'the skill or voice folder it replaced' : `the ${kept.length} skill and voice folders it replaced`}${where}. Reloading Batshit...`
@@ -1722,7 +1730,7 @@
       }
       window.setTimeout(() => {
         window.location.reload()
-      }, kept.length > 0 ? 6000 : 900)
+      }, kept.length > 0 || warnings.length > 0 ? 6000 : 900)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to restore backup'
       backupError = message
@@ -1853,6 +1861,7 @@
         1,
         MAX_DCM_TOOL_NAME_THRESHOLD
       ),
+      dcmSchemaHintTotalTokens: normalizeTotalHintTokens(admin.dcm_schema_hint_total_tokens),
       goonLipSyncLabEnabled:
         typeof admin.goon_lip_sync_lab_enabled === 'boolean'
           ? admin.goon_lip_sync_lab_enabled
@@ -1938,6 +1947,8 @@
       onRetry={loadCoreSystemPrompts}
       onEdit={openCorePromptEditor}
       onReset={resetCorePrompt}
+      onViewBuiltIn={openBuiltInText}
+      viewBusyId={builtInBusyId}
     />
 
     <AdminBackupRestoreCard
@@ -2018,32 +2029,23 @@
           (adminSettings.goonLipSyncLabEnabled = checked)}
       />
 
-      <AdminWebSearchCard
-        defaultProvider={adminSettings.webSearchDefaultProvider}
-        defaultProviderLabel={webSearchProviderLabel(adminSettings.webSearchDefaultProvider)}
-        exaType={adminSettings.webSearchExaType}
-        perplexityMaxTokensPerPage={adminSettings.webSearchPerplexityMaxTokensPerPage}
-        providerOptions={webSearchProviderOptions}
+      <AdminToolOperationsSettings userId={data?.user?.id ?? null}
         providerAvailability={availableWebSearchProviders}
-        loadingProviders={webSearchProvidersLoading}
-        providerError={webSearchProvidersError}
-        disabled={isLoading}
-        onProviderChange={(provider) => (adminSettings.webSearchDefaultProvider = provider)}
-        onExaTypeChange={(exaType) => (adminSettings.webSearchExaType = exaType)}
-        onPerplexityMaxTokensPerPageChange={(tokens) =>
-          (adminSettings.webSearchPerplexityMaxTokensPerPage = tokens)}
-      />
+        loadingProviders={webSearchProvidersLoading} providerError={webSearchProvidersError}
+        availabilityLoaded={hasLoadedWebSearchProviderAvailability} />
 
       <AdminDynamicSchemaHintsCard
         requiredLimit={adminSettings.dcmSchemaHintRequiredLimit}
         optionalLimit={adminSettings.dcmSchemaHintOptionalLimit}
         toolNameThreshold={adminSettings.dcmToolNameThreshold}
         maxChars={adminSettings.dcmSchemaHintMaxChars}
+        totalTokens={adminSettings.dcmSchemaHintTotalTokens}
         disabled={isLoading}
         onRequiredLimitChange={(value) => (adminSettings.dcmSchemaHintRequiredLimit = value)}
         onOptionalLimitChange={(value) => (adminSettings.dcmSchemaHintOptionalLimit = value)}
         onToolNameThresholdChange={(value) => (adminSettings.dcmToolNameThreshold = value)}
         onMaxCharsChange={(value) => (adminSettings.dcmSchemaHintMaxChars = value)}
+        onTotalTokensChange={(value) => (adminSettings.dcmSchemaHintTotalTokens = value)}
       />
     {/if}
 
@@ -2080,8 +2082,8 @@
                   </button>
                   <SettingsInfoMenu ariaLabel="About n8n Runtime" contentClass="w-80">
                     <p>
-                      Status for the n8n instance Batshit will call for n8n agents, workflow
-                      inspection, and Execution Viewer hydration.
+                      Status for the n8n instance Batshit will call for workflow
+                      inspection and Execution Viewer hydration.
                     </p>
                   </SettingsInfoMenu>
                 </div>
@@ -2152,6 +2154,7 @@
 
           <AdminPinokioRuntimeRow
             open={openRuntimeCardId === 'pinokio'}
+            windowsWsl={runtimeContext?.windowsWsl === true}
             onToggle={() => toggleRuntimeCard('pinokio')}
           />
 
@@ -2546,6 +2549,9 @@
                     Uninstall
                   </Button>
                 </div>
+                <p class="batshit-settings-form-help">
+                  For Pinokio on Windows (WSL), use Linux x64. For Pinokio on Mac, use macOS.
+                </p>
                 {/if}
                 {#if cloudflaredRuntimeStatus?.version}
                   <p class="batshit-settings-form-label">
@@ -2778,7 +2784,7 @@
                   {#if sandboxBusy || sandboxRecoverBusy}
                     <Badge variant="outline" class={runtimeStatusBadgeClass('checking')}>Checking…</Badge>
                   {:else if sandboxRuntimeStatus?.dockerUnsupported}
-                    <Badge variant="outline" class={runtimeStatusBadgeClass('bad')}>Disabled</Badge>
+                    <Badge variant="outline" class={runtimeStatusBadgeClass('neutral')}>Unavailable in this setup</Badge>
                   {:else if isSandboxOperatorRequired()}
                     <Badge variant="outline" class={runtimeStatusBadgeClass('warning')}>Operator Required</Badge>
                   {:else if sandboxRuntimeStatus?.available}
@@ -3061,6 +3067,15 @@
   onSave={saveCorePrompt}
 />
 
+<SystemPromptEditor
+  bind:open={builtInViewerOpen}
+  title={builtInViewerTitle}
+  description={builtInViewerDescription}
+  prompt={builtInViewerText}
+  readOnly={true}
+  width="large"
+/>
+
 <style>
   :global(.core-prompt-status-badge) {
     --core-prompt-status-border: var(--bs-app-success-line);
@@ -3111,5 +3126,9 @@
 
   :global(.runtime-status-badge.is-checking) {
     --runtime-status-color: oklch(0.68 0.08 255);
+  }
+
+  :global(.runtime-status-badge.is-neutral) {
+    --runtime-status-color: var(--bs-settings-disabled-text);
   }
 </style>

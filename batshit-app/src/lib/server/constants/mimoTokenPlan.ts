@@ -7,17 +7,17 @@ export const MIMO_TOKEN_PLAN_OPENAI_BASE_URL = 'https://token-plan-sgp.xiaomimim
  */
 export const MIMO_TOKEN_PLAN_MODELS = [
   {
-    id: 'mimo-v2.5-pro',
+    id: 'mimo-v2.6-pro',
     developerId: 'xiaomi',
-    displayName: 'MiMo V2.5 Pro',
+    displayName: 'MiMo V2.6 Pro',
     tags: ['chat', 'reasoning', 'code', 'vision', 'audio', 'multimodal', 'long-context'],
     contextWindow: 1_000_000,
     modelType: 'chat'
   },
   {
-    id: 'mimo-v2.5',
+    id: 'mimo-v2.6-flash',
     developerId: 'xiaomi',
-    displayName: 'MiMo V2.5',
+    displayName: 'MiMo V2.6 Flash',
     tags: ['chat', 'reasoning', 'code', 'vision', 'audio', 'multimodal', 'long-context'],
     contextWindow: 1_000_000,
     modelType: 'chat'

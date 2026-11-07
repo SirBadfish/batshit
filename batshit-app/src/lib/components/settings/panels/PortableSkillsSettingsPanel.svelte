@@ -11,7 +11,10 @@
   import { confirmDialog } from '$lib/stores/confirmDialog'
   import { copyTextToClipboard } from '$lib/utils/clipboard'
   import { buildPortableSkillEnvLines } from '$lib/utils/portableSkillEnv'
-  import { Check, Copy, Download, KeyRound, Loader2, Plus, RefreshCw, RotateCw, Trash2 } from '@lucide/svelte'
+  import PortableAppActionsGrant from '$lib/components/settings/agent/PortableAppActionsGrant.svelte'
+  import { onUserChannelEvent } from '$lib/services/userChannel'
+  import { APP_ACTIONS_PORTABLE_REFRESH_EVENT } from '$lib/appActions/settings/managementContract'
+  import { Check, Copy, KeyRound, Loader2, Plus, RefreshCw, RotateCw, Trash2 } from '@lucide/svelte'
   import type {
     PortableSkillEnvTemplateInfo,
     PortableSkillFamilyId,
@@ -27,15 +30,6 @@
     token?: string
     record?: PortableSkillTokenSummary
     error?: string
-  }
-
-  type PortableSkillInstallCard = {
-    id: string
-    title: string
-    // null = informational bundle: no Portable Skill Token family required.
-    family: PortableSkillFamilyId | null
-    summary: string
-    zipUrl: string
   }
 
   interface Props {
@@ -60,54 +54,9 @@
   let revealedFamilies = $state<PortableSkillFamilyId[]>([])
   let copied = $state(false)
   let copiedEnvSnippet = $state(false)
-  let copiedInstallSkillId = $state<string | null>(null)
+  let grantTokenIds = $state<string[]>([])
 
   const tokenCount = $derived(tokens.filter((token) => !token.revokedAt).length)
-  const portableSkillInstallCards: PortableSkillInstallCard[] = [
-    {
-      id: 'batshit-guide',
-      title: 'Batshit Guide',
-      family: null,
-      summary: 'Teaches an outside coding agent Batshit itself, with the official product docs bundled as references.',
-      zipUrl: 'https://docs.batshit.ai/portable-skills/batshit-guide.zip'
-    },
-    {
-      id: 'voice-engine-installer',
-      title: 'Voice Engine Installer',
-      family: 'voice-engines',
-      summary: 'Installs, registers, health-checks, and enables local speech engines.',
-      zipUrl: 'https://docs.batshit.ai/portable-skills/voice-engine-installer.zip'
-    },
-    {
-      id: 'artifact-creator',
-      title: 'Artifact Creator',
-      family: 'artifacts',
-      summary: 'Creates, validates, patches, publishes, and places Batshit artifacts.',
-      zipUrl: 'https://docs.batshit.ai/portable-skills/artifact-creator.zip'
-    },
-    {
-      id: 'cli-tool-creator',
-      title: 'CLI Tool Creator',
-      family: 'cli-tools',
-      summary: 'Creates, updates, tests, archives, and deletes Batshit CLI tools.',
-      zipUrl: 'https://docs.batshit.ai/portable-skills/cli-tool-creator.zip'
-    },
-    {
-      id: 'skill-creator',
-      title: 'Skill Creator',
-      family: 'skills',
-      summary: 'Saves and imports Batshit skills from an outside coding agent.',
-      zipUrl: 'https://docs.batshit.ai/portable-skills/skill-creator.zip'
-    },
-    {
-      id: 'goon-scene-creator',
-      title: 'Goon Scene Creator',
-      family: 'goon-scenes',
-      summary: 'Plans Goon scenes, skyboxes, Room Builder settings, and ComfyUI skybox handoffs.',
-      zipUrl: 'https://docs.batshit.ai/portable-skills/goon-scene-creator.zip'
-    }
-  ]
-
   function formatDate(value: string | null) {
     if (!value) return 'Never'
     try {
@@ -124,10 +73,6 @@
 
   function familyLabel(familyId: string) {
     return families.find((family) => family.id === familyId)?.label ?? familyId
-  }
-
-  function familyControlCount(familyId: string) {
-    return families.find((family) => family.id === familyId)?.controlIds.length ?? null
   }
 
   function tokenMask(token: PortableSkillTokenSummary) {
@@ -147,17 +92,6 @@
     newLabel = ''
     selectedFamilies = []
     createDialogOpen = true
-  }
-
-  function installPrompt(skill: PortableSkillInstallCard) {
-    if (skill.family === null) {
-      return `Install the Batshit Portable ${skill.title} skill from ${skill.zipUrl}. No token or env file is needed; it is informational only.`
-    }
-    const sharedTemplate = envTemplates.find((template) => template.kind === 'shared')
-    const credentialGuidance = sharedTemplate
-      ? `Use credentials from ${sharedTemplate.path}.`
-      : 'Use the shared env file shown in Portable Skills settings.'
-    return `Install the Batshit Portable ${skill.title} skill from ${skill.zipUrl}. ${credentialGuidance}`
   }
 
   function setResponseState(payload: TokensResponse) {
@@ -313,18 +247,9 @@
     }
   }
 
-  async function copyInstallPrompt(skill: PortableSkillInstallCard) {
-    try {
-      await copyTextToClipboard(installPrompt(skill))
-      copiedInstallSkillId = skill.id
-      toast.success('Install prompt copied')
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Could not copy install prompt.')
-    }
-  }
-
   onMount(() => {
     void loadTokens()
+    return onUserChannelEvent(event => { if (event.type === APP_ACTIONS_PORTABLE_REFRESH_EVENT || event.type === 'reconnected') void loadTokens() })
   })
 </script>
 
@@ -356,50 +281,12 @@
     </div>
   {/if}
 
-  <div class="grid gap-3 md:grid-cols-2">
-    {#each portableSkillInstallCards as skill}
-      <Card.Root>
-        <Card.Content class="grid h-full gap-4 p-4">
-          <div class="flex items-start justify-between gap-3">
-            <div class="min-w-0 space-y-2">
-              <div class="flex flex-wrap items-center gap-2">
-                <h3 class="text-base font-medium">{skill.title}</h3>
-                {#if skill.family === null}
-                  <Badge variant="outline">No token needed</Badge>
-                {:else}
-                  <Badge variant="outline">{familyLabel(skill.family)}</Badge>
-                  {#if familyControlCount(skill.family) !== null}
-                    <Badge variant="secondary">{familyControlCount(skill.family)} controls</Badge>
-                  {/if}
-                {/if}
-              </div>
-              <p class="text-sm text-muted-foreground">{skill.summary}</p>
-            </div>
-            <Download class="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-          </div>
-
-          <div class="grid gap-2 rounded-md border bg-muted/20 p-3">
-            <div class="text-xs font-medium uppercase tracking-normal text-muted-foreground">Install prompt</div>
-            <code class="break-words text-xs leading-relaxed">{installPrompt(skill)}</code>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              class="justify-self-start"
-              onclick={() => copyInstallPrompt(skill)}
-            >
-              {#if copiedInstallSkillId === skill.id}
-                <Check class="size-4" aria-hidden="true" />
-                Copied
-              {:else}
-                <Copy class="size-4" aria-hidden="true" />
-                Copy install prompt
-              {/if}
-            </Button>
-          </div>
-        </Card.Content>
-      </Card.Root>
-    {/each}
+  <div class="batshit-settings-inline-alert is-info">
+    <p class="batshit-settings-form-label">Install the Batshit Plugin</p>
+    <p>
+      Download the complete Batshit plugin for your coding agent from
+      Settings → Plugins &amp; shit → Plugins → Batshit → Download Plugin.
+    </p>
   </div>
 
   <div class="grid gap-3">
@@ -415,7 +302,7 @@
     {:else if tokens.length === 0}
       <div class="rounded-md border p-4 text-sm text-muted-foreground">No Portable Skill Tokens yet.</div>
     {:else}
-      {#each tokens as token}
+      {#each tokens as token (token.id)}
         <Card.Root>
           <Card.Content class="flex flex-col gap-4 p-4 md:flex-row md:items-center md:justify-between">
             <div class="min-w-0 space-y-2">
@@ -461,6 +348,12 @@
               </Button>
             </div>
           </Card.Content>
+          <details class="p-4" ontoggle={event => { if (event.currentTarget.open && !grantTokenIds.includes(token.id)) grantTokenIds = [...grantTokenIds, token.id] }}>
+            <summary class="batshit-settings-parent-label">App Actions Access</summary>
+            {#if grantTokenIds.includes(token.id)}
+              <PortableAppActionsGrant tokenId={token.id} disabled={busyTokenId === token.id} onSaved={() => { void loadTokens() }} />
+            {/if}
+          </details>
         </Card.Root>
       {/each}
     {/if}

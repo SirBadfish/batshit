@@ -2,11 +2,10 @@ import type { CatalogConnectionOption } from '$lib/types/modelCatalog'
 import type { SavedModel } from '$lib/types/savedModels'
 import { determineModelCompatibility } from '$lib/data/model-compatibility-registry'
 import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
-import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
+import { chatModelUnavailableReason, resolveSavedModelConnection } from '$lib/utils/modelConnections'
 import { resolveModelVoiceSessionConfig } from '$lib/utils/modelVoiceSession'
-import type { PrimaryAgentType } from '$lib/utils/primaryAgentType'
-import { isCliPrimaryAgentType } from '$lib/utils/primaryAgentType'
 import type { ToolHostScope } from '$lib/utils/brokerAvailability'
+import { RETIRED_CODEX_CLI_CONNECTION_ID, RETIRED_CODEX_CLI_PROVIDER_IDS } from '$lib/utils/cliRuntimeIdentity'
 
 /**
  * SA-102 P6: derived, never hand-listed — see localImageTransportPolicy.ts.
@@ -88,16 +87,19 @@ function resolveCompatibility(model: SavedModel) {
   const connection = resolveSavedModelConnection(model)
 
   if (connection.type === 'openrouter' || connection.type === 'vercel-gateway') {
-    return { n8n: true, managed: true }
+    return { managed: true }
   }
 
   return {
-    n8n: base.n8n !== false,
     managed: base.batshit !== false,
     note: base.note
   }
 }
 
+/**
+ * `agentType` is the picker's tool-host scope. Every Batshit picker passes `api` (SA-139 R4 for
+ * Primaries, R5 for Subagents); a speech-to-speech preset is for that scope only.
+ */
 export function getModelPresetAvailability({
   model,
   agentType,
@@ -116,17 +118,30 @@ export function getModelPresetAvailability({
   const connectionService = normalize(connection.service ?? null)
   const providerHint = normalize(model.provider).toLowerCase()
   const modelHint = normalize(model.modelId).toLowerCase()
-  const isCodexPreset =
-    connectionId === 'codex-cli' ||
-    connectionService.includes('codex') ||
-    providerHint.includes('codex') ||
-    modelHint.includes('codex')
-  const isClaudeCliPreset =
+  // SA-139 R1: only the provider or connection ids name the retired Codex CLI. An OpenAI model id
+  // that contains "codex" (an API or ChatGPT plan preset) is an ordinary API preset.
+  const isRetiredCodexCliPreset =
+    connectionId === RETIRED_CODEX_CLI_CONNECTION_ID ||
+    RETIRED_CODEX_CLI_PROVIDER_IDS.has(connectionService) ||
+    RETIRED_CODEX_CLI_PROVIDER_IDS.has(providerHint)
+  // SA-139 R5: the Claude Code CLI lane was removed with its Subagent type, so a saved Claude Code
+  // CLI preset gets the Codex CLI treatment: it stays saved and readable, and nothing can use it.
+  const isRetiredClaudeCliPreset =
     connectionId === 'claude-cli' ||
     connectionService.includes('claude-cli') ||
     providerHint.includes('claude-cli') ||
     modelHint.includes('claude-cli')
-  const isCliPreset = isCodexPreset || isClaudeCliPreset
+
+  // A saved Codex CLI or Claude Code CLI preset never runs, and never runs as an API preset either.
+  if (isRetiredCodexCliPreset || isRetiredClaudeCliPreset) {
+    return { disabled: true, disabledBecause: 'incompatible', reason: 'This preset can no longer be used', connectionOption }
+  }
+
+  const chatUnavailable = !voiceSession &&
+    chatModelUnavailableReason(connection, model.effectiveModelId ?? model.modelId, model.purpose)
+  if (chatUnavailable) {
+    return { disabled: true, disabledBecause: 'locked', reason: chatUnavailable, connectionOption }
+  }
 
   if (!isChatModel) {
     return { disabled: true, disabledBecause: 'non_chat', reason: 'Not a chat model', connectionOption }
@@ -137,7 +152,7 @@ export function getModelPresetAvailability({
       return {
         disabled: true,
         disabledBecause: 'voice_session',
-        reason: 'Speech-to-speech presets are for API voice agents',
+        reason: 'Speech-to-speech: Primary Agents only',
         connectionOption
       }
     }
@@ -155,41 +170,11 @@ export function getModelPresetAvailability({
     }
   }
 
-  if (agentType === 'n8n') {
-    if (!compatibility.n8n) {
-      return {
-        disabled: true,
-        disabledBecause: 'incompatible',
-        reason: compatibility.note ?? 'Not available for n8n agents',
-        connectionOption
-      }
-    }
-    return { disabled: false, disabledBecause: null, reason: null, connectionOption }
-  }
-
   if (!compatibility.managed) {
     return {
       disabled: true,
       disabledBecause: 'incompatible',
-      reason: compatibility.note ?? 'Not available for API or CLI agents',
-      connectionOption
-    }
-  }
-
-  if (isCliPrimaryAgentType(agentType) && !isCliPreset) {
-    return {
-      disabled: true,
-      disabledBecause: 'incompatible',
-      reason: 'CLI agents only support CLI presets',
-      connectionOption
-    }
-  }
-
-  if (!isCliPrimaryAgentType(agentType) && isCliPreset) {
-    return {
-      disabled: true,
-      disabledBecause: 'incompatible',
-      reason: 'CLI presets are only available for CLI agents',
+      reason: compatibility.note ?? 'Not available for agents',
       connectionOption
     }
   }
@@ -200,15 +185,6 @@ export function getModelPresetAvailability({
   }
 
   if (connectionOption?.status === 'locked') {
-    if (isCliPrimaryAgentType(agentType) && isCliPreset) {
-      return {
-        disabled: false,
-        disabledBecause: null,
-        reason: connectionOption.lockedReason ?? 'CLI login required',
-        connectionOption
-      }
-    }
-
     return {
       disabled: true,
       disabledBecause: 'locked',

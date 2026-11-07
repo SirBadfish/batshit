@@ -1,6 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RequestEvent } from '@sveltejs/kit'
 
+// This fixture owns route/file-error handling; grouped persistence and actor authority use actual Redis in agentPlugins.redis.test.
+vi.mock('$lib/server/services/agentPlugins', async original => {
+  const actual = await original<typeof import('$lib/server/services/agentPlugins')>()
+  return { ...actual, listAgentPlugins: async () => [], pluginForCommand: async () => null,
+    projectPluginCommand: async (_user: string, command: unknown) => command,
+    refusePluginMemberWrite: async (_user: string, command: { id: string; skill_id?: string; plugin_id?: string }) => {
+      if (command.plugin_id !== undefined || actual.isBuiltinPluginMember(command)) throw new actual.AgentPluginError('PLUGIN_MEMBER_USER_MANAGED', 'Manage this member through its plugin.')
+    }
+  }
+})
+
 vi.mock('$lib/server/redis', () => ({
   redis: {
     json: {
@@ -12,7 +23,8 @@ vi.mock('$lib/server/redis', () => ({
 
 // BL-544: the whole-record write is one Lua step on real Redis (`command-update-keeps-access.test.ts`);
 // here it answers the record it was given, as the real write does when nothing changed meanwhile.
-vi.mock('$lib/server/services/agentAccessLists', () => ({
+vi.mock('$lib/server/services/agentAccessLists', async importOriginal => ({
+  ...await importOriginal<typeof import('$lib/server/services/agentAccessLists')>(),
   writeSlashCommandRecord: vi.fn(async (_key: string, record: unknown) => record)
 }))
 
@@ -21,6 +33,11 @@ vi.mock('$lib/server/services/skillRegistry', () => ({
   getSkill: vi.fn(),
   normalizeSkillId: vi.fn((value: string) => value),
   upsertSkill: vi.fn()
+}))
+
+vi.mock('$lib/server/services/slashCommandRevision', async importOriginal => ({
+  ...await importOriginal<typeof import('$lib/server/services/slashCommandRevision')>(),
+  captureSlashCommandWriteBasis: vi.fn(async () => Object.freeze({}))
 }))
 
 import { PUT } from './+server'
@@ -84,6 +101,26 @@ describe('PUT /api/slash-commands/[id]', () => {
     expect(writeSlashCommandRecord).not.toHaveBeenCalled()
   })
 
+  it('keeps exact explicit assignment IDs separate, and refuses malformed lists before saving', async () => {
+    const response = await PUT(buildEvent({ enabled_agent_ids: ['A-B', 'a_b'] }))
+    expect(response.status).toBe(200)
+    expect((await response.json()).slashCommand.enabled_agent_ids).toEqual(['A-B', 'a_b'])
+    vi.mocked(writeSlashCommandRecord).mockClear()
+    for (const list of [['A/B'], [12], null, 'A-B']) {
+      expect((await PUT(buildEvent({ enabled_agent_ids: list }))).status).toBe(400)
+    }
+    expect(writeSlashCommandRecord).not.toHaveBeenCalled()
+  })
+
+  it('rejects invalid access IDs before a simultaneous skill content write', async () => {
+    vi.mocked(redis.json.get).mockResolvedValue({ ...baseCommand, type: 'skill', skill_id: 'probe' } as any)
+    vi.mocked(upsertSkill).mockResolvedValue({ id: 'probe' } as any)
+    const response = await PUT(buildEvent({ enabled_agent_ids: ['A/B'], skill: { id: 'probe', markdown: '# Changed' } }))
+    expect(response.status).toBe(400)
+    expect(upsertSkill).not.toHaveBeenCalled()
+    expect(writeSlashCommandRecord).not.toHaveBeenCalled()
+  })
+
   it('allows updating existing command fields when type is unchanged', async () => {
     const response = await PUT(buildEvent({ name: 'helper-updated' }))
 
@@ -109,7 +146,7 @@ describe('PUT /api/slash-commands/[id]', () => {
     expect(writeSlashCommandRecord).not.toHaveBeenCalled()
   })
 
-  it('allows built-in skills to update status and access fields', async () => {
+  it('refuses built-in member status and access writes in favor of the group', async () => {
     vi.mocked(redis.json.get).mockResolvedValue({
       ...baseCommand,
       id: 'voice-engine-installer',
@@ -131,16 +168,13 @@ describe('PUT /api/slash-commands/[id]', () => {
       })
     )
 
-    expect(response.status).toBe(200)
-    const payload = await response.json()
-    expect(payload.slashCommand.is_active).toBe(false)
-    expect(payload.slashCommand.enabled_for_all_agents).toBe(true)
-    expect(payload.slashCommand.can_be_attached_to_agents).toBe(true)
-    expect(payload.slashCommand.is_system).toBe(true)
-    expect(writeSlashCommandRecord).toHaveBeenCalledTimes(1)
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ code: 'PLUGIN_MEMBER_USER_MANAGED' })
+    expect(writeSlashCommandRecord).not.toHaveBeenCalled()
+    expect(upsertSkill).not.toHaveBeenCalled()
   })
 
-  it('allows built-in skills to change trust level only', async () => {
+  it('refuses built-in member trust rewrites before skill-file effects', async () => {
     vi.mocked(redis.json.get).mockResolvedValue({
       ...baseCommand,
       id: 'artifact-creator',
@@ -184,10 +218,9 @@ describe('PUT /api/slash-commands/[id]', () => {
 
     const response = await PUT(buildEvent({ skill: { trustLevel: 'untrusted' } }))
 
-    expect(response.status).toBe(200)
-    const payload = await response.json()
-    expect(payload.slashCommand.trust_level).toBe('untrusted')
-    expect(upsertSkill).toHaveBeenCalledTimes(1)
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ code: 'PLUGIN_MEMBER_USER_MANAGED' })
+    expect(upsertSkill).not.toHaveBeenCalled()
   })
 
   it("says a skill's files are missing instead of a generic 500 (BL-369 review 5)", async () => {
@@ -241,20 +274,20 @@ describe('PUT /api/slash-commands/[id]', () => {
 
     const response = await PUT(buildEvent({ displayName: 'New Name' }))
 
-    expect(response.status).toBe(403)
-    const payload = await response.json()
-    expect(payload.error).toContain('status and access settings')
-    expect(payload.error).toContain('displayName')
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ code: 'PLUGIN_MEMBER_USER_MANAGED' })
     expect(writeSlashCommandRecord).not.toHaveBeenCalled()
   })
 
   it('keeps the stored per-agent list unless the save sends one (BL-544)', async () => {
     await PUT(buildEvent({ name: 'helper-updated' }))
-    expect(vi.mocked(writeSlashCommandRecord).mock.calls[0][2]).toEqual({ keepAgentAccess: true })
+    expect(vi.mocked(writeSlashCommandRecord).mock.calls[0][2]).toEqual({ keepAgentAccess: true,
+      preserveAccess: ['enabled_agent_ids', 'enabled_for_all_agents', 'is_active', 'can_be_invoked_in_chat'] })
 
     vi.mocked(writeSlashCommandRecord).mockClear()
     await PUT(buildEvent({ enabled_agent_ids: ['agent-a'] }))
-    expect(vi.mocked(writeSlashCommandRecord).mock.calls[0][2]).toEqual({ keepAgentAccess: false })
+    expect(vi.mocked(writeSlashCommandRecord).mock.calls[0][2]).toEqual({ keepAgentAccess: false,
+      preserveAccess: ['enabled_for_all_agents', 'is_active', 'can_be_invoked_in_chat'] })
   })
 
   it('answers 404 when the command was deleted while the save ran (BL-544)', async () => {

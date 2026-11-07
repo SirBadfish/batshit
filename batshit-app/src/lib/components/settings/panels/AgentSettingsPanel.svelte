@@ -1,13 +1,31 @@
 <script lang="ts">
+  import { resolveVoiceTtsDisplayEndpoint, resolveVoiceTtsDisplaySelection, voiceTtsModelStreams } from '$lib/utils/voiceTtsDisplay';
+  import { mimoVoiceModelNotice } from '$lib/data/mimoVoiceProfiles';
+  import { voiceModelApplicabilityNotice, voiceTranscriptionModelNotice } from '$lib/data/voiceModelApplicability';
+  import { getQwenAudioTtsVoices, isQwenAudioTtsModel, parseQwenAudioEndpoint } from '$lib/data/qwenAudioTts';
+  import { readVoiceProviderEnvelope } from '$lib/utils/voiceProviderEnvelope';
+  import { voiceModelCatalogNotice, voiceProviderModelProfile } from '$lib/utils/builtinVoiceCatalogProjection';
+import type { ToolGridEnableControl } from '$lib/components/tools/ToolGridEnableCell.svelte';
+  import { TYPED_FILE_TOOLS_REVISION_HEADER, captureTypedFileToolsBaseline, typedFileToolsBodyValue,
+    withExpectedTypedFileTools, withoutExpectedTypedFileTools, adoptTypedFileToolsAck,
+    withTypedFileToolsChoice, withoutTypedFileToolsChoice, type TypedFileToolsBaseline } from "$lib/utils/typedFileToolsSave";
   import { performAvatarImport, uploadAvatarFile } from '$lib/appActions/imports/avatars'
   import type { ImportArgs, ImportOutcome } from '$lib/appActions/imports/contracts'
   import { refuse, type SettingsTarget } from '$lib/appActions/catalog'
   import { appActionsHaveDrafts, type ActionContext } from '$lib/appActions/owners'
 
   import { onDestroy, onMount, untrack } from "svelte";
+  import { isExactSavedAccessAgentId, readArtifactAgentAccess } from "$lib/utils/agentAccessIds";
   import { createEntitySaverCount } from "$lib/utils/entitySaverCount";
   import { AGENT_MEMORY_GROUP, AGENT_SAVE_FIELD_GROUPS } from "$lib/utils/agentSettingsSavePatch";
   import { agentWritableConflictLabels, rebaseAgentWritableFields } from "$lib/utils/agentWritableFieldRebase";
+  import { MODEL_SELECTION_REVISION_HEADER, MODEL_SELECTION_FIELDS, MODEL_SELECTION_IDENTITY_FIELDS, captureModelSelectionBaseline, isModelSelectionWrite, sameModelSelection, withModelSelection, type ModelSelectionBaseline, type ModelSelectionKind } from '$lib/appActions/settings/modelSelectionBaseline';
+  import { CLAUDE_CLI_PRESET_REFUSAL, namesRetiredCodexCliModel } from '$lib/utils/cliRuntimeIdentity';
+  import { INSTRUCTIONS_REVISION_HEADER, captureInstructionsBaseline, instructionsExpectedForWrites, namesInstructions, type InstructionsBaseline, type InstructionsRevisions } from '$lib/appActions/settings/instructionsBaseline';
+  import { AUTO_COMPACT_COMMON_FIELDS, AUTO_COMPACT_REVISION_HEADER, captureAutoCompactBaseline, type AutoCompactBaseline } from '$lib/appActions/settings/autoCompactBaseline';
+  import { CONFIGURED_TTS_REVISION_HEADER, captureConfiguredTtsBaseline, type ConfiguredTtsBaseline } from '$lib/appActions/settings/configuredTtsBaseline';
+  import { buildPickedPresetSelection, buildClearedPresetSelection } from '$lib/utils/modelPresetPick';
+  import { isAgentRuntimeSettingKey } from '$lib/utils/modelSettingsMapper';
   import { onUserChannelEvent, type UserChannelEvent } from "$lib/services/userChannel";
   import { SUBAGENT_SAVE_FIELD_GROUPS } from "$lib/utils/subagentSettingsSavePatch";
   import {
@@ -17,18 +35,23 @@
   } from "$lib/utils/dcmDisplaySettings";
   import { toast } from "$lib/components/ui/sonner/settings-toast";
   import * as agentStore from "$lib/stores/agents.svelte";
-  import * as n8nRuntimeStatusStore from "$lib/stores/n8nRuntimeStatus.svelte";
+  import * as projectStore from "$lib/stores/projects.svelte";
+  import { noteSavedDefaultProject } from "$lib/projects/agentProjectSelection.svelte";
+  import { refreshAllDeadCopies } from "$lib/stores/zipDeadCopies.svelte";
+  import ModelReasoningControl from '$lib/components/models/ModelReasoningControl.svelte';
+  import { agentReasoningReadGeneration, captureAgentReasoningReads, preserveNewerReasoningLeaves } from '$lib/utils/agentReasoningReadGuard';
   import type { Agent as AgentStoreRecord } from "$lib/stores/agents.svelte";
   import { loadGoons } from "$lib/services/goons";
   import { getGoons } from "$lib/stores/goons.svelte";
   import { isGoonRuntimeReady } from "$lib/goons/recipe";
   import { subagentStore } from "$lib/stores/subagents.svelte";
   import { getUserSettings } from "$lib/stores/userSettings.svelte";
+  import ReasoningRetentionFields from '$lib/components/settings/ReasoningRetentionFields.svelte';
+  import type { AgentReasoningRetention } from '$lib/utils/reasoningRetention';
   import { confirmDialog, confirmDialogWithCheckbox } from "$lib/stores/confirmDialog";
   import { copyTextToClipboard } from "$lib/utils/clipboard";
   import { requestAvatarPictureTidy, shouldTidyAvatarPictures } from "$lib/utils/avatarPictureTidy";
   import { sandboxUnavailableMessage } from "$lib/utils/nativeExecutionBackend";
-  import { isClaudeToolEnabled, withClaudeToolEnabled } from "$lib/utils/claudeToolSwitch";
   import {
     resolveAgentDeleteChatCountOutcome,
     type AgentChatCounts,
@@ -61,30 +84,6 @@
   normalizeVoiceSettings
 } from "$lib/utils/voiceSchema";
 import { loadMicrophoneDeviceOptions } from "$lib/utils/microphoneDevices";
-  import type {
-  CodexAgentSettings,
-  CodexPermissionMode,
-  CodexApproval,
-  CodexSandbox,
-  CodexHistoryPersistence,
-  CodexServiceTier,
-} from "$lib/types/codex";
-import type {
-  ClaudeAgentSettings,
-  ClaudePermissionMode,
-  ClaudeConfigScope,
-  ClaudeSystemPromptMode
-} from "$lib/types/claude";
-import {
-  CODEX_FAST_MODE_HELPER_TEXT,
-  CODEX_SUBMODEL_CHOICES,
-  CODEX_XHIGH_REASONING_HELPER_TEXT,
-  supportsCodexFastMode,
-  supportsCodexXhighReasoning,
-} from "$lib/data/codex-models";
-import { CLAUDE_CLI_MODEL_CHOICES } from "$lib/data/claude-cli-models";
-  import CliRuntimeManagerCard from "$lib/components/settings/CliRuntimeManagerCard.svelte";
-  import RetiredCliModelNotice from "$lib/components/settings/agent/RetiredCliModelNotice.svelte";
   import { Input } from "$lib/components/ui/input";
   import * as Label from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
@@ -93,7 +92,6 @@ import { CLAUDE_CLI_MODEL_CHOICES } from "$lib/data/claude-cli-models";
   import { Separator } from "$lib/components/ui/separator";
   import * as Switch from "$lib/components/ui/switch";
   import * as Select from "$lib/components/ui/select";
-  import * as Collapsible from "$lib/components/ui/collapsible";
   import * as Tabs from "$lib/components/ui/tabs";
   import * as ToggleGroup from "$lib/components/ui/toggle-group";
   import * as Dialog from "$lib/components/ui/dialog";
@@ -106,21 +104,25 @@ import EntityAvatar from "$lib/components/avatar/EntityAvatar.svelte";
 import { getSavedModelBadgeProvider, resolveSavedModelConnection } from "$lib/utils/modelConnections";
 import {
   getVoiceModeLockLabel,
+  findSettingsVoicePresetFallback,
   resolveModelVoiceSessionConfig
 } from "$lib/utils/modelVoiceSession";
 import * as savedModelsStore from "$lib/stores/savedModels.svelte";
 import type { CatalogConnectionOption } from "$lib/types/modelCatalog";
 import { getModelPresetAvailability, presetAvailabilityKeepsSelection } from "$lib/utils/modelPresetAvailability";
-import { applyAgentProviderSettingsUpdate, presetModelSettings } from "$lib/utils/agentProviderSettings";
+import { CLI_GROUP_KEY, captureCliDcmWrite, applyCliDcmPatch, readCliDcmPair, readCliNativeChoice } from "$lib/utils/cliToolGridEnable";
+import type { AgentDcmDisplaySettingsSave } from "$lib/utils/agentBlockFieldSettings";
+import { applyAgentProviderSettingsUpdate } from "$lib/utils/agentProviderSettings";
 import { buildAgentSettingsSavePatch } from "$lib/utils/agentSettingsSavePatch";
 import {
   AGENT_FIELD_BY_FIELD_BLOCKS,
   applyAgentBlockUpdate,
-  diffAgentBlockWithGroups,
+  sameJsonValue,
   type AgentBlockSaveByField,
   type AgentFieldByFieldBlock,
 } from "$lib/utils/agentBlockFieldSettings";
 import {
+  MCP_SETTINGS_REVISION_HEADER, mcpSettingsLeaves, readMcpSettingsRevisions, withExpectedMcpSettings, withoutExpectedMcpSettings, type ExpectedMcpSettings,
   diffMcpSection,
   diffZipPayload,
   zipPayloadForSave,
@@ -147,25 +149,22 @@ import {
 import {
   type PrimaryAgentType,
   type StoredPrimaryAgentType,
-  getPrimaryAgentDisplayLabel,
-  isCliPrimaryAgentType,
-  isManagedPrimaryAgentType,
+  isApiPrimaryAgentType,
+  isRetiredPrimaryAgentType,
   normalizePrimaryAgentType,
+  retiredPrimaryAgentTypeMessage,
   shouldShowReasoningByDefaultForPrimaryAgent
 } from "$lib/utils/primaryAgentType";
-import type { ToolHostScope } from "$lib/utils/brokerAvailability";
+import { resolveAgentFabricUtilitiesEnabled, type ToolHostScope } from "$lib/utils/brokerAvailability";
 import {
-  getCompatibleSubagentTypesForPrimaryAgent,
-  getSubagentTypeBadgeTone,
-  getSubagentTypeDisplayLabel,
-  getSubagentTypeShortLabel,
+  isCliSubagentType,
+  isRetiredSubagentType,
   isSubagentCompatibleWithPrimaryAgent,
-  isWorkflowBackedSubagentType,
   normalizeSubagentType,
+  retiredSubagentTypeSentences,
   type SubagentType,
   type StoredSubagentType,
 } from "$lib/utils/subagentType";
-import { validateN8nProductionWebhookUrl } from "$lib/utils/n8nWebhookValidation";
 import { ProjectService } from "$lib/services/projects";
 import { artifactService, type ArtifactRow } from "$lib/services/artifactService";
 import { isArtifactAgentUseEligible } from "$lib/artifacts/agentUseEligibility";
@@ -178,6 +177,7 @@ import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from "$
   import SettingsSaveStatus from "$lib/components/settings/SettingsSaveStatus.svelte";
   import { sanitizeId } from "$lib/utils/idSanitizer";
   import AgentAccessAssignmentsSection from "$lib/components/settings/agent/AgentAccessAssignmentsSection.svelte";
+  import AgentAppActionsAccessCard from "$lib/components/settings/agent/AgentAppActionsAccessCard.svelte";
   import AgentDeleteDisclosure from "$lib/components/settings/agent/AgentDeleteDisclosure.svelte";
   import AgentSelectorSection from "$lib/components/settings/agent/AgentSelectorSection.svelte";
   import AgentAutoCompactSettingsCard from "$lib/components/settings/agent/AgentAutoCompactSettingsCard.svelte";
@@ -185,15 +185,18 @@ import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from "$
   import AgentDmsSettingsCard from "$lib/components/settings/agent/AgentDmsSettingsCard.svelte";
   import AgentJevJuiceSettingsCard from "$lib/components/settings/agent/AgentJevJuiceSettingsCard.svelte";
   import {
-    resolveAgentJevJudgeToolEnabled,
+    readAgentJevJudgeToolSwitch,
     resolveAgentJevMemoryRecallEnabled,
     resolveAgentJevMemoryRerankEnabled,
     resolveAgentJevReplyCheckEnabled,
-    resolveAgentJevSkillToolHintsEnabled,
+    resolveAgentJevSkillSessionMode,
+    type JevSkillSessionMode,
+    type StoredJevSkillSessionMode,
     resolveAgentJevStyleCoachEnabled,
   } from "$lib/utils/jevJuiceControl";
   import {
     DEFAULT_WAKE_TARGET,
+    readAgentDmsSwitch,
     resolveAgentDmsEnabled,
     resolveAgentWakeEnabled,
     resolveDmSenderPolicy,
@@ -209,16 +212,20 @@ import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from "$
   } from "$lib/utils/memoryControl";
   import {
     WORKERS_MAX_CONCURRENT,
-    WORKERS_MAX_RUNS_PER_TURN,
     resolveWorkersEnabled,
   } from "$lib/utils/delegationCapabilities";
+  import { typedFileToolsUnavailableReason, type TypedFileToolsHost } from "$lib/utils/typedFileToolsGrant";
+  import { liveFileReadsChosenOn, resolveZipAiViewModeOf } from "$lib/utils/liveFileReads";
   import {
-    CODEX_PERMISSION_PRESETS,
-    CODEX_SANDBOX_LABELS,
-    CODEX_SANDBOX_ORDER,
-    sanitizeCodexSandbox,
-  } from "$lib/utils/codexRunAccess";
-  import AgentWebSearchDefaultsDisclosure from "$lib/components/settings/agent/AgentWebSearchDefaultsDisclosure.svelte";
+    agentRefreshedFileReadsAvailability,
+    fetchToolsHostFacts,
+    refreshedFileReadsRecordInputsChanged,
+  } from "$lib/utils/refreshedFileReadsSettings";
+  import {
+    TYPED_FILE_TOOLS_AGENT_FIELD,
+    TYPED_FILE_TOOLS_BLOCK_LIST_SENTENCE,
+    readTypedFileToolsValue,
+  } from "$lib/utils/typedFileToolsGrant";
   import SubagentAccessAssignmentsSection from "$lib/components/settings/agent/SubagentAccessAssignmentsSection.svelte";
   import {
     CREATE_AGENT_SENTINEL,
@@ -245,7 +252,6 @@ import {
   Shield,
   ShieldPlus,
   Brain,
-  TerminalSquare,
   Lock,
   Mic,
   ChevronDown,
@@ -253,7 +259,6 @@ import {
   Plus,
   RotateCcw,
   Wrench,
-  Eye,
   X
 } from '@lucide/svelte';
 import type { SavedModel, ModelCapabilities, ModelConnectionInfo } from "$lib/types/savedModels";
@@ -266,19 +271,24 @@ import {
   type SharedNonMcpToolGridRowId,
 } from "$lib/components/tools/toolGridConfig";
 import { getToolGridDefaultAutoZip, getToolGridDefaultNumber } from "$lib/utils/toolGridZipDefaults";
-import { listUnsupportedN8NParameters } from "$lib/utils/modelCompatibility";
-import * as compatibilityMatrixStore from "$lib/stores/compatibilityMatrix.svelte";
 import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSettingsEvents";
-import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
+import {
+  formatDelegationDuration,
+  getSubagentTimeoutValidationError,
+  normalizeSubagentTimeoutSeconds,
+  MAX_SUBAGENT_TIMEOUT_SECONDS,
+  MIN_SUBAGENT_TIMEOUT_SECONDS,
+} from "$lib/utils/subagentTimeout";
+import {
+  getSubagentMaxToolStepsValidationError,
+  MAX_SUBAGENT_MAX_TOOL_STEPS,
+  MIN_SUBAGENT_MAX_TOOL_STEPS,
+} from "$lib/utils/subagentToolSteps";
 
   const BASIC_SAVE_DEBOUNCE_MS = 600;
   const ZIP_SAVE_DEBOUNCE_MS = 700;
   const SUBAGENT_SAVE_DEBOUNCE_MS = 600;
   const MCP_SAVE_DEBOUNCE_MS = 650;
-  const MODE4_PRELAUNCH_REPLACEMENT_PROMPT = "You are a helpful assistant.";
-  const CLAUDE_DEFAULT_MAX_THINKING_TOKENS = 1024;
-  const CODEX_SAVE_DEBOUNCE_MS = 650;
-  const CLAUDE_SAVE_DEBOUNCE_MS = 650;
   const DEFAULT_AGENT_VOICE_TEST_PHRASE = "Hey! This is a quick voice test from Batshit.";
   const NATIVE_BASH_TIMEOUT_OPTIONS = [10_000, 30_000, 60_000, 120_000];
   const NATIVE_AGENT_BROWSER_TIMEOUT_OPTIONS = [15_000, 30_000, 45_000, 60_000, 120_000];
@@ -387,6 +397,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     supported?: boolean;
     dockerUnsupported?: boolean;
     containerized?: boolean;
+    typedFileToolsHost?: TypedFileToolsHost;
     backend: NativeExecutionBackend;
     policy: string;
     version: string | null;
@@ -399,7 +410,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   };
 
 
-  interface BasicForm {
+  interface BasicForm extends AgentReasoningRetention {
     displayName: string;
     agentType: StoredPrimaryAgentType;
     show_reasoning: boolean;
@@ -418,7 +429,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     wake_timeout_minutes: number | null;
     wake_target: WakeTarget;
     // SA-120 P1 (DL-120-01): the per-agent Judge Juice skill/tool hint switch. Default off.
-    jev_juice_skill_tool_hints: boolean;
+    jev_juice_skill_tool_hints: JevSkillSessionMode;
     // SA-120 P2 (LS-050): the per-agent switch for the sys.judge.ask tool. Default off.
     jev_juice_judge_tool: boolean;
     // SA-120 P4a (LS-052): the per-agent switch for the memory search rerank. Default off.
@@ -470,6 +481,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   type CustomToolSettingForm = {
+    retained?: Record<string, unknown>;
     tool_name: string;
     buffer_size: string;
     zip_threshold: string;
@@ -512,6 +524,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   interface ZipForm {
     zip_ai_view_mode: string;
     zip_tool_notes_enabled: string;
+    live_file_reads: string;
     buffer_size: string;
     buffer_size_image: string;
     buffer_size_error: string;
@@ -614,98 +627,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     return field === "buffer_size_image";
   }
 
-  interface ConfigRow {
-    id: string;
-    key: string;
-    value: string;
-  }
-
-  interface CodexFormOptions {
-    permissionMode: CodexPermissionMode;
-    includeProjectInstructions: boolean;
-    model: string;
-    reasoningEffort: "default" | "low" | "medium" | "high" | "xhigh";
-    serviceTier: CodexServiceTier;
-    streamingEffect: boolean;
-    unifiedExec: boolean;
-    search: boolean;
-    sandbox: CodexSandbox;
-    approval: CodexApproval;
-    configScope: "managed" | "global";
-    addDirs: string[];
-    enableFeatures: string[];
-    disableFeatures: string[];
-    configOverrides: ConfigRow[];
-    workingDirectoryMode: "project" | "custom";
-    customWorkingDirectory: string;
-    historyPersistence: CodexHistoryPersistence;
-  }
-
-  interface ClaudeFormOptions {
-    permissionMode: ClaudePermissionMode;
-    includeCoreSystemPrompt: boolean;
-    includeProjectInstructions: boolean;
-    model: string;
-    alwaysThinkingEnabled: boolean;
-    maxThinkingTokens: string;
-    configScope: ClaudeConfigScope;
-    systemPromptMode: ClaudeSystemPromptMode;
-    systemPrompt: string;
-    systemPromptFile: string;
-    chrome: boolean;
-    addDirs: string[];
-    allowedTools: string[];
-    disallowedTools: string[];
-    configOverrides: ConfigRow[];
-    workingDirectoryMode: "project" | "custom";
-    customWorkingDirectory: string;
-  }
-
-  type ManagedConfigProvider = "codex" | "claude";
-
-  const CODEX_PERMISSION_OPTIONS: Array<{
-    value: CodexPermissionMode;
-    label: string;
-    helper: string;
-    icon: typeof MessageCircle;
-  }> = [
-    { value: "chat", label: "Chat", helper: "Read-only, never prompts", icon: MessageCircle },
-    { value: "agent", label: "Agent", helper: "Workspace write, ask when needed", icon: Shield },
-    {
-      value: "agent_full",
-      label: "Agent (full access)",
-      helper: "Full access, run without prompts",
-      icon: ShieldPlus,
-    },
-  ];
-
-  const CLAUDE_PERMISSION_OPTIONS: Array<{
-    value: ClaudePermissionMode;
-    label: string;
-    helper: string;
-    icon: typeof MessageCircle;
-  }> = [
-    { value: "plan", label: "Plan", helper: "Plan-only, no edits or commands", icon: MessageCircle },
-    {
-      value: "default",
-      label: "Ask before edits",
-      helper: "Edits and commands follow Approval Policy.",
-      icon: MessageCircle,
-    },
-    {
-      value: "acceptEdits",
-      label: "Edit automatically",
-      helper: "Approved work runs automatically; extra actions follow Approval Policy.",
-      icon: Shield,
-    },
-    {
-      value: "bypassPermissions",
-      label: "Bypass permissions",
-      helper: "Full trust, no approvals",
-      icon: ShieldPlus,
-    },
-  ];
-
   const PRIMARY_TOOL_APPROVAL_OPTIONS: Array<{
     value: "off" | "all";
     label: string;
@@ -718,7 +639,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     },
     {
       value: "all",
-      label: "On Request",
+      label: "On Failure",
       helper: "When a primary agent hits a permission boundary, supported runtimes can ask for extra approval.",
     },
   ];
@@ -749,42 +670,19 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     },
   ];
 
-  const CODEX_SANDBOX_OPTIONS = CODEX_SANDBOX_ORDER.map((value) => ({
-    value,
-    label: CODEX_SANDBOX_LABELS[value],
-  }));
-
-  const CODEX_REASONING_OPTIONS: Array<{
-    value: CodexFormOptions["reasoningEffort"];
-    label: string;
-    helper: string;
-  }> = [
-    { value: "default", label: "Auto", helper: "Use provider default" },
-    { value: "low", label: "Low", helper: "Fastest, minimal planning" },
-    { value: "medium", label: "Medium", helper: "Balanced effort" },
-    { value: "high", label: "High", helper: "Most careful, slower" },
-    { value: "xhigh", label: "Extra High", helper: CODEX_XHIGH_REASONING_HELPER_TEXT },
-  ];
-  const CODEX_SERVICE_TIER_OPTIONS: Array<{
-    value: CodexServiceTier;
-    label: string;
-    helper: string;
-  }> = [
-    { value: "standard", label: "Standard", helper: "Use normal Codex speed." },
-    { value: "fast", label: "Fast", helper: CODEX_FAST_MODE_HELPER_TEXT },
-  ];
-
   const ZIP_LAYOUT_INHERIT = "__inherit__";
   const ZIP_NOTES_INHERIT = "__inherit__";
+  const LIVE_READS_INHERIT = "__inherit__";
   const ZIP_AUTO_INHERIT = "__inherit__";
   const VOICE_PROVIDER_INHERIT = "__inherit__";
   const VOICE_ITALIC_NARRATION_INHERIT = "__inherit_italic_narration__";
 
-  interface BasicPayloadBody {
+  interface BasicPayloadBody extends AgentReasoningRetention {
+    expectedTypedFileTools?: string;
     displayName: string;
     agentType: PrimaryAgentType;
     show_reasoning: boolean;
-    preserve_reasoning: boolean;
+    preserve_reasoning?: boolean;
     tool_approval_mode?: "off" | "all" | null;
     memory_enabled?: boolean;
     /** SA-111 P4 (DL-111-11). */
@@ -792,7 +690,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     dms_enabled?: boolean;
     dm_senders?: DmSenderScope | { scope?: DmSenderScope; agentIds?: string[] } | null;
     dm_sender_agent_ids?: string[] | null;
-    jev_juice_skill_tool_hints?: boolean | null;
+    jev_juice_skill_tool_hints?: StoredJevSkillSessionMode;
     jev_juice_judge_tool?: boolean | null;
     jev_juice_memory_rerank?: boolean | null;
     jev_juice_memory_recall?: boolean | null;
@@ -843,7 +741,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     | "voice"
     | "permissions"
     | "approvals";
-  type CliSaveScope = "core" | "projects" | "instructions" | "permissions" | "tools";
   type AccessSaveScope =
     | "agent-skills"
     | "agent-artifacts"
@@ -856,25 +753,14 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     return Array.from(
       new Set(
         input
-          .map((entry) => sanitizeId(String(entry ?? "").trim()))
-          .filter((entry) => entry.length > 0),
+          .filter(isExactSavedAccessAgentId),
       ),
     );
   }
 
   function getArtifactAccessScope(artifact: ArtifactRow): "all" | "selected" {
     if (!isArtifactAgentUseEligible(artifact)) return "selected";
-    const direct =
-      typeof (artifact as any).agent_access_scope === "string"
-        ? String((artifact as any).agent_access_scope).trim().toLowerCase()
-        : "";
-    if (direct === "all" || direct === "selected") {
-      return direct;
-    }
-    const allowlist = normalizeAccessEntityIds(artifact.agent_allowlist);
-    if (allowlist.length > 0) return "selected";
-    if (artifact.agent_use_enabled === true) return "selected";
-    return "all";
+    return readArtifactAgentAccess(artifact).scope;
   }
 
   function getArtifactPlacementLabel(artifact: ArtifactRow): string {
@@ -918,7 +804,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     if (!isArtifactAgentUseEligible(artifact)) return false;
     if (artifact.agent_use_enabled === false) return false;
     if (getArtifactAccessScope(artifact) === "all") return true;
-    return normalizeAccessEntityIds(artifact.agent_allowlist).includes(entityId);
+    return readArtifactAgentAccess(artifact).ids.includes(entityId);
   }
 
   function markAccessSaved(_message: string) {
@@ -932,35 +818,71 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     }, 1800);
   }
 
-  async function loadAccessResources(force = false) {
-    if (!data?.user?.id) return;
+  let accessResourcesGeneration = 0;
+  type AccessReadScope = "all" | "commands";
+  let accessFullReadRequired = true;
+  let accessRefreshQueued: AccessReadScope | null = null;
+  function queueAccessRefresh(commandsOnly: boolean) {
+    // Invalidating a full read must retain its Artifact work, including first load and Retry.
+    const scope = commandsOnly && !accessFullReadRequired
+      ? "commands" : "all";
+    if (accessRefreshQueued !== "all") accessRefreshQueued = scope;
+    accessResourcesGeneration += 1;
+  }
+  function handleSlashCommandsUpdated() {
+    if (!accessResourcesLoaded && !accessResourcesLoading) return;
+    queueAccessRefresh(true);
+    flushAccessRefresh();
+  }
+  function flushAccessRefresh() {
+    if (settingsPanelAlive && accessRefreshQueued && !accessResourcesLoading && accessSaveState !== "saving") {
+      void loadAccessResources(true, accessRefreshQueued === "commands");
+    }
+  }
+  async function loadAccessResources(force = false, commandsOnly = false) {
+    if (!settingsPanelAlive || !data?.user?.id) return;
     if (accessResourcesLoaded && !force) return;
+    if (accessResourcesLoading || accessSaveState === "saving") {
+      if (force) queueAccessRefresh(commandsOnly);
+      return;
+    }
+    const userId = data.user.id;
+    const generation = ++accessResourcesGeneration;
+    const readScope: AccessReadScope = commandsOnly && !accessFullReadRequired ? "commands" : "all";
+    if (readScope === "all") accessFullReadRequired = true;
+    accessRefreshQueued = null;
 
     accessResourcesLoading = true;
     accessResourcesError = null;
     try {
       const [commands, artifacts] = await Promise.all([
-        slashCommandStore.getSlashCommands(data.user.id),
-        artifactService.getArtifacts(data.user.id),
+        slashCommandStore.getSlashCommands(userId, { required: true }),
+        readScope === "commands" ? Promise.resolve(null) : artifactService.getArtifacts(userId, { required: true }),
       ]);
+      if (!settingsPanelAlive || generation !== accessResourcesGeneration || data?.user?.id !== userId) return;
 
       accessSlashCommands = [...commands].sort((left, right) =>
         String(left.displayName || left.name || left.id).localeCompare(
           String(right.displayName || right.name || right.id),
         ),
       );
-      accessArtifacts = artifacts
+      if (artifacts) accessArtifacts = artifacts
         .filter((artifact) => isArtifactAgentUseEligible(artifact))
         .sort((left, right) =>
           String(left.name || left.id).localeCompare(String(right.name || right.id)),
         );
       accessResourcesLoaded = true;
+      if (readScope === "all") accessFullReadRequired = false;
     } catch (error) {
+      if (!settingsPanelAlive || generation !== accessResourcesGeneration || data?.user?.id !== userId) return;
       console.error("Failed to load access resources:", error);
       accessResourcesError =
         error instanceof Error ? error.message : "Failed to load access resources.";
     } finally {
-      accessResourcesLoading = false;
+      if (settingsPanelAlive) {
+        accessResourcesLoading = false;
+        flushAccessRefresh();
+      }
     }
   }
 
@@ -1011,6 +933,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       accessSaveState = "idle";
       accessSaveError =
         error instanceof Error ? error.message : "Failed to save command access.";
+    } finally {
+      flushAccessRefresh();
     }
   }
 
@@ -1063,6 +987,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       accessSaveState = "idle";
       accessSaveError =
         error instanceof Error ? error.message : "Failed to save artifact access.";
+    } finally {
+      flushAccessRefresh();
     }
   }
 
@@ -1089,7 +1015,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   /**
    * SA-113 P2 (DL-113-01): the other primary agents this one could accept DMs from.
    *
-   * Every other API/CLI primary is listed, not only the ones with DMs already on: the user
+   * Every other API primary is listed, not only the ones with DMs already on: the user
    * picks who may write, and turning that agent's own DMs on afterwards is a separate act.
    * A `DMs off` pill says which ones cannot write yet, so the list is honest rather than
    * quietly incomplete.
@@ -1098,14 +1024,24 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     agents
       .filter((agent) => {
         if (agent.id === selectedAgentId) return false;
-        const type = normalizePrimaryAgentType(agent);
-        return type === "api" || type === "cli";
+        // SA-139 R4: a leftover of a removed Primary type never runs, so it never sends a DM.
+        return isApiPrimaryAgentType(normalizePrimaryAgentType(agent));
       })
       .map((agent) => ({
         id: agent.id,
         name: agent.displayName || agent.id,
         dmsEnabled: resolveAgentDmsEnabled(agent),
       })),
+  );
+  /**
+   * This agent's Fabric & Utilities switch as the form holds it now, read by the server's own
+   * rule (every saved shape and alias the server accepts). Agent DMs and the Judge Juice
+   * Judgment Tool need it (Josh, 2026-10-24), so their cards lock while it is off.
+   */
+  const primaryFabricUtilitiesEnabled = $derived.by(
+    () =>
+      isNativeToolUiAvailable("fabric") &&
+      resolveAgentFabricUtilitiesEnabled({ provider_specific_settings: getProviderSpecificSettings("agent") }),
   );
   let detailLoading = $state(false);
   let hydrationInProgress = $state(false);
@@ -1125,9 +1061,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   let agentReadDeferredUi = $state(false);
   let primaryOwnedSaveInFlightUi = $state(false);
   let primaryOwnedWritePendingUi = $state(false);
-  type PrimaryCaptureSection = "basic" | "codex" | "claude" | "zip" | "mcp" | "assignment";
+  type PrimaryCaptureSection = "basic" | "zip" | "mcp" | "assignment";
   const primaryDeferredCaptures = new Map<string, Set<PrimaryCaptureSection>>();
-  const primaryCaptureWake = $state({ basic: 0, codex: 0, claude: 0, zip: 0, mcp: 0, assignment: 0 });
+  const primaryCaptureWake = $state({ basic: 0, zip: 0, mcp: 0, assignment: 0 });
   let primarySaveWaitExpiredUi = $state(false);
   let primaryReadWaitError = $state<string | null>(null);
   /**
@@ -1140,9 +1076,449 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
    */
   let memoryConflictBase: { agentId: string; base: BasicForm } | null = null;
   let memoryConflictResendUsed = false;
+  type ModelSelectionSave = { baseline: ModelSelectionBaseline | null; generation: number; hold: 'read' | 'conflict' | 'unknown' | null; earlierUnknown: boolean };
+  const modelSelectionSaves = new Map<string, ModelSelectionSave>();
+  const modelSelectionReadbacks = new Set<string>();
+  let primaryModelSelectionNotice = $state<string | null>(null);
+  let subagentModelSelectionNotice = $state<string | null>(null);
+  let primaryModelSelectionBlocked = $state(true);
+  let subagentModelSelectionBlocked = $state(true);
+  let primaryModelClearBlocked = $state(true);
+  let subagentModelClearBlocked = $state(true);
+  type InstructionsLeaf = 'customPrompt' | 'includeGlobalPrompt';
+  type InstructionsSave = { bases: Record<InstructionsLeaf, InstructionsBaseline | null>; holds: Record<InstructionsLeaf, 'read' | 'conflict' | 'unknown' | null>; generation: number; earlierUnknown: boolean };
+  const instructionsSaves = new Map<string, InstructionsSave>();
+  const instructionsReadbacks = new Set<string>();
+  let primaryInstructionsBaseline = $state.raw<InstructionsBaseline | null>(null);
+  let subagentInstructionsBaseline = $state.raw<InstructionsBaseline | null>(null);
+  let primaryInstructionsNotice = $state<string | null>(null);
+  let subagentInstructionsNotice = $state<string | null>(null);
+  let primaryInstructionsPromptBlocked = $state(true);
+  let primaryInstructionsIncludeBlocked = $state(true);
+  let subagentInstructionsPromptBlocked = $state(true);
+  let subagentInstructionsIncludeBlocked = $state(true);
+  type AutoCompactSave = { baseline: AutoCompactBaseline | null; generation: number; hold: 'read' | 'conflict' | 'unknown' | null; earlierUnknown: boolean };
+  const autoCompactSaves = new Map<string, AutoCompactSave>();
+  const autoCompactReadbacks = new Set<string>();
+  const memoryReadbacks = new Set<string>();
+  let autoCompactNotice = $state<string | null>(null);
+  let autoCompactBlocked = $state(true);
+  type TypedToolsSave = { baseline: TypedFileToolsBaseline | null; hold: 'read' | 'conflict' | 'unknown' | null; generation: number; earlierUnknown: boolean };
+  let typedToolsSaves = $state<Record<string, TypedToolsSave>>({});
+  class TypedToolsSaveRefusedError extends Error {}
+  function typedToolsSave(kind: NativeToolsScope, id: string): TypedToolsSave {
+    const key = `${kind}:${id}`;
+    if (!typedToolsSaves[key]) typedToolsSaves[key] = { baseline: null, hold: null, generation: 0, earlierUnknown: false };
+    return typedToolsSaves[key];
+  }
+  function typedToolsInfo(kind: NativeToolsScope) {
+    const id = kind === 'agent' ? selectedAgentId : selectedEditableSubagentId;
+    const saved = id ? typedToolsSaves[`${kind}:${id}`] : null;
+    const blocked = Boolean(id && (!saved?.baseline || saved.hold !== null));
+    let notice = saved?.hold === 'unknown' ? 'This choice is unconfirmed. Your draft is kept.' :
+      saved?.hold === 'conflict' ? 'The saved choice changed. Your draft was not saved.' : blocked ? 'Read the saved choice before changing it.' : null;
+    if (saved?.earlierUnknown && saved.hold !== 'unknown') notice = `An earlier save remains unconfirmed.${notice ? ` ${notice}` : ''}`;
+    return { blocked, notice, reloading: kind === 'agent' ? detailLoading : subagentDetailLoading };
+  }
+  function adoptTypedToolsRead(kind: NativeToolsScope, row: AgentRow | SubagentRow, baseline: TypedFileToolsBaseline | null, clean: boolean, takeSaved: boolean) {
+    const saved = typedToolsSave(kind, row.id);
+    const busy = kind === 'agent' ? basicSaves.busy(row.id) : subagentCoreSaves.busy(row.id);
+    if (busy || !takeSaved && (saved.hold === 'unknown' || saved.hold === 'conflict')) return;
+    if (baseline && (clean || takeSaved)) {
+      if (kind === 'agent' && basicPersistedForm) {
+        basicForm = withTypedFileToolsChoice(basicForm, baseline.value);
+        basicPersistedForm = withTypedFileToolsChoice(basicPersistedForm, baseline.value);
+        basicPersistedSignature = makeBasicSignature(basicPersistedForm);
+      } else if (kind === 'subagent' && subagentPersistedForm) {
+        subagentForm = withTypedFileToolsChoice(subagentForm, baseline.value);
+        subagentPersistedForm = withTypedFileToolsChoice(subagentPersistedForm, baseline.value);
+        subagentPersistedSignature = makeSubagentFormSignature(subagentPersistedForm);
+      }
+      saved.baseline = baseline; saved.hold = null;
+    } else if (!clean && saved.baseline && baseline?.token !== saved.baseline.token) saved.hold = 'conflict';
+    else if (clean && !baseline) { saved.baseline = null; saved.hold = 'read'; }
+  }
+  function captureTypedTools<T extends object, F extends { provider_specific_settings: Record<string, any> | null }>(kind: NativeToolsScope, id: string, body: T, nextForm: F, baseForm: F) {
+    if (typedFileToolsBodyValue(body) === undefined) return { body, nextForm };
+    const saved = typedToolsSave(kind, id);
+    if (saved.baseline && saved.hold === null) return { body: withExpectedTypedFileTools(body, saved.baseline), nextForm };
+    const before = typedFileToolsBodyValue(baseForm);
+    return { body: withoutTypedFileToolsChoice(body), nextForm: before === undefined ? withoutTypedFileToolsChoice(nextForm) : withTypedFileToolsChoice(nextForm, before) };
+  }
+  function beginTypedToolsWrite(kind: NativeToolsScope, id: string, body: object) {
+    if (typedFileToolsBodyValue(body) === undefined) return null;
+    const saved = typedToolsSave(kind, id);
+    const expected = (body as { expectedTypedFileTools?: string }).expectedTypedFileTools;
+    if (!saved.baseline || saved.hold !== null || expected !== saved.baseline.token) throw new TypedToolsSaveRefusedError('This choice was not sent. Use Saved Choice and make a new choice.');
+    saved.generation += 1;
+    return saved.baseline;
+  }
+  function adoptTypedToolsReceipt(kind: NativeToolsScope, id: string, body: object, original: TypedFileToolsBaseline | null, ack: unknown) {
+    const expected = (body as { expectedTypedFileTools?: string }).expectedTypedFileTools;
+    const next = adoptTypedFileToolsAck(original, expected, typedFileToolsBodyValue(body), ack);
+    if (!next) return false;
+    const saved = typedToolsSave(kind, id);
+    if (saved.baseline?.token === expected) {
+      saved.baseline = next; saved.hold = null; saved.generation += 1;
+      if (kind === 'agent' && selectedAgentId === id && basicPersistedForm) {
+        basicPersistedForm = withTypedFileToolsChoice(basicPersistedForm, next.value);
+        basicPersistedSignature = makeBasicSignature(basicPersistedForm);
+      } else if (kind === 'subagent' && selectedEditableSubagentId === id && subagentPersistedForm) {
+        subagentPersistedForm = withTypedFileToolsChoice(subagentPersistedForm, next.value);
+        subagentPersistedSignature = makeSubagentFormSignature(subagentPersistedForm);
+      }
+    }
+    return true;
+  }
+  function refuseTypedToolsWrite(kind: NativeToolsScope, id: string, knownNoWrite: boolean) {
+    const saved = typedToolsSave(kind, id); saved.generation += 1;
+    saved.hold = knownNoWrite ? 'conflict' : 'unknown'; saved.earlierUnknown ||= !knownNoWrite;
+  }
+  async function useSavedTypedTools(kind: NativeToolsScope) {
+    const id = kind === 'agent' ? selectedAgentId : selectedEditableSubagentId;
+    if (!id || (kind === 'agent' ? basicSaves.busy(id) : subagentCoreSaves.busy(id))) return;
+    if (kind === 'agent') await hydrateAgent(id, undefined, true, false, false, false, false, false, true);
+    else await hydrateSubagent(id, undefined, false, false, true);
+  }
+  type TtsSave = { baseline: ConfiguredTtsBaseline | null; generation: number; hold: 'read' | 'conflict' | 'unknown' | null; earlierUnknown: boolean };
+  const ttsSaves = new Map<string, TtsSave>();
+  const ttsReadbacks = new Set<string>();
+  let ttsBlocked = $state(true);
+  let ttsNotice = $state<string | null>(null);
+  const ttsFormFields = ['provider', 'model', 'voiceId', 'profileId'] as const;
+  function ttsSave(id: string): TtsSave {
+    let saved = ttsSaves.get(id);
+    if (!saved) { saved = { baseline: null, generation: 0, hold: null, earlierUnknown: false }; ttsSaves.set(id, saved); }
+    return saved;
+  }
+  function syncTtsNotice() {
+    const saved = selectedAgentId ? ttsSave(selectedAgentId) : null;
+    ttsBlocked = !saved?.baseline || saved.hold !== null;
+    ttsNotice = saved?.hold === 'unknown' ? 'This reply voice save is unconfirmed. Your draft is kept. Use Saved Reply Voice reads the current selection.' :
+      saved?.hold === 'conflict' ? 'Reply voice changed while you were editing. Your draft was not saved. Use Saved Reply Voice, then make a new choice.' :
+      !saved?.baseline ? 'Read the saved reply voice before another voice change.' : null;
+    if (saved?.earlierUnknown && saved.hold !== 'unknown') ttsNotice = `An earlier reply voice save remains unconfirmed.${ttsNotice ? ` ${ttsNotice}` : ''}`;
+  }
+  function guardVoiceChoice<T extends (...args: any[]) => any>(callback: T): T { return guardPrimaryChoice(((...args: Parameters<T>) => { if (!ttsBlocked) return callback(...args); }) as T); }
+  function sameTtsForm(left: VoiceProfileForm, right: VoiceProfileForm) { return ttsFormFields.every(field => left[field] === right[field]); }
+  function adoptTtsRead(row: AgentRow, baseline: ConfiguredTtsBaseline | null, clean: boolean, takeSaved: boolean) {
+    const saved = ttsSave(row.id);
+    if (!basicPersistedForm || basicSaves.busy(row.id)) return;
+    if (!takeSaved && (saved.hold === 'unknown' || saved.hold === 'conflict')) { syncTtsNotice(); return; }
+    if (baseline && (clean || takeSaved)) {
+      const incoming = normaliseBasicForm(row).voice_profile;
+      const merge = (voice: VoiceProfileForm) => ({ ...voice, ...Object.fromEntries(ttsFormFields.map(field => [field, incoming[field]])) });
+      basicForm = { ...basicForm, voice_profile: merge(basicForm.voice_profile) };
+      basicPersistedForm = { ...basicPersistedForm, voice_profile: merge(basicPersistedForm.voice_profile) };
+      basicPersistedSignature = makeBasicSignature(basicPersistedForm);
+      saved.baseline = baseline; saved.hold = null;
+    } else if (!clean && saved.baseline && baseline?.token !== saved.baseline.token) saved.hold = 'conflict';
+    else if (clean && !baseline) saved.baseline = null;
+    syncTtsNotice();
+  }
+  function captureBasicTts(id: string, body: Partial<BasicPayloadBody>, nextForm: BasicForm, baseForm: BasicForm) {
+    if (!Object.hasOwn(body, 'voice_profile')) return { body, nextForm, expectedTtsSelection: undefined as string | undefined };
+    const saved = ttsSave(id);
+    if (saved.baseline?.id === id && saved.hold === null) return { body, nextForm, expectedTtsSelection: saved.baseline.token };
+    const nextBody = { ...body }; delete nextBody.voice_profile;
+    return { body: nextBody, nextForm: { ...nextForm, voice_profile: baseForm.voice_profile }, expectedTtsSelection: undefined };
+  }
+  function tryTtsReadback() {
+    const id = selectedAgentId;
+    if (!settingsPanelAlive || !id || selectedEntity?.kind !== 'agent' || !ttsReadbacks.has(id) || detailLoading || basicSaves.busy(id)) return;
+    ttsReadbacks.delete(id); void hydrateAgent(id, undefined, true);
+  }
+  async function useSavedTts() { const id = selectedAgentId; if (id && !basicSaves.busy(id)) await hydrateAgent(id, undefined, true, false, false, false, true); }
+
+  function autoCompactSave(id: string): AutoCompactSave {
+    let saved = autoCompactSaves.get(id);
+    if (!saved) { saved = { baseline: null, generation: 0, hold: null, earlierUnknown: false }; autoCompactSaves.set(id, saved); }
+    return saved;
+  }
+  function syncAutoCompactNotice() {
+    const saved = selectedAgentId ? autoCompactSave(selectedAgentId) : null;
+    autoCompactBlocked = !saved?.baseline || saved.hold !== null;
+    let message: string | null = null;
+    if (saved?.hold === 'unknown') message = 'This Auto Compact save is unconfirmed. Your draft is kept. Use Saved Auto Compact reads the current values and replaces this draft.';
+    else if (saved?.hold === 'conflict') message = 'Auto Compact changed while you were editing. Your draft was not saved. Use Saved Auto Compact reads the current values; make a new choice to continue.';
+    else if (!saved?.baseline) message = saved?.hold === 'read' ? 'Auto Compact was saved. Read its current values before another change.' : 'Read the saved Auto Compact settings before editing them.';
+    if (saved?.earlierUnknown && saved.hold !== 'unknown') message = `An earlier Auto Compact save remains unconfirmed.${message ? ` ${message}` : ''}`;
+    autoCompactNotice = message;
+  }
+  function sameAutoCompactCommon(left: AgentAutoCompactSettings, right: AgentAutoCompactSettings) {
+    return AUTO_COMPACT_COMMON_FIELDS.every(field => left[field] === right[field]);
+  }
+  /** A whole human block must never send common leaves from before a clean agent refresh. */
+  function adoptAutoCompactRead(row: AgentRow, baseline: AutoCompactBaseline | null, cleanCommon: boolean, cleanAdvanced: boolean, takeSaved = false) {
+    const saved = autoCompactSave(row.id);
+    if (!basicPersistedForm || basicSaves.busy(row.id)) return;
+    if (!takeSaved && (saved.hold === 'unknown' || saved.hold === 'conflict')) { syncAutoCompactNotice(); return; }
+    if (baseline && (cleanCommon || takeSaved)) {
+      const incoming = normalizeAgentAutoCompactSettings(row.auto_compact_settings);
+      const merge = (current: AgentAutoCompactSettings) => cleanAdvanced || takeSaved ? incoming : {
+        ...current, ...Object.fromEntries(AUTO_COMPACT_COMMON_FIELDS.map(field => [field, incoming[field]]))
+      } as AgentAutoCompactSettings;
+      basicForm = { ...basicForm, auto_compact_settings: merge(basicForm.auto_compact_settings) };
+      basicPersistedForm = { ...basicPersistedForm, auto_compact_settings: merge(basicPersistedForm.auto_compact_settings) };
+      basicPersistedSignature = makeBasicSignature(basicPersistedForm);
+      saved.baseline = baseline;
+      saved.hold = null;
+      if (takeSaved && basicSaveError?.includes('Auto Compact')) { basicSaveError = null; basicSaveState = 'idle'; }
+    } else if (!cleanCommon && saved.baseline && baseline?.token !== saved.baseline.token) {
+      saved.hold = 'conflict';
+    } else if (cleanCommon && !baseline) {
+      saved.baseline = null;
+    }
+    syncAutoCompactNotice();
+  }
+  function captureBasicAutoCompact(id: string, body: Partial<BasicPayloadBody>, nextForm: BasicForm, baseForm: BasicForm) {
+    const voice = captureBasicTts(id, body, nextForm, baseForm); body = voice.body; nextForm = voice.nextForm;
+    const expectedTtsSelection = voice.expectedTtsSelection;
+    if (!Object.hasOwn(body, 'auto_compact_settings')) return { body, nextForm, expectedTtsSelection, expectedAutoCompact: undefined as string | undefined };
+    const saved = autoCompactSave(id);
+    if (saved.baseline?.id === id && saved.hold === null) return { body, nextForm, expectedTtsSelection, expectedAutoCompact: saved.baseline.token };
+    const nextBody = { ...body };
+    delete nextBody.auto_compact_settings;
+    return { body: nextBody, nextForm: { ...nextForm, auto_compact_settings: baseForm.auto_compact_settings }, expectedTtsSelection, expectedAutoCompact: undefined };
+  }
+  function tryAutoCompactReadback() {
+    const id = selectedAgentId;
+    if (!settingsPanelAlive || !id || selectedEntity?.kind !== 'agent' || !autoCompactReadbacks.has(id) || detailLoading || basicSaves.busy(id)) return;
+    autoCompactReadbacks.delete(id);
+    void hydrateAgent(id, undefined, true);
+  }
+  function tryMemoryReadback() {
+    const id = selectedAgentId;
+    if (!settingsPanelAlive || !id || selectedEntity?.kind !== 'agent' || !memoryReadbacks.has(id) || detailLoading || basicSaves.busy(id)) return;
+    memoryReadbacks.delete(id);
+    void hydrateAgent(id, undefined, true);
+  }
+  async function useSavedAutoCompact() {
+    const id = selectedAgentId;
+    if (!id || basicSaves.busy(id)) return;
+    await hydrateAgent(id, undefined, true, false, false, true);
+  }
+
+  function instructionsSave(kind: ModelSelectionKind, id: string): InstructionsSave {
+    const key = `${kind}:${id}`;
+    let saved = instructionsSaves.get(key);
+    if (!saved) { saved = { bases: { customPrompt: null, includeGlobalPrompt: null }, holds: { customPrompt: null, includeGlobalPrompt: null }, generation: 0, earlierUnknown: false }; instructionsSaves.set(key, saved); }
+    return saved;
+  }
+  function syncInstructionsNotices() {
+    for (const kind of ['agent', 'subagent'] as const) {
+      const id = kind === 'agent' ? selectedAgentId : selectedEditableSubagentId;
+      const saved = id ? instructionsSave(kind, id) : null;
+      const blocked = (leaf: InstructionsLeaf) => !saved?.bases[leaf] || saved.holds[leaf] !== null;
+      let message: string | null = null;
+      if (saved && Object.values(saved.holds).includes('unknown')) message = 'This instructions save is unconfirmed. Your draft is kept. Use Saved Instructions reads the current values and replaces this instructions draft.';
+      else if (saved && Object.values(saved.holds).includes('conflict')) message = 'Saved instructions changed while you were editing. Your draft was not saved. Use Saved Instructions reads the current values; make a new choice to continue.';
+      else if (blocked('customPrompt') || blocked('includeGlobalPrompt')) message = 'Read the saved instructions before editing them.';
+      if (saved?.earlierUnknown && !Object.values(saved.holds).includes('unknown')) message = `An earlier instructions save remains unconfirmed.${message ? ` ${message}` : ''}`;
+      if (kind === 'agent') {
+        primaryInstructionsBaseline = saved?.bases.customPrompt ?? null;
+        primaryInstructionsPromptBlocked = blocked('customPrompt'); primaryInstructionsIncludeBlocked = blocked('includeGlobalPrompt'); primaryInstructionsNotice = message;
+      } else {
+        subagentInstructionsBaseline = saved?.bases.customPrompt ?? null;
+        subagentInstructionsPromptBlocked = blocked('customPrompt'); subagentInstructionsIncludeBlocked = blocked('includeGlobalPrompt'); subagentInstructionsNotice = message;
+      }
+    }
+  }
+  function adoptInstructionsRead(kind: ModelSelectionKind, row: Record<string, any>, baseline: InstructionsBaseline | null, cleanPrompt: boolean, cleanInclude: boolean, takeSaved = false) {
+    const saved = instructionsSave(kind, row.id);
+    if (takeSaved && !baseline) { syncInstructionsNotices(); return; }
+    const incoming = kind === 'agent' ? normaliseBasicForm(row as AgentRow) : normaliseSubagentForm(row as SubagentRow);
+    for (const [leaf, clean] of [['customPrompt', cleanPrompt], ['includeGlobalPrompt', cleanInclude]] as const) {
+      if (!clean || !takeSaved && (saved.holds[leaf] === 'conflict' || saved.holds[leaf] === 'unknown')) continue;
+      if (leaf === 'customPrompt') {
+        if (kind === 'agent') { promptValue = typeof row.system_prompt === 'string' ? row.system_prompt : ''; promptPersistedSignature = promptValue; }
+        else if (subagentPersistedForm) {
+          const value = typeof row.system_prompt === 'string' ? row.system_prompt : '';
+          subagentForm = { ...subagentForm, system_prompt: value };
+          subagentPersistedForm = { ...subagentPersistedForm, system_prompt: value };
+        }
+      } else if (kind === 'agent' && basicPersistedForm) {
+        basicForm = { ...basicForm, include_global_prompt: incoming.include_global_prompt };
+        basicPersistedForm = { ...basicPersistedForm, include_global_prompt: incoming.include_global_prompt };
+        basicPersistedSignature = makeBasicSignature(basicPersistedForm);
+      } else if (kind === 'subagent' && subagentPersistedForm) {
+        subagentForm = { ...subagentForm, include_global_prompt: incoming.include_global_prompt };
+        subagentPersistedForm = { ...subagentPersistedForm, include_global_prompt: incoming.include_global_prompt };
+      }
+      // Keep stable opaque identity when only the other leaf changed.
+      if (!baseline || baseline.type !== saved.bases[leaf]?.type || baseline.tokens[leaf] !== saved.bases[leaf]?.tokens[leaf]) saved.bases[leaf] = baseline;
+      if (baseline) saved.holds[leaf] = null;
+    }
+    if (kind === 'subagent' && subagentPersistedForm) subagentPersistedSignature = makeSubagentFormSignature(subagentPersistedForm);
+    if (takeSaved) { if (kind === 'agent') agentPromptEditorOpen = false; else subagentPromptEditorOpen = false; }
+    syncInstructionsNotices();
+  }
+  function captureInstructions<T extends Record<string, any>, F extends Record<string, any>>(kind: ModelSelectionKind, id: string, body: T, nextForm: F, baseForm: F, editorBase?: InstructionsBaseline | null) {
+    const nextBody = { ...body };
+    let resultForm = nextForm;
+    const expectedInstructions: Partial<InstructionsRevisions> = {};
+    const saved = instructionsSave(kind, id);
+    for (const [field, leaf] of [['system_prompt', 'customPrompt'], ['include_global_prompt', 'includeGlobalPrompt']] as const) {
+      if (!Object.hasOwn(nextBody, field)) continue;
+      const baseline = leaf === 'customPrompt' && editorBase !== undefined ? editorBase : saved.bases[leaf];
+      const expected = instructionsExpectedForWrites(baseline, { [field]: nextBody[field] });
+      if (!baseline || baseline.kind !== kind || baseline.id !== id || saved.holds[leaf] !== null || !expected) {
+        delete nextBody[field];
+        resultForm = { ...resultForm, [field]: baseForm[field] };
+      } else Object.assign(expectedInstructions, expected);
+    }
+    return { body: nextBody, nextForm: resultForm, expectedInstructions: Object.keys(expectedInstructions).length ? expectedInstructions : undefined };
+  }
+  function beginInstructionsWrite(kind: ModelSelectionKind, id: string, body: Record<string, unknown>, expected?: Partial<InstructionsRevisions>) {
+    if (!namesInstructions(body)) return;
+    const saved = instructionsSave(kind, id);
+    for (const [field, leaf] of [['system_prompt', 'customPrompt'], ['include_global_prompt', 'includeGlobalPrompt']] as const) {
+      if (Object.hasOwn(body, field) && (!expected?.[leaf] || saved.holds[leaf] !== null)) throw new InstructionsSaveRefusedError('This instructions change was not sent. Use Saved Instructions and make a new choice.');
+    }
+    saved.generation += 1;
+  }
+  /** HTTP status alone does not establish whether an issued route saved before readback failed. */
+  function instructionsKnownNoSave(status: unknown, code: unknown): boolean {
+    return status === 400 && ['instructions_base_required', 'model_selection_base_required', 'cli_reasoning_base_required', 'auto_compact_base_required', 'tts_selection_base_required'].includes(String(code)) ||
+      status === 409 && ['instructions_settings_changed', 'model_selection_settings_changed', 'cli_reasoning_settings_changed', 'auto_compact_settings_changed', 'memory_settings_changed', 'cli_promotion_changed', 'tts_selection_changed', 'tts_speech_to_speech_locked', 'tts_model_selection_unavailable', 'model_preset_unavailable', 'cli_selection_changes_unadopted_native_controls', 'MANAGED_PROFILE_SOURCE_CHANGED'].includes(String(code));
+  }
+  function settleInstructionsWrite(kind: ModelSelectionKind, id: string, body: Record<string, unknown>, outcome: 'read' | 'conflict' | 'unknown') {
+    if (!namesInstructions(body)) return;
+    const saved = instructionsSave(kind, id);
+    saved.generation += 1;
+    for (const [field, leaf] of [['system_prompt', 'customPrompt'], ['include_global_prompt', 'includeGlobalPrompt']] as const) {
+      if (Object.hasOwn(body, field)) { saved.holds[leaf] = outcome; if (outcome === 'read') saved.bases[leaf] = null; }
+    }
+    saved.earlierUnknown ||= outcome === 'unknown';
+    if (outcome !== 'unknown') instructionsReadbacks.add(`${kind}:${id}`);
+    syncInstructionsNotices();
+  }
+  function tryInstructionsReadbacks() {
+    for (const kind of ['agent', 'subagent'] as const) {
+      const id = kind === 'agent' ? selectedAgentId : selectedEditableSubagentId;
+      if (!settingsPanelAlive || !id || selectedEntity?.kind !== kind || !instructionsReadbacks.has(`${kind}:${id}`) ||
+        (kind === 'agent' ? detailLoading || basicSaves.busy(id) || promptSaves.busy(id) : subagentDetailLoading || subagentCoreSaves.busy(id))) continue;
+      instructionsReadbacks.delete(`${kind}:${id}`);
+      if (kind === 'agent') void hydrateAgent(id, undefined, true); else void hydrateSubagent(id);
+    }
+  }
+  async function useSavedInstructions(kind: ModelSelectionKind) {
+    const id = kind === 'agent' ? selectedAgentId : selectedEditableSubagentId;
+    if (!id || (kind === 'agent' ? basicSaves.busy(id) || promptSaves.busy(id) : subagentCoreSaves.busy(id))) return;
+    if (kind === 'agent') await hydrateAgent(id, undefined, true, false, true); else await hydrateSubagent(id, undefined, false, true);
+  }
+
+  function modelSelectionSave(kind: ModelSelectionKind, id: string): ModelSelectionSave {
+    const key = `${kind}:${id}`;
+    let saved = modelSelectionSaves.get(key);
+    if (!saved) { saved = { baseline: null, generation: 0, hold: null, earlierUnknown: false }; modelSelectionSaves.set(key, saved); }
+    return saved;
+  }
+
+  function syncModelSelectionNotices() {
+    for (const kind of ['agent', 'subagent'] as const) {
+      const id = kind === 'agent' ? selectedAgentId : selectedEditableSubagentId;
+      const saved = id ? modelSelectionSave(kind, id) : null;
+      const validBase = Boolean(saved?.baseline);
+      // SA-139 R5: a leftover CLI Subagent shows no model picker (it is delete-only), so only the
+      // live API type needs the guard.
+      const needsGuard = kind === 'agent'
+        ? ['api', 'cli'].includes(basicForm.agentType) || ['api', 'cli'].includes(basicPersistedForm?.agentType ?? '')
+        : subagentForm.subagentType === 'api' || subagentPersistedForm?.subagentType === 'api';
+      if (!needsGuard) {
+        if (kind === 'agent') { primaryModelSelectionNotice = null; primaryModelSelectionBlocked = false; primaryModelClearBlocked = true; }
+        else { subagentModelSelectionNotice = null; subagentModelSelectionBlocked = false; subagentModelClearBlocked = true; }
+        continue;
+      }
+      let message: string | null = null;
+      if (saved?.hold === 'unknown') message = 'This model save is unconfirmed. Your choice is kept. Use Saved Model reads the current choice and replaces only this model draft.';
+      else if (saved?.hold === 'conflict') message = 'The saved model changed while you were editing. Your choice was not saved. Use Saved Model reads the current choice and replaces only this model draft.';
+      else if (!validBase) message = saved?.hold === 'read' ? 'The model was saved. Read its current selection before choosing another model.' : 'The original model and native selection source is unavailable. Read it before choosing another model.';
+      const blocked = !validBase || saved?.hold !== null;
+      if (saved?.earlierUnknown && saved.hold !== 'unknown') message = `An earlier model save remains unconfirmed.${message ? ` ${message}` : ''}`;
+      if (kind === 'agent') { primaryModelSelectionNotice = message; primaryModelSelectionBlocked = blocked; primaryModelClearBlocked = blocked; }
+      else { subagentModelSelectionNotice = message; subagentModelSelectionBlocked = blocked; subagentModelClearBlocked = blocked; }
+    }
+  }
+
+  function adoptModelSelectionRead(kind: ModelSelectionKind, row: Record<string, any>, baseline: ModelSelectionBaseline | null, canAdopt: boolean) {
+    const saved = modelSelectionSave(kind, row.id);
+    if (canAdopt) {
+      const incoming = kind === 'agent' ? normaliseBasicForm(row as AgentRow) : normaliseSubagentForm(row as SubagentRow);
+      if (kind === 'agent' && basicPersistedForm) {
+        basicForm = withModelSelection(kind, basicForm, incoming);
+        basicPersistedForm = withModelSelection(kind, basicPersistedForm, incoming);
+        basicPersistedSignature = makeBasicSignature(basicPersistedForm);
+        syncSelectedModelFromAgent();
+      } else if (kind === 'subagent' && subagentPersistedForm) {
+        subagentForm = withModelSelection(kind, subagentForm, incoming);
+        subagentPersistedForm = withModelSelection(kind, subagentPersistedForm, incoming);
+        subagentPersistedSignature = makeSubagentFormSignature(subagentPersistedForm);
+        syncSelectedModelFromSubagent();
+      }
+      saved.baseline = baseline;
+      if (baseline) { saved.hold = null; modelSelectionReadbacks.delete(`${kind}:${row.id}`); }
+    } else if (saved.baseline && baseline?.revision !== saved.baseline.revision && saved.hold !== 'unknown' &&
+      (['api', 'cli'].includes(saved.baseline.type) || ['api', 'cli'].includes(kind === 'agent' ? basicForm.agentType : subagentForm.subagentType))) {
+      saved.hold = 'conflict';
+    }
+    syncModelSelectionNotices();
+  }
+
+  function captureModelSelection<T extends Record<string, any>, F extends Record<string, any>>(kind: ModelSelectionKind, id: string, body: T, nextForm: F, baseForm: F) {
+    if (!isModelSelectionWrite(kind, body)) return { body, nextForm, expectedModelSelection: undefined as string | undefined };
+    const typeField = kind === 'agent' ? 'agentType' : 'subagentType';
+    if (!['api', 'cli'].includes(baseForm[typeField]) && !['api', 'cli'].includes(nextForm[typeField])) return { body, nextForm, expectedModelSelection: undefined };
+    const saved = modelSelectionSave(kind, id);
+    if (saved.baseline && saved.hold === null) {
+      return { body, nextForm, expectedModelSelection: saved.baseline.revision };
+    }
+    const nextBody = { ...body };
+    if (nextForm[kind === 'agent' ? 'agentType' : 'subagentType'] !== baseForm[kind === 'agent' ? 'agentType' : 'subagentType']) return { body: {} as T, nextForm: baseForm, expectedModelSelection: undefined };
+    for (const field of kind === 'agent' ? MODEL_SELECTION_FIELDS : MODEL_SELECTION_IDENTITY_FIELDS) delete nextBody[field];
+    if (kind === 'agent' && 'provider_specific_settings' in nextBody) {
+      const own = Object.fromEntries(Object.entries(nextBody.provider_specific_settings ?? {}).filter(([key]) => isAgentRuntimeSettingKey(key)));
+      if (Object.keys(own).length) (nextBody as Record<string, unknown>).provider_specific_settings = own;
+      else delete nextBody.provider_specific_settings;
+    }
+    return { body: nextBody, nextForm: withModelSelection(kind, nextForm, baseForm), expectedModelSelection: undefined };
+  }
+
+  function ownsModelSelectionBase(baseline: ModelSelectionBaseline | null, token: unknown) {
+    return typeof token === 'string' && Boolean(baseline && baseline.revision === token);
+  }
+
+  async function useSavedModelSelection(kind: ModelSelectionKind) {
+    const id = kind === 'agent' ? selectedAgentId : selectedEditableSubagentId;
+    if (!id || (kind === 'agent' ? basicSaves.busy(id) : subagentCoreSaves.busy(id))) return;
+    if (kind === 'agent') await hydrateAgent(id, undefined, false, true);
+    else await hydrateSubagent(id, undefined, true);
+  }
+
+  function tryModelSelectionReadbacks() {
+    for (const kind of ['agent', 'subagent'] as const) {
+      const id = kind === 'agent' ? selectedAgentId : selectedEditableSubagentId;
+      if (!settingsPanelAlive || !id || selectedEntity?.kind !== kind || !modelSelectionReadbacks.has(`${kind}:${id}`) ||
+        (kind === 'agent' ? detailLoading || basicSaves.busy(id)
+          : subagentDetailLoading || subagentCoreSaves.busy(id))) continue;
+      modelSelectionReadbacks.delete(`${kind}:${id}`);
+      if (kind === 'agent') void hydrateAgent(id, undefined, true);
+      else void hydrateSubagent(id);
+    }
+  }
+
+  $effect(() => {
+    basicForm.agentType;
+    subagentForm.subagentType;
+    untrack(syncModelSelectionNotices);
+  });
   const MEMORY_CONFLICT_RETRY_MESSAGE =
     "This agent's memory settings changed while you were editing them, so your change was not saved. Retry reads them again and keeps your edits.";
   const primarySettingsReadWaiting = $derived(detailLoading || agentReadDeferredUi || primaryReadWaitError !== null || primarySaveWaitExpiredUi || primaryOwnedSaveInFlightUi);
+  const primaryDeferredDraftOnly = $derived.by(() => agentReadDeferredUi && !detailLoading && primaryReadWaitError === null &&
+    !primarySaveWaitExpiredUi && !primaryOwnedWritePendingUi && !primaryOwnedSaveInFlightUi &&
+    primaryModelSelectionNotice === null && ![basicSaveError, zipSaveError, mcpSaveError, assignmentSaveError].some(Boolean) &&
+    hydratedAgentId === selectedAgentId && Object.values(agentSectionsAtRest()).some(atRest => !atRest));
   const primaryCaptureBlocked = $derived(detailLoading || primaryReadWaitError !== null || primaryOwnedWritePendingUi);
   /**
    * BL-912: whether each Primary saver has a save queued or on its way. The basic one counts the
@@ -1154,17 +1530,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   const zipSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
   const mcpSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
   const cliToolSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
-  const codexSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
-  const claudeSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
   const assignmentSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
 
   let basicForm = $state<BasicForm>(createDefaultBasicForm());
-
-  $effect(() => {
-    if (!basicForm.show_reasoning && basicForm.preserve_reasoning) {
-      basicForm.preserve_reasoning = false;
-    }
-  });
 
   let basicPersistedSignature = $state<string | null>(null);
   /**
@@ -1192,31 +1560,48 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   let zipForm = $state<ZipForm>(createDefaultZipForm());
   let zipPersistedSignature = $state<string | null>(null);
   /**
-   * BL-855: the four sections below as they were loaded or last saved. A save sends only what
-   * differs from them (`agentSettingsSectionSaves.ts`, and `diffAgentBlockWithGroups` for the Codex
-   * and Claude blocks), so a copy that the chat bar or a second Settings window has since changed is
-   * never written back over that change. A failed save leaves them as they were. Not reactive,
-   * like `basicPersistedForm`: each is set and cleared beside its `...PersistedSignature`, and no
-   * effect reads what it writes. Codex and Claude: `null` while the agent has no such block yet
-   * (its first save then writes the whole block).
+   * BL-855: the two sections below as they were loaded or last saved. A save sends only what
+   * differs from them (`agentSettingsSectionSaves.ts`), so a copy that the chat bar or a second
+   * Settings window has since changed is never written back over that change. A failed save
+   * leaves them as they were. Not reactive, like `basicPersistedForm`: each is set and cleared
+   * beside its `...PersistedSignature`, and no effect reads what it writes.
    */
   let zipPersistedPayload: ZipPayloadBody | null = null;
-  let codexPersistedBlock: CodexAgentSettings | null = null;
-  let claudePersistedBlock: ClaudeAgentSettings | null = null;
   let mcpPersistedValues: McpSectionValues | null = null;
+  let primaryMcpBases = $state<Record<string, ExpectedMcpSettings>>({});
+  let primaryMcpHolds = $state<Record<string, 'read' | 'conflict' | 'unknown'>>({});
+  const primaryMcpVersions = new Map<string, number>();
+  function capturePrimaryMcpBody<T extends object>(body: T) {
+    return untrack(() => {
+      const id = selectedAgentId;
+      if (!mcpSettingsLeaves(body).length) return body;
+      if (!id || primaryMcpHolds[id]) throw new Error('Your Tool Settings draft is kept. Use Saved Tool Settings before another choice.');
+      let captured;
+      try { captured = withExpectedMcpSettings(body, primaryMcpBases[id]); }
+      catch (error) { primaryMcpHolds = { ...primaryMcpHolds, [id]: 'read' }; throw error; }
+      primaryMcpVersions.set(id, (primaryMcpVersions.get(id) ?? 0) + 1);
+      return captured;
+    });
+  }
+  function adoptPrimaryMcpAck(id: string, expected: ExpectedMcpSettings | undefined, ack: unknown) {
+    if (!ack || typeof ack !== 'object' || !('revisions' in ack)) return false;
+    const revisions = readMcpSettingsRevisions(JSON.stringify(ack.revisions));
+    if (!expected || !revisions) return false;
+    const base = primaryMcpBases[id];
+    if (!base || Object.keys(expected).some(field => base[field as keyof ExpectedMcpSettings] !== expected[field as keyof ExpectedMcpSettings] || !revisions[field as keyof ExpectedMcpSettings])) return false;
+    primaryMcpBases = { ...primaryMcpBases, [id]: { ...base, ...Object.fromEntries(Object.keys(expected).map(field => [field, revisions[field as keyof ExpectedMcpSettings]])) } };
+    return true;
+  }
+  async function useSavedMcpSettings() {
+    const id = selectedAgentId;
+    if (id && !mcpSaves.busy(id) && !zipSaves.busy(id)) await hydrateAgent(id, undefined, false, false, false, false, false, true);
+  }
+
   let zipValidationError = $state<string | null>(null);
   let zipSaveState = $state<SaveState>("idle");
   let zipSaveError = $state<string | null>(null);
   let zipLastSaved = $state<Date | null>(null);
 
-  let codexForm = $state(createDefaultCodexForm());
-  let codexPersistedSignature = $state<string | null>(null);
-  let codexSaveState = $state<SaveState>("idle");
-  let codexSaveError = $state<string | null>(null);
-  let codexLastSaved = $state<Date | null>(null);
-  let codexSaveScope = $state<CliSaveScope>("core");
-  let codexAdvancedOpen = $state(false);
-  let codexConfigOverridesOpen = $state(false);
   let primaryWebSearchDefaultsOpen = $state(false);
   let primaryAgentBrowserDefaultsOpen = $state(false);
   let primarySkillsAccessOpen = $state(true);
@@ -1227,46 +1612,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   let subagentAgentBrowserDefaultsOpen = $state(false);
   let subagentSkillsAccessOpen = $state(true);
   let subagentArtifactsAccessOpen = $state(false);
-  let codexDirDraft = $state("");
-  let codexEnableDraft = $state("");
-  let codexDisableDraft = $state("");
-  let subagentCodexForm = $state(createDefaultCodexForm());
-  let subagentCodexPersistedSignature = $state<string | null>(null);
-  let subagentCodexSaveState = $state<SaveState>("idle");
-  let subagentCodexSaveError = $state<string | null>(null);
-  let subagentCodexLastSaved = $state<Date | null>(null);
-  let subagentCodexSaveScope = $state<CliSaveScope>("core");
-  let subagentCodexAdvancedOpen = $state(false);
-  let subagentCodexConfigOverridesOpen = $state(false);
-  let subagentCodexEnableDraft = $state("");
-  let subagentCodexDisableDraft = $state("");
 
-  let claudeForm = $state(createDefaultClaudeForm());
-  let claudePersistedSignature = $state<string | null>(null);
-  let claudeSaveState = $state<SaveState>("idle");
-  let claudeSaveError = $state<string | null>(null);
-  let claudeLastSaved = $state<Date | null>(null);
-  let claudeSaveScope = $state<CliSaveScope>("core");
-  let claudeConfigOverridesOpen = $state(false);
-  let claudeDirDraft = $state("");
-  let claudeAllowedToolDraft = $state("");
-  let claudeDisallowedToolDraft = $state("");
-  let subagentClaudeForm = $state(createDefaultClaudeForm());
-  let subagentClaudePersistedSignature = $state<string | null>(null);
-  let subagentClaudeSaveState = $state<SaveState>("idle");
-  let subagentClaudeSaveError = $state<string | null>(null);
-  let subagentClaudeLastSaved = $state<Date | null>(null);
-  let subagentClaudeSaveScope = $state<CliSaveScope>("core");
-  let subagentClaudeConfigOverridesOpen = $state(false);
-  let subagentClaudeAllowedToolDraft = $state("");
-  let subagentClaudeDisallowedToolDraft = $state("");
-  let managedConfigDialogOpen = $state(false);
-  let managedConfigLoading = $state(false);
-  let managedConfigError = $state<string | null>(null);
-  let managedConfigProvider = $state<ManagedConfigProvider | null>(null);
-  let managedConfigFileName = $state("");
-  let managedConfigPath = $state("");
-  let managedConfigContents = $state("");
   function toCustomToolArray(
     value: unknown,
   ): Array<{
@@ -1360,6 +1706,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   let savedModels = $state<SavedModel[]>([]);
   let savedModelsLoading = $state(false);
   let savedModelsError = $state<string | null>(null);
+  let savedModelsRead: Promise<void> | null = null;
   let webSearchProviderAvailabilityLoading = $state(false);
   let webSearchProviderAvailabilityError = $state<string | null>(null);
   let hasLoadedWebSearchProviderAvailability = $state(false);
@@ -1374,6 +1721,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   let nativeSandboxStatusError = $state<string | null>(null);
   let nativeSandboxStatus = $state<NativeSandboxStatus | null>(null);
   let nativeAppleSandboxStatus = $state<NativeSandboxStatus | null>(null);
+  // BL-2049: the Tools card's host facts (Refreshed File Reads, Typed File Tools), read alone (no
+  // sandbox probe) beside the full sandbox status, so neither waits on that probe's `sbx` timeouts.
+  let toolsHostFacts = $state<TypedFileToolsHost | null>(null);
+  let toolsHostFactsFailed = $state(false);
   const nativeWebSearchProviderOptions = $derived.by<
     Array<{ value: NativeWebSearchProvider; label: string }>
   >(() => {
@@ -1400,20 +1751,24 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     return options;
   });
   const savedModelsFromStore = $derived(savedModelsStore.getSavedModels());
-  const matrixEntries = $derived(compatibilityMatrixStore.getMatrixEntries());
   const isChatPreset = (model: SavedModel) => (model.purpose ? model.purpose === "chat" : true);
   const chatModelPresets = $derived.by(() => savedModels.filter(isChatPreset));
   let modelConnectionOptions = $state<CatalogConnectionOption[] | null>(null);
   let modelConnectionOptionsLoading = $state(false);
   let modelConnectionOptionsError = $state<string | null>(null);
   let modelConnectionOptionsLoadedForAgentType = $state<StoredPrimaryAgentType | null>(null);
-  let unsupportedSubagentModelParams = $state<string[]>([]);
+  const primaryModelConnectionsBlocked = $derived(
+    isApiPrimaryAgentType(basicForm.agentType) &&
+    (modelConnectionOptionsLoading || modelConnectionOptionsError !== null || modelConnectionOptions === null),
+  );
   let voiceProfiles = $state<VoiceProfileRecord[]>([]);
   let voiceProfilesLoading = $state(false);
   let voiceProfilesError = $state<string | null>(null);
 
   let voiceProviders = $state<VoiceProviderSummary[]>([]);
   let voiceProvidersLoading = $state(false);
+  let voiceCatalogRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  const refreshVisibleVoiceCatalog = () => { if (settingsPanelAlive && document.visibilityState === 'visible') void loadVoiceProviders(); };
   let voiceProvidersError = $state<string | null>(null);
 
   let voiceOptions = $state<VoiceSummary[]>([]);
@@ -1610,14 +1965,14 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     return "batshit-settings-pill is-danger";
   }
 
-  function getTtsLaneLabel(provider: VoiceProviderSummary | null) {
+  function getTtsLaneLabel(provider: VoiceProviderSummary | null, model?: string | null) {
     if (!provider) return "Not configured";
-    return provider.supports.streaming ? "Realtime TTS" : "Batch TTS";
+    return voiceTtsModelStreams(provider, model) ? "Realtime TTS" : "Batch TTS";
   }
 
-  function getTtsBadgeClass(provider: VoiceProviderSummary | null) {
+  function getTtsBadgeClass(provider: VoiceProviderSummary | null, model?: string | null) {
     if (!provider) return "batshit-settings-pill";
-    return provider.supports.streaming ? "batshit-settings-pill is-success" : "batshit-settings-pill";
+    return voiceTtsModelStreams(provider, model) ? "batshit-settings-pill is-success" : "batshit-settings-pill";
   }
 
   function getVoiceSourceLabel(hasAgentOverride: boolean) {
@@ -1684,10 +2039,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     selectedVoiceProvider?.ttsModels ?? [],
   );
 
-  const selectedVoiceDefaultModel = $derived(
-    selectedVoiceProvider?.defaultTtsModel ?? selectedVoiceProvider?.defaultModel ?? null,
-  );
-
   const selectedSttProvider = $derived(
     sttProviderOptions.find(
       (provider) => provider.id === basicForm.voice_profile.sttProvider,
@@ -1718,12 +2069,21 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   );
 
   const agentVoiceOptions = $derived.by<AgentVoiceOption[]>(() => {
-    const provider = basicForm.voice_profile.provider;
+    const selected = resolveVoiceTtsDisplaySelection(basicForm.voice_profile, globalVoiceSettings, voiceProfiles, voiceProviders);
+    const provider = selected.providerId;
     if (!provider) return [];
 
     const merged = new Map<string, AgentVoiceOption>();
+    const model = selected.modelId;
+    if (provider === 'alibaba' && isQwenAudioTtsModel(model ?? '')) {
+      try {
+        const { region } = parseQwenAudioEndpoint(resolveVoiceTtsDisplayEndpoint(selected, globalVoiceSettings, voiceProfiles));
+        return getQwenAudioTtsVoices(model ?? '', region).map(id => ({ id, name: id, provider: 'alibaba' as VoiceProviderId }));
+      } catch { return []; }
+    }
+    const step3 = provider === 'stepfun' && model === 'stepaudio-3-tts';
     const defaultVoiceId = selectedVoiceProvider?.defaultVoice?.trim();
-    if (defaultVoiceId) {
+    if (defaultVoiceId && !step3) {
       merged.set(defaultVoiceId, {
         id: defaultVoiceId,
         name: defaultVoiceId,
@@ -1732,8 +2092,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       });
     }
     voiceOptions.forEach((voice) => {
+      if (step3 && voice.id !== 'zixinnansheng') return;
       merged.set(voice.id, voice);
     });
+    if (step3 && !merged.has('zixinnansheng')) merged.set('zixinnansheng', { id: 'zixinnansheng', name: 'zixinnansheng', provider: 'stepfun' });
 
     voiceProfiles
       .filter((profile) => profile.provider === provider)
@@ -1757,6 +2119,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     canListAgentVoices || agentVoiceOptions.length > 0,
   );
 
+  const agentVoiceUsesModelSpecificVoices = $derived.by(() => {
+    const selected = resolveVoiceTtsDisplaySelection(basicForm.voice_profile, globalVoiceSettings, voiceProfiles, voiceProviders);
+    return selected.providerId === 'alibaba' && isQwenAudioTtsModel(selected.modelId ?? '') || selected.providerId === 'stepfun' && selected.modelId === 'stepaudio-3-tts';
+  });
+
   const voiceRefreshBusy = $derived(
     voiceOptionsLoading || voiceProfilesLoading,
   );
@@ -1768,15 +2135,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     selectedPrimaryModel
       ? getModelPresetAvailability({
           model: selectedPrimaryModel,
-          agentType: basicForm.agentType,
+          agentType: getPrimaryToolHostScope(),
           connectionOptions: modelConnectionOptions,
         })
       : null,
   );
-  const selectedCliConnectionSetup = $derived.by(() => {
-    const option = selectedPrimaryModelAvailability?.connectionOption ?? null;
-    return isCliLoginSetupConnectionOption(option) ? option : null;
-  });
 
   const selectedVoiceSessionConfig = $derived(
     resolveModelVoiceSessionConfig(selectedPrimaryModel),
@@ -1793,6 +2156,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   const globalVoiceSettings = $derived.by(() => {
     const settings = getUserSettings() ?? data?.userSettings ?? null;
     return normalizeVoiceSettings(settings?.voice_settings);
+  });
+  const effectiveVoiceModelNotice = $derived.by(() => {
+    const selected = resolveVoiceTtsDisplaySelection(basicForm.voice_profile, globalVoiceSettings, voiceProfiles, voiceProviders)
+    const provider = resolveVoiceProviderById(selected.providerId)
+    return mimoVoiceModelNotice(selected.providerId, selected.modelId, voiceProviderModelProfile(provider, 'tts-batch', selected.modelId)) ?? voiceModelApplicabilityNotice(selected.providerId, selected.modelId)
   });
   const globalVoiceRuntime = $derived(globalVoiceSettings.voiceSessionRuntime ?? "direct");
   const globalVoiceModeInputMode = $derived(
@@ -1908,8 +2276,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     }
     return `${source}.`;
   });
-  const effectiveAgentTtsLaneLabel = $derived(getTtsLaneLabel(effectiveAgentTtsProvider));
-  const effectiveAgentTtsBadgeClass = $derived(getTtsBadgeClass(effectiveAgentTtsProvider));
+  const effectiveAgentTtsModel = $derived(resolveVoiceTtsDisplaySelection(basicForm.voice_profile, globalVoiceSettings, voiceProfiles, voiceProviders).modelId);
+  const defaultAgentTtsModel = $derived(resolveVoiceTtsDisplaySelection({ ...basicForm.voice_profile, model: '' }, globalVoiceSettings, voiceProfiles, voiceProviders).modelId);
+  const effectiveAgentTtsLaneLabel = $derived(getTtsLaneLabel(effectiveAgentTtsProvider, effectiveAgentTtsModel));
+  const effectiveAgentTtsBadgeClass = $derived(getTtsBadgeClass(effectiveAgentTtsProvider, effectiveAgentTtsModel));
   const selectedAgentTranscribeProviderForBadge = $derived(
     basicForm.voice_profile.sttProvider ? selectedSttProvider : effectiveAgentTranscribeProvider,
   );
@@ -1931,10 +2301,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     getVoiceModeSttBadgeClass(selectedAgentVoiceModeSttProviderForBadge),
   );
   const selectedAgentTtsLaneLabel = $derived(
-    getTtsLaneLabel(selectedAgentTtsProviderForBadge),
+    getTtsLaneLabel(selectedAgentTtsProviderForBadge, effectiveAgentTtsModel),
   );
   const selectedAgentTtsBadgeClass = $derived(
-    getTtsBadgeClass(selectedAgentTtsProviderForBadge),
+    getTtsBadgeClass(selectedAgentTtsProviderForBadge, effectiveAgentTtsModel),
   );
   const globalInputDeviceLabel = $derived.by(() =>
     getInputDeviceLabel(globalVoiceSettings.inputDeviceId),
@@ -1950,6 +2320,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
   $effect(() => {
     savedModels = savedModelsFromStore;
+    savedModelsError = savedModelsStore.getReadError();
     if (!savedModelsLoading) {
       syncSelectedModelFromAgent();
       syncSelectedModelFromSubagent();
@@ -1961,7 +2332,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       model,
       availability: getModelPresetAvailability({
         model,
-        agentType: getPrimaryToolHostScope(basicForm.agentType),
+        agentType: getPrimaryToolHostScope(),
         connectionOptions: modelConnectionOptions,
       }),
     }));
@@ -1974,62 +2345,12 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     return items;
   });
 
-  const cliConnectionSetups = $derived.by(() => {
-    if (!isCliPrimaryAgentType(basicForm.agentType)) return [];
-    const lockedOptions =
-      modelConnectionOptions?.filter(isCliLoginSetupConnectionOption) ?? [];
-    if (selectedCliConnectionSetup) {
-      return [selectedCliConnectionSetup];
-    }
-
-    const hintedConnectionId = resolveCliLoginSetupHintId();
-    if (hintedConnectionId) {
-      return lockedOptions.filter((option) => option.id === hintedConnectionId);
-    }
-
-    return [];
-  });
-
-  function isCliLoginSetupConnectionOption(
-    option: CatalogConnectionOption | null | undefined,
-  ): option is CatalogConnectionOption {
-    return Boolean(
-      option &&
-        (option.id === "codex-cli" || option.id === "claude-cli") &&
-        option.status === "locked" &&
-        option.setupCommand,
-    );
-  }
-
-  function resolveCliLoginSetupHintId(): "codex-cli" | "claude-cli" | null {
-    const connectionHint = (
-      basicForm.primary_model_connection?.id ??
-      basicForm.primary_model_connection?.service ??
-      ""
-    ).toLowerCase();
-    const hint = [
-      basicForm.primary_model_provider,
-      basicForm.primary_model_name,
-      connectionHint,
-      selectedAgentId,
-      basicForm.displayName,
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-
-    if (hint.includes("codex")) return "codex-cli";
-    if (hint.includes("claude-cli") || hint.includes("claude")) return "claude-cli";
-
-    return null;
-  }
-
   const subagentModelMenuItems = $derived.by(() => {
     const items = chatModelPresets.map((model) => ({
       model,
       availability: getModelPresetAvailability({
         model,
-        agentType: getSubagentToolHostScope(subagentForm.subagentType),
+        agentType: getSubagentToolHostScope(),
         connectionOptions: null,
       }),
     }));
@@ -2126,30 +2447,17 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     | "web-search"
     | "fabric";
 
-  type NativeToolUiRuntime = "n8n" | "api" | "cli";
-
-  function getNativeToolUiRuntime(scope: NativeToolsScope = "agent"): NativeToolUiRuntime {
-    if (scope === "subagent") {
-      if (subagentForm.subagentType === "api") return "api";
-      if (subagentForm.subagentType === "cli") return "cli";
-      return "n8n";
-    }
-    if (basicForm.agentType === "api") return "api";
-    if (basicForm.agentType === "cli") return "cli";
-    return "api";
-  }
-
+  // SA-139 R4/R5: every live Primary and Subagent is an API agent (a leftover retired type is
+  // refused, not run), so Batshit's own Bash and Web Search are the only lane these rows serve.
   function isNativeToolUiAvailable(
     family: NativeToolUiFamily,
     scope: NativeToolsScope = "agent",
   ): boolean {
-    const runtime = getNativeToolUiRuntime(scope);
     switch (family) {
+      case "fabric":
+        return scope === "agent";
       case "bash":
       case "web-search":
-        return runtime !== "cli";
-      case "fabric":
-        return scope === "agent" && runtime !== "n8n";
       case "mcp":
       case "cli":
       case "artifact":
@@ -2162,19 +2470,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     family: NativeToolUiFamily,
     scope: NativeToolsScope = "agent",
   ): string | null {
-    const runtime = getNativeToolUiRuntime(scope);
     switch (family) {
-      case "bash":
-        return runtime === "cli"
-          ? "Use Claude/Codex built-in Bash Tool instead."
-          : null;
-      case "web-search":
-        return runtime === "cli"
-          ? "Use Claude/Codex built-in Web Search Tool instead."
-          : null;
       case "fabric":
         if (scope === "subagent") {
-          return "Fabric Controls are not available for Subagents.";
+          return "Broad Fabric Controls are not available for Subagents. Delegated runs do not receive the Judge Juice judgment tool or the MCP search/call utility refs.";
         }
         return null;
       default:
@@ -2183,17 +2482,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   function getBashToolName(scope: NativeToolsScope = "agent"): string | null {
-    const runtime = getNativeToolUiRuntime(scope);
-    if (runtime === "api") return "native_bash_execute";
-    if (runtime === "n8n") return "bash_execute";
-    return null;
+    return "native_bash_execute";
   }
 
   function getWebSearchToolName(scope: NativeToolsScope = "agent"): string | null {
-    const runtime = getNativeToolUiRuntime(scope);
-    if (runtime === "api") return "native_web_search";
-    if (runtime === "n8n") return "web_search";
-    return null;
+    return "native_web_search";
   }
 
   function normalizeNativeExecutionBackend(
@@ -2238,6 +2531,65 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     );
     return normalized ?? getDefaultNativeExecutionBackend();
   }
+
+  // This record's materialized grant is explicit. Missing source stays unavailable; Bash,
+  // the parent and current host/backend facts remain separate execution bounds.
+  function getTypedFileToolsValue(scope: NativeToolsScope = "agent"): boolean | null {
+    return readTypedFileToolsValue(getNativeToolsSettings(scope)[TYPED_FILE_TOOLS_AGENT_FIELD]);
+  }
+
+  // The command location the server resolves for this record's Bash: an explicit one, else Local
+  // for Dangerous mode, else the default sandbox (`resolveNativeBashDcmState`). The typed file tools
+  // and Refreshed File Reads both read it.
+  function getEffectiveBashBackend(scope: NativeToolsScope = "agent"): NativeExecutionBackend {
+    const settings = getNativeToolsSettings(scope);
+    const explicitBackend = normalizeNativeExecutionBackend(
+      settings.executionBackend ??
+        settings.nativeExecutionBackend ??
+        settings.bashExecutionBackend ??
+        settings.nativeBashExecutionBackend,
+    );
+    return (
+      explicitBackend ??
+      (getNativeBashAccessMode(scope) === "dangerous" ? "local" : getDefaultNativeExecutionBackend())
+    );
+  }
+
+  function getTypedFileToolsUnavailableReason(scope: NativeToolsScope = "agent"): string | null {
+    return typedFileToolsUnavailableReason(
+      getEffectiveBashBackend(scope),
+      toolsHostFacts ?? nativeSandboxStatus?.typedFileToolsHost ?? nativeAppleSandboxStatus?.typedFileToolsHost ?? null,
+    );
+  }
+
+  // SA-137 Round 2 (R2-2): what the Tools tab says about whether Refreshed File Reads can run for
+  // this agent now, from the same rule the route uses. The agent's Zip view is the form's own
+  // choice, else the user's global one, so choosing Inline in the same card makes the switch
+  // unavailable at once. The saved choice is never touched; it shows again when the reason goes.
+  // A host that could not be read never locks the switch: it is a plain note (the server checks
+  // again on every turn).
+  const refreshedFileReadsAvailability = $derived.by(() => {
+    const host =
+      toolsHostFacts ??
+      nativeSandboxStatus?.typedFileToolsHost ??
+      nativeAppleSandboxStatus?.typedFileToolsHost ??
+      null;
+    const own = zipForm.live_file_reads;
+    return agentRefreshedFileReadsAvailability({
+      primaryType: basicForm.agentType,
+      zipViewMode: resolveZipAiViewModeOf(
+        { zip_ai_view_mode: zipForm.zip_ai_view_mode },
+        globalZipSettings,
+      ),
+      backend: getEffectiveBashBackend("agent"),
+      host,
+      hostCheckFailed: !host && (toolsHostFactsFailed || nativeSandboxStatusError !== null),
+      chosenOn: liveFileReadsChosenOn(
+        { live_file_reads: own === "enabled" ? true : own === "disabled" ? false : null },
+        globalZipSettings,
+      ),
+    });
+  });
 
   function getNativeExecutionBackendLabel(value: NativeExecutionBackend): string {
     if (value === "local" && nativeSandboxStatus?.containerized) {
@@ -2448,11 +2800,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   function getGlobalDefaultProjectLabel(): string {
-    const settings = getUserSettings() ?? data?.userSettings ?? null;
-    const defaultWorkspacePath =
-      typeof settings?.default_workspace_path === "string"
-        ? settings.default_workspace_path.trim()
-        : "";
+    // The Default Project Path lives in the project preferences (`project_prefs:<user>`), which
+    // the project store holds for the page; user settings never carry it.
+    const defaultWorkspacePath = projectStore.getDefaultProjectPath() ?? "";
     const defaultProject =
       defaultWorkspacePath.length > 0
         ? projectOptions.find((project) => project.root_path === defaultWorkspacePath) ?? null
@@ -2765,12 +3115,200 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     );
   }
 
+  type CliPairChoice = { owner: string; value: boolean; pending: boolean; reading: boolean; hold: boolean; notice: string; earlierUnknown: boolean };
+  let cliPairChoices = $state<Record<string, CliPairChoice>>({});
+  function cliPairId(scope: NativeToolsScope) { return selectedEntity?.kind === scope ? scope === 'agent' ? selectedAgentId : selectedEditableSubagentId : null; }
+  function cliPairRow(scope: NativeToolsScope, id: string) { return scope === 'agent' ? agents.find(row => row.id === id) : subagents.find(row => row.id === id); }
+  function cliPairOwner(scope: NativeToolsScope, row: any) { return JSON.stringify([scope, row?.id, row?.user_id, row?.created_at, scope === 'agent' ? row?.agentType : row?.subagentType]); }
+  function cliPairHeld(scope: NativeToolsScope) { const id = cliPairId(scope), pair = id ? cliPairChoices[`${scope}:${id}`] : undefined; return !!id && !!pair && pair.owner === untrack(() => cliPairOwner(scope, cliPairRow(scope, id))) && pair.hold === true; }
+  function cliPairBlocked(scope: NativeToolsScope) { const id = cliPairId(scope), pair = id ? cliPairChoices[`${scope}:${id}`] : undefined; return !!id && !!pair && pair.owner === untrack(() => cliPairOwner(scope, cliPairRow(scope, id))) && (pair.hold || pair.pending || pair.reading); }
+  function cliPairReady(scope: NativeToolsScope) {
+    return scope === 'agent' ? !listLoading && !detailLoading && primaryReadWaitError === null && basicPersistedForm !== null && mcpPersistedSignature !== null
+      : !subagentsLoading && !subagentDetailLoading && subagentReadWaitError === null && subagentPersistedForm !== null && subagentMcpPersistedSignature !== null;
+  }
+  type CliPairSource = { id: string; owner: string; generation: number; row: unknown };
+  type CliAckSection = 'basic' | 'mcp';
+  type CliAckOperation = { scope: NativeToolsScope; id: string; owner: string; generation: number; body: object; knownSaved: boolean; before: Record<CliAckSection, string> };
+  type CliAckOrigin = { operation: CliAckOperation; row: unknown; before: string; after: string };
+  const cliAckOrigins = new Map<string, CliAckOrigin>();
+  const cliAckKey = (scope: NativeToolsScope, id: string, section: CliAckSection) => JSON.stringify([scope, id, section]);
+  function retireCliAckOrigin(scope: NativeToolsScope, id: string | null, section?: CliAckSection) {
+    if (!id) return;
+    for (const field of section ? [section] : ['basic', 'mcp'] as const) cliAckOrigins.delete(cliAckKey(scope, id, field));
+  }
+  function cliUnownedProjection(scope: NativeToolsScope, section: CliAckSection) {
+    if (section === 'basic') return scope === 'agent'
+      ? JSON.stringify(withNativeToolSetting(basicForm, 'cliToolsEnabled', undefined))
+      : JSON.stringify(withNativeToolSetting(subagentForm, 'cliToolsEnabled', undefined));
+    const dcm = cloneDcmDisplaySettings(scope === 'agent' ? dcmDisplaySettings : subagentDcmDisplaySettings);
+    delete dcm.groups[CLI_GROUP_KEY];
+    if (dcm.groupDisplayPreferences) delete dcm.groupDisplayPreferences[CLI_GROUP_KEY];
+    return makeMcpSignature(scope === 'agent' ? defaultMCPGateways : subagentDefaultMCPGateways,
+      scope === 'agent' ? defaultMCPToolSelections : subagentDefaultMCPToolSelections, dcm);
+  }
+  function cliAckOwnsRebase(scope: NativeToolsScope, section: CliAckSection) {
+    const id = cliPairId(scope);
+    if (!id) return false;
+    const key = cliAckKey(scope, id, section), origin = cliAckOrigins.get(key);
+    if (!origin) return false;
+    const operation = origin.operation;
+    if (!operation.knownSaved || !cliPairCurrent(scope, id, operation.generation, operation.owner, origin.row) ||
+      origin.before !== origin.after || cliUnownedProjection(scope, section) !== origin.after) {
+      cliAckOrigins.delete(key);
+      return false;
+    }
+    return true;
+  }
+  function rememberCliAckRebase(operation: CliAckOperation, before: Record<CliAckSection, string>, changesDcm: boolean) {
+    for (const section of changesDcm ? ['basic', 'mcp'] as const : ['basic'] as const) {
+      const after = cliUnownedProjection(operation.scope, section);
+      const key = cliAckKey(operation.scope, operation.id, section);
+      // A real unowned edit while the ACK travelled keeps its normal sender.
+      if (operation.before[section] === before[section] && before[section] === after) cliAckOrigins.set(key, {
+        operation, row: cliPairRow(operation.scope, operation.id), before: before[section], after
+      });
+      else cliAckOrigins.delete(key);
+    }
+  }
+  function cliPairBusy(scope: NativeToolsScope, id: string) { return scope === 'agent' ? primaryOwnedWritesPending(id) : subagentOwnedWritesPending(id); }
+  function cliPairCurrent(scope: NativeToolsScope, id: string, generation: number, owner: string, row: unknown) {
+    return settingsPanelAlive && cliPairId(scope) === id && cliPairRow(scope, id) === row && cliPairOwner(scope, cliPairRow(scope, id)) === owner &&
+      (scope === 'agent' ? agentHydrationRequestId : subagentReadGeneration) === generation;
+  }
+  function installCliPair(scope: NativeToolsScope, value: unknown, patch: AgentDcmDisplaySettingsSave | undefined, keepLegacy = false) {
+    if (scope === 'agent') {
+      basicForm = withNativeToolSetting(basicForm, 'cliToolsEnabled', value);
+      if (basicPersistedForm) { basicPersistedForm = withNativeToolSetting(basicPersistedForm, 'cliToolsEnabled', value); basicPersistedSignature = makeBasicSignature(basicPersistedForm); }
+      if (patch) {
+        dcmDisplaySettings = applyCliDcmPatch(dcmDisplaySettings, readCliDcmPair({ dcmDisplaySettings: patch }));
+        if (mcpPersistedValues) mcpPersistedValues = { ...mcpPersistedValues, dcm: keepLegacy ? null : applyCliDcmPatch(mcpPersistedValues.dcm ?? mcpPersistedValues.viewedDcm, patch), viewedDcm: applyCliDcmPatch(mcpPersistedValues.dcm ?? mcpPersistedValues.viewedDcm, patch) };
+      }
+      if (mcpPersistedValues) mcpPersistedSignature = makeMcpSignature(mcpPersistedValues.gateways, mcpPersistedValues.selections, mcpPersistedValues.dcm ?? mcpPersistedValues.viewedDcm ?? createDefaultDcmDisplaySettings());
+    } else {
+      subagentForm = withNativeToolSetting(subagentForm, 'cliToolsEnabled', value);
+      if (subagentPersistedForm) { subagentPersistedForm = withNativeToolSetting(subagentPersistedForm, 'cliToolsEnabled', value); subagentPersistedSignature = makeSubagentFormSignature(subagentPersistedForm); }
+      if (patch) {
+        subagentDcmDisplaySettings = applyCliDcmPatch(subagentDcmDisplaySettings, readCliDcmPair({ dcmDisplaySettings: patch }));
+        if (subagentMcpPersistedValues) subagentMcpPersistedValues = { ...subagentMcpPersistedValues, dcm: keepLegacy ? null : applyCliDcmPatch(subagentMcpPersistedValues.dcm ?? subagentMcpPersistedValues.viewedDcm, patch), viewedDcm: applyCliDcmPatch(subagentMcpPersistedValues.dcm ?? subagentMcpPersistedValues.viewedDcm, patch) };
+      }
+      if (subagentMcpPersistedValues) subagentMcpPersistedSignature = makeMcpSignature(subagentMcpPersistedValues.gateways, subagentMcpPersistedValues.selections, subagentMcpPersistedValues.dcm ?? subagentMcpPersistedValues.viewedDcm ?? createDefaultDcmDisplaySettings());
+    }
+  }
+  function updateCliPairCache(scope: NativeToolsScope, id: string, value: unknown, patch?: AgentDcmDisplaySettingsSave, legacyRead = false) {
+    const native = { nativeTools: { cliToolsEnabled: value ?? null } };
+    if (scope === 'agent') { const row = cliPairRow(scope, id); updateAgentCollections(id, { provider_specific_settings: native, ...(patch ? legacyRead ? { dcm_display_settings: applyCliDcmPatch((row as any)?.dcm_display_settings, patch) } : { dcmDisplaySettings: patch } : {}) } as AgentCollectionsUpdate); }
+    else {
+      const row = subagents.find(row => row.id === id);
+      if (!row) return;
+      const next = { ...row, provider_specific_settings: applyAgentProviderSettingsUpdate(row.provider_specific_settings, native), ...(patch ? legacyRead ? { dcm_display_settings: applyCliDcmPatch((row as any).dcm_display_settings, patch) } : { dcmDisplaySettings: applyCliDcmPatch(row.dcmDisplaySettings ?? (row as any).dcm_display_settings, patch) } : {}) };
+      subagentStore.acceptServerRecord(next);
+      const accepted = subagentStore.subagents.find(row => row.id === id) ?? next;
+      subagents = subagents.map(row => row.id === id ? accepted : row);
+    }
+  }
+  async function chooseCliPair(scope: NativeToolsScope, value: boolean, companion: AgentDcmDisplaySettingsSave | undefined, source: CliPairSource) {
+    const id = cliPairId(scope), row = id ? cliPairRow(scope, id) : null;
+    if (!id || !row || source.id !== id || !cliPairCurrent(scope, source.id, source.generation, source.owner, source.row) || !cliPairReady(scope) || cliPairBusy(scope, id) || cliPairHeld(scope)) return;
+    if (scope === 'agent') requirePrimaryCaptureReady(); else requireSubagentCaptureReady();
+    retireCliAckOrigin(scope, id);
+    const owner = cliPairOwner(scope, row), generation = scope === 'agent' ? agentHydrationRequestId : subagentReadGeneration;
+    const baseline = scope === 'agent' ? mcpPersistedValues : subagentMcpPersistedValues;
+    const patch = value ? captureCliDcmWrite({ ...row, ...(baseline?.dcm === null && baseline.viewedDcm ? { dcmDisplaySettings: null, dcm_display_settings: baseline.viewedDcm } : {}) }, companion) : undefined;
+    const body = $state.snapshot({ provider_specific_settings: { nativeTools: { cliToolsEnabled: value } }, ...(patch ? { dcmDisplaySettings: patch } : {}) });
+    const operation: CliAckOperation = { scope, id, owner, generation, body, knownSaved: false, before: { basic: cliUnownedProjection(scope, 'basic'), mcp: cliUnownedProjection(scope, 'mcp') } };
+    const key = `${scope}:${id}`;
+    cliPairChoices = { ...cliPairChoices, [key]: { owner, value, pending: true, reading: false, hold: false, notice: '', earlierUnknown: cliPairChoices[key]?.earlierUnknown ?? false } };
+    const choice = cliPairChoices[key];
+    await (scope === 'agent' ? mcpSaves : subagentMcpSaves).run(id, async () => {
+      try {
+        const response = await fetch(`/api/${scope === 'agent' ? 'agents' : 'subagents'}/${encodeURIComponent(id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const answer = await response.json().catch(() => null);
+        const known = response.ok && (scope === 'agent' ? answer?.success === true : answer?.subagent && cliPairOwner(scope, answer.subagent) === owner);
+        if (!known) throw new Error('This CLI Tools choice is unconfirmed. Your draft is kept.');
+        const returnedPair = scope === 'subagent' ? readCliDcmPair(answer.subagent) : body.dcmDisplaySettings;
+        const returnedValue = scope === 'subagent' ? readCliNativeChoice(answer.subagent) : value;
+        if (returnedValue != null && parseBooleanSetting(returnedValue) === null) throw new Error('The saved CLI Tools readback is unavailable. Your draft is kept.');
+        const keepLegacy = scope === 'subagent' && answer.subagent.dcmDisplaySettings == null && answer.subagent.dcm_display_settings != null;
+        untrack(() => {
+          const current = cliPairCurrent(scope, id, generation, owner, row);
+          if (current) {
+            const before = { basic: cliUnownedProjection(scope, 'basic'), mcp: cliUnownedProjection(scope, 'mcp') };
+            installCliPair(scope, returnedValue, returnedPair, keepLegacy);
+            updateCliPairCache(scope, id, returnedValue, returnedPair, keepLegacy);
+            operation.knownSaved = true;
+            rememberCliAckRebase(operation, before, returnedPair !== undefined);
+          }
+          // A newer accepted source keeps its forms/cache; request a current detail read.
+          if (!current && cliPairId(scope) === id) {
+            if (scope === 'agent') setAgentReadDeferred(true); else setSubagentReadDeferred(true);
+          }
+          if (cliPairChoices[key] === choice) delete cliPairChoices[key];
+        });
+      } catch (error) {
+        choice.hold = true; choice.earlierUnknown = true;
+        choice.notice = error instanceof Error ? error.message : 'This CLI Tools choice is unconfirmed. Your draft is kept.';
+      } finally { choice.pending = false; }
+    });
+  }
+  async function readCliPair(scope: NativeToolsScope, source: CliPairSource) {
+    const id = cliPairId(scope), key = `${scope}:${id}`, choice = cliPairChoices[key];
+    if (!id || !choice || source.id !== id || !cliPairCurrent(scope, source.id, source.generation, source.owner, source.row) || choice.owner !== source.owner || !cliPairReady(scope) || choice.pending || choice.reading || cliPairBusy(scope, id)) return;
+    retireCliAckOrigin(scope, id);
+    const generation = scope === 'agent' ? agentHydrationRequestId : subagentReadGeneration;
+    choice.reading = true;
+    await (scope === 'agent' ? mcpSaves : subagentMcpSaves).run(id, async () => {
+      try {
+        const response = await fetch(`/api/${scope === 'agent' ? 'agents' : 'subagents'}/${encodeURIComponent(id)}`, { cache: 'no-store' });
+        const payload = await response.json();
+        const record = scope === 'agent' ? payload : payload?.subagent;
+        if (!response.ok || cliPairOwner(scope, record) !== choice.owner) throw new Error('The saved CLI Tools choice could not be read. Your draft is kept.');
+        const patch = readCliDcmPair(record), value = readCliNativeChoice(record);
+        if (!cliPairCurrent(scope, id, generation, choice.owner, source.row) || cliPairChoices[key] !== choice) return;
+        untrack(() => { installCliPair(scope, value, patch, record.dcmDisplaySettings == null && record.dcm_display_settings != null); updateCliPairCache(scope, id, value, patch, record.dcmDisplaySettings == null && record.dcm_display_settings != null); choice.hold = false; choice.notice = 'An earlier save remains unconfirmed. Current saved choices are shown.'; });
+      } catch (error) { choice.hold = true; choice.notice = error instanceof Error ? error.message : 'The saved CLI Tools choice could not be read. Your draft is kept.'; }
+      finally { choice.reading = false; }
+    });
+  }
+
+  function getToolGridEnableControl(id: string, scope: NativeToolsScope = "agent"): ToolGridEnableControl | null {
+    const fields: Record<string, string> = { bash: 'bashEnabled', web_search: 'webSearchEnabled', agent_browser_actions: 'agentBrowserEnabled', artifact_find: 'artifactRuntimeEnabled', fabric_find: 'batshitToolsEnabled', typed_file_tools: TYPED_FILE_TOOLS_AGENT_FIELD, mcp_tools: 'dynamicMcpEnabled', cli_tools: 'cliToolsEnabled' };
+    const field = fields[id];
+    if (!field) return null;
+    const gate = id === 'bash' ? 'bash' : id === 'web_search' ? 'web-search' : id === 'fabric_find' ? 'fabric' : null;
+    const available = !gate || isNativeToolUiAvailable(gate, scope);
+    const typed = id === 'typed_file_tools';
+    const typedInfo = typedToolsInfo(scope);
+    const note = id === 'fabric_find' && scope === 'subagent' ? getNativeToolUiUnavailableMessage('fabric', scope) : typed ? [typedInfo.notice, getTypedFileToolsUnavailableReason(scope), !getNativeToolToggle('bashEnabled', true, scope) ? 'Typed File Tools also needs Bash enabled.' : null].filter(Boolean).join(' ') : gate && !available ? getNativeToolUiUnavailableMessage(gate, scope) : null;
+    const choice = (value: boolean) => {
+      if (!available || cliPairHeld(scope) || id === 'fabric_find' && scope === 'subagent') return;
+      retireCliAckOrigin(scope, cliPairId(scope), 'basic');
+      if (scope === 'agent') basicSaveScope = 'tools'; else subagentSaveScope = 'tools';
+      updateNativeToolSetting(field, value, scope);
+    };
+    const cliId = cliPairId(scope), cliOwner = cliId ? cliPairOwner(scope, cliPairRow(scope, cliId)) : '';
+    const pair = cliId && cliPairChoices[`${scope}:${cliId}`]?.owner === cliOwner ? cliPairChoices[`${scope}:${cliId}`] : undefined;
+    const cliSource = { id: cliId ?? '', owner: cliOwner, row: cliId ? cliPairRow(scope, cliId) : undefined, generation: scope === 'agent' ? agentHydrationRequestId : subagentReadGeneration };
+    return {
+      ...(id === 'cli_tools' && pair && (pair.pending || pair.hold) ? { draftChecked: pair.value } : {}),
+      checked: id === 'fabric_find' && scope === 'subagent' ? false : typed ? getTypedFileToolsValue(scope) === true : getNativeToolToggle(field, id === 'artifact_find' ? getNativeToolToggle('batshitToolsEnabled', true, scope) : true, scope),
+      disabled: id === 'fabric_find' && scope === 'subagent' || !available || cliPairHeld(scope) || id === 'cli_tools' && (!cliPairReady(scope) || !!cliId && cliPairBusy(scope, cliId)) || typed && (typedInfo.blocked || !getNativeToolToggle('bashEnabled', true, scope) || !!getTypedFileToolsUnavailableReason(scope)),
+      notice: id === 'cli_tools' && pair ? pair.notice : note,
+      ...(id === 'cli_tools' && pair ? { onRead: () => void readCliPair(scope, cliSource), reading: pair.pending || pair.reading } : {}),
+      onChange: id === 'cli_tools' ? (value, companion) => void chooseCliPair(scope, value, companion, cliSource) : scope === 'agent' ? guardPrimaryChoice(choice) : guardSubagentChoice(choice),
+      ...(typed ? { onRead: () => void useSavedTypedTools(scope), reading: typedInfo.reloading } : {})
+    };
+  }
+
   function updateNativeToolSetting(
     key: string,
     value: unknown,
     scope: NativeToolsScope = "agent",
   ) {
     untrack(() => {
+      if (key === TYPED_FILE_TOOLS_AGENT_FIELD) {
+        const id = scope === 'agent' ? selectedAgentId : selectedEditableSubagentId;
+        if (id) typedToolsSave(scope, id).generation += 1;
+      }
       const currentProviderSettings = getProviderSpecificSettings(scope) ?? {};
       const currentNativeTools = {
         ...(currentProviderSettings.nativeTools &&
@@ -2803,44 +3341,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     });
   }
 
-  const isCodexProvider = $derived.by(() => {
-    if (!isCliPrimaryAgentType(basicForm.agentType)) return false;
-    const provider = (basicForm.primary_model_provider ?? "").toLowerCase();
-    const modelName = (basicForm.primary_model_name ?? "").toLowerCase();
-    const connectionHint =
-      basicForm.primary_model_connection?.id ??
-      basicForm.primary_model_connection?.service ??
-      "";
-    return (
-      provider.includes("codex") ||
-      modelName.includes("codex") ||
-      connectionHint === "codex-cli"
-    );
-  });
-
-  const isClaudeCliProvider = $derived.by(() => {
-    if (!isCliPrimaryAgentType(basicForm.agentType)) return false;
-    const provider = (basicForm.primary_model_provider ?? "").toLowerCase();
-    const modelName = (basicForm.primary_model_name ?? "").toLowerCase();
-    const connectionHint =
-      basicForm.primary_model_connection?.id ??
-      basicForm.primary_model_connection?.service ??
-      "";
-    return (
-      provider.includes("claude-cli") ||
-      modelName.includes("claude-cli") ||
-      connectionHint === "claude-cli"
-    );
-  });
-
-  const isCliProvider = $derived.by(() => {
-    return isCliPrimaryAgentType(basicForm.agentType) || isCodexProvider || isClaudeCliProvider;
-  });
-
   const toolApprovalEligible = $derived(
-    isManagedPrimaryAgentType(basicForm.agentType),
+    isApiPrimaryAgentType(basicForm.agentType),
   );
-  const n8nRuntimeUnavailable = $derived(n8nRuntimeStatusStore.isUnavailable());
 
   let isUploadingAgentAvatar = $state(false);
   let agentAvatarUploadRequestId = 0;
@@ -2849,27 +3352,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   let subagents = $state<SubagentRow[]>([]);
   let selectedEditableSubagentId = $state<string | null>(null);
   let selectedSubagentModelId = $state<string | null>(null);
-
-  $effect(() => {
-    if (!selectedSubagentModelId) {
-      unsupportedSubagentModelParams = [];
-      return;
-    }
-    const selectedModel = savedModels.find(
-      (model) => model.id === selectedSubagentModelId,
-    );
-    unsupportedSubagentModelParams = selectedModel
-      ? getSubagentToolHostScope(subagentForm.subagentType) !== "n8n"
-        ? []
-        : listUnsupportedN8NParameters(selectedModel, { matrixEntries })
-      : [];
-  });
-
-  function getN8nSubagentUnavailableReason(subagent: SubagentRow | null | undefined) {
-    if (!subagent || !n8nRuntimeUnavailable) return null;
-    const type = normalizeSubagentType(subagent, subagent.subagentType);
-    return type === "n8n-workflow" ? "n8n is not connected" : null;
-  }
 
   const primaryAgentOptions = $derived(
     agents.map((agent) => {
@@ -2901,22 +3383,22 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       defaultModelProvider: subagent.primary_model_provider ?? null,
       defaultModelName: subagent.primary_model_name ?? null,
       specialty: subagent.specialty ?? null,
-      badgeLabel: getSubagentTypeDisplayLabel(
-        normalizeSubagentType(subagent, subagent.subagentType),
-      ),
-      badgeTone: getSubagentTypeBadgeTone(
-        normalizeSubagentType(subagent, subagent.subagentType),
-      ),
-      disabledReason: getN8nSubagentUnavailableReason(subagent),
+      // SA-139 R6 (D16): one Subagent kind. This menu mixes Primary Agents and Subagents, so a
+      // Subagent row carries the role label, never a type label, as a Primary row does (R3).
+      badgeLabel: "Subagent",
+      disabledReason: null,
     })),
   );
 
   const combinedAgentSections = $derived<MegaAgentSection[]>([
     {
       heading: "Primary Agents",
+      // SA-139 R3: one Primary concept. This menu mixes Primary Agents and Subagents, so a
+      // Primary row carries the role label, never an API/CLI type label (decision 16).
       items: primaryAgentOptions.map((agent) => ({
         ...agent,
         id: `agent:${agent.id}`,
+        badgeLabel: "Primary Agent",
       })),
     },
     {
@@ -2941,9 +3423,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
   let subagentForm = $state<SubagentForm>({
     displayName: "",
-    subagentType: "n8n-workflow",
+    subagentType: "api",
     specialty: "general",
-    webhook_url: "",
     include_global_prompt: false,
     system_prompt: "",
     primary_model_provider: "",
@@ -2951,30 +3432,24 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     primary_model_preset_id: "",
     primary_model_connection: null,
     timeout_seconds: "",
+    max_tool_steps: "",
     avatar: null,
     avatar_icon_ref: DEFAULT_AGENT_ICON_REF,
     avatar_icon_fit: "fill",
     provider_specific_settings: null,
   });
 
-  const isCodexCliSubagentProvider = $derived.by(() => {
-    if (subagentForm.subagentType !== "cli") return false;
-    const provider = (subagentForm.primary_model_provider ?? "").toLowerCase();
-    const modelName = (subagentForm.primary_model_name ?? "").toLowerCase();
-    return provider.includes("codex") || modelName.includes("codex");
-  });
-
-  const isClaudeCliSubagentProvider = $derived.by(() => {
-    if (subagentForm.subagentType !== "cli") return false;
-    const provider = (subagentForm.primary_model_provider ?? "").toLowerCase();
-    const modelName = (subagentForm.primary_model_name ?? "").toLowerCase();
-    return provider.includes("claude-cli") || modelName.includes("claude-cli");
-  });
-
-  const isCliSubagentProvider = $derived.by(() => {
-    return subagentForm.subagentType === "cli" &&
-      (isCodexCliSubagentProvider || isClaudeCliSubagentProvider);
-  });
+  /**
+   * SA-139 R5 (D14): the refusal for a stored Subagent of a removed type (a Claude Code CLI or
+   * Codex CLI Subagent), or null for a live one. Such a leftover opens showing only its identity,
+   * this line and its Delete; validation refuses every save of it, so opening or editing it
+   * writes nothing (the leftover Primary's R4 rule).
+   */
+  const retiredSubagentDetails = $derived.by(() =>
+    isRetiredSubagentType(subagentForm.subagentType)
+      ? retiredSubagentTypeSentences(subagentForm.subagentType, subagentForm).details
+      : null,
+  );
 
   let subagentPersistedSignature = $state<string | null>(null);
   /**
@@ -2985,18 +3460,15 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
    */
   let subagentPersistedForm: SubagentForm | null = null;
   /**
-   * BL-914: the Subagent's Tool Grid values, Codex block and Claude block as they were loaded or last
-   * saved, the twins of the Primary Agent's `mcpPersistedValues`, `codexPersistedBlock` and
-   * `claudePersistedBlock`. The Subagent PUT writes those blocks key by key, so each section save
-   * sends only what differs from its copy (`diffMcpSection`, `diffAgentBlockWithGroups`), a dropped
-   * key as `null`. Plain variables, not `$state`: set at select and at the list-effect hydrate,
-   * moved after a successful save, cleared at both resets, left as they are by a failed save; an
-   * effect that reads one does not depend on it. A Codex or Claude block of `null` is a Subagent
-   * that has none yet (its first edit sends the whole block).
+   * BL-914: the Subagent's Tool Grid values as they were loaded or last saved, the twin of the
+   * Primary Agent's `mcpPersistedValues`. The Subagent PUT writes those blocks key by key, so the
+   * section save sends only what differs from its copy (`diffMcpSection`), a dropped key as
+   * `null`. A plain variable, not `$state`: set at select and at the list-effect hydrate, moved
+   * after a successful save, cleared at both resets, left as it is by a failed save; an effect
+   * that reads it does not depend on it. (SA-139 R5 removed the CLI Subagent's Claude block
+   * section and its copies.)
    */
   let subagentMcpPersistedValues: McpSectionValues | null = null;
-  let subagentCodexPersistedBlock: CodexAgentSettings | null = null;
-  let subagentClaudePersistedBlock: ClaudeAgentSettings | null = null;
   /**
    * BL-955: raised by each read that replaces the Subagent's section forms (a pick, the list
    * effect's hydrate, the deferred read); each Subagent save carries the value from when its
@@ -3009,18 +3481,20 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   const subagentCoreSaves = createEntitySaverCount(readSubagentAgainWhenAtRest, () => untrack(syncSubagentSaveWaits));
   const subagentMcpSaves = createEntitySaverCount(readSubagentAgainWhenAtRest, () => untrack(syncSubagentSaveWaits));
   const subagentCliToolSaves = createEntitySaverCount(readSubagentAgainWhenAtRest, () => untrack(syncSubagentSaveWaits));
-  const subagentCodexSaves = createEntitySaverCount(readSubagentAgainWhenAtRest, () => untrack(syncSubagentSaveWaits));
-  const subagentClaudeSaves = createEntitySaverCount(readSubagentAgainWhenAtRest, () => untrack(syncSubagentSaveWaits));
   let subagentDetailLoading = $state(false);
   let subagentReadDeferredUi = $state(false);
   let subagentOwnedSaveInFlightUi = $state(false);
   let subagentOwnedWritePendingUi = $state(false);
-  type SubagentCaptureSection = "core" | "codex" | "claude" | "mcp";
+  type SubagentCaptureSection = "core" | "mcp";
   const subagentDeferredCaptures = new Map<string, Set<SubagentCaptureSection>>();
-  const subagentCaptureWake = $state({ core: 0, codex: 0, claude: 0, mcp: 0 });
+  const subagentCaptureWake = $state({ core: 0, mcp: 0 });
   let subagentSaveWaitExpiredUi = $state(false);
   let subagentReadWaitError = $state<string | null>(null);
   const subagentSettingsReadWaiting = $derived(subagentDetailLoading || subagentReadDeferredUi || subagentReadWaitError !== null || subagentSaveWaitExpiredUi || subagentOwnedSaveInFlightUi);
+  const subagentDeferredDraftOnly = $derived.by(() => subagentReadDeferredUi && !subagentDetailLoading && subagentReadWaitError === null &&
+    !subagentSaveWaitExpiredUi && !subagentOwnedWritePendingUi && !subagentOwnedSaveInFlightUi && subagentModelSelectionNotice === null &&
+    ![subagentEditSaveError, subagentAvatarError].some(Boolean) &&
+    Object.values(subagentSectionsAtRest()).some(atRest => !atRest));
   const subagentCaptureBlocked = $derived(subagentDetailLoading || subagentReadWaitError !== null || subagentOwnedWritePendingUi);
   const SETTINGS_WAIT_MS = 30_000;
   type SaveWait = { timer: ReturnType<typeof setTimeout> | null; expired: boolean };
@@ -3059,12 +3533,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     displayName: string;
     slug: string;
     slugManuallyEdited: boolean;
-    agentType: PrimaryAgentType;
-    webhook_url: string;
-    workflow_url: string;
     include_global_prompt: boolean;
     subagentType: SubagentType;
-    specialty: SubagentForm["specialty"];
+    // SA-139 R5: a new Subagent never takes the old `claude-code` specialty (a stored value only).
+    specialty: Exclude<SubagentForm["specialty"], "claude-code">;
   }
 
   let selectedEntity = $state<SelectedEntity | null>(null);
@@ -3085,11 +3557,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     displayName: "",
     slug: "",
     slugManuallyEdited: false,
-    agentType: "api",
-    webhook_url: "",
-    workflow_url: "",
     include_global_prompt: true,
-    subagentType: "n8n-workflow",
+    subagentType: "api",
     specialty: "general",
   });
   let createEntityBusy = $state(false);
@@ -3107,11 +3576,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       displayName: "",
       slug: "",
       slugManuallyEdited: false,
-      agentType: "api",
-      webhook_url: "",
-      workflow_url: "",
       include_global_prompt: true,
-      subagentType: "n8n-workflow",
+      subagentType: "api",
       specialty: "general",
     };
     createEntityError = null;
@@ -3153,7 +3619,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         const payload = {
           id: generatedSlug,
           displayName: name,
-          agentType: createEntityForm.agentType,
+          // SA-139 R4 (D14): a new Primary Agent is always an API agent.
+          agentType: "api",
           show_reasoning: true,
           preserve_reasoning: false,
           include_global_prompt: createEntityForm.include_global_prompt,
@@ -3200,35 +3667,12 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           return;
         }
 
-        if (
-          isWorkflowBackedSubagentType(createEntityForm.subagentType) &&
-          !createEntityForm.webhook_url.trim()
-        ) {
-          createEntityError = "Production webhook URL is required for n8n Workflow Subagents.";
-          createEntityBusy = false;
-          return;
-        }
-        if (isWorkflowBackedSubagentType(createEntityForm.subagentType)) {
-          const webhookValidation = validateN8nProductionWebhookUrl(
-            createEntityForm.webhook_url,
-          );
-          if (webhookValidation) {
-            createEntityError = webhookValidation;
-            createEntityBusy = false;
-            return;
-          }
-        }
-
         const created = await subagentStore.create({
           id: generatedSlug,
           displayName: name,
           subagentType: createEntityForm.subagentType,
           specialty: createEntityForm.specialty,
           include_global_prompt: false,
-          webhook_url:
-            isWorkflowBackedSubagentType(createEntityForm.subagentType)
-              ? createEntityForm.webhook_url.trim() || undefined
-              : undefined,
         });
 
         createEntityMode = false;
@@ -3405,10 +3849,13 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     if (!selectedEditableSubagentId || subagentCaptureBlocked) return;
     const targetId = selectedEditableSubagentId;
     const label = subagentForm.displayName?.trim() || "this Subagent";
+    // SA-139 R5: only a leftover CLI Subagent has a managed CLI settings folder; the server's
+    // delete removes it with the record.
     const confirmed = await confirmDialog({
       title: `Delete ${label}?`,
-      description:
-        "It will be unassigned from every Primary Agent, and its settings, avatar pictures, and managed CLI settings folder will be removed. Chat history stays intact.",
+      description: isCliSubagentType(subagentForm.subagentType)
+        ? "It will be unassigned from every Primary Agent, and its settings, avatar pictures, and managed CLI settings folder will be removed. Chat history stays intact."
+        : "It will be unassigned from every Primary Agent, and its settings and avatar pictures will be removed. Chat history stays intact.",
       confirmLabel: "Delete Subagent",
       tone: "destructive",
     });
@@ -3488,43 +3935,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   });
 
   $effect(() => {
-    if (createEntityMode && createEntityForm.kind === "agent") {
-      if (createEntityForm.webhook_url || createEntityForm.workflow_url) {
-        createEntityForm = {
-          ...createEntityForm,
-          webhook_url: "",
-          workflow_url: "",
-        };
-      }
-    }
-  });
-
-  $effect(() => {
-    if (createEntityMode && createEntityForm.kind === "subagent") {
-      if (
-        !isWorkflowBackedSubagentType(createEntityForm.subagentType) &&
-        createEntityForm.webhook_url
-      ) {
-        createEntityForm = {
-          ...createEntityForm,
-          webhook_url: "",
-        };
-      }
-    }
-  });
-
-  $effect(() => {
-    // API and CLI agents do not own n8n workflow URLs. Retired stored records remain
-    // untouched so the user can delete them without an auto-save mutation.
-  });
-
-  $effect(() => {
-    if (!isWorkflowBackedSubagentType(subagentForm.subagentType) && subagentForm.webhook_url) {
-      subagentForm = { ...subagentForm, webhook_url: "" };
-    }
-  });
-
-  $effect(() => {
     const storeSettings = getUserSettings();
     if (storeSettings?.global_zip_settings) {
       globalZipSettings = normaliseGlobalZipSettings(
@@ -3545,6 +3955,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   });
 
   onMount(async () => {
+    window.addEventListener("focus", refreshVisibleVoiceCatalog);
+    voiceCatalogRefreshTimer = setInterval(refreshVisibleVoiceCatalog, 60 * 60_000);
+    window.addEventListener(LIVE_SETTINGS_EVENTS.slashCommandsUpdated, handleSlashCommandsUpdated);
     window.addEventListener(
       LIVE_SETTINGS_EVENTS.localAiSettingsUpdated,
       handleLocalAiSettingsUpdated,
@@ -3553,14 +3966,13 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     await Promise.all([
       loadAgents(),
       loadProjectsForDefaults(),
-      n8nRuntimeStatusStore.refreshN8nRuntimeStatus(),
     ]);
     void loadGoons();
     void refreshModelPickerData();
     void loadWebSearchProviderAvailability();
     void loadAgentBrowserRuntimeStatus();
     void loadNativeSandboxStatus();
-    void compatibilityMatrixStore.loadCompatibilityMatrix();
+    void loadToolsHostFacts();
     void loadVoiceProfiles();
     void loadVoiceProviders();
     void loadInputDevices();
@@ -3570,6 +3982,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       await subagentStore.load();
       subagentsLoading = false;
     }
+    if (savedModelsRead) await savedModelsRead;
     const selectableAgentId =
       selectedAgentId && agents.find((agent) => agent.id === selectedAgentId)
         ? selectedAgentId
@@ -3588,6 +4001,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
   onDestroy(() => {
     settingsPanelAlive = false;
+    window.removeEventListener("focus", refreshVisibleVoiceCatalog);
+    if (voiceCatalogRefreshTimer) clearInterval(voiceCatalogRefreshTimer);
+    cliAckOrigins.clear();
+    accessResourcesGeneration += 1;
+    window.removeEventListener(LIVE_SETTINGS_EVENTS.slashCommandsUpdated, handleSlashCommandsUpdated);
     stopAgentSettingsEvents();
     if (primaryReadTimer) clearTimeout(primaryReadTimer);
     if (subagentReadTimer) clearTimeout(subagentReadTimer);
@@ -3609,7 +4027,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
     if (!shouldLoadAccess) return;
     if (!data?.user?.id) return;
-    void loadAccessResources();
+    // BL-1871: the loader reads its own loading/loaded flags (b34b0e201). Tracked here, a failed read
+    // (the store now throws) flipped the loading flag back and re-ran this effect without end.
+    untrack(() => void loadAccessResources());
   });
 
   $effect(() => {
@@ -3684,9 +4104,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           selectedEditableSubagentId = null;
           subagentForm = {
             displayName: "",
-            subagentType: "n8n-workflow",
+            subagentType: "api",
             specialty: "general",
-            webhook_url: "",
             include_global_prompt: false,
             system_prompt: "",
             primary_model_provider: "",
@@ -3694,6 +4113,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
             primary_model_preset_id: "",
             primary_model_connection: null,
             timeout_seconds: "",
+            max_tool_steps: "",
             avatar: null,
             avatar_icon_ref: DEFAULT_AGENT_ICON_REF,
             avatar_icon_fit: "fill",
@@ -3708,18 +4128,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           subagentDcmDisplaySettings = createDefaultDcmDisplaySettings();
           subagentMcpPersistedSignature = null;
           subagentMcpPersistedValues = null;
-          subagentCodexForm = createDefaultCodexForm();
-          subagentCodexPersistedSignature = null;
-          subagentCodexPersistedBlock = null;
-          subagentCodexSaveState = "idle";
-          subagentCodexSaveError = null;
-          subagentCodexLastSaved = null;
-          subagentClaudeForm = createDefaultClaudeForm();
-          subagentClaudePersistedSignature = null;
-          subagentClaudePersistedBlock = null;
-          subagentClaudeSaveState = "idle";
-          subagentClaudeSaveError = null;
-          subagentClaudeLastSaved = null;
           selectedSubagentModelId = null;
       });
     }
@@ -3741,9 +4149,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         selectedEditableSubagentId = null;
         subagentForm = {
           displayName: "",
-          subagentType: "n8n-workflow",
+          subagentType: "api",
           specialty: "general",
-          webhook_url: "",
           include_global_prompt: false,
           system_prompt: "",
           primary_model_provider: "",
@@ -3751,6 +4158,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           primary_model_preset_id: "",
           primary_model_connection: null,
           timeout_seconds: "",
+          max_tool_steps: "",
           avatar: null,
           avatar_icon_ref: DEFAULT_AGENT_ICON_REF,
           avatar_icon_fit: "fill",
@@ -3765,18 +4173,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         subagentDcmDisplaySettings = createDefaultDcmDisplaySettings();
         subagentMcpPersistedSignature = null;
         subagentMcpPersistedValues = null;
-        subagentCodexForm = createDefaultCodexForm();
-        subagentCodexPersistedSignature = null;
-        subagentCodexPersistedBlock = null;
-        subagentCodexSaveState = "idle";
-        subagentCodexSaveError = null;
-        subagentCodexLastSaved = null;
-        subagentClaudeForm = createDefaultClaudeForm();
-        subagentClaudePersistedSignature = null;
-        subagentClaudePersistedBlock = null;
-        subagentClaudeSaveState = "idle";
-        subagentClaudeSaveError = null;
-        subagentClaudeLastSaved = null;
         selectedSubagentModelId = null;
       });
     }
@@ -3813,12 +4209,17 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       return;
     }
 
-      // BL-915: the core, Codex and Claude sections (not the Tool Grid), each only while at rest.
-      untrack(() => readSubagentSections(current, false, false));
-      syncSelectedModelFromSubagent();
+      // BL-915: the core section (not the Tool Grid), only while at rest.
+      untrack(() => {
+        readSubagentSections(current, false, false);
+        // Hydration preserves headerless instruction drafts; its picker sync must
+        // not subscribe this cache effect to the form object it just replaced.
+        syncSelectedModelFromSubagent();
+      });
     });
 
   async function loadAgents() {
+    const reasoningReads = captureAgentReasoningReads();
     listLoading = true;
     listError = null;
 
@@ -3833,6 +4234,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       const loadedAgents: AgentRow[] = Array.isArray(payload?.agents)
         ? payload.agents
         : [];
+      for (const agent of loadedAgents) agent.model_reasoning_overrides = preserveNewerReasoningLeaves(
+        agent.id, agent.model_reasoning_overrides, agentStore.getAgentById(agent.id)?.model_reasoning_overrides,
+        reasoningReads.get(agent.id) ?? 0);
 
       untrack(() => {
         agents = loadedAgents;
@@ -3897,11 +4301,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   function primarySavers() {
-    return [basicSaves, promptSaves, zipSaves, mcpSaves, cliToolSaves, codexSaves, claudeSaves, assignmentSaves];
+    return [basicSaves, promptSaves, zipSaves, mcpSaves, cliToolSaves, assignmentSaves];
   }
 
   function subagentSavers() {
-    return [subagentCoreSaves, subagentMcpSaves, subagentCliToolSaves, subagentCodexSaves, subagentClaudeSaves];
+    return [subagentCoreSaves, subagentMcpSaves, subagentCliToolSaves];
   }
 
   // BL-1028: ownership is a gate, never an ordinary autosave dependency. A real
@@ -3989,8 +4393,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     }
   }
 
-  function syncPrimarySaveWaits() { syncSaveWaits("agent"); resumeDeferredCaptures(); }
-  function syncSubagentSaveWaits() { syncSaveWaits("subagent"); resumeDeferredCaptures(); }
+  function syncPrimarySaveWaits() { syncSaveWaits("agent"); resumeDeferredCaptures(); tryModelSelectionReadbacks(); tryInstructionsReadbacks(); tryAutoCompactReadback(); tryMemoryReadback(); tryTtsReadback(); }
+  function syncSubagentSaveWaits() { syncSaveWaits("subagent"); resumeDeferredCaptures(); tryModelSelectionReadbacks(); tryInstructionsReadbacks(); }
 
   async function retryPrimarySettingsRead() {
     const id = selectedAgentId;
@@ -4006,7 +4410,12 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     await hydrateSubagent(id);
   }
 
-  async function hydrateSubagent(id: string) {
+  async function hydrateSubagent(id: string, admit?: () => boolean, takeSavedModel = false, takeSavedInstructions = false, takeSavedTypedTools = false) {
+    const typedGeneration = typedToolsSave('subagent', id).generation;
+    const cleanTyped = !subagentPersistedForm || typedFileToolsBodyValue(subagentForm) === typedFileToolsBodyValue(subagentPersistedForm);
+    const modelGeneration = modelSelectionSave('subagent', id).generation;
+    const instructionsGeneration = instructionsSave('subagent', id).generation;
+    retireCliAckOrigin("subagent", id);
     const requestId = ++subagentReadRequestId;
     // A real server read supersedes saves built before its snapshot; list refreshes still do not.
     subagentReadGeneration += 1;
@@ -4024,11 +4433,21 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       const payload = await response.json();
       const record = payload?.subagent as SubagentRow | undefined;
       if (!record || typeof record !== "object" || Array.isArray(record) || record.id !== id) throw new Error("Subagent settings response did not contain the requested record");
-      if (!settingsPanelAlive || requestId !== subagentReadRequestId || selectedEntity?.kind !== "subagent" || selectedEditableSubagentId !== id) return;
+      const typedBaseline = captureTypedFileToolsBaseline('subagent', id, record, response.headers.get(TYPED_FILE_TOOLS_REVISION_HEADER));
+      const modelBaseline = captureModelSelectionBaseline('subagent', record as unknown as Record<string, unknown>, response.headers.get(MODEL_SELECTION_REVISION_HEADER));
+      const instructionsBaseline = captureInstructionsBaseline('subagent', record as unknown as Record<string, unknown>, response.headers.get(INSTRUCTIONS_REVISION_HEADER));
+      if (typedGeneration !== typedToolsSave('subagent', id).generation) { setSubagentReadDeferred(true); return; }
+      if (!settingsPanelAlive || requestId !== subagentReadRequestId || selectedEntity?.kind !== "subagent" || selectedEditableSubagentId !== id || admit && !admit() || modelGeneration !== modelSelectionSave('subagent', id).generation || instructionsGeneration !== instructionsSave('subagent', id).generation) return;
       untrack(() => {
+        const canAdoptModel = !subagentCoreSaves.busy(id) && (takeSavedModel || Boolean(subagentPersistedForm && sameModelSelection('subagent', subagentForm, subagentPersistedForm)));
+        const cleanPrompt = !subagentCoreSaves.busy(id) && (takeSavedInstructions || subagentForm.system_prompt === subagentPersistedForm?.system_prompt);
+        const cleanInclude = !subagentCoreSaves.busy(id) && (takeSavedInstructions || subagentForm.include_global_prompt === subagentPersistedForm?.include_global_prompt);
         subagentStore.acceptServerRecord(record);
         subagents = subagents.map((existing) => existing.id === id ? record : existing);
         readSubagentSections(record, false, true);
+        adoptModelSelectionRead('subagent', record, modelBaseline, canAdoptModel);
+        adoptInstructionsRead('subagent', record, instructionsBaseline, cleanPrompt, cleanInclude, takeSavedInstructions);
+        adoptTypedToolsRead('subagent', record, typedBaseline, cleanTyped, takeSavedTypedTools);
         syncSelectedModelFromSubagent();
         subagentReadWaitError = null;
         if (!subagentOwnedWritesPending(id)) {
@@ -4045,6 +4464,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         if (subagentReadTimer) clearTimeout(subagentReadTimer);
         subagentReadTimer = null;
         subagentDetailLoading = false;
+        tryModelSelectionReadbacks();
+        tryInstructionsReadbacks();
       }
     }
   }
@@ -4060,25 +4481,24 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   function primaryOwnedWritesPending(id: string) {
-    return [basicSaves, promptSaves, zipSaves, mcpSaves, cliToolSaves, codexSaves,
-      claudeSaves, assignmentSaves].some((saver) => saver.busy(id));
+    return [basicSaves, promptSaves, zipSaves, mcpSaves, cliToolSaves,
+      assignmentSaves].some((saver) => saver.busy(id));
   }
 
   function subagentOwnedWritesPending(id: string) {
-    return [subagentCoreSaves, subagentMcpSaves, subagentCliToolSaves,
-      subagentCodexSaves, subagentClaudeSaves].some((saver) => saver.busy(id));
+    return [subagentCoreSaves, subagentMcpSaves, subagentCliToolSaves].some((saver) => saver.busy(id));
   }
 
-  function guardPrimaryChoice<T extends (...args: any[]) => any>(callback: T): T {
+  function guardPrimaryChoice<T extends (...args: any[]) => any>(callback: T, cliShared = false): T {
     return ((...args: Parameters<T>) => {
-      if (primaryOwnedSaveInFlightUi) return;
+      if (primaryOwnedSaveInFlightUi || cliShared && cliPairHeld("agent")) return;
       return callback(...args);
     }) as T;
   }
 
-  function guardSubagentChoice<T extends (...args: any[]) => any>(callback: T): T {
+  function guardSubagentChoice<T extends (...args: any[]) => any>(callback: T, cliShared = false): T {
     return ((...args: Parameters<T>) => {
-      if (subagentOwnedSaveInFlightUi) return;
+      if (subagentOwnedSaveInFlightUi || cliShared && cliPairHeld("subagent")) return;
       return callback(...args);
     }) as T;
   }
@@ -4099,20 +4519,29 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     if (subagentCaptureBlocked) throw new Error("Subagent settings are waiting for a read. Retry when the read finishes.");
   }
 
-  async function hydrateAgent(agentId: string) {
+  async function hydrateAgent(agentId: string, admit?: () => boolean, quietReadback = false, takeSavedModel = false, takeSavedInstructions = false, takeSavedAutoCompact = false, takeSavedTts = false, takeSavedMcp = false, takeSavedTypedTools = false) {
+    const typedGeneration = typedToolsSave('agent', agentId).generation;
+    const cleanTyped = !basicPersistedForm || typedFileToolsBodyValue(basicForm) === typedFileToolsBodyValue(basicPersistedForm);
+    const mcpReadVersion = primaryMcpVersions.get(agentId) ?? 0;
+    const ttsGeneration = ttsSave(agentId).generation;
+    const compactGeneration = autoCompactSave(agentId).generation;
+    const modelGeneration = modelSelectionSave('agent', agentId).generation;
+    const instructionsGeneration = instructionsSave('agent', agentId).generation;
+    const reasoningRead = agentReasoningReadGeneration(agentId);
+    quietReadback = !detailLoading && quietReadback;
+    retireCliAckOrigin("agent", agentId);
     const requestId = ++agentHydrationRequestId;
     syncPrimarySaveWaits();
     primaryReadWaitError = null;
     if (primaryReadTimer) clearTimeout(primaryReadTimer);
-    primaryReadTimer = setTimeout(() => {
+    primaryReadTimer = quietReadback ? null : setTimeout(() => {
       if (settingsPanelAlive && requestId === agentHydrationRequestId && selectedEntity?.kind === "agent" && selectedAgentId === agentId) {
         primaryReadWaitError = "These settings did not load within 30 seconds. Retry reads the record.";
       }
     }, SETTINGS_WAIT_MS);
     // BL-912: this read shows what the record holds now; a section it leaves alone asks again.
     setAgentReadDeferred(false);
-    detailLoading = true;
-    hydrationInProgress = true;
+    if (!quietReadback) { detailLoading = true; hydrationInProgress = true; }
     subagentEditSaveError = null;
 
     try {
@@ -4127,16 +4556,40 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
       const agent = (await response.json()) as AgentRow;
       if (!agent || typeof agent !== "object" || Array.isArray(agent) || agent.id !== agentId) throw new Error("Agent settings response did not contain the requested record");
+      const modelBaseline = captureModelSelectionBaseline('agent', agent as unknown as Record<string, unknown>, response.headers.get(MODEL_SELECTION_REVISION_HEADER));
+      const instructionsBaseline = captureInstructionsBaseline('agent', agent as unknown as Record<string, unknown>, response.headers.get(INSTRUCTIONS_REVISION_HEADER));
+      const compactBaseline = captureAutoCompactBaseline(agent as unknown as Record<string, unknown>, response.headers.get(AUTO_COMPACT_REVISION_HEADER));
+      const ttsBaseline = captureConfiguredTtsBaseline(agent as unknown as Record<string, unknown>, response.headers.get(CONFIGURED_TTS_REVISION_HEADER));
+      const typedBaseline = captureTypedFileToolsBaseline('agent', agentId, agent, response.headers.get(TYPED_FILE_TOOLS_REVISION_HEADER));
+      const incomingMcpBase = readMcpSettingsRevisions(response.headers.get(MCP_SETTINGS_REVISION_HEADER));
 
       const currentSubagents = await fetchAgentSubagents(agentId);
-      if (!settingsPanelAlive || requestId !== agentHydrationRequestId || selectedAgentId !== agentId || selectedEntity?.kind !== "agent" || selectedEntity.id !== agentId) {
+      if (!settingsPanelAlive || requestId !== agentHydrationRequestId || selectedAgentId !== agentId || selectedEntity?.kind !== "agent" || selectedEntity.id !== agentId || admit && !admit()) {
         return;
       }
+      if (typedGeneration !== typedToolsSave('agent', agentId).generation) { setAgentReadDeferred(true); return; }
+      if (mcpReadVersion !== (primaryMcpVersions.get(agentId) ?? 0)) { setAgentReadDeferred(true); return; }
+      if (modelGeneration !== modelSelectionSave('agent', agentId).generation) { setAgentReadDeferred(true); return; }
+      if (instructionsGeneration !== instructionsSave('agent', agentId).generation) { setAgentReadDeferred(true); return; }
+      if (compactGeneration !== autoCompactSave(agentId).generation) { autoCompactReadbacks.add(agentId); setAgentReadDeferred(true); return; }
+      if (ttsGeneration !== ttsSave(agentId).generation) { ttsReadbacks.add(agentId); setAgentReadDeferred(true); return; }
 
+      // Explicit recovery replaces BOTH guarded sections from this one owned read.
+      // A partial header must not pair new form values with an old baseline.
+      const canTakeSavedMcp = takeSavedMcp && !mcpSaves.busy(agentId) && !zipSaves.busy(agentId) &&
+        ['defaultMCPGateways', 'defaultMCPToolSelections', 'custom_tool_settings'].every(field =>
+          Boolean(incomingMcpBase?.[field as keyof ExpectedMcpSettings]));
       untrack(() => {
+        if (takeSavedMcp && !canTakeSavedMcp) {
+          const message = 'Saved Tool Settings could not be read completely. Your draft is kept; retry Use Saved Tool Settings.';
+          mcpSaveError = message;
+          zipSaveError = message;
+        }
         agents = agents.map((existing) =>
           existing.id === agent.id ? agent : existing,
         );
+        agent.model_reasoning_overrides = preserveNewerReasoningLeaves(agent.id, agent.model_reasoning_overrides,
+          agentStore.getAgentById(agent.id)?.model_reasoning_overrides, reasoningRead);
         agentStore.updateAgent(agent.id, mapToStoreAgent(agent));
 
         // BL-912, BL-942: a read of another agent (a first open, a pick, a delete fallback, the
@@ -4146,6 +4599,13 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         // (an edit, typed text, a failed save and its error line), and the panel reads again
         // when it comes to rest.
         const fill = hydratedAgentId !== agentId;
+        const cleanTts = fill || Boolean(basicPersistedForm && sameTtsForm(basicForm.voice_profile, basicPersistedForm.voice_profile));
+        const cleanCompactCommon = fill || Boolean(basicPersistedForm && sameAutoCompactCommon(basicForm.auto_compact_settings, basicPersistedForm.auto_compact_settings));
+        const cleanCompactAdvanced = fill || Boolean(basicPersistedForm && ['modelMode', 'modelPresetId', 'promptMode', 'prompt'].every(field =>
+          basicForm.auto_compact_settings[field as keyof AgentAutoCompactSettings] === basicPersistedForm!.auto_compact_settings[field as keyof AgentAutoCompactSettings]));
+        const cleanInstructionsPrompt = !promptSaves.busy(agentId);
+        const cleanInstructionsInclude = !basicSaves.busy(agentId) && (fill || takeSavedInstructions || basicForm.include_global_prompt === basicPersistedForm?.include_global_prompt);
+        const canAdoptModel = !basicSaves.busy(agentId) && (fill || takeSavedModel || Boolean(basicPersistedForm && sameModelSelection('agent', basicForm, basicPersistedForm)));
         const atRest = agentSectionsAtRest();
         const replaces = (section: keyof typeof atRest) => {
           if (fill || atRest[section]) return true;
@@ -4168,19 +4628,25 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           basicSaveError = null;
           syncSelectedModelFromAgent();
         } else if (basicPersistedForm && !basicSaves.busy(agentId)) {
-          memoryConflictNeedsRetry = rebaseBusyBasicSection(agent, conflict?.base ?? null);
+          memoryConflictNeedsRetry = rebaseBusyBasicSection(agent, conflict?.base ?? null) && conflict !== null;
         } else if (conflict) {
           // A save of the section is queued or on its way: it carries its own baseline and meets the
           // same check, so this read leaves the section to it and keeps the refused save's baseline.
           memoryConflictBase = conflict;
         }
+        adoptAutoCompactRead(agent, compactBaseline, cleanCompactCommon, cleanCompactAdvanced, takeSavedAutoCompact);
+        adoptTtsRead(agent, ttsBaseline, cleanTts, takeSavedTts);
+        adoptTypedToolsRead('agent', agent, typedBaseline, cleanTyped, takeSavedTypedTools);
+        adoptModelSelectionRead('agent', agent, modelBaseline, canAdoptModel);
 
         if (replaces("prompt")) {
           promptValue = agent.system_prompt ?? "";
           promptPersistedSignature = promptValue;
         }
+        adoptInstructionsRead('agent', agent, instructionsBaseline, cleanInstructionsPrompt, cleanInstructionsInclude, takeSavedInstructions);
 
-        if (replaces("zip")) {
+        if (takeSavedMcp ? canTakeSavedMcp : replaces("zip") && !primaryMcpHolds[agentId]) {
+          if (incomingMcpBase?.custom_tool_settings) primaryMcpBases = { ...primaryMcpBases, [agentId]: { ...primaryMcpBases[agentId], custom_tool_settings: incomingMcpBase.custom_tool_settings } };
           zipForm = normaliseZipForm(agent);
           zipPersistedSignature = makeZipSignature(zipForm);
           syncCustomToolOverridesFromGlobal();
@@ -4190,7 +4656,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           zipSaveError = null;
         }
 
-        if (replaces("toolGrid")) {
+        if (takeSavedMcp ? canTakeSavedMcp : replaces("toolGrid") && !primaryMcpHolds[agentId]) {
+          if (incomingMcpBase) primaryMcpBases = { ...primaryMcpBases, [agentId]: { ...primaryMcpBases[agentId], defaultMCPGateways: incomingMcpBase.defaultMCPGateways, defaultMCPToolSelections: incomingMcpBase.defaultMCPToolSelections } };
+          if (takeSavedMcp) { const holds = { ...primaryMcpHolds }; delete holds[agentId]; primaryMcpHolds = holds; }
           const mcpDefaults = normaliseMcpDefaults(agent);
           defaultMCPGateways = mcpDefaults.gateways;
           defaultMCPToolSelections = mcpDefaults.selections;
@@ -4208,6 +4676,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           // `dcmDisplaySettings` yet: its first save writes the whole block, so the older name's
           // entries are not dropped (the chat bar's Tools menu does the same).
           mcpPersistedValues = {
+            viewedDcm: cloneDcmDisplaySettings(dcmDisplaySettings),
             gateways: [...mcpDefaults.gateways],
             selections: cloneToolSelections(mcpDefaults.selections),
             dcm:
@@ -4216,26 +4685,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                 : cloneDcmDisplaySettings(mcpDefaults.dcmDisplaySettings),
           };
           mcpRenderNonce = mcpRenderNonce + 1;
-        }
-
-        if (replaces("codex")) {
-          codexForm = normaliseCodexForm(agent, "agent");
-          codexPersistedSignature = makeCodexSignature(codexForm, "agent");
-          codexPersistedBlock =
-            agent.codex_settings == null ? null : serializeCodexForm(codexForm, "agent");
-          codexSaveState = "idle";
-          codexSaveError = null;
-          codexLastSaved = null;
-        }
-
-        if (replaces("claude")) {
-          claudeForm = normaliseClaudeForm(agent, "agent");
-          claudePersistedSignature = makeClaudeSignature(claudeForm);
-          claudePersistedBlock =
-            agent.claude_settings == null ? null : serializeClaudeForm(claudeForm);
-          claudeSaveState = "idle";
-          claudeSaveError = null;
-          claudeLastSaved = null;
         }
 
         if (replaces("assignment")) {
@@ -4258,7 +4707,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       untrack(() => {
         // A failed same-entity Retry keeps every typed draft; a first load has no own draft.
         if (hydratedAgentId !== agentId) resetAgentDetailState();
-        primaryReadWaitError = error instanceof Error ? error.message : "Failed to load agent details";
+        // A failed quiet readback leaves the read-wait notice alone; the toast reports it.
+        if (!(quietReadback && hydratedAgentId === agentId)) primaryReadWaitError = error instanceof Error ? error.message : "Failed to load agent details";
       });
       toast.error(
         error instanceof Error ? error.message : "Failed to load agent details",
@@ -4270,8 +4720,12 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       if (primaryReadTimer) clearTimeout(primaryReadTimer);
       primaryReadTimer = null;
       untrack(() => {
-        hydrationInProgress = false;
-        detailLoading = false;
+        if (!quietReadback) { hydrationInProgress = false; detailLoading = false; }
+        tryModelSelectionReadbacks();
+        tryInstructionsReadbacks();
+        tryAutoCompactReadback();
+        tryTtsReadback();
+        tryMemoryReadback();
       });
     }
   }
@@ -4342,6 +4796,19 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     }
   }
 
+  async function loadToolsHostFacts() {
+    try {
+      toolsHostFacts = await fetchToolsHostFacts();
+      toolsHostFactsFailed = false;
+    } catch (error) {
+      console.warn(
+        "[AgentSettings] Could not read the host facts alone; the Tools card waits for the full sandbox status, and Refreshed File Reads stays usable:",
+        error,
+      );
+      toolsHostFactsFailed = true;
+    }
+  }
+
   async function loadNativeSandboxStatus() {
     if (nativeSandboxStatusLoading) return;
     nativeSandboxStatusLoading = true;
@@ -4396,8 +4863,16 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     }
   }
 
-  async function loadSavedModelsForPanel() {
-    if (savedModelsLoading) return;
+  function loadSavedModelsForPanel(): Promise<void> {
+    if (savedModelsRead) return savedModelsRead;
+    const read = readSavedModelsForPanel();
+    savedModelsRead = read;
+    void read.finally(() => { if (savedModelsRead === read) savedModelsRead = null; });
+    return read;
+  }
+
+  async function readSavedModelsForPanel() {
+    const read = savedModelsStore.beginSavedModelsRead();
     savedModelsLoading = true;
     savedModelsError = null;
 
@@ -4414,15 +4889,17 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       const payload = await response.json();
       const models: SavedModel[] = Array.isArray(payload)
         ? payload
-        : (payload?.models ?? payload ?? []);
-      savedModels = models ?? [];
-      savedModelsStore.setSavedModels(savedModels);
+        : payload?.models;
+      if (!settingsPanelAlive || !read.install(models)) return;
+      savedModels = models;
     } catch (error) {
+      if (!settingsPanelAlive || !read.current()) return;
+      read.fail("Saved models could not be loaded. The last good list is retained.");
       console.error("Failed to load saved models:", error);
-      savedModels = [];
       savedModelsError =
         error instanceof Error ? error.message : "Failed to load saved models";
     } finally {
+      read.finish();
       savedModelsLoading = false;
       syncSelectedModelFromAgent();
       syncSelectedModelFromSubagent();
@@ -4431,7 +4908,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
   async function refreshModelPickerData() {
     const tasks: Promise<unknown>[] = [loadSavedModelsForPanel()];
-    if (isManagedPrimaryAgentType(basicForm.agentType)) {
+    if (isApiPrimaryAgentType(basicForm.agentType)) {
       tasks.push(loadModelConnectionOptionsForPanel({ force: true }));
     }
     await Promise.all(tasks);
@@ -4468,12 +4945,12 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   async function loadVoiceProviders() {
-    if (voiceProvidersLoading) return;
+    if (voiceProvidersLoading || !settingsPanelAlive) return;
     voiceProvidersLoading = true;
     voiceProvidersError = null;
 
     try {
-      const response = await fetch("/api/voice/providers");
+      const response = await fetch("/api/voice/providers?catalog=refresh");
       if (!response.ok) {
         const message = await extractError(
           response,
@@ -4483,14 +4960,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       }
 
       const payload = await response.json();
-      voiceProviders = Array.isArray(payload?.providers)
-        ? payload.providers
-        : [];
+      if (settingsPanelAlive) voiceProviders = readVoiceProviderEnvelope(payload);
     } catch (error) {
       console.error("Failed to load voice providers:", error);
-      voiceProvidersError =
+      if (settingsPanelAlive) voiceProvidersError =
         error instanceof Error ? error.message : "Failed to load voice providers";
-      voiceProviders = [];
     } finally {
       voiceProvidersLoading = false;
     }
@@ -4556,7 +5030,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
   async function loadModelConnectionOptionsForPanel({ force = false }: { force?: boolean } = {}) {
     const agentTypeAtRequest = basicForm.agentType;
-    if (!isManagedPrimaryAgentType(agentTypeAtRequest)) return;
+    if (!isApiPrimaryAgentType(agentTypeAtRequest)) return;
     if (modelConnectionOptionsLoading) return;
     if (
       !force &&
@@ -4579,7 +5053,15 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       }
 
       const payload = await response.json();
-      modelConnectionOptions = payload?.data?.connections ?? null;
+      const connections = payload?.data?.connections;
+      if (!Array.isArray(connections) || connections.some((option) =>
+        !option || typeof option !== 'object' || Array.isArray(option) ||
+        typeof option.id !== 'string' || !option.id.trim() ||
+        (option.status !== 'ready' && option.status !== 'locked')
+      )) {
+        throw new Error('Connection status could not be read. Refresh Saved Models to retry.');
+      }
+      modelConnectionOptions = connections;
       modelConnectionOptionsLoadedForAgentType = agentTypeAtRequest;
     } catch (error) {
       console.error("Failed to load model connection options:", error);
@@ -4601,14 +5083,14 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   // itself; `handleLocalAiSettingsUpdated` and `refreshModelPickerData` reload with `force`.
   const primaryTypeForConnectionOptions = $derived(basicForm.agentType);
   $effect(() => {
-    if (!isManagedPrimaryAgentType(primaryTypeForConnectionOptions)) return;
+    if (!isApiPrimaryAgentType(primaryTypeForConnectionOptions)) return;
     untrack(() => {
       void loadModelConnectionOptionsForPanel();
     });
   });
 
   function handleLocalAiSettingsUpdated() {
-    if (!isManagedPrimaryAgentType(basicForm.agentType)) return;
+    if (!isApiPrimaryAgentType(basicForm.agentType)) return;
     void loadModelConnectionOptionsForPanel({ force: true });
   }
 
@@ -4626,23 +5108,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     }
 
     if (!match) {
-      match =
-        savedModels.find((model) => {
-          if (
-            model.provider !== basicForm.primary_model_provider ||
-            model.modelId !== basicForm.primary_model_name &&
-            model.effectiveModelId !== basicForm.primary_model_name
-          ) {
-            return false;
-          }
-
-          const connection = resolveSavedModelConnection(model);
-          const agentConnection = basicForm.primary_model_connection;
-          if (!agentConnection) return true;
-          if (connection.type !== agentConnection.type) return false;
-          if (agentConnection.service && connection.service !== agentConnection.service) return false;
-          return true;
-        }) ?? null;
+      match = findSettingsVoicePresetFallback(savedModels, basicForm);
     }
 
     selectedModelId = match && agentPresetShowsAsSelected(match) ? match.id : null;
@@ -4659,7 +5125,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     return presetAvailabilityKeepsSelection(
       getModelPresetAvailability({
         model,
-        agentType: basicForm.agentType,
+        agentType: getPrimaryToolHostScope(),
         connectionOptions: modelConnectionOptions,
       }),
     );
@@ -4676,167 +5142,49 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   function applySavedModelToBasicForm(model: SavedModel) {
-    const settings = model.settings ?? {};
-
+    const picked = buildPickedPresetSelection(model);
     basicForm = {
       ...basicForm,
-      primary_model_preset_id: model.id,
-      primary_model_connection: resolveSavedModelConnection(model),
-      primary_model_provider: model.provider,
-      primary_model_name: model.effectiveModelId ?? model.modelId,
-      provider_specific_settings: withAgentModelKeys(presetModelSettings(settings)),
-      primary_model_temperature:
-        typeof settings.temperature === "number" ? settings.temperature : null,
-      primary_model_max_tokens:
-        typeof settings.maxTokens === "number" ? settings.maxTokens : null,
-      primary_model_top_p:
-        typeof settings.topP === "number" ? settings.topP : null,
-      primary_model_top_k:
-        typeof settings.topK === "number" ? settings.topK : null,
-      primary_model_frequency_penalty:
-        typeof settings.frequencyPenalty === "number"
-          ? settings.frequencyPenalty
-          : null,
-      primary_model_presence_penalty:
-        typeof settings.presencePenalty === "number"
-          ? settings.presencePenalty
-          : null,
-      primary_model_seed:
-        typeof settings.seed === "number" ? settings.seed : null,
-      primary_model_stop_sequences: Array.isArray(settings.stopSequences)
-        ? settings.stopSequences.map((entry) => String(entry))
-        : null,
-      primary_model_reasoning_effort:
-        typeof settings.reasoningEffort === "string"
-          ? settings.reasoningEffort
-          : null,
-      primary_model_capabilities: model.capabilities ?? null,
+      ...picked,
+      provider_specific_settings: withAgentModelKeys(picked.provider_specific_settings),
     };
   }
 
-  function resolveSavedCliSubagentRuntime(model: SavedModel): "codex" | "claude" | null {
-    const connection = resolveSavedModelConnection(model);
-    const connectionId = (connection.id ?? "").trim().toLowerCase();
-    const connectionService = (connection.service ?? "").trim().toLowerCase();
-    const provider = (model.provider ?? "").trim().toLowerCase();
-    const modelId = (model.modelId ?? "").trim().toLowerCase();
-
-    if (
-      connectionId === "codex-cli" ||
-      connectionService.includes("codex") ||
-      provider.includes("codex") ||
-      modelId.includes("codex")
-    ) {
-      return "codex";
-    }
-
-    if (
-      connectionId === "claude-cli" ||
-      connectionService.includes("claude-cli") ||
-      provider.includes("claude-cli") ||
-      modelId.includes("claude-cli")
-    ) {
-      return "claude";
-    }
-
-    return null;
-  }
-
-  function extractSavedCliRuntimeModel(
-    model: SavedModel,
-    runtime: "codex" | "claude",
-  ): string | null {
-    const settings = model.settings ?? null;
-    if (!settings || typeof settings !== "object") return null;
-
-    const key = runtime === "codex" ? "codex_model" : "claude_model";
-    const value = settings[key];
-    return typeof value === "string" && value.trim().length > 0
-      ? value.trim()
-      : null;
-  }
-
-  function mergeSubagentCliRuntimeModelSetting(
-    runtime: "codex" | "claude",
-    modelId: string | null,
-  ): Record<string, any> | null {
-    const current =
-      subagentForm.provider_specific_settings &&
-      typeof subagentForm.provider_specific_settings === "object"
-        ? { ...subagentForm.provider_specific_settings }
-        : {};
-
-    const key = runtime === "codex" ? "codex_model" : "claude_model";
-    if (modelId && modelId.trim().length > 0) {
-      current[key] = modelId.trim();
-    }
-
-    return Object.keys(current).length > 0 ? current : null;
-  }
-
-  function seedCliSubagentFormsFromSavedModel(model: SavedModel) {
-    if (subagentForm.subagentType !== "cli") return;
-
-    const runtime = resolveSavedCliSubagentRuntime(model);
-    if (!runtime) return;
-
-    const nativeModel = extractSavedCliRuntimeModel(model, runtime);
-    if (!nativeModel) return;
-
-    if (runtime === "codex") {
-      updateCodexForm(
-        (current) =>
-          current.model === nativeModel
-            ? current
-            : { ...current, model: nativeModel },
-        "subagent",
-      );
-      subagentForm = {
-        ...subagentForm,
-        provider_specific_settings: mergeSubagentCliRuntimeModelSetting(
-          "codex",
-          nativeModel,
-        ),
-      };
-      return;
-    }
-
-    updateClaudeForm(
-      (current) =>
-        current.model === nativeModel
-          ? current
-          : { ...current, model: nativeModel },
-      "subagent",
-    );
-    subagentForm = {
-      ...subagentForm,
-      provider_specific_settings: mergeSubagentCliRuntimeModelSetting(
-        "claude",
-        nativeModel,
-      ),
-    };
-  }
+  type ModelClearFormView = { [Key in keyof BasicForm]: BasicForm[Key] } | { [Key in keyof SubagentSaveForm]: SubagentSaveForm[Key] };
 
   function clearAgentModelSelection() {
     selectedModelId = null;
+    const source: ModelClearFormView = basicForm;
+    const clear = buildClearedPresetSelection('agent', source);
     basicForm = {
       ...basicForm,
-      primary_model_preset_id: "",
-      primary_model_connection: null,
-      primary_model_provider: "",
-      primary_model_name: "",
-      provider_specific_settings: withAgentModelKeys(null),
-      primary_model_temperature: null,
-      primary_model_max_tokens: null,
-      primary_model_top_p: null,
-      primary_model_top_k: null,
-      primary_model_frequency_penalty: null,
-      primary_model_presence_penalty: null,
-      primary_model_seed: null,
-      primary_model_stop_sequences: null,
-      primary_model_reasoning_effort: null,
-      primary_model_capabilities: null,
+      ...clear,
+      ...(clear.provider_specific_settings ? { provider_specific_settings: withAgentModelKeys(null) } : {}),
     };
+  }
+  function modelClearEligibility(kind: ModelSelectionKind) {
+    try {
+      const form: ModelClearFormView = kind === 'agent' ? basicForm : subagentForm;
+      const draft = buildClearedPresetSelection(kind, form);
+      const persisted = kind === 'agent' ? basicPersistedForm : subagentPersistedForm;
+      if (persisted && sameModelSelection(kind, form, persisted)) {
+        const id = kind === 'agent' ? selectedAgentId : selectedEditableSubagentId;
+        const saved = id ? modelSelectionSaves.get(`${kind}:${id}`) : undefined;
+        if (!id || !saved?.baseline || saved.baseline.id !== id || saved.baseline.kind !== kind || saved.hold !== null) return { meaningful: false, unreadable: false };
+        return { meaningful: Object.keys(buildClearedPresetSelection(kind, saved.baseline.group)).length > 0, unreadable: false };
+      }
+      return { meaningful: Object.keys(draft).length > 0, unreadable: false };
+    } catch {
+      return { meaningful: false, unreadable: true };
+    }
+  }
+  function canClearModelSelection(kind: ModelSelectionKind) {
+    const blocked = kind === 'agent' ? primaryModelClearBlocked : subagentModelClearBlocked;
+    const id = kind === 'agent' ? selectedAgentId : selectedEditableSubagentId;
+    const saved = id ? modelSelectionSaves.get(`${kind}:${id}`) : undefined;
+    if (!id || !saved?.baseline || saved.baseline.id !== id || saved.baseline.kind !== kind || saved.hold !== null) return false;
+    if (kind === 'agent' ? primaryOwnedSaveInFlightUi || blocked : subagentOwnedSaveInFlightUi || blocked) return false;
+    return modelClearEligibility(kind).meaningful;
   }
 
   function syncSelectedModelFromSubagent() {
@@ -4861,7 +5209,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     return presetAvailabilityKeepsSelection(
       getModelPresetAvailability({
         model,
-        agentType: getSubagentToolHostScope(subagentForm.subagentType),
+        agentType: getSubagentToolHostScope(),
         connectionOptions: null,
       }),
     );
@@ -4870,7 +5218,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   function handleSubagentModelChange(
     value: string | string[] | null | undefined,
   ) {
-    if (subagentOwnedSaveInFlightUi) return;
+    if (subagentOwnedSaveInFlightUi || subagentModelSelectionBlocked) return;
     const nextValue = Array.isArray(value) ? value[0] : value;
     if (!nextValue) {
       clearSubagentModelSelection();
@@ -4885,7 +5233,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
     const availability = getModelPresetAvailability({
       model,
-      agentType: getSubagentToolHostScope(subagentForm.subagentType),
+      agentType: getSubagentToolHostScope(),
       connectionOptions: null,
     });
     if (availability.disabled) {
@@ -4901,11 +5249,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       primary_model_preset_id: model.id,
       primary_model_connection: resolveSavedModelConnection(model),
     };
-    seedCliSubagentFormsFromSavedModel(model);
   }
 
   function handleAgentModelChange(value: string | string[] | null | undefined) {
-    if (primaryOwnedSaveInFlightUi) return;
+    if (primaryOwnedSaveInFlightUi || primaryModelSelectionBlocked || primaryModelConnectionsBlocked) return;
     const nextValue = Array.isArray(value) ? value[0] : value;
     if (!nextValue) {
       clearAgentModelSelection();
@@ -4920,7 +5267,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
     const availability = getModelPresetAvailability({
       model,
-      agentType: basicForm.agentType,
+      agentType: getPrimaryToolHostScope(),
       connectionOptions: modelConnectionOptions,
     });
     if (availability.disabled) {
@@ -4934,34 +5281,24 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
   function clearSubagentModelSelection() {
     selectedSubagentModelId = null;
+    const source: ModelClearFormView = subagentForm;
     subagentForm = {
       ...subagentForm,
-      primary_model_provider: "",
-      primary_model_name: "",
-      primary_model_preset_id: "",
-      primary_model_connection: null,
+      ...buildClearedPresetSelection('subagent', source),
     };
   }
 
   /**
    * BL-266: the saved model a Subagent's form points at. The preset it saved wins; without one,
-   * an API Subagent shows no selection (its model was saved before Batshit kept the connection,
-   * and it will not run until the model is picked again, which saves the preset), while the
-   * other types still match by provider and model name, the way they always have.
+   * the Subagent shows no selection (its model was saved before Batshit kept the connection, and
+   * it will not run until the model is picked again, which saves the preset). SA-139 R5: the
+   * provider-and-name match served only the removed CLI Subagent type.
    */
   function findSubagentFormModel(form: SubagentForm): SavedModel | null {
     if (form.primary_model_preset_id) {
       return savedModels.find((model) => model.id === form.primary_model_preset_id) ?? null;
     }
-    if (form.subagentType === "api") return null;
-    return (
-      savedModels.find(
-        (model) =>
-          model.provider === form.primary_model_provider &&
-          (model.modelId === form.primary_model_name ||
-            model.effectiveModelId === form.primary_model_name),
-      ) ?? null
-    );
+    return null;
   }
 
   let avatarAppActionBusy = $state(false);
@@ -4976,6 +5313,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       if (!Object.values(agentSectionsAtRest()).every(Boolean)) return 'unsaved_changes';
     } else if (args.entityType === 'subagent') {
       if (selectedEntity?.kind !== 'subagent' || selectedEditableSubagentId !== args.entityId) return 'unsupported_target';
+      // SA-139 R5 (D14): a leftover of a removed Subagent type is never saved, so no file is uploaded for it.
+      if (retiredSubagentDetails) return 'unsupported_target';
       if (subagentSettingsReadWaiting || !subagentPersistedForm) return 'settings_unconfirmed';
       if (subagentOwnedSaveInFlightUi || subagentAvatarUploading) return 'owner_busy';
       if (!Object.values(subagentSectionsAtRest()).every(Boolean)) return 'unsaved_changes';
@@ -5176,6 +5515,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
   function selectAgent(agentId: string) {
     if (createEntityMode) return;
+    cliAckOrigins.clear();
     if (selectedEntity?.kind !== "agent") { subagentAvatarUploadRequestId += 1; subagentAvatarUploading = false; }
     if (agentId === selectedAgentId) {
       untrack(() => {
@@ -5228,7 +5568,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     wake_enabled: true,
     wake_timeout_minutes: null,
     wake_target: DEFAULT_WAKE_TARGET,
-    jev_juice_skill_tool_hints: false,
+    jev_juice_skill_tool_hints: 'off',
     jev_juice_judge_tool: false,
     jev_juice_memory_rerank: false,
     jev_juice_memory_recall: false,
@@ -5275,6 +5615,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       show_reasoning:
         agent.show_reasoning ?? shouldShowReasoningByDefaultForPrimaryAgent(normalisedType),
       preserve_reasoning: agent.preserve_reasoning ?? false,
+      api_reasoning_retention: agent.api_reasoning_retention ?? null,
+      whiteboard_budget_tokens: agent.whiteboard_budget_tokens ?? null,
+      show_whiteboard: agent.show_whiteboard ?? null,
       tool_approval_mode:
         (agent as any).tool_approval_mode === "all" || (agent as any).toolApprovalMode === "all"
           ? "all"
@@ -5282,11 +5625,13 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       auto_compact_settings: normalizeAgentAutoCompactSettings(agent.auto_compact_settings),
       memory_settings: resolveAgentMemorySettingsDraft(agent),
       workers_enabled: resolveWorkersEnabled(agent),
-    dms_enabled: resolveAgentDmsEnabled(agent),
+    // The saved switches, not the rules: the rules are also off while Fabric & Utilities is
+    // off, and hydrating from them would erase the saved choice on the next save.
+    dms_enabled: readAgentDmsSwitch(agent),
     dm_sender_scope: resolveDmSenderPolicy(agent).scope,
     dm_sender_agent_ids: resolveDmSenderPolicy(agent).agentIds,
-    jev_juice_skill_tool_hints: resolveAgentJevSkillToolHintsEnabled(agent),
-    jev_juice_judge_tool: resolveAgentJevJudgeToolEnabled(agent),
+    jev_juice_skill_tool_hints: resolveAgentJevSkillSessionMode(agent),
+    jev_juice_judge_tool: readAgentJevJudgeToolSwitch(agent),
     jev_juice_memory_rerank: resolveAgentJevMemoryRerankEnabled(agent),
     jev_juice_memory_recall: resolveAgentJevMemoryRecallEnabled(agent),
     jev_juice_reply_check: resolveAgentJevReplyCheckEnabled(agent),
@@ -5347,6 +5692,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     return {
       zip_ai_view_mode: ZIP_LAYOUT_INHERIT,
       zip_tool_notes_enabled: ZIP_NOTES_INHERIT,
+      live_file_reads: LIVE_READS_INHERIT,
       buffer_size: "",
       buffer_size_image: "",
       buffer_size_error: "",
@@ -5395,6 +5741,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     basicForm = createDefaultBasicForm();
     basicPersistedSignature = null;
     basicPersistedForm = null;
+    autoCompactNotice = null;
+    autoCompactBlocked = true;
+    ttsNotice = null;
+    ttsBlocked = true;
     basicValidationError = null;
     basicSaveState = "idle";
     basicSaveError = null;
@@ -5424,24 +5774,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     mcpSaveError = null;
     mcpLastSaved = null;
     mcpRenderNonce += 1;
-    codexForm = createDefaultCodexForm();
-    codexPersistedSignature = null;
-    codexPersistedBlock = null;
-    codexSaveState = "idle";
-    codexSaveError = null;
-    codexLastSaved = null;
-    codexDirDraft = "";
-    codexEnableDraft = "";
-    codexDisableDraft = "";
-    claudeForm = createDefaultClaudeForm();
-    claudePersistedSignature = null;
-    claudePersistedBlock = null;
-    claudeSaveState = "idle";
-    claudeSaveError = null;
-    claudeLastSaved = null;
-    claudeDirDraft = "";
-    claudeAllowedToolDraft = "";
-    claudeDisallowedToolDraft = "";
     selectedSubagentIds = [];
     assignmentPersistedSignature = null;
     assignmentSaveState = "idle";
@@ -5465,9 +5797,16 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           ? "enabled"
           : "disabled"
         : ZIP_NOTES_INHERIT;
+    const liveFileReadsValue =
+      typeof agent.live_file_reads === "boolean"
+        ? agent.live_file_reads
+          ? "enabled"
+          : "disabled"
+        : LIVE_READS_INHERIT;
     return {
       zip_ai_view_mode: layoutValue,
       zip_tool_notes_enabled: notesValue,
+      live_file_reads: liveFileReadsValue,
       buffer_size: toStringValue(agent.buffer_size),
       buffer_size_image: toStringValue(agent.buffer_size_image),
       buffer_size_error: toStringValue(agent.buffer_size_error),
@@ -5506,6 +5845,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       auto_zip_all_other_tools: toAutoZipValue((agent as any).auto_zip_all_other_tools, (agent as any).zip_disabled_all_other_tools),
       custom_tool_settings: toCustomToolArray(agent.custom_tool_settings).map(
         (tool) => ({
+          retained: Object.fromEntries(Object.entries(tool).filter(([field]) => !['tool_name','buffer_size','zip_threshold','auto_zip','zip_disabled'].includes(field))),
           tool_name: tool.tool_name,
           buffer_size: toStringValue(tool.buffer_size),
           zip_threshold: toStringValue(tool.zip_threshold),
@@ -5518,9 +5858,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   function normaliseSubagentForm(subagent: SubagentRow): SubagentForm {
     return {
       displayName: subagent.displayName ?? "",
+      // The stored type, kept as read (SA-139 R5): a leftover CLI Subagent stays `cli`, so it is
+      // shown delete-only and never saved as an API Subagent. The list never holds a removed n8n
+      // Subagent type (`GET /api/subagents`, SA-139 R2).
       subagentType: normalizeSubagentType(subagent, subagent.subagentType),
       specialty: subagent.specialty ?? "general",
-      webhook_url: subagent.webhook_url ?? subagent.webhookUrl ?? "",
       include_global_prompt: subagent.include_global_prompt ?? false,
       system_prompt: subagent.system_prompt ?? "",
       primary_model_provider: subagent.primary_model_provider ?? "",
@@ -5530,6 +5872,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       timeout_seconds:
         typeof subagent.timeout_seconds === "number"
           ? String(subagent.timeout_seconds)
+          : "",
+      max_tool_steps:
+        typeof subagent.max_tool_steps === "number"
+          ? String(subagent.max_tool_steps)
           : "",
       avatar: subagent.avatar ?? null,
       avatar_icon_ref: normalizeIconRef(subagent.avatar_icon_ref, DEFAULT_AGENT_ICON_REF),
@@ -5541,7 +5887,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   /**
    * BL-912: which Primary sections are at rest: the form equals what it last loaded or saved, and
    * no save of the section is queued or on its way (its savers in `basicSaves` and the others). A
-   * section that has not loaded (a null persisted signature) is not at rest; the zip section is
+   * section that has not loaded is not at rest. The zip section is
    * compared the way its own effect decides to save (`diffZipPayload`), because the global custom
    * tool sync can reorder its signature without anything to send. The prompt and the CLI tools
    * list have no form of their own to differ, so their savers decide. Plain reads, never in an
@@ -5553,7 +5899,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       : null;
     return {
       basic:
-        basicPersistedSignature !== null &&
+        !cliPairBlocked("agent") && basicPersistedSignature !== null &&
         makeBasicSignature(basicForm) === basicPersistedSignature &&
         !basicSaves.busy(selectedAgentId ?? ""),
       prompt:
@@ -5562,19 +5908,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         !promptSaves.busy(selectedAgentId ?? ""),
       zip: zipChanges !== null && Object.keys(zipChanges).length === 0 && !zipSaves.busy(selectedAgentId ?? ""),
       toolGrid:
-        mcpPersistedSignature !== null &&
+        !cliPairBlocked("agent") && mcpPersistedSignature !== null &&
         makeMcpSignature(defaultMCPGateways, defaultMCPToolSelections, dcmDisplaySettings) ===
           mcpPersistedSignature &&
         !mcpSaves.busy(selectedAgentId ?? "") &&
         !cliToolSaves.busy(selectedAgentId ?? ""),
-      codex:
-        codexPersistedSignature !== null &&
-        makeCodexSignature(codexForm, "agent") === codexPersistedSignature &&
-        !codexSaves.busy(selectedAgentId ?? ""),
-      claude:
-        claudePersistedSignature !== null &&
-        makeClaudeSignature(claudeForm) === claudePersistedSignature &&
-        !claudeSaves.busy(selectedAgentId ?? ""),
       assignment:
         assignmentPersistedSignature !== null &&
         makeSubagentSignature(selectedSubagentIds) === assignmentPersistedSignature &&
@@ -5625,21 +5963,59 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
    */
   function handleAgentSettingsEvent(event: UserChannelEvent) {
     if (!settingsPanelAlive) return;
+    const modelRefresh = event.type === 'reconnected' ||
+      (event.type === 'agent_settings_changed' || event.type === 'subagent_settings_changed') && event.family === 'model-selection';
+    if (modelRefresh) {
+      // The user-channel owner refreshes the shared list once through its pure stored
+      // projection. This mounted owner only follows target detail at its existing rest boundary.
+      if (selectedEntity?.kind === 'subagent' && selectedEditableSubagentId &&
+        (event.type === 'reconnected' || event.type === 'subagent_settings_changed' && event.agentId === selectedEditableSubagentId)) {
+        if (!subagentCoreSaves.busy(selectedEditableSubagentId)) void hydrateSubagent(selectedEditableSubagentId);
+        else setSubagentReadDeferred(true);
+      }
+    }
+    if (event.type === 'subagent_settings_changed' && event.family === 'instructions' && selectedEntity?.kind === 'subagent' && event.agentId === selectedEditableSubagentId && selectedEditableSubagentId) {
+      if (!subagentCoreSaves.busy(selectedEditableSubagentId)) void hydrateSubagent(selectedEditableSubagentId);
+      else { instructionsReadbacks.add(`subagent:${selectedEditableSubagentId}`); setSubagentReadDeferred(true); }
+    }
+    if (event.type === 'subagent_settings_changed' && event.family === 'provider-settings' && selectedEntity?.kind === 'subagent' && event.agentId === selectedEditableSubagentId && selectedEditableSubagentId) {
+      if (!subagentCoreSaves.busy(selectedEditableSubagentId)) void hydrateSubagent(selectedEditableSubagentId);
+      else setSubagentReadDeferred(true);
+    }
     // The selected agent, loaded or still loading: `readAgentAgainWhenAtRest` replaces a first read
     // that is still on its way (its answer may predate the agent's save) and waits for rest otherwise.
     const shownAgentId = selectedEntity?.kind === "agent" ? selectedAgentId : null;
-    const readShownAgent = () =>
+    const readShownAgent = (refreshModel = false, refreshInstructions = false, refreshCompact = false, refreshMemory = false, refreshTts = false) =>
       untrack(() => {
+        if (shownAgentId === null) return;
         setAgentReadDeferred(true);
-        readAgentAgainWhenAtRest();
+        if (refreshTts && hydratedAgentId === shownAgentId) {
+          ttsReadbacks.add(shownAgentId); tryTtsReadback();
+        } else if (refreshMemory && hydratedAgentId === shownAgentId) {
+          memoryReadbacks.add(shownAgentId);
+          tryMemoryReadback();
+        } else if (refreshCompact && hydratedAgentId === shownAgentId) {
+          autoCompactReadbacks.add(shownAgentId);
+          tryAutoCompactReadback();
+        } else if (refreshInstructions && hydratedAgentId === shownAgentId) {
+          instructionsReadbacks.add(`agent:${shownAgentId}`);
+          tryInstructionsReadbacks();
+        } else if (refreshModel && hydratedAgentId === shownAgentId && !basicSaves.busy(shownAgentId)) {
+          void hydrateAgent(shownAgentId);
+        } else readAgentAgainWhenAtRest();
       });
     if (event.type === "reconnected") {
-      if (shownAgentId !== null) readShownAgent();
+      if (shownAgentId !== null) readShownAgent(true, true, true, true, true);
       return;
     }
     if (event.type !== "agent_settings_changed" || typeof event.agentId !== "string") return;
-    if (shownAgentId !== null && event.agentId === shownAgentId) readShownAgent();
-    else if (agents.some((agent) => agent.id === event.agentId)) void refreshListedAgent(event.agentId);
+    if (event.family === "mcp-settings" && event.agentId === shownAgentId && shownAgentId) {
+      if (!mcpSaves.busy(shownAgentId) && !zipSaves.busy(shownAgentId)) void hydrateAgent(shownAgentId); else setAgentReadDeferred(true);
+      return;
+    }
+    if (shownAgentId !== null && event.agentId === shownAgentId) {
+      readShownAgent(event.family === 'model-selection', event.family === 'instructions', event.family === 'auto-compact', event.family === 'memory', event.family === 'voice-selection');
+    } else if (agents.some((agent) => agent.id === event.agentId)) void refreshListedAgent(event.agentId);
   }
 
   /** A-1y: a listed agent that is not shown, read again for its list entry (the picker's name). */
@@ -5710,11 +6086,17 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
    * from: the baseline its body was worked out from, written the way the save writes them. The
    * server refuses it (409 `memory_settings_changed`) when the saved ones changed meanwhile.
    */
-  function basicRequestBody(body: Partial<BasicPayloadBody>, baseForm: BasicForm): Record<string, unknown> {
-    return AGENT_MEMORY_GROUP.some((field) => field in body)
+  function basicRequestBody(body: Partial<BasicPayloadBody>, baseForm: BasicForm, expectedModelSelection?: string, expectedInstructions?: Partial<InstructionsRevisions>, expectedAutoCompact?: string, expectedTtsSelection?: string): Record<string, unknown> {
+    const request = AGENT_MEMORY_GROUP.some((field) => field in body)
       ? { ...body, expectedMemory: buildAgentMemoryRecordFields(baseForm.memory_settings) }
       : body;
+    return { ...request, ...(expectedModelSelection ? { expectedModelSelection } : {}), ...(expectedInstructions ? { expectedInstructions } : {}), ...(expectedAutoCompact ? { expectedAutoCompact } : {}), ...(expectedTtsSelection ? { expectedTtsSelection } : {}) };
   }
+
+  class ModelSelectionSaveRefusedError extends Error {}
+  class InstructionsSaveRefusedError extends Error {}
+  class AutoCompactSaveRefusedError extends Error {}
+  class TtsSaveRefusedError extends Error {}
 
   class MemorySettingsChangedError extends Error {}
 
@@ -5765,20 +6147,86 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
    * (A-1y): a memory save carries it as `expectedMemory`, and a refused one rebases from it.
    */
   async function persistBasic(
-    payload: { id: string; body: Partial<BasicPayloadBody>; hydrationGeneration: number; baseForm: BasicForm },
+    payload: { id: string; body: Partial<BasicPayloadBody>; hydrationGeneration: number; baseForm: BasicForm; expectedModelSelection?: string; expectedInstructions?: Partial<InstructionsRevisions>; expectedAutoCompact?: string; expectedTtsSelection?: string },
     savedForm: BasicForm,
     applyToLive?: (form: BasicForm) => BasicForm,
   ) {
+    retireCliAckOrigin("agent", payload.id, "basic");
     const stored = agents.find((agent) => agent.id === payload.id);
     const previousAvatar = stored?.avatar ?? stored?.avatar_url ?? null;
+    const modelSent = isModelSelectionWrite('agent', payload.body) && Boolean(payload.expectedModelSelection);
+    let modelIssued = false;
+    let modelKnownSaved = false;
+    let instructionsIssued = false;
+    let instructionsKnownSaved = false;
+    const compactSent = Object.hasOwn(payload.body, 'auto_compact_settings');
+    const compactBase = compactSent ? autoCompactSave(payload.id).baseline : null;
+    const compactBefore = compactSent ? { ...payload.baseForm.auto_compact_settings } : null;
+    const compactSaved = compactSent ? { ...savedForm.auto_compact_settings } : null;
+    let compactIssued = false;
+    let compactKnownSaved = false;
+    let knownNoSave = false;
+    const ttsSent = Object.hasOwn(payload.body, 'voice_profile');
+    const ttsBase = ttsSent ? ttsSave(payload.id).baseline : null;
+    const ttsBefore = ttsSent ? { ...payload.baseForm.voice_profile } : null;
+    const ttsSaved = ttsSent ? { ...savedForm.voice_profile } : null;
+    const ttsType = ttsSent ? payload.baseForm.agentType : null;
+    let ttsIssued = false, ttsKnownSaved = false;
+    const typedSent = typedFileToolsBodyValue(payload.body) !== undefined;
+    let typedOriginal: TypedFileToolsBaseline | null = null, typedIssued = false, typedKnownSaved = false;
     try {
+      if (typedSent) typedOriginal = beginTypedToolsWrite('agent', payload.id, payload.body);
+      if (ttsSent) {
+        const saved = ttsSave(payload.id);
+        if (!payload.expectedTtsSelection || saved.baseline?.token !== payload.expectedTtsSelection || saved.hold !== null) throw new TtsSaveRefusedError('This reply voice change was not sent. Use Saved Reply Voice and make a new choice.');
+        saved.generation += 1;
+      }
+      if (compactSent) {
+        const saved = autoCompactSave(payload.id);
+        if (!payload.expectedAutoCompact || saved.baseline?.token !== payload.expectedAutoCompact || saved.hold !== null) {
+          throw new AutoCompactSaveRefusedError('This Auto Compact change was not sent. Use Saved Auto Compact and make a new choice.');
+        }
+        saved.generation += 1;
+      }
+      beginInstructionsWrite('agent', payload.id, payload.body, payload.expectedInstructions);
+      if (modelSent) {
+        const saved = modelSelectionSave('agent', payload.id);
+        if (!ownsModelSelectionBase(saved.baseline, payload.expectedModelSelection) || saved.hold !== null) {
+          throw new ModelSelectionSaveRefusedError('This model choice was not sent. Use Saved Model before choosing another model.');
+        }
+        saved.generation += 1;
+        modelIssued = true;
+      }
+      instructionsIssued = namesInstructions(payload.body);
+      compactIssued = compactSent;
+      ttsIssued = ttsSent;
+      typedIssued = typedSent;
       const response = await fetch(`/api/agents/${payload.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(basicRequestBody(payload.body, payload.baseForm)),
+        body: JSON.stringify(basicRequestBody(payload.body, payload.baseForm, payload.expectedModelSelection, payload.expectedInstructions, payload.expectedAutoCompact, payload.expectedTtsSelection)),
       });
 
+      const typedAnswer = typedSent ? await response.clone().json().catch(() => null) : null;
+      if (typedSent) typedKnownSaved = adoptTypedToolsReceipt('agent', payload.id, payload.body, typedOriginal, typedAnswer?.typedFileTools);
+      if (typedSent && response.ok && !typedKnownSaved) throw new Error('The saved choice receipt is unconfirmed. Your draft is kept; do not repeat it automatically.');
       if (!response.ok) {
+        knownNoSave = typedSent && [400, 409].includes(response.status) && ['typed_file_tools_base_required', 'typed_file_tools_changed'].includes(typedAnswer?.code);
+        knownNoSave ||= instructionsKnownNoSave(response.status, (await response.clone().json().catch(() => null))?.code);
+        if (compactSent && knownNoSave) {
+          const answer = await response.clone().json().catch(() => null);
+          if (answer?.code === 'auto_compact_base_required' || answer?.code === 'auto_compact_settings_changed') throw new AutoCompactSaveRefusedError('Auto Compact changed while you were editing. Your draft was not saved. Use Saved Auto Compact and make a new choice.');
+        }
+        if (namesInstructions(payload.body) && (response.status === 400 || response.status === 409)) {
+          const answer = await response.clone().json().catch(() => null);
+          if (answer?.code === 'instructions_base_required' || answer?.code === 'instructions_settings_changed') throw new InstructionsSaveRefusedError('Saved instructions changed while you were editing. Your draft was not saved. Use Saved Instructions and make a new choice.');
+        }
+        if (modelSent && (response.status === 400 || response.status === 409)) {
+          const answer = await response.clone().json().catch(() => null);
+          if (answer?.code === 'model_selection_base_required' || answer?.code === 'model_selection_settings_changed') {
+            throw new ModelSelectionSaveRefusedError('The model changed while you were editing. Your choice was not saved. Use Saved Model before choosing another model.');
+          }
+        }
         if (response.status === 409) {
           const answer = await response.clone().json().catch(() => null);
           if (answer?.code === "memory_settings_changed") {
@@ -5794,6 +6242,28 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         throw new Error(message);
       }
 
+      modelKnownSaved = true;
+      instructionsKnownSaved = true;
+      compactKnownSaved = true;
+      ttsKnownSaved = true;
+      if (ttsSent) { const saved = ttsSave(payload.id); saved.generation += 1; saved.baseline = null; saved.hold = 'read'; ttsReadbacks.add(payload.id); syncTtsNotice(); }
+      if (compactSent) {
+        const saved = autoCompactSave(payload.id);
+        saved.generation += 1;
+        saved.baseline = null;
+        saved.hold = 'read';
+        autoCompactReadbacks.add(payload.id);
+        syncAutoCompactNotice();
+      }
+      settleInstructionsWrite('agent', payload.id, payload.body, 'read');
+      if (modelSent) {
+        const saved = modelSelectionSave('agent', payload.id);
+        saved.generation += 1;
+        saved.baseline = null;
+        saved.hold = 'read';
+        modelSelectionReadbacks.add(`agent:${payload.id}`);
+      }
+
       untrack(() => {
         const landing = agentLanding(payload.id, payload.hydrationGeneration);
         if (landing === "current") {
@@ -5807,14 +6277,37 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           basicLastSaved = new Date();
         } else if (landing === "older") {
           basicSaveState = "idle";
+          // A later detail read can leave this known save's baseline behind. Move only
+          // its still-owned Compact block to the captured saved snapshot, so its own
+          // readback can obtain the new token beside an unrelated invalid draft.
+          // Never use the live form: a later Compact edit and every other draft stay owned.
+          if (compactSaved && compactBase && compactBase.token === payload.expectedAutoCompact &&
+            selectedEntity?.kind === 'agent' && selectedEntity.id === payload.id &&
+            basicPersistedForm?.agentType === compactBase.type && basicForm.agentType === compactBase.type &&
+            sameJsonValue(basicPersistedForm.auto_compact_settings, compactBefore)) {
+            basicPersistedForm = { ...basicPersistedForm, auto_compact_settings: compactSaved };
+            basicPersistedSignature = makeBasicSignature(basicPersistedForm);
+          }
+          if (ttsSaved && ttsBefore && ttsBase?.id === payload.id && ttsBase.token === payload.expectedTtsSelection &&
+            selectedEntity?.kind === 'agent' && selectedEntity.id === payload.id &&
+            basicPersistedForm?.agentType === ttsType && basicForm.agentType === ttsType &&
+            sameTtsForm(basicPersistedForm.voice_profile, ttsBefore)) {
+            const tuple = { provider: ttsSaved.provider, model: ttsSaved.model, voiceId: ttsSaved.voiceId, profileId: ttsSaved.profileId };
+            basicPersistedForm = { ...basicPersistedForm, voice_profile: { ...basicPersistedForm.voice_profile, ...tuple } };
+            basicPersistedSignature = makeBasicSignature(basicPersistedForm);
+          }
         }
         // BL-514: the body holds only what this save changed; a field it left out keeps its value.
         updateAgentCollections(payload.id, {
-          ...payload.body,
+          ...withoutExpectedTypedFileTools(payload.body),
           ...("primary_model_name" in payload.body
             ? { model: payload.body.primary_model_name }
             : {}),
         } as Partial<AgentRow>);
+        syncModelSelectionNotices();
+        // Round 2: whether Refreshed File Reads can run reads the agent's type and its Bash
+        // command location and permissions mode, so a save that changes one changes the badges' facts.
+        if (refreshedFileReadsRecordInputsChanged(payload.baseForm, savedForm)) void refreshAllDeadCopies();
       });
       // BL-142: the save changed the picture, so the pictures the agent no longer shows go.
       if (
@@ -5831,6 +6324,23 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     } catch (error) {
       console.error("Failed to save agent settings:", error);
       untrack(() => {
+        if (typedSent && !typedKnownSaved) refuseTypedToolsWrite('agent', payload.id, knownNoSave || !typedIssued || error instanceof TypedToolsSaveRefusedError);
+        if (ttsSent && !ttsKnownSaved) { const saved = ttsSave(payload.id); saved.generation += 1; saved.hold = knownNoSave || !ttsIssued || error instanceof TtsSaveRefusedError ? 'conflict' : 'unknown'; saved.earlierUnknown ||= saved.hold === 'unknown'; syncTtsNotice(); }
+        if (compactSent && !compactKnownSaved) {
+          const saved = autoCompactSave(payload.id);
+          saved.generation += 1;
+          saved.hold = knownNoSave || !compactIssued ? 'conflict' : 'unknown';
+          saved.earlierUnknown ||= saved.hold === 'unknown';
+          syncAutoCompactNotice();
+        }
+        if (!instructionsKnownSaved) settleInstructionsWrite('agent', payload.id, payload.body, error instanceof InstructionsSaveRefusedError || !instructionsIssued || knownNoSave ? 'conflict' : 'unknown');
+        if (modelSent && !modelKnownSaved) {
+          const saved = modelSelectionSave('agent', payload.id);
+          saved.generation += 1;
+          saved.hold = knownNoSave || error instanceof AutoCompactSaveRefusedError || error instanceof InstructionsSaveRefusedError || error instanceof ModelSelectionSaveRefusedError || error instanceof MemorySettingsChangedError || !modelIssued ? 'conflict' : 'unknown';
+          saved.earlierUnknown ||= saved.hold === 'unknown';
+          syncModelSelectionNotices();
+        }
         if (error instanceof MemorySettingsChangedError) {
           recoverRefusedMemorySave(payload);
         } else if (selectedAgentId === payload.id) {
@@ -5858,28 +6368,40 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       nextForm: BasicForm;
       hydrationGeneration: number;
       baseForm: BasicForm;
+      expectedModelSelection?: string;
+      expectedInstructions?: Partial<InstructionsRevisions>;
+      expectedAutoCompact?: string;
+      expectedTtsSelection?: string;
     }) => persistBasic(payload, payload.nextForm),
     BASIC_SAVE_DEBOUNCE_MS,
   );
 
   async function persistPrompt(
-    payload: { id: string; system_prompt: string; hydrationGeneration: number },
+    payload: { id: string; system_prompt: string; hydrationGeneration: number; expectedInstructions: Partial<InstructionsRevisions> },
     nextPrompt: string = promptValue,
   ) {
+    let issued = false;
+    let knownSaved = false;
+    let knownNoSave = false;
     try {
+      beginInstructionsWrite('agent', payload.id, payload, payload.expectedInstructions);
+      issued = true;
       const response = await fetch(`/api/agents/${payload.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ system_prompt: payload.system_prompt }),
+        body: JSON.stringify({ system_prompt: payload.system_prompt, expectedInstructions: payload.expectedInstructions }),
       });
 
       if (!response.ok) {
+        knownNoSave = instructionsKnownNoSave(response.status, (await response.clone().json().catch(() => null))?.code);
         const message = await extractError(
           response,
           "Failed to save system prompt",
         );
         throw new Error(message);
       }
+      knownSaved = true;
+      settleInstructionsWrite('agent', payload.id, payload, 'read');
 
       untrack(() => {
         // The prompt has no form of its own to differ from a baseline and no effect that saves it
@@ -5894,6 +6416,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         });
       });
     } catch (error) {
+      if (!knownSaved) settleInstructionsWrite('agent', payload.id, payload, !issued || knownNoSave ? 'conflict' : 'unknown');
       console.error("Failed to save prompt:", error);
       throw error instanceof Error
         ? error
@@ -5904,20 +6427,39 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   const saveZipSettings = zipSaves.debounce(
     async (payload: {
       id: string;
-      body: Partial<ZipPayloadBody>;
+      body: Partial<ZipPayloadBody> & { expectedMcpSettings?: ExpectedMcpSettings };
       signature: string;
       /** The whole payload the body was worked out from: the baseline once the save lands. */
       full: ZipPayloadBody;
       hydrationGeneration: number;
     }) => {
+      let issued = false;
+      let ownsAck = false;
+      let knownRefusal = false;
       try {
+        // A queued capture cannot issue after an earlier guarded outcome became held.
+        if (payload.body.expectedMcpSettings && primaryMcpHolds[payload.id]) {
+          throw new Error('Your Tool Settings draft is kept. Use Saved Tool Settings before another choice.');
+        }
+        const body = JSON.stringify(payload.body);
+        issued = true;
         const response = await fetch(`/api/agents/${payload.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload.body),
+          body,
         });
 
+        const mcpAnswer = await response.clone().json().catch(() => null);
+        ownsAck = adoptPrimaryMcpAck(payload.id, payload.body.expectedMcpSettings, mcpAnswer?.mcpSettings);
+        if (response.ok && payload.body.expectedMcpSettings && !ownsAck) {
+          primaryMcpHolds = { ...primaryMcpHolds, [payload.id]: 'unknown' };
+          throw new Error('The Tool Settings save acknowledgement is unconfirmed. Your draft is kept; use saved values before another choice.');
+        }
         if (!response.ok) {
+          if (payload.body.expectedMcpSettings && !ownsAck) {
+            knownRefusal = [400, 409].includes(response.status) && ['mcp_settings_base_required', 'mcp_settings_changed'].includes(mcpAnswer?.code);
+            primaryMcpHolds = { ...primaryMcpHolds, [payload.id]: knownRefusal ? 'conflict' : 'unknown' };
+          }
           const message = await extractError(
             response,
             "Failed to save zip overrides",
@@ -5938,12 +6480,20 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           }
           updateAgentCollections(
             payload.id,
-            zipPayloadToAgentUpdates(payload.body),
+            zipPayloadToAgentUpdates(withoutExpectedMcpSettings(payload.body)),
           );
+          // SA-137 P4 (D11): the badges' live-read facts depend on this agent's choice, and
+          // Round 2 on its Zip view (one of the availability rule's inputs).
+          if ("live_file_reads" in payload.body || "zip_ai_view_mode" in payload.body) void refreshAllDeadCopies();
         });
       } catch (error) {
         console.error("Failed to save zip overrides:", error);
         untrack(() => {
+          // A lost/unreadable answer is unknown even if this entity is no longer selected.
+          // A genuine same-request ACK survives any later follow-up failure.
+          if (issued && payload.body.expectedMcpSettings && !ownsAck && !knownRefusal) {
+            primaryMcpHolds = { ...primaryMcpHolds, [payload.id]: 'unknown' };
+          }
           if (selectedAgentId === payload.id) {
             zipSaveState = "idle";
             zipSaveError =
@@ -5953,6 +6503,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           }
         });
       } finally {
+        primaryMcpVersions.set(payload.id, (primaryMcpVersions.get(payload.id) ?? 0) + 1);
         setTimeout(() => {
           untrack(() => {
             if (zipSaveState === "saved") {
@@ -5968,20 +6519,40 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   const saveMcpSettings = mcpSaves.debounce(
     async (payload: {
       id: string;
-      body: McpSectionSave;
+      body: McpSectionSave & { expectedMcpSettings?: ExpectedMcpSettings };
       signature: string;
       /** The values the body was worked out from: the baseline once the save lands. */
       values: McpSectionValues;
       hydrationGeneration: number;
     }) => {
+      retireCliAckOrigin("agent", payload.id, "mcp");
+      let issued = false;
+      let ownsAck = false;
+      let knownRefusal = false;
       try {
+        // A queued capture cannot issue after an earlier guarded outcome became held.
+        if (payload.body.expectedMcpSettings && primaryMcpHolds[payload.id]) {
+          throw new Error('Your Tool Settings draft is kept. Use Saved Tool Settings before another choice.');
+        }
+        const body = JSON.stringify(payload.body);
+        issued = true;
         const response = await fetch(`/api/agents/${payload.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload.body),
+          body,
         });
 
+        const mcpAnswer = await response.clone().json().catch(() => null);
+        ownsAck = adoptPrimaryMcpAck(payload.id, payload.body.expectedMcpSettings, mcpAnswer?.mcpSettings);
+        if (response.ok && payload.body.expectedMcpSettings && !ownsAck) {
+          primaryMcpHolds = { ...primaryMcpHolds, [payload.id]: 'unknown' };
+          throw new Error('The Tool Settings save acknowledgement is unconfirmed. Your draft is kept; use saved values before another choice.');
+        }
         if (!response.ok) {
+          if (payload.body.expectedMcpSettings && !ownsAck) {
+            knownRefusal = [400, 409].includes(response.status) && ['mcp_settings_base_required', 'mcp_settings_changed'].includes(mcpAnswer?.code);
+            primaryMcpHolds = { ...primaryMcpHolds, [payload.id]: knownRefusal ? 'conflict' : 'unknown' };
+          }
           const message = await extractError(
             response,
             "Failed to save default MCP settings",
@@ -6001,11 +6572,16 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
             mcpSaveState = "idle";
           }
           // BL-855: the body names only what changed; each copy takes it the way the server does.
-          updateAgentCollections(payload.id, payload.body);
+          updateAgentCollections(payload.id, withoutExpectedMcpSettings(payload.body));
         });
       } catch (error) {
         console.error("Failed to save default MCP settings:", error);
         untrack(() => {
+          // A lost/unreadable answer is unknown even if this entity is no longer selected.
+          // A genuine same-request ACK survives any later follow-up failure.
+          if (issued && payload.body.expectedMcpSettings && !ownsAck && !knownRefusal) {
+            primaryMcpHolds = { ...primaryMcpHolds, [payload.id]: 'unknown' };
+          }
           if (selectedAgentId === payload.id) {
             mcpSaveState = "idle";
             mcpSaveError =
@@ -6015,6 +6591,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           }
         });
       } finally {
+        primaryMcpVersions.set(payload.id, (primaryMcpVersions.get(payload.id) ?? 0) + 1);
         setTimeout(() => {
           untrack(() => {
             if (mcpSaveState === "saved") {
@@ -6142,234 +6719,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     MCP_SAVE_DEBOUNCE_MS,
   );
 
-  const saveCodexSettings = codexSaves.debounce(
-    async (payload: {
-      id: string;
-      body: { codex_settings: NonNullable<AgentBlockSaveByField["codex_settings"]> };
-      signature: string;
-      /** The whole block the body was worked out from: the baseline once the save lands. */
-      block: CodexAgentSettings;
-      hydrationGeneration: number;
-    }) => {
-      try {
-        const response = await fetch(`/api/agents/${payload.id}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload.body),
-        });
-
-        if (!response.ok) {
-          const message = await extractError(
-            response,
-            "Failed to save Codex settings",
-          );
-          throw new Error(message);
-        }
-
-        untrack(() => {
-          const landing = agentLanding(payload.id, payload.hydrationGeneration);
-          if (landing === "current") {
-            codexPersistedSignature = payload.signature;
-            codexPersistedBlock = payload.block;
-            codexSaveState = "saved";
-            codexSaveError = null;
-            codexLastSaved = new Date();
-          } else if (landing === "older") {
-            codexSaveState = "idle";
-          }
-          updateAgentCollections(payload.id, {
-            codex_settings: payload.body.codex_settings,
-          });
-        });
-      } catch (error) {
-        console.error("Failed to save Codex settings:", error);
-        untrack(() => {
-          if (selectedAgentId === payload.id) {
-            codexSaveState = "idle";
-            codexSaveError =
-              error instanceof Error
-                ? error.message
-                : "Failed to save Codex settings";
-          }
-        });
-      } finally {
-        setTimeout(() => {
-          untrack(() => {
-            if (codexSaveState === "saved") {
-              codexSaveState = "idle";
-            }
-          });
-        }, 2000);
-      }
-    },
-    CODEX_SAVE_DEBOUNCE_MS,
-  );
-
-  const saveClaudeSettings = claudeSaves.debounce(
-    async (payload: {
-      id: string;
-      body: { claude_settings: NonNullable<AgentBlockSaveByField["claude_settings"]> };
-      signature: string;
-      /** The whole block the body was worked out from: the baseline once the save lands. */
-      block: ClaudeAgentSettings;
-      hydrationGeneration: number;
-    }) => {
-      try {
-        const response = await fetch(`/api/agents/${payload.id}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload.body),
-        });
-
-        if (!response.ok) {
-          const message = await extractError(
-            response,
-            "Failed to save Claude settings",
-          );
-          throw new Error(message);
-        }
-
-        untrack(() => {
-          const landing = agentLanding(payload.id, payload.hydrationGeneration);
-          if (landing === "current") {
-            claudePersistedSignature = payload.signature;
-            claudePersistedBlock = payload.block;
-            claudeSaveState = "saved";
-            claudeSaveError = null;
-            claudeLastSaved = new Date();
-          } else if (landing === "older") {
-            claudeSaveState = "idle";
-          }
-          updateAgentCollections(payload.id, {
-            claude_settings: payload.body.claude_settings,
-          });
-        });
-      } catch (error) {
-        console.error("Failed to save Claude settings:", error);
-        untrack(() => {
-          if (selectedAgentId === payload.id) {
-            claudeSaveState = "idle";
-            claudeSaveError =
-              error instanceof Error
-                ? error.message
-                : "Failed to save Claude settings";
-          }
-        });
-      } finally {
-        setTimeout(() => {
-          untrack(() => {
-            if (claudeSaveState === "saved") {
-              claudeSaveState = "idle";
-            }
-          });
-        }, 2000);
-      }
-    },
-    CLAUDE_SAVE_DEBOUNCE_MS,
-  );
-
-  const saveSubagentCodexSettings = subagentCodexSaves.debounce(
-    async (payload: {
-      id: string;
-      body: { codex_settings: NonNullable<AgentBlockSaveByField["codex_settings"]> };
-      signature: string;
-      /** The whole block the body was worked out from: the baseline once the save lands. */
-      block: CodexAgentSettings;
-      readGeneration: number;
-    }) => {
-      try {
-        const landing = await persistSubagentDetails({
-          id: payload.id,
-          body: payload.body,
-          readGeneration: payload.readGeneration,
-        });
-        untrack(() => {
-          // The Primary Agent's rule (`agentLanding`).
-          if (landing === "current") {
-            subagentCodexPersistedSignature = payload.signature;
-            subagentCodexPersistedBlock = payload.block;
-            subagentCodexSaveState = "saved";
-            subagentCodexSaveError = null;
-            subagentCodexLastSaved = new Date();
-          } else if (landing === "older") {
-            subagentCodexSaveState = "idle";
-          }
-        });
-      } catch (error) {
-        console.error("Failed to save subagent Codex settings:", error);
-        untrack(() => {
-          if (selectedEditableSubagentId === payload.id) {
-            subagentCodexSaveState = "idle";
-            subagentCodexSaveError =
-              error instanceof Error
-                ? error.message
-                : "Failed to save subagent Codex settings";
-          }
-        });
-      } finally {
-        setTimeout(() => {
-          untrack(() => {
-            if (subagentCodexSaveState === "saved") {
-              subagentCodexSaveState = "idle";
-            }
-          });
-        }, 2000);
-      }
-    },
-    CODEX_SAVE_DEBOUNCE_MS,
-  );
-
-  const saveSubagentClaudeSettings = subagentClaudeSaves.debounce(
-    async (payload: {
-      id: string;
-      body: { claude_settings: NonNullable<AgentBlockSaveByField["claude_settings"]> };
-      signature: string;
-      /** The whole block the body was worked out from: the baseline once the save lands. */
-      block: ClaudeAgentSettings;
-      readGeneration: number;
-    }) => {
-      try {
-        const landing = await persistSubagentDetails({
-          id: payload.id,
-          body: payload.body,
-          readGeneration: payload.readGeneration,
-        });
-        untrack(() => {
-          // The Primary Agent's rule (`agentLanding`).
-          if (landing === "current") {
-            subagentClaudePersistedSignature = payload.signature;
-            subagentClaudePersistedBlock = payload.block;
-            subagentClaudeSaveState = "saved";
-            subagentClaudeSaveError = null;
-            subagentClaudeLastSaved = new Date();
-          } else if (landing === "older") {
-            subagentClaudeSaveState = "idle";
-          }
-        });
-      } catch (error) {
-        console.error("Failed to save subagent Claude settings:", error);
-        untrack(() => {
-          if (selectedEditableSubagentId === payload.id) {
-            subagentClaudeSaveState = "idle";
-            subagentClaudeSaveError =
-              error instanceof Error
-                ? error.message
-                : "Failed to save subagent Claude settings";
-          }
-        });
-      } finally {
-        setTimeout(() => {
-          untrack(() => {
-            if (subagentClaudeSaveState === "saved") {
-              subagentClaudeSaveState = "idle";
-            }
-          });
-        }, 2000);
-      }
-    },
-    CLAUDE_SAVE_DEBOUNCE_MS,
-  );
-
   const saveSubagentAssignments = assignmentSaves.debounce(
     async (payload: {
       id: string;
@@ -6443,11 +6792,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   function subagentSectionsAtRest() {
     return {
       core:
-        subagentPersistedSignature !== null &&
+        !cliPairBlocked("subagent") && subagentPersistedSignature !== null &&
         makeSubagentFormSignature(subagentForm) === subagentPersistedSignature &&
         !subagentCoreSaves.busy(selectedEditableSubagentId ?? ""),
       toolGrid:
-        subagentMcpPersistedSignature !== null &&
+        !cliPairBlocked("subagent") && subagentMcpPersistedSignature !== null &&
         makeMcpSignature(
           subagentDefaultMCPGateways,
           subagentDefaultMCPToolSelections,
@@ -6455,14 +6804,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         ) === subagentMcpPersistedSignature &&
         !subagentMcpSaves.busy(selectedEditableSubagentId ?? "") &&
         !subagentCliToolSaves.busy(selectedEditableSubagentId ?? ""),
-      codex:
-        subagentCodexPersistedSignature !== null &&
-        makeCodexSignature(subagentCodexForm, "subagent") === subagentCodexPersistedSignature &&
-        !subagentCodexSaves.busy(selectedEditableSubagentId ?? ""),
-      claude:
-        subagentClaudePersistedSignature !== null &&
-        makeClaudeSignature(subagentClaudeForm) === subagentClaudePersistedSignature &&
-        !subagentClaudeSaves.busy(selectedEditableSubagentId ?? ""),
     };
   }
 
@@ -6494,24 +6835,56 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
    * `applyToLive` is for a save whose change is not in the live form yet (the multiline editors
    * change the form only when their save works): it is laid over the live form as the save lands.
    *
-   * The saves of the other sections (the Tool Settings Grid, CLI tools, Codex, Claude) name no
-   * form and leave the baseline AND the persisted signature alone: they save none of the core
-   * fields, so a core edit that is unsaved (waiting in its debounce, in flight, or failed) stays
-   * a difference from the baseline, the store-refresh effect can tell it is unsaved, and the
-   * next core edit sends it. The save error and the "Saved" status belong to the core edit while
-   * one is unsaved, so none of the four sections touches them then: not when it starts (the Tool
-   * Settings Grid and CLI tools clear the error only when no core edit is unsaved; Codex and
-   * Claude clear only their own error) and not when it lands (no "Saved", no cleared error). The
-   * error of a failed core save stays on screen until a core save works.
+   * The saves of the other sections (the Tool Settings Grid, CLI tools) name no form and leave
+   * the baseline AND the persisted signature alone: they save none of the core fields, so a core
+   * edit that is unsaved (waiting in its debounce, in flight, or failed) stays a difference from
+   * the baseline, the store-refresh effect can tell it is unsaved, and the next core edit sends
+   * it. The save error and the "Saved" status belong to the core edit while one is unsaved, so
+   * neither section touches them then: not when it starts (both clear the error only when no
+   * core edit is unsaved) and not when it lands (no "Saved", no cleared error). The error of a
+   * failed core save stays on screen until a core save works.
    */
   async function persistSubagentDetails(
     payload: { id: string; body: LiveSubagentUpdate; readGeneration: number },
     savedForm?: SubagentForm,
     applyToLive?: (form: SubagentForm) => SubagentForm,
   ): Promise<SaveLanding> {
+    if (savedForm || Object.hasOwn(payload.body, 'provider_specific_settings')) retireCliAckOrigin('subagent', payload.id, 'basic');
+    if (['defaultMCPGateways', 'defaultMCPToolSelections', 'dcmDisplaySettings'].some(field => Object.hasOwn(payload.body, field))) retireCliAckOrigin('subagent', payload.id, 'mcp');
     const previousAvatar = subagents.find((subagent) => subagent.id === payload.id)?.avatar ?? null;
+    const modelSent = isModelSelectionWrite('subagent', payload.body) && Boolean(payload.body.expectedModelSelection);
+    let modelIssued = false;
+    let modelKnownSaved = false;
+    let instructionsIssued = false;
+    let instructionsKnownSaved = false;
+    const typedSent = typedFileToolsBodyValue(payload.body) !== undefined;
+    let typedOriginal: TypedFileToolsBaseline | null = null, typedIssued = false, typedKnownSaved = false;
     try {
-      await subagentStore.update(payload.id, payload.body);
+      if (typedSent) typedOriginal = beginTypedToolsWrite('subagent', payload.id, payload.body);
+      beginInstructionsWrite('subagent', payload.id, payload.body, payload.body.expectedInstructions);
+      if (modelSent) {
+        const saved = modelSelectionSave('subagent', payload.id);
+        if (!ownsModelSelectionBase(saved.baseline, payload.body.expectedModelSelection) || saved.hold !== null) throw new ModelSelectionSaveRefusedError('This model choice was not sent. Use Saved Model before choosing another model.');
+        saved.generation += 1;
+        modelIssued = true;
+      }
+      instructionsIssued = namesInstructions(payload.body);
+      typedIssued = typedSent;
+      const result = await subagentStore.update(payload.id, payload.body);
+      if (typedSent) {
+        typedKnownSaved = adoptTypedToolsReceipt('subagent', payload.id, payload.body, typedOriginal, result.typedFileTools);
+        if (!typedKnownSaved) throw new Error('The saved choice receipt is unconfirmed. Your draft is kept; do not repeat it automatically.');
+      }
+      modelKnownSaved = true;
+      instructionsKnownSaved = true;
+      settleInstructionsWrite('subagent', payload.id, payload.body, 'read');
+      if (modelSent) {
+        const saved = modelSelectionSave('subagent', payload.id);
+        saved.generation += 1;
+        saved.baseline = null;
+        saved.hold = 'read';
+        modelSelectionReadbacks.add(`subagent:${payload.id}`);
+      }
       const landing = untrack(() => {
         // Only the Subagent the panel still shows, and only when no read replaced its forms since
         // the payload was built (`subagentLanding`, BL-955): otherwise the landing moves nothing.
@@ -6536,6 +6909,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         }
         return kind;
       });
+      syncModelSelectionNotices();
       // BL-142: the save changed the picture, so the pictures the Subagent no longer shows go.
       if (
         Object.prototype.hasOwnProperty.call(payload.body, "avatar") &&
@@ -6552,6 +6926,22 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     } catch (error) {
       console.error("Failed to save subagent:", error);
       untrack(() => {
+        if (typedSent && !typedKnownSaved) {
+          typedKnownSaved = adoptTypedToolsReceipt('subagent', payload.id, payload.body, typedOriginal, (error as { typedFileTools?: unknown }).typedFileTools);
+          if (!typedKnownSaved) refuseTypedToolsWrite('subagent', payload.id, !typedIssued || error instanceof TypedToolsSaveRefusedError ||
+            instructionsKnownNoSave((error as { status?: number }).status, (error as { code?: string }).code) ||
+            [400, 409].includes((error as { status?: number }).status ?? 0) && ['typed_file_tools_base_required', 'typed_file_tools_changed'].includes((error as { code?: string }).code ?? ''));
+        }
+        if (!instructionsKnownSaved) settleInstructionsWrite('subagent', payload.id, payload.body, !instructionsIssued ||
+          instructionsKnownNoSave((error as { status?: number }).status, (error as { code?: string }).code) ? 'conflict' : 'unknown');
+        if (modelSent && !modelKnownSaved) {
+          const saved = modelSelectionSave('subagent', payload.id);
+          saved.generation += 1;
+          saved.hold = error instanceof ModelSelectionSaveRefusedError || !modelIssued ||
+            instructionsKnownNoSave((error as { status?: number }).status, (error as { code?: string }).code) ? 'conflict' : 'unknown';
+          saved.earlierUnknown ||= saved.hold === 'unknown';
+          syncModelSelectionNotices();
+        }
         if (selectedEntity?.kind !== "subagent" || selectedEditableSubagentId !== payload.id) return;
         subagentEditSaveState = "idle";
         subagentEditSaveError =
@@ -6594,6 +6984,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     if (!selectedAgentId || listLoading || detailLoading || hydrationInProgress)
       return;
     const signature = makeBasicSignature(basicForm);
+    const ackOwnsCliRebase = untrack(() => cliAckOwnsRebase("agent", "basic"));
     if (
       !basicPersistedSignature ||
       !basicPersistedForm ||
@@ -6603,6 +6994,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       return;
     }
 
+    if (ackOwnsCliRebase) return;
     const validation = validateBasicForm(basicForm);
     basicValidationError = validation;
 
@@ -6619,134 +7011,25 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     // A-1y: the baseline the body is worked out from; a memory save says it started from it.
     const baseForm = $state.snapshot(basicPersistedForm) as BasicForm;
     const body = buildBasicSavePatch(nextForm);
-    if (patchContainsGroupedValues(body, "agent") && deferPrimaryCapture("basic")) return;
+    if (untrack(() => cliPairHeld("agent"))) return;
+    const modelCaptured = untrack(() => captureModelSelection('agent', selectedAgentId!, body, nextForm, baseForm));
+    const typedCaptured = { ...modelCaptured, ...untrack(() => captureTypedTools('agent', selectedAgentId!, modelCaptured.body, modelCaptured.nextForm, baseForm)) };
+    const compactCaptured = { ...typedCaptured, ...untrack(() => captureBasicAutoCompact(selectedAgentId!, typedCaptured.body, typedCaptured.nextForm, baseForm)) };
+    const captured = { ...compactCaptured, ...untrack(() => captureInstructions('agent', selectedAgentId!, compactCaptured.body, compactCaptured.nextForm, baseForm)) };
+    if (patchContainsGroupedValues(captured.body, "agent") && deferPrimaryCapture("basic")) return;
     // A form that differs from the saved copy only in ways the save does not see (a reordered
     // block) has nothing to send.
-    if (Object.keys(body).length === 0) return;
+    if (Object.keys(captured.body).length === 0) return;
 
     basicSaveState = "saving";
     basicSaveError = null;
     saveBasic({
       id: selectedAgentId,
-      body,
-      nextForm,
+      ...captured,
       // Read when the body is built: a re-read of the agent during the debounce or the round trip
       // is what `persistBasic` checks at the landing (BL-911).
       hydrationGeneration: agentHydrationRequestId,
       baseForm,
-    });
-  });
-
-  $effect(() => {
-    primaryCaptureWake.codex;
-    if (!selectedAgentId || listLoading || detailLoading || hydrationInProgress)
-      return;
-    if (!isCodexProvider) return;
-    const signature = makeCodexSignature(codexForm, "agent");
-    if (!codexPersistedSignature || signature === codexPersistedSignature) return;
-    // BL-848: only the keys that differ from the block as it loaded or was last saved, a key the
-    // form dropped as `null`; a form that differs only in ways the save does not see sends nothing.
-    // BL-919: the permission trio (mode, sandbox, approval) is one choice: a change to any of its
-    // keys sends all three, so an older copy never leaves a mix with another window's mode.
-    const block = serializeCodexForm(codexForm, "agent");
-    const change = diffAgentBlockWithGroups("codex_settings", codexPersistedBlock, block);
-    if (change == null) return;
-    if (deferPrimaryCapture("codex")) return;
-    codexSaveState = "saving";
-    codexSaveError = null;
-    saveCodexSettings({
-      id: selectedAgentId,
-      body: { codex_settings: change },
-      signature,
-      block,
-      hydrationGeneration: agentHydrationRequestId,
-    });
-  });
-
-  $effect(() => {
-    primaryCaptureWake.claude;
-    if (!selectedAgentId || listLoading || detailLoading || hydrationInProgress)
-      return;
-    if (!isClaudeCliProvider) return;
-    const signature = makeClaudeSignature(claudeForm);
-    if (!claudePersistedSignature || signature === claudePersistedSignature) return;
-    // BL-848, BL-919: as the Codex section above; the thinking switch and its budget are one pair.
-    const block = serializeClaudeForm(claudeForm);
-    const change = diffAgentBlockWithGroups("claude_settings", claudePersistedBlock, block);
-    if (change == null) return;
-    if (deferPrimaryCapture("claude")) return;
-    claudeSaveState = "saving";
-    claudeSaveError = null;
-    saveClaudeSettings({
-      id: selectedAgentId,
-      body: { claude_settings: change },
-      signature,
-      block,
-      hydrationGeneration: agentHydrationRequestId,
-    });
-  });
-
-  $effect(() => {
-    subagentCaptureWake.codex;
-    if (
-      !selectedEditableSubagentId ||
-      subagentDetailLoading ||
-      subagentsLoading ||
-      hydrationInProgress
-    ) {
-      return;
-    }
-    if (!(subagentForm.subagentType === "cli" && isCodexCliSubagentProvider)) return;
-    const signature = makeCodexSignature(subagentCodexForm, "subagent");
-    // A null signature is a Subagent that is not hydrated yet: nothing is saved from it.
-    if (subagentCodexPersistedSignature === null || signature === subagentCodexPersistedSignature) return;
-    // BL-914: the Subagent PUT writes `codex_settings` key by key, so only the keys that differ
-    // from the block as it loaded or was last saved go, a key the form dropped as `null`; a
-    // Subagent with no block yet gets the whole block. BL-919: the permission trio is one choice
-    // and goes whole when any of its keys changed. A Subagent has no Tool Approval tie (CLI
-    // Subagents never pause for approval), so `serializeCodexForm(..., "subagent")` always gives
-    // approval `never`, and the trio always carries it.
-    const block = serializeCodexForm(subagentCodexForm, "subagent");
-    const change = diffAgentBlockWithGroups("codex_settings", subagentCodexPersistedBlock, block);
-    if (change == null) return;
-    if (deferSubagentCapture("codex")) return;
-    subagentCodexSaveState = "saving";
-    subagentCodexSaveError = null;
-    saveSubagentCodexSettings({
-      id: selectedEditableSubagentId,
-      body: { codex_settings: change },
-      signature,
-      block,
-      readGeneration: subagentReadGeneration,
-    });
-  });
-
-  $effect(() => {
-    subagentCaptureWake.claude;
-    if (
-      !selectedEditableSubagentId ||
-      subagentDetailLoading ||
-      subagentsLoading ||
-      hydrationInProgress
-    ) {
-      return;
-    }
-    if (!(subagentForm.subagentType === "cli" && isClaudeCliSubagentProvider)) return;
-    const signature = makeClaudeSignature(subagentClaudeForm);
-    if (subagentClaudePersistedSignature === null || signature === subagentClaudePersistedSignature) return;
-    // BL-914, BL-919: as the Codex section above; the thinking switch and its budget are one pair.
-    const block = serializeClaudeForm(subagentClaudeForm);
-    const change = diffAgentBlockWithGroups("claude_settings", subagentClaudePersistedBlock, block);
-    if (change == null) return;
-    if (deferSubagentCapture("claude")) return;
-    subagentClaudeSaveState = "saving";
-    subagentClaudeSaveError = null;
-    saveSubagentClaudeSettings({
-      id: selectedEditableSubagentId,
-      body: { claude_settings: change },
-      signature,
-      block,
-      readGeneration: subagentReadGeneration,
     });
   });
 
@@ -6771,7 +7054,12 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     // (`custom_tool_settings` whole, and only when a custom tool row differs).
     const payload = buildZipPayload(zipForm);
     if (!zipPersistedPayload) return;
-    const body = diffZipPayload(zipPersistedPayload, payload);
+    let body: Partial<ZipPayloadBody> & { expectedMcpSettings?: ExpectedMcpSettings } = diffZipPayload(zipPersistedPayload, payload);
+    // A read finishing is not a new choice. Keep the held draft's owning error,
+    // including an incomplete recovery read, until saved values are adopted.
+    const mcpId = selectedAgentId;
+    if (mcpSettingsLeaves(body).length && untrack(() => primaryMcpHolds[mcpId])) return;
+    try { body = capturePrimaryMcpBody(body); } catch (error) { zipSaveError = error instanceof Error ? error.message : "Read Saved Tool Settings before another choice."; return; }
     if (Object.keys(body).length === 0) return;
     if (deferPrimaryCapture("zip")) return;
 
@@ -6795,9 +7083,12 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       defaultMCPToolSelections,
       dcmDisplaySettings,
     );
+    const ackOwnsCliRebase = untrack(() => cliAckOwnsRebase("agent", "mcp"));
     if (!mcpPersistedSignature || signature === mcpPersistedSignature) {
       return;
     }
+
+    if (ackOwnsCliRebase) return;
 
     // BL-855: the gateway list and the tool selections whole, only when they differ; the display
     // settings entry by entry (`diffAgentBlock`).
@@ -6812,7 +7103,13 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       selections: payload.defaultMCPToolSelections,
       dcm: payload.dcmDisplaySettings,
     };
-    const body = diffMcpSection(mcpPersistedValues, values);
+    let body: McpSectionSave & { expectedMcpSettings?: ExpectedMcpSettings } = diffMcpSection(mcpPersistedValues, values);
+    if (untrack(() => cliPairHeld("agent"))) return;
+    // The held owner already has its save/read failure; hydration must not
+    // replace it by trying to capture the same unsaved draft again.
+    const mcpId = selectedAgentId;
+    if (mcpSettingsLeaves(body).length && untrack(() => primaryMcpHolds[mcpId])) return;
+    try { body = capturePrimaryMcpBody(body); } catch (error) { mcpSaveError = error instanceof Error ? error.message : "Read Saved Tool Settings before another choice."; return; }
     if (Object.keys(body).length === 0) return;
     if (deferPrimaryCapture("mcp")) return;
 
@@ -6836,19 +7133,20 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       hydrationInProgress
     )
       return;
-    if (subagentForm.subagentType === "n8n-subnode") return;
-
     const signature = makeMcpSignature(
       subagentDefaultMCPGateways,
       subagentDefaultMCPToolSelections,
       subagentDcmDisplaySettings,
     );
+    const ackOwnsCliRebase = untrack(() => cliAckOwnsRebase("subagent", "mcp"));
     if (
       !subagentMcpPersistedSignature ||
       signature === subagentMcpPersistedSignature
     ) {
       return;
     }
+
+    if (ackOwnsCliRebase) return;
 
     // BL-914: the gateway list and the tool selections whole, only when they differ; the display
     // settings entry by entry (a removed entry as `null`), the Primary Agent's rule
@@ -6865,6 +7163,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       dcm: payload.dcmDisplaySettings,
     };
     const body = diffMcpSection(subagentMcpPersistedValues, values);
+    if (untrack(() => cliPairHeld("subagent"))) return;
     if (Object.keys(body).length === 0) return;
     if (deferSubagentCapture("mcp")) return;
 
@@ -6911,9 +7210,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       hydrationInProgress
     )
       return;
-    if (subagentForm.subagentType === "n8n-subnode") return;
-
     const signature = makeSubagentFormSignature(subagentForm);
+    const ackOwnsCliRebase = untrack(() => cliAckOwnsRebase("subagent", "basic"));
     if (
       !subagentPersistedSignature ||
       !subagentPersistedForm ||
@@ -6923,6 +7221,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       return;
     }
 
+    if (ackOwnsCliRebase) return;
     const validation = validateSubagentForm(subagentForm);
     subagentValidationError = validation;
 
@@ -6934,10 +7233,14 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
     lastInvalidSubagentSignature = null;
     const nextForm = $state.snapshot(subagentForm) as SubagentForm;
-    const body = buildSubagentSavePatch(nextForm);
+    if (untrack(() => cliPairHeld("subagent"))) return;
+    const typedCaptured = untrack(() => captureTypedTools('subagent', selectedEditableSubagentId!, buildSubagentSavePatch(nextForm), nextForm, subagentPersistedForm!));
+    const modelCaptured = untrack(() => captureModelSelection('subagent', selectedEditableSubagentId!, typedCaptured.body, typedCaptured.nextForm, subagentPersistedForm!));
+    const captured = { ...modelCaptured, ...untrack(() => captureInstructions('subagent', selectedEditableSubagentId!, modelCaptured.body, modelCaptured.nextForm, subagentPersistedForm!)) };
+    const body = { ...captured.body, ...(captured.expectedModelSelection ? { expectedModelSelection: captured.expectedModelSelection } : {}), ...(captured.expectedInstructions ? { expectedInstructions: captured.expectedInstructions } : {}) };
     if (patchContainsGroupedValues(body, "subagent") && deferSubagentCapture("core")) return;
-    // A form that differs from the saved copy only in ways the save does not see (a workflow URL
-    // an API Subagent does not keep) has nothing to send.
+    // A form that differs from the saved copy only in ways the save does not see has nothing to
+    // send.
     if (Object.keys(body).length === 0) return;
 
     subagentEditSaveState = "saving";
@@ -6946,7 +7249,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     saveSubagentDetails({
       id: selectedEditableSubagentId,
       body,
-      nextForm,
+      nextForm: captured.nextForm,
       readGeneration: subagentReadGeneration,
     });
   });
@@ -6989,8 +7292,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     ) {
       return "Selected Default Project no longer exists. Pick another project or set None.";
     }
-    if (form.agentType === "n8n") {
-      return "This Primary Agent uses the retired n8n type and can only be deleted.";
+    const retired = retiredPrimaryDetails(form);
+    if (retired) return retired;
+    if (typeof form.primary_model_provider !== 'string' || typeof form.primary_model_name !== 'string') {
+      return "The saved model identity is unreadable. Choose a Saved Model before saving these settings.";
     }
     const provider = form.primary_model_provider.trim().toLowerCase();
     const modelName = form.primary_model_name.trim().toLowerCase();
@@ -6998,24 +7303,30 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       form.primary_model_connection?.id ??
       form.primary_model_connection?.service ??
       "";
-    const hasModelSelection = Boolean(provider || modelName || connectionHint);
-    const isCodexPreset =
-      provider.includes("codex") ||
-      modelName.includes("codex") ||
-      connectionHint.toLowerCase().includes("codex");
-    const isClaudeCliPreset =
+    if (typeof connectionHint !== 'string') {
+      return "The saved model connection is unreadable. Choose a Saved Model before saving these settings.";
+    }
+    const isCliPreset =
       provider.includes("claude-cli") ||
       modelName.includes("claude-cli") ||
       connectionHint.toLowerCase().includes("claude-cli");
-    const isCliPreset = isCodexPreset || isClaudeCliPreset;
 
-    if (isCliPrimaryAgentType(form.agentType) && hasModelSelection && !isCliPreset) {
-      return "CLI agents only support CLI presets.";
-    }
-    if (!isCliPrimaryAgentType(form.agentType) && isCliPreset) {
-      return "CLI presets are only available for CLI agents.";
+    if (isCliPreset) {
+      return CLAUDE_CLI_PRESET_REFUSAL;
     }
     return null;
+  }
+
+  /**
+   * SA-139 R4 (D14): the plain refusal for a stored Primary of a removed type (`cli`, `n8n`), or
+   * null for a live one. Such a leftover is shown and deleted, never saved: validation and
+   * `buildBasicPayload` refuse it, so opening it saves nothing.
+   */
+  function retiredPrimaryDetails(form: Pick<BasicForm, "agentType" | "primary_model_provider" | "primary_model_connection">): string | null {
+    if (!isRetiredPrimaryAgentType(form.agentType)) return null;
+    return retiredPrimaryAgentTypeMessage(form.agentType, {
+      codex: form.agentType === "cli" && namesRetiredCodexCliModel(form),
+    }).details;
   }
 
   function validateZipForm(form: ZipForm) {
@@ -7133,28 +7444,24 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   });
 
   function validateSubagentForm(form: SubagentForm) {
+    // SA-139 R5 (D14): a leftover of a removed Subagent type is shown and deleted, never saved.
+    if (isRetiredSubagentType(form.subagentType)) {
+      return retiredSubagentTypeSentences(form.subagentType, form).details;
+    }
     if (!form.displayName.trim()) {
       return "Display name is required.";
-    }
-    if (
-      isWorkflowBackedSubagentType(form.subagentType) &&
-      !form.webhook_url.trim()
-    ) {
-      return "Production webhook URL is required for n8n Workflow Subagents.";
-    }
-    if (isWorkflowBackedSubagentType(form.subagentType)) {
-      const webhookValidation = validateN8nProductionWebhookUrl(
-        form.webhook_url,
-      );
-      if (webhookValidation) {
-        return webhookValidation;
-      }
     }
     const timeoutValidation = getSubagentTimeoutValidationError(
       form.timeout_seconds,
     );
     if (timeoutValidation) {
       return timeoutValidation;
+    }
+    const maxToolStepsValidation = getSubagentMaxToolStepsValidationError(
+      form.max_tool_steps,
+    );
+    if (maxToolStepsValidation) {
+      return maxToolStepsValidation;
     }
     return null;
   }
@@ -7188,6 +7495,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
   function selectSubagent(id: string) {
     if (createEntityMode) return;
+    cliAckOrigins.clear();
     agentAvatarUploadRequestId += 1;
     isUploadingAgentAvatar = false;
     createEntityMode = false;
@@ -7227,7 +7535,14 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     };
 
     if (replaces("core")) {
-      const normalisedSubagentForm = normaliseSubagentForm(match);
+      const normalisedSubagentForm = { ...normaliseSubagentForm(match), ...(!fill ? {
+        system_prompt: subagentForm.system_prompt,
+        include_global_prompt: subagentForm.include_global_prompt,
+      } : {}) };
+      if (!fill && !sameModelSelection('subagent', subagentForm, normalisedSubagentForm)) {
+        modelSelectionSave('subagent', match.id).baseline = null;
+        modelSelectionReadbacks.add(`subagent:${match.id}`);
+      }
       subagentForm = normalisedSubagentForm;
       subagentPersistedSignature = makeSubagentFormSignature(normalisedSubagentForm);
       subagentPersistedForm = $state.snapshot(normalisedSubagentForm) as SubagentForm;
@@ -7251,6 +7566,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       // entries are not dropped (the Primary Agent's rule, and the runtime readers still take the
       // older name).
       subagentMcpPersistedValues = {
+        viewedDcm: cloneDcmDisplaySettings(subagentDcmDisplaySettings),
         gateways: [...mcpDefaults.gateways],
         selections: cloneToolSelections(mcpDefaults.selections),
         dcm:
@@ -7260,29 +7576,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       };
       subagentMcpRenderNonce += 1;
     }
-    if (replaces("codex")) {
-      const normalisedCodexForm = normaliseCodexForm(match, "subagent");
-      subagentCodexForm = normalisedCodexForm;
-      subagentCodexPersistedSignature = makeCodexSignature(normalisedCodexForm, "subagent");
-      subagentCodexPersistedBlock =
-        match.codex_settings == null ? null : serializeCodexForm(normalisedCodexForm, "subagent");
-      subagentCodexSaveState = "idle";
-      subagentCodexSaveError = null;
-      subagentCodexLastSaved = null;
-    }
-    if (replaces("claude")) {
-      const normalisedClaudeForm = normaliseClaudeForm(match, "subagent");
-      subagentClaudeForm = normalisedClaudeForm;
-      subagentClaudePersistedSignature = makeClaudeSignature(normalisedClaudeForm);
-      subagentClaudePersistedBlock =
-        match.claude_settings == null ? null : serializeClaudeForm(normalisedClaudeForm);
-      subagentClaudeSaveState = "idle";
-      subagentClaudeSaveError = null;
-      subagentClaudeLastSaved = null;
-    }
   }
 
-  function selectEditableSubagent(id: string) {
+  async function selectEditableSubagent(id: string) {
     if (createEntityMode) return;
     const match = subagents.find((item) => item.id === id);
     if (!match) return;
@@ -7296,23 +7592,38 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       subagentReadWaitError = null;
     }
     subagentDetailLoading = true;
-
+    const fill = selectedEditableSubagentId !== id;
+    modelSelectionSave('subagent', id).baseline = null;
+    instructionsSave('subagent', id).bases = { customPrompt: null, includeGlobalPrompt: null };
+    const requestId = subagentReadRequestId;
     untrack(() => {
-      const fill = selectedEditableSubagentId !== id;
       selectedEditableSubagentId = id;
       selectedEntity = { kind: "subagent", id };
       createEntityMode = false;
       activeSubagentSettingsTab = "core";
-      readSubagentSections(match, fill, true);
-      subagentValidationError = null;
-      subagentAvatarError = null;
-      selectedSubagentModelId = null;
-      lastInvalidSubagentSignature = null;
     });
-
-    syncSelectedModelFromSubagent();
-    subagentDetailLoading = false;
-    syncSubagentSaveWaits();
+    try {
+      untrack(() => {
+        readSubagentSections(match, fill, true);
+        subagentValidationError = null;
+        subagentAvatarError = null;
+        selectedSubagentModelId = null;
+        lastInvalidSubagentSignature = null;
+      });
+      syncSelectedModelFromSubagent();
+      syncModelSelectionNotices();
+      syncInstructionsNotices();
+      await hydrateSubagent(id);
+    } catch (error) {
+      if (settingsPanelAlive && requestId === subagentReadRequestId && selectedEntity?.kind === "subagent" && selectedEditableSubagentId === id) {
+        subagentReadWaitError = error instanceof Error ? error.message : "Failed to read the selected Subagent";
+      }
+    } finally {
+      if (requestId === subagentReadRequestId && selectedEditableSubagentId === id) {
+        subagentDetailLoading = false;
+        syncSubagentSaveWaits();
+      }
+    }
   }
 
   function resetZipOverrides() {
@@ -7322,6 +7633,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       ...zipForm,
       zip_ai_view_mode: ZIP_LAYOUT_INHERIT,
       zip_tool_notes_enabled: ZIP_NOTES_INHERIT,
+      live_file_reads: LIVE_READS_INHERIT,
       custom_tool_settings: (globalZipSettings?.custom_tool_settings ?? []).map((tool) => ({
         tool_name: tool.tool_name,
         buffer_size: "",
@@ -7352,17 +7664,20 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   function handleMcpGatewaysChange(gateways: string[]) {
+    retireCliAckOrigin("agent", selectedAgentId, "mcp");
     if (primaryOwnedSaveInFlightUi) return;
     defaultMCPGateways = [...gateways];
   }
 
   function handleMcpDcmDisplaySettingsChange(settings: AgentDcmDisplaySettings) {
+    retireCliAckOrigin("agent", selectedAgentId, "mcp");
     if (primaryOwnedSaveInFlightUi) return;
     dcmDisplaySettings = cloneDcmDisplaySettings(settings);
   }
 
   function clearMcpDefaults(showToast = true) {
     if (primaryCaptureBlocked) return;
+    retireCliAckOrigin("agent", selectedAgentId, "mcp");
     if (
       defaultMCPGateways.length === 0 &&
       defaultMCPToolSelections.length === 0 &&
@@ -7403,6 +7718,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   function handleVoiceProviderChange(value: string) {
+    if (ttsBlocked) return;
     const provider =
       value === VOICE_PROVIDER_INHERIT ? "" : value;
     voiceIdManual = false;
@@ -7423,6 +7739,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   function resetVoiceProfile() {
+    if (ttsBlocked) return;
     basicForm = {
       ...basicForm,
       voice_profile: createDefaultVoiceProfile(),
@@ -7466,7 +7783,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       displayName: form.displayName.trim(),
       agentType: form.agentType,
       show_reasoning: form.show_reasoning,
-      preserve_reasoning: form.show_reasoning ? form.preserve_reasoning : false,
+      ...(form.agentType === 'api' ? {
+        api_reasoning_retention: form.api_reasoning_retention ?? null,
+        whiteboard_budget_tokens: form.whiteboard_budget_tokens ?? null,
+        show_whiteboard: form.show_whiteboard ?? null
+      } : { preserve_reasoning: form.preserve_reasoning }),
       tool_approval_mode: form.tool_approval_mode,
       auto_compact_settings: normalizeAgentAutoCompactSettings(form.auto_compact_settings),
       memory_settings: buildAgentMemoryRecordFields(form.memory_settings),
@@ -7487,9 +7808,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       agent_url: form.agent_url.trim(),
       default_project_id: form.default_project_id ?? null,
       include_global_prompt: form.include_global_prompt,
-      primary_model_provider: form.primary_model_provider.trim(),
-      primary_model_name: form.primary_model_name.trim(),
-      primary_model_preset_id: form.primary_model_preset_id.trim(),
+      primary_model_provider: typeof form.primary_model_provider === 'string' ? form.primary_model_provider.trim() : form.primary_model_provider,
+      primary_model_name: typeof form.primary_model_name === 'string' ? form.primary_model_name.trim() : form.primary_model_name,
+      primary_model_preset_id: typeof form.primary_model_preset_id === 'string' ? form.primary_model_preset_id.trim() : form.primary_model_preset_id,
       primary_model_connection: form.primary_model_connection ?? null,
       avatar_url: form.avatar_url ?? "",
       avatar_icon_ref: iconRefKey(form.avatar_icon_ref),
@@ -7633,14 +7954,14 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   function buildBasicPayload(form: BasicForm): BasicPayloadBody {
-    if (form.agentType === "n8n") {
-      throw new Error("This Primary Agent uses the retired n8n type and can only be deleted.");
-    }
+    if (isRetiredPrimaryAgentType(form.agentType)) throw new Error(retiredPrimaryDetails(form)!);
     return {
       displayName: form.displayName.trim(),
       agentType: form.agentType,
       show_reasoning: form.show_reasoning,
-      preserve_reasoning: form.show_reasoning ? form.preserve_reasoning : false,
+      api_reasoning_retention: form.api_reasoning_retention ?? null,
+      whiteboard_budget_tokens: form.whiteboard_budget_tokens ?? null,
+      show_whiteboard: form.show_whiteboard ?? null,
       tool_approval_mode: form.tool_approval_mode,
       auto_compact_settings: normalizeAgentAutoCompactSettings(form.auto_compact_settings),
       ...buildAgentMemoryRecordFields(form.memory_settings),
@@ -7688,15 +8009,17 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     };
   }
 
-  async function saveAgentPromptFromEditor(nextPrompt: string) {
+  async function saveAgentPromptFromEditor(nextPrompt: string, openingBaseline?: unknown) {
     requirePrimaryCaptureReady();
     const agentId = requireHydratedAgentDetail(
       selectedAgentId,
       promptPersistedSignature,
       "the agent prompt",
     );
+    const captured = captureInstructions('agent', agentId, { system_prompt: nextPrompt }, {}, {}, openingBaseline as InstructionsBaseline | null ?? null);
+    if (!Object.hasOwn(captured.body, 'system_prompt') || !captured.expectedInstructions) throw new InstructionsSaveRefusedError('This prompt was not sent. Use Saved Instructions and open the editor again.');
     basicSaveScope = "instructions";
-    const payload = { id: agentId, system_prompt: nextPrompt, hydrationGeneration: agentHydrationRequestId };
+    const payload = { id: agentId, system_prompt: nextPrompt, expectedInstructions: captured.expectedInstructions, hydrationGeneration: agentHydrationRequestId };
     await promptSaves.run(agentId, () => persistPrompt(payload, nextPrompt));
   }
 
@@ -7720,7 +8043,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     const savedForm = $state.snapshot(nextForm) as BasicForm;
     const baseForm = $state.snapshot(basicPersistedForm) as BasicForm;
     const body = buildBasicSavePatch(savedForm);
-    if (Object.keys(body).length === 0) return;
+    const modelCaptured = untrack(() => captureModelSelection('agent', agentId, body, savedForm, baseForm));
+    const compactCaptured = { ...modelCaptured, ...untrack(() => captureBasicAutoCompact(agentId, modelCaptured.body, modelCaptured.nextForm, baseForm)) };
+    const captured = { ...compactCaptured, ...untrack(() => captureInstructions('agent', agentId, compactCaptured.body, compactCaptured.nextForm, baseForm)) };
+    if (Object.keys(captured.body).length === 0) return;
 
     basicSaveScope = scope;
     basicSaveState = "saving";
@@ -7728,8 +8054,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     // BL-911: the editor's change is not in the live form yet: it is laid over the form as the
     // save lands, so text typed elsewhere during the round trip stays (unless the agent was read
     // again meanwhile: `persistBasic` then leaves the form to that read and asks for another).
-    const payload = { id: agentId, body, hydrationGeneration: agentHydrationRequestId, baseForm };
-    await basicSaves.run(agentId, () => persistBasic(payload, savedForm, mutator));
+    const payload = { id: agentId, body: captured.body, expectedModelSelection: captured.expectedModelSelection, expectedInstructions: captured.expectedInstructions, expectedAutoCompact: captured.expectedAutoCompact, expectedTtsSelection: captured.expectedTtsSelection, hydrationGeneration: agentHydrationRequestId, baseForm };
+    await basicSaves.run(agentId, () => persistBasic(payload, captured.nextForm, mutator));
   }
 
   /**
@@ -7747,6 +8073,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   async function saveSubagentMultilineEditor(
     scope: SubagentSaveScope,
     mutator: (current: SubagentForm) => SubagentForm,
+    openingBaseline?: unknown,
   ) {
     requireSubagentCaptureReady();
     if (!selectedEditableSubagentId) return;
@@ -7758,14 +8085,18 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     }
 
     const savedForm = $state.snapshot(nextForm) as SubagentForm;
-    const body = buildSubagentSavePatch(savedForm);
+    const typedCaptured = untrack(() => captureTypedTools('subagent', selectedEditableSubagentId!, buildSubagentSavePatch(savedForm), savedForm, subagentPersistedForm!));
+    const modelCaptured = untrack(() => captureModelSelection('subagent', selectedEditableSubagentId!, typedCaptured.body, typedCaptured.nextForm, subagentPersistedForm!));
+    const captured = { ...modelCaptured, ...untrack(() => captureInstructions('subagent', selectedEditableSubagentId!, modelCaptured.body, modelCaptured.nextForm, subagentPersistedForm!, scope === 'instructions' ? openingBaseline as InstructionsBaseline | null ?? null : undefined)) };
+    if (scope === 'instructions' && Object.hasOwn(modelCaptured.body, 'system_prompt') && !Object.hasOwn(captured.body, 'system_prompt')) throw new InstructionsSaveRefusedError('This prompt was not sent. Use Saved Instructions and open the editor again.');
+    const body = { ...captured.body, ...(captured.expectedModelSelection ? { expectedModelSelection: captured.expectedModelSelection } : {}), ...(captured.expectedInstructions ? { expectedInstructions: captured.expectedInstructions } : {}) };
     if (Object.keys(body).length === 0) return;
 
     subagentSaveScope = scope;
     subagentEditSaveState = "saving";
     subagentEditSaveError = null;
     const payload = { id: selectedEditableSubagentId, body, readGeneration: subagentReadGeneration };
-    await subagentCoreSaves.run(payload.id, () => persistSubagentDetails(payload, savedForm, mutator));
+    await subagentCoreSaves.run(payload.id, () => persistSubagentDetails(payload, captured.nextForm, mutator));
   }
 
   function makeZipSignature(form: ZipForm) {
@@ -7783,10 +8114,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         const threshold = toNumberOrNull(tool.zip_threshold);
         const autoZip = toAutoZipPayload(tool.auto_zip);
         const zipDisabled = toZipDisabledPayload(tool.auto_zip);
-        if (buffer === null && threshold === null && autoZip === null && zipDisabled === null) {
+        if (buffer === null && threshold === null && autoZip === null && zipDisabled === null && !Object.keys(tool.retained ?? {}).length) {
           return null;
         }
         const payload: CustomToolPayload = {
+          ...tool.retained,
           tool_name: tool.tool_name,
         };
         if (buffer !== null) payload.buffer_size = buffer;
@@ -7810,10 +8142,17 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         : form.zip_tool_notes_enabled === "disabled"
           ? false
           : null;
+    const liveFileReads =
+      form.live_file_reads === "enabled"
+        ? true
+        : form.live_file_reads === "disabled"
+          ? false
+          : null;
 
     return {
       zip_ai_view_mode: zipAiViewMode,
       zip_tool_notes_enabled: zipToolNotesEnabled,
+      live_file_reads: liveFileReads,
       buffer_size: toNumberOrNull(form.buffer_size),
       buffer_size_image: toNumberOrNull(form.buffer_size_image),
       buffer_size_error: toNumberOrNull(form.buffer_size_error),
@@ -7918,6 +8257,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   function handleSubagentMcpGatewaysChange(gateways: string[]) {
+    retireCliAckOrigin("subagent", selectedEditableSubagentId, "mcp");
     if (subagentOwnedSaveInFlightUi) return;
     subagentDefaultMCPGateways = [...gateways];
   }
@@ -7925,12 +8265,14 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   function handleSubagentMcpDcmDisplaySettingsChange(
     settings: AgentDcmDisplaySettings,
   ) {
+    retireCliAckOrigin("subagent", selectedEditableSubagentId, "mcp");
     if (subagentOwnedSaveInFlightUi) return;
     subagentDcmDisplaySettings = cloneDcmDisplaySettings(settings);
   }
 
   function clearSubagentMcpDefaults() {
     if (subagentCaptureBlocked) return;
+    retireCliAckOrigin("subagent", selectedEditableSubagentId, "mcp");
     if (
       subagentDefaultMCPGateways.length === 0 &&
       subagentDefaultMCPToolSelections.length === 0 &&
@@ -7970,6 +8312,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       } else if (key === "zip_tool_notes_enabled") {
         result.zip_tool_notes_enabled =
           (value as AgentRow["zip_tool_notes_enabled"]) ?? null;
+      } else if (key === "live_file_reads") {
+        result.live_file_reads = (value as AgentRow["live_file_reads"]) ?? null;
       } else if (key.startsWith("auto_zip_") || key.startsWith("zip_disabled_")) {
         result[key as keyof AgentRow] = (value as boolean | null) ?? null;
       } else {
@@ -8134,6 +8478,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       (tool) => tool.tool_name === normalizedName,
     );
     const nextEntry: CustomToolSettingForm = {
+      retained: current?.retained,
       tool_name: normalizedName,
       buffer_size: current?.buffer_size ?? "",
       zip_threshold: current?.zip_threshold ?? "",
@@ -8149,7 +8494,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       !nextEntry.buffer_size &&
       !nextEntry.zip_threshold &&
       nextEntry.auto_zip === ZIP_AUTO_INHERIT &&
-      !getGlobalCustomToolSetting(normalizedName);
+      !getGlobalCustomToolSetting(normalizedName) && !Object.keys(nextEntry.retained ?? {}).length;
 
     const withoutCurrent = zipForm.custom_tool_settings.filter(
       (tool) => tool.tool_name !== normalizedName,
@@ -8301,6 +8646,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     zipForm = { ...zipForm, zip_tool_notes_enabled: value };
   }
 
+  function handleLiveFileReadsChange(value: string) {
+    if (primaryOwnedSaveInFlightUi) return;
+    zipForm = { ...zipForm, live_file_reads: value };
+  }
+
   function normaliseMcpDefaults(agent: AgentRow) {
     const gateways = Array.isArray(agent.defaultMCPGateways)
       ? [...agent.defaultMCPGateways]
@@ -8348,600 +8698,10 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     return [...source];
   }
 
-  function createConfigRow(initial?: Partial<ConfigRow>): ConfigRow {
-    const id =
-      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-        ? crypto.randomUUID()
-        : `codex_cfg_${Math.random().toString(36).slice(2, 10)}`;
-    return {
-      id,
-      key: initial?.key ?? "",
-      value: initial?.value ?? "",
-    };
-  }
-
-  function createDefaultCodexForm(): CodexFormOptions {
-    return {
-      permissionMode: "chat",
-      includeProjectInstructions: true,
-      model: CODEX_SUBMODEL_CHOICES[0]?.value ?? "gpt-6-astra",
-      reasoningEffort: "default",
-      serviceTier: "standard",
-      streamingEffect: true,
-      unifiedExec: true,
-      search: true,
-      sandbox: CODEX_PERMISSION_PRESETS.chat.sandbox,
-      approval: "never",
-      configScope: "managed",
-      addDirs: [],
-      enableFeatures: [],
-      disableFeatures: [],
-      configOverrides: [],
-      workingDirectoryMode: "project",
-      customWorkingDirectory: "",
-      historyPersistence: "none",
-    };
-  }
-
-  function createDefaultClaudeForm(): ClaudeFormOptions {
-    return {
-      permissionMode: "acceptEdits",
-      includeCoreSystemPrompt: false,
-      includeProjectInstructions: true,
-      model: "",
-      alwaysThinkingEnabled: false,
-      maxThinkingTokens: "",
-      configScope: "managed",
-      systemPromptMode: "replace",
-      systemPrompt: MODE4_PRELAUNCH_REPLACEMENT_PROMPT,
-      systemPromptFile: "",
-      chrome: false,
-      addDirs: [],
-      allowedTools: [],
-      disallowedTools: [],
-      configOverrides: [],
-      workingDirectoryMode: "project",
-      customWorkingDirectory: "",
-    };
-  }
-
-  function parseClaudeList(value: unknown) {
-    if (!value) return [];
-    if (Array.isArray(value)) {
-      return value
-        .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
-        .filter((entry) => entry.length > 0);
-    }
-    if (typeof value === "string") {
-      return value
-        .split(",")
-        .map((entry) => entry.trim())
-        .filter((entry) => entry.length > 0);
-    }
-    return [];
-  }
-
-  function resolveCodexApprovalPolicy(
-    permissionMode: CodexPermissionMode,
-    sharedToolApprovalMode: "off" | "all",
-    scope: CliSettingsScope = "agent",
-  ): CodexApproval {
-    if (scope === "subagent") return "never";
-    if (permissionMode !== "agent") return "never";
-    return sharedToolApprovalMode === "all" ? "on-request" : "never";
-  }
-
   function getPrimaryApprovalPolicyLabel(mode: "off" | "all") {
     return (
       PRIMARY_TOOL_APPROVAL_OPTIONS.find((option) => option.value === mode)?.label ?? "Never"
     );
-  }
-
-  function normaliseCodexForm(
-    agent: AgentRow | SubagentRow | null,
-    scope: CliSettingsScope = "agent",
-  ): CodexFormOptions {
-    const options = createDefaultCodexForm();
-    if (!agent) return options;
-    const source = agent.codex_settings ?? null;
-    const providerSettings =
-      !source && agent.provider_specific_settings
-        ? agent.provider_specific_settings
-        : null;
-    if (!source && !providerSettings) return options;
-
-    const permission = source?.permissionMode ?? providerSettings?.codex_permission_mode;
-    if (
-      permission === "chat" ||
-      permission === "agent" ||
-      permission === "agent_full"
-    ) {
-      options.permissionMode = permission;
-    }
-
-    options.includeProjectInstructions =
-      typeof source?.includeProjectInstructions === "boolean"
-        ? source.includeProjectInstructions
-        : providerSettings?.codex_include_project_instructions === true ||
-            providerSettings?.codex_include_core_system_prompt === true;
-    options.model =
-      source?.model ??
-      (typeof providerSettings?.codex_model === "string"
-        ? providerSettings.codex_model.trim()
-        : options.model);
-    if (source?.reasoningEffort) {
-      options.reasoningEffort = source.reasoningEffort as CodexFormOptions["reasoningEffort"];
-    }
-    options.serviceTier = source?.serviceTier === "fast" ? "fast" : "standard";
-    options.streamingEffect = true;
-    options.unifiedExec = true;
-    options.search = source ? source.search !== false : providerSettings?.codex_search !== false;
-    // BL-941 S: mirror the runtime's saved level; missing is this mode's own preset.
-    // A structured block is authoritative; only an absent block reads the legacy bag.
-    const savedSandbox = source ? source.sandbox : providerSettings?.codex_sandbox;
-    options.sandbox = savedSandbox == null
-      ? CODEX_PERMISSION_PRESETS[options.permissionMode].sandbox
-      : sanitizeCodexSandbox(savedSandbox) ?? "read-only";
-    if (source?.approval) {
-      options.approval = source.approval;
-    }
-    options.configScope = "managed";
-    options.addDirs = Array.isArray(source?.addDirs) ? [...source.addDirs] : [];
-    options.enableFeatures = Array.isArray(source?.enableFeatures)
-      ? [...source.enableFeatures]
-      : [];
-    options.disableFeatures = Array.isArray(source?.disableFeatures)
-      ? [...source.disableFeatures]
-      : [];
-    if (Array.isArray(source?.configOverrides)) {
-      options.configOverrides = source.configOverrides.map((entry) =>
-        createConfigRow({ key: entry.key, value: entry.value ?? "" }),
-      );
-    }
-    options.workingDirectoryMode = "project";
-    options.customWorkingDirectory = "";
-    options.historyPersistence = source?.historyPersistence ?? "none";
-    options.approval = resolveCodexApprovalPolicy(
-      options.permissionMode,
-      scope === "agent" ? basicForm.tool_approval_mode : "off",
-      scope,
-    );
-    return options;
-  }
-
-  function normaliseClaudeForm(
-    agent: AgentRow | SubagentRow | null,
-    _scope: CliSettingsScope = "agent",
-  ): ClaudeFormOptions {
-    const options = createDefaultClaudeForm();
-    if (!agent) return options;
-
-    const source = agent.claude_settings ?? null;
-    const providerSettings =
-      !source && agent.provider_specific_settings
-        ? agent.provider_specific_settings
-        : null;
-
-    const permission = source?.permissionMode ?? providerSettings?.claude_permission_mode;
-    if (permission === "default" || permission === "acceptEdits" || permission === "plan" || permission === "bypassPermissions") {
-      options.permissionMode = permission;
-    } else if (permission === "chat") {
-      options.permissionMode = "default";
-    } else if (permission === "agent") {
-      options.permissionMode = "acceptEdits";
-    } else if (permission === "agent_full") {
-      options.permissionMode = "bypassPermissions";
-    }
-
-    const modelValue =
-      typeof source?.model === "string"
-        ? source.model
-        : typeof providerSettings?.claude_model === "string"
-          ? providerSettings.claude_model
-          : "";
-    options.model = modelValue?.trim() ?? "";
-
-    const alwaysThinking =
-      typeof source?.alwaysThinkingEnabled === "boolean"
-        ? source.alwaysThinkingEnabled
-        : typeof providerSettings?.claude_always_thinking_enabled === "boolean"
-          ? providerSettings.claude_always_thinking_enabled
-          : typeof providerSettings?.claude_always_thinking === "boolean"
-            ? providerSettings.claude_always_thinking
-            : false;
-    options.alwaysThinkingEnabled = alwaysThinking;
-
-    const rawMaxThinking =
-      source?.maxThinkingTokens ?? providerSettings?.claude_max_thinking_tokens ?? "";
-    const normalizedMaxThinking =
-      typeof rawMaxThinking === "number"
-        ? String(rawMaxThinking)
-        : typeof rawMaxThinking === "string"
-          ? rawMaxThinking.trim()
-          : "";
-    options.maxThinkingTokens = alwaysThinking
-      ? normalizedMaxThinking.length > 0
-        ? normalizedMaxThinking
-        : String(CLAUDE_DEFAULT_MAX_THINKING_TOKENS)
-      : "";
-
-    options.configScope = "managed";
-    options.includeCoreSystemPrompt =
-      source?.includeCoreSystemPrompt === true ||
-      providerSettings?.claude_include_core_system_prompt === true;
-    options.includeProjectInstructions =
-      typeof source?.includeProjectInstructions === "boolean"
-        ? source.includeProjectInstructions
-        : typeof providerSettings?.claude_include_project_instructions === "boolean"
-          ? providerSettings.claude_include_project_instructions
-          : true;
-    options.systemPromptMode = options.includeCoreSystemPrompt ? "default" : "replace";
-    options.systemPrompt = options.includeCoreSystemPrompt
-      ? ""
-      : MODE4_PRELAUNCH_REPLACEMENT_PROMPT;
-    options.systemPromptFile = "";
-
-    options.chrome = Boolean(
-      source?.chrome ?? providerSettings?.claude_chrome_enabled ?? false,
-    );
-    options.addDirs = Array.isArray(source?.addDirs)
-      ? [...source.addDirs]
-      : parseClaudeList(providerSettings?.claude_additional_dirs);
-    options.allowedTools = Array.isArray(source?.allowedTools)
-      ? [...source.allowedTools]
-      : parseClaudeList(providerSettings?.claude_allowed_tools);
-    options.disallowedTools = Array.isArray(source?.disallowedTools)
-      ? [...source.disallowedTools]
-      : parseClaudeList(providerSettings?.claude_disallowed_tools);
-    if (Array.isArray(source?.configOverrides)) {
-      options.configOverrides = source.configOverrides.map((entry) =>
-        createConfigRow({ key: entry.key, value: entry.value ?? "" }),
-      );
-    } else if (Array.isArray(providerSettings?.claude_config_overrides)) {
-      options.configOverrides = providerSettings.claude_config_overrides
-        .filter((entry) => entry && typeof entry === "object")
-        .map((entry) =>
-          createConfigRow({
-            key: typeof entry.key === "string" ? entry.key : "",
-            value:
-              typeof entry.value === "string"
-                ? entry.value
-                : entry.value !== undefined
-                  ? String(entry.value)
-                  : "",
-          }),
-        )
-        .filter((entry) => entry.key.trim().length > 0);
-    }
-
-    options.workingDirectoryMode = "project";
-    options.customWorkingDirectory = "";
-
-    return options;
-  }
-
-  function makeCodexSignature(
-    form: CodexFormOptions,
-    scope: CliSettingsScope = "agent",
-  ) {
-    return JSON.stringify({
-      ...form,
-      approval: resolveCodexApprovalPolicy(
-        form.permissionMode,
-        scope === "agent" ? basicForm.tool_approval_mode : "off",
-        scope,
-      ),
-      includeProjectInstructions: form.includeProjectInstructions,
-      addDirs: [...form.addDirs].sort(),
-      enableFeatures: [...form.enableFeatures].sort(),
-      disableFeatures: [...form.disableFeatures].sort(),
-      configOverrides: form.configOverrides
-        .map((row) => ({ key: row.key.trim(), value: row.value }))
-        .sort((a, b) => a.key.localeCompare(b.key)),
-    });
-  }
-
-  function makeClaudeSignature(form: ClaudeFormOptions) {
-    return JSON.stringify({
-      ...form,
-      includeCoreSystemPrompt: form.includeCoreSystemPrompt,
-      includeProjectInstructions: form.includeProjectInstructions,
-      model: form.model.trim(),
-      alwaysThinkingEnabled: form.alwaysThinkingEnabled,
-      maxThinkingTokens: form.maxThinkingTokens.trim(),
-      systemPrompt: form.systemPrompt.trim(),
-      systemPromptFile: form.systemPromptFile.trim(),
-      customWorkingDirectory: form.customWorkingDirectory.trim(),
-      addDirs: [...form.addDirs].sort(),
-      allowedTools: [...form.allowedTools].sort(),
-      disallowedTools: [...form.disallowedTools].sort(),
-      configOverrides: form.configOverrides
-        .map((row) => ({ key: row.key.trim(), value: row.value }))
-        .sort((a, b) => a.key.localeCompare(b.key)),
-    });
-  }
-
-  type CliSettingsScope = "agent" | "subagent";
-
-  function updateCodexForm(
-    updater: (current: CodexFormOptions) => CodexFormOptions,
-    scope: CliSettingsScope = "agent",
-  ) {
-    if (scope === "agent" ? primaryOwnedSaveInFlightUi : subagentOwnedSaveInFlightUi) return;
-    if (scope === "subagent") {
-      subagentCodexForm = updater(subagentCodexForm);
-      return;
-    }
-    codexForm = updater(codexForm);
-  }
-
-  /**
-   * SA-017, BL-910: the form for a Codex model the USER just picked. `xhigh` reasoning effort and
-   * the `fast` service tier are only allowed for the models the static support sets name, so a pick
-   * of a model outside them lowers the value in the pick itself (it shows, and it saves once).
-   * Nothing else lowers them: opening an agent never changes the form, so a saved value the sets
-   * do not know (a model outside Batshit's list) stays as saved; the server passes it through and
-   * Codex itself validates it.
-   */
-  function codexFormForPickedModel(
-    current: CodexFormOptions,
-    model: string,
-  ): CodexFormOptions {
-    return {
-      ...current,
-      model,
-      reasoningEffort:
-        current.reasoningEffort === "xhigh" && !supportsCodexXhighReasoning(model)
-          ? "high"
-          : current.reasoningEffort,
-      serviceTier:
-        current.serviceTier === "fast" && !supportsCodexFastMode(model)
-          ? "standard"
-          : current.serviceTier,
-    };
-  }
-
-  function updateClaudeForm(
-    updater: (current: ClaudeFormOptions) => ClaudeFormOptions,
-    scope: CliSettingsScope = "agent",
-  ) {
-    if (scope === "agent" ? primaryOwnedSaveInFlightUi : subagentOwnedSaveInFlightUi) return;
-    if (scope === "subagent") {
-      subagentClaudeForm = updater(subagentClaudeForm);
-      return;
-    }
-    claudeForm = updater(claudeForm);
-  }
-
-
-  function serializeCodexForm(
-    form: CodexFormOptions,
-    scope: CliSettingsScope = "agent",
-  ): CodexAgentSettings {
-    return {
-      permissionMode: form.permissionMode,
-      includeProjectInstructions: form.includeProjectInstructions === true,
-      model: form.model,
-      reasoningEffort:
-        form.reasoningEffort && form.reasoningEffort !== "default"
-          ? form.reasoningEffort
-          : undefined,
-      serviceTier: form.serviceTier === "fast" ? "fast" : undefined,
-      streamingEffect: true,
-      unifiedExec: true,
-      search: form.search,
-      sandbox: form.sandbox,
-      approval: resolveCodexApprovalPolicy(
-        form.permissionMode,
-        scope === "agent" ? basicForm.tool_approval_mode : "off",
-        scope,
-      ),
-      configScope: "managed",
-      addDirs: [...form.addDirs],
-      enableFeatures: [...form.enableFeatures],
-      disableFeatures: [...form.disableFeatures],
-      configOverrides: form.configOverrides.map((row) => ({
-        key: row.key.trim(),
-        value: row.value,
-      })),
-      workingDirectoryMode: "project",
-      customWorkingDirectory: undefined,
-      historyPersistence: form.historyPersistence,
-    };
-  }
-
-  function serializeClaudeForm(form: ClaudeFormOptions): ClaudeAgentSettings {
-    const trimmedModel = form.model.trim();
-    const trimmedMaxThinking = form.maxThinkingTokens.trim();
-    const parsedMaxThinking = Number.parseInt(trimmedMaxThinking, 10);
-    const thinkingEnabled = form.alwaysThinkingEnabled === true;
-    const maxThinkingTokens = thinkingEnabled
-      ? Number.isFinite(parsedMaxThinking) && parsedMaxThinking > 0
-        ? parsedMaxThinking
-        : CLAUDE_DEFAULT_MAX_THINKING_TOKENS
-      : undefined;
-
-    return {
-      permissionMode: form.permissionMode,
-      includeCoreSystemPrompt: form.includeCoreSystemPrompt === true,
-      includeProjectInstructions: form.includeProjectInstructions === true,
-      model: trimmedModel.length ? trimmedModel : undefined,
-      alwaysThinkingEnabled: thinkingEnabled,
-      maxThinkingTokens,
-      configScope: "managed",
-      systemPromptMode: form.includeCoreSystemPrompt ? "default" : "replace",
-      systemPrompt: form.includeCoreSystemPrompt
-        ? undefined
-        : MODE4_PRELAUNCH_REPLACEMENT_PROMPT,
-      systemPromptFile: undefined,
-      chrome: form.chrome === true ? true : false,
-      addDirs: [...form.addDirs],
-      allowedTools: [...form.allowedTools],
-      disallowedTools: [...form.disallowedTools],
-      configOverrides: form.configOverrides.map((row) => ({
-        key: row.key.trim(),
-        value: row.value,
-      })),
-      workingDirectoryMode: "project",
-      customWorkingDirectory: undefined,
-    };
-  }
-
-  function setCodexPermissionMode(mode: CodexPermissionMode, scope: CliSettingsScope = "agent") {
-    const preset = CODEX_PERMISSION_PRESETS[mode];
-    updateCodexForm((current) => ({
-      ...current,
-      permissionMode: mode,
-      sandbox: preset.sandbox,
-    }), scope);
-  }
-
-  function setClaudePermissionMode(mode: ClaudePermissionMode, scope: CliSettingsScope = "agent") {
-    updateClaudeForm((current) => ({
-      ...current,
-      permissionMode: mode,
-    }), scope);
-  }
-
-  function addCodexListValue(
-    key: "addDirs" | "enableFeatures" | "disableFeatures",
-    value: string,
-    scope: CliSettingsScope = "agent",
-  ) {
-    const trimmed = value.trim();
-    if (!trimmed) return;
-    updateCodexForm((current) => {
-      if (current[key].includes(trimmed)) {
-        return current;
-      }
-      return {
-        ...current,
-        [key]: [...current[key], trimmed],
-      };
-    }, scope);
-  }
-
-  function removeCodexListValue(
-    key: "addDirs" | "enableFeatures" | "disableFeatures",
-    index: number,
-    scope: CliSettingsScope = "agent",
-  ) {
-    updateCodexForm((current) => ({
-      ...current,
-      [key]: current[key].filter((_, idx) => idx !== index),
-    }), scope);
-  }
-
-  function addClaudeListValue(
-    key: "addDirs" | "allowedTools" | "disallowedTools",
-    value: string,
-    scope: CliSettingsScope = "agent",
-  ) {
-    const trimmed = value.trim();
-    if (!trimmed) return;
-    updateClaudeForm((current) => {
-      if (current[key].includes(trimmed)) {
-        return current;
-      }
-      return {
-        ...current,
-        [key]: [...current[key], trimmed],
-      };
-    }, scope);
-  }
-
-  function removeClaudeListValue(
-    key: "addDirs" | "allowedTools" | "disallowedTools",
-    index: number,
-    scope: CliSettingsScope = "agent",
-  ) {
-    updateClaudeForm((current) => ({
-      ...current,
-      [key]: current[key].filter((_, idx) => idx !== index),
-    }), scope);
-  }
-
-  // BL-499: this switch (Agent Settings' "Allow Claude Web Search") is driven by
-  // `disallowedTools` alone, from the shared, unit-tested `claudeToolSwitch` module — never
-  // `allowedTools`, and never reimplemented inline here. Claude Code reads `allowedTools` as
-  // "skip the permission prompt for these", not "only these tools work", so a tool absent from
-  // it still runs normally; consulting it here used to show the switch OFF for a tool that was
-  // still fully working the moment any OTHER Allowed Tools entry existed, and could silently
-  // erase an existing denial when turning it OFF in that state.
-  function getClaudeToolEnabled(toolName: string, scope: CliSettingsScope = "agent") {
-    const form = scope === "subagent" ? subagentClaudeForm : claudeForm;
-    return isClaudeToolEnabled(form.disallowedTools, toolName);
-  }
-
-  function setClaudeToolEnabled(
-    toolName: string,
-    enabled: boolean,
-    scope: CliSettingsScope = "agent",
-  ) {
-    updateClaudeForm((current) => {
-      const nextDisallowed = withClaudeToolEnabled(current.disallowedTools, toolName, enabled);
-      if (nextDisallowed === current.disallowedTools) return current;
-      return {
-        ...current,
-        disallowedTools: nextDisallowed,
-      };
-    }, scope);
-  }
-
-  function addCodexConfig(scope: CliSettingsScope = "agent") {
-    updateCodexForm((current) => ({
-      ...current,
-      configOverrides: [...current.configOverrides, createConfigRow()],
-    }), scope);
-  }
-
-  function updateCodexConfig(
-    id: string,
-    field: "key" | "value",
-    value: string,
-    scope: CliSettingsScope = "agent",
-  ) {
-    updateCodexForm((current) => ({
-      ...current,
-      configOverrides: current.configOverrides.map((row) =>
-        row.id === id ? { ...row, [field]: value } : row,
-      ),
-    }), scope);
-  }
-
-  function removeCodexConfig(id: string, scope: CliSettingsScope = "agent") {
-    updateCodexForm((current) => ({
-      ...current,
-      configOverrides: current.configOverrides.filter((row) => row.id !== id),
-    }), scope);
-  }
-
-  function addClaudeConfig(scope: CliSettingsScope = "agent") {
-    updateClaudeForm((current) => ({
-      ...current,
-      configOverrides: [...current.configOverrides, createConfigRow()],
-    }), scope);
-  }
-
-  function updateClaudeConfig(
-    id: string,
-    field: "key" | "value",
-    value: string,
-    scope: CliSettingsScope = "agent",
-  ) {
-    updateClaudeForm((current) => ({
-      ...current,
-      configOverrides: current.configOverrides.map((row) =>
-        row.id === id ? { ...row, [field]: value } : row,
-      ),
-    }), scope);
-  }
-
-  function removeClaudeConfig(id: string, scope: CliSettingsScope = "agent") {
-    updateClaudeForm((current) => ({
-      ...current,
-      configOverrides: current.configOverrides.filter((row) => row.id !== id),
-    }), scope);
   }
 
   function sortMcpSelections(selections: MCPToolSelections): MCPToolSelections {
@@ -8956,7 +8716,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   }
 
   /**
-   * What a save names, as a copy takes it. The Codex and Claude settings and the Tool Grid display
+   * What a save names, as a copy takes it. The Claude settings and the Tool Grid display
    * settings are written key by key (BL-848, BL-855), so a save of them names only the keys (or
    * map entries) it changed, a removed one as `null`, and a copy takes them the way the server
    * does (`applyAgentBlockUpdate`), never as a whole replacement of the block.
@@ -8966,6 +8726,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   };
 
   function updateAgentCollections(id: string, updates: AgentCollectionsUpdate) {
+    // BL-2372 review A2: a landed save naming this agent's default project outranks an older
+    // sidebar pick for it, even while another agent is current.
+    if ("default_project_id" in updates) noteSavedDefaultProject(id);
     // BL-514: a saved block is laid over each copy the way the agent PUT stores it (model keys
     // replaced, the agent's own keys kept unless named), each over its own copy: the store's
     // may hold a newer chat-bar change than this panel's list.
@@ -9039,46 +8802,22 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     return `${first}${last}`.toUpperCase();
   }
 
+  // SA-139 R6 (D16): one Subagent kind, so a live Subagent's row carries no type badge. A leftover
+  // of a removed type (a CLI Subagent, R5; the list never holds an n8n one, R2) is listed but can
+  // never be assigned, and its badge says why its switch is off.
   function formatSubagentBadge(subagent: SubagentRow) {
-    return getSubagentTypeShortLabel(
-      normalizeSubagentType(subagent, subagent.subagentType),
-    );
+    return isRetiredSubagentType(normalizeSubagentType(subagent, subagent.subagentType)) ? "Removed Type" : "";
   }
 
-  const TYPE_BADGE_BASE =
-    "batshit-agent-type-badge";
-
-  function formatPrimaryAgentTypeLabel(
-    type: StoredPrimaryAgentType,
-  ) {
-    return `${getPrimaryAgentDisplayLabel(type)} Primary Agent`;
+  // SA-139 R4: every live Primary is an API agent, so Claude Code CLI presets never fit a Primary.
+  function getPrimaryToolHostScope(): ToolHostScope {
+    return "api";
   }
 
-  function formatSubagentTypeLabel(type: StoredSubagentType) {
-    return getSubagentTypeDisplayLabel(type);
-  }
-
-  function primaryTypeBadgeClass(type: StoredPrimaryAgentType) {
-    return `${TYPE_BADGE_BASE} is-agent-type-${type}`;
-  }
-
-  function subagentTypeBadgeClass(type: StoredSubagentType) {
-    return `${TYPE_BADGE_BASE} is-agent-type-${getSubagentTypeBadgeTone(type)}`;
-  }
-
-  function formatCompatibleSubagentTypes(primaryAgentType: StoredPrimaryAgentType) {
-    return getCompatibleSubagentTypesForPrimaryAgent(primaryAgentType)
-      .map((type) => getSubagentTypeDisplayLabel(type))
-      .join(" or ");
-  }
-
-  function getPrimaryToolHostScope(type: StoredPrimaryAgentType): ToolHostScope {
-    return type === "cli" ? "cli" : "api";
-  }
-
-  function getSubagentToolHostScope(type: StoredSubagentType): ToolHostScope {
-    if (type === "cli") return "cli";
-    return type === "api" ? "api" : "n8n";
+  // SA-139 R5: every live Subagent is an API agent too (a leftover CLI Subagent shows no picker
+  // or Tool Grid), so the Subagent pickers and grid pass `api`, never `cli`.
+  function getSubagentToolHostScope(): ToolHostScope {
+    return "api";
   }
 
   async function copyId(value: string | null | undefined, label: string) {
@@ -9090,87 +8829,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       console.error(`Failed to copy ${label.toLowerCase()}:`, error);
       toast.error(`Failed to copy ${label.toLowerCase()}`);
     }
-  }
-
-  function formatCliLoginHelp(setupContext: string | undefined, setupWorkingDirectory?: string) {
-    if (setupContext === "docker") {
-      return setupWorkingDirectory?.trim()
-        ? "Open Terminal, go to the Batshit Docker folder shown below, then run this login command once."
-        : "Open Terminal, go to your Batshit Docker install folder, then run this login command once.";
-    }
-
-    return "Open Terminal and run this once.";
-  }
-
-  function formatCliLoginNote(option: CatalogConnectionOption | null | undefined) {
-    if (option?.id !== "claude-cli") return null;
-
-    return 'Claude Code on Windows may hide pasted auth-code input. At "Paste code here if prompted", paste the browser code, then press Enter even if no text appears.';
-  }
-
-  async function fetchManagedConfig(provider: ManagedConfigProvider) {
-    const isSubagent = selectedEntity?.kind === "subagent";
-    const targetId = isSubagent ? selectedEditableSubagentId : selectedAgentId;
-    if (!targetId) {
-      throw new Error(`Select a ${isSubagent ? "subagent" : "primary agent"} first.`);
-    }
-
-    const basePath = isSubagent
-      ? `/api/subagents/${targetId}/managed-config`
-      : `/api/agents/${targetId}/managed-config`;
-    const response = await fetch(`${basePath}?provider=${provider}`);
-    if (!response.ok) {
-      throw new Error(await extractError(response, "Failed to load managed config"));
-    }
-
-    return (await response.json()) as {
-      provider: ManagedConfigProvider;
-      fileName: string;
-      path: string;
-      contents: string;
-    };
-  }
-
-  async function openManagedConfigViewer(provider: ManagedConfigProvider) {
-    managedConfigDialogOpen = true;
-    managedConfigLoading = true;
-    managedConfigError = null;
-    managedConfigProvider = provider;
-    managedConfigFileName = provider === "codex" ? "config.toml" : "settings.json";
-    managedConfigPath = "";
-    managedConfigContents = "";
-
-    try {
-      const payload = await fetchManagedConfig(provider);
-      managedConfigProvider = payload.provider;
-      managedConfigFileName = payload.fileName;
-      managedConfigPath = payload.path;
-      managedConfigContents = payload.contents;
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to load managed config";
-      managedConfigError = message;
-      toast.error(message);
-    } finally {
-      managedConfigLoading = false;
-    }
-  }
-
-  async function copyManagedConfigPath(provider: ManagedConfigProvider) {
-    try {
-      const payload = await fetchManagedConfig(provider);
-      await copyId(payload.path, `${payload.fileName} path`);
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to copy managed config path";
-      toast.error(message);
-    }
-  }
-
-  function getManagedConfigDialogTitle() {
-    if (managedConfigProvider === "codex") return "Managed Codex config.toml";
-    if (managedConfigProvider === "claude") return "Managed Claude settings.json";
-    return "Managed Config";
   }
 
   async function extractError(response: Response, fallback: string) {
@@ -9265,23 +8923,32 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
       onSelectSubagent={selectSubagent}
       onCreateAgent={() => handleStartCreateEntity("agent")}
       onOpen={() => {
-        void n8nRuntimeStatusStore.refreshN8nRuntimeStatus({ force: true });
       }}
     />
 
     {#if selectedEntity?.kind === "agent" && selectedAgentId}
       <!-- Primary Agent Settings Start -->
       <div class="batshit-settings-surface space-y-6">
+              {#if primaryModelSelectionNotice && !detailLoading}
+                <div class="batshit-settings-note is-dashed flex items-center gap-2" data-testid="primary-model-selection-notice" role="status">
+                  <AlertCircle class="h-4 w-4" />
+                  <span>{primaryModelSelectionNotice}</span>
+                  <Button variant="outline" size="sm" disabled={primaryOwnedWritePendingUi} onclick={() => useSavedModelSelection('agent')}>Use Saved Model</Button>
+                </div>
+              {/if}
               {#if primarySettingsReadWaiting || primaryOwnedSaveInFlightUi}
                 <div class="batshit-settings-note is-dashed flex items-center gap-2" data-testid="primary-settings-read-wait" role="status">
                   {#if primaryReadWaitError || primarySaveWaitExpiredUi}
                     <AlertCircle class="h-4 w-4" />
                     <span>{primaryReadWaitError ?? "Your last change to this agent did not confirm within 30 seconds. Batshit does not know if it was saved. Retry reads the record."}</span>
+                  {:else if primaryDeferredDraftOnly}
+                    <Info class="h-4 w-4" />
+                    <span>Your unsaved edits are being kept.</span>
                   {:else}
                     <Loader2 class="h-4 w-4 animate-spin" />
                     <span>Waiting for saved agent settings…</span>
                   {/if}
-                  <Button variant="outline" size="sm" onclick={retryPrimarySettingsRead}>Retry</Button>
+                  {#if !primaryDeferredDraftOnly}<Button variant="outline" size="sm" onclick={retryPrimarySettingsRead}>Retry</Button>{/if}
                 </div>
               {/if}
               <fieldset disabled={primaryOwnedSaveInFlightUi} inert={primaryOwnedSaveInFlightUi} class="min-w-0 space-y-6 border-0 p-0 m-0">
@@ -9294,6 +8961,12 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                 </div>
               {/if}
 
+              {#if selectedAgentId && primaryMcpHolds[selectedAgentId]}
+                <div class="batshit-settings-action-row">
+                  <span class="batshit-settings-form-meta is-error">Your Tool Settings draft is kept. Read saved values before another choice.</span>
+                  <Button variant="outline" size="sm" disabled={mcpSaves.busy(selectedAgentId) || zipSaves.busy(selectedAgentId)} onclick={useSavedMcpSettings}>Use Saved Tool Settings</Button>
+                </div>
+              {/if}
               <Tabs.Root bind:value={activeAgentSettingsTab} class="w-full">
                 <Tabs.List class="flex w-full flex-wrap gap-2">
                   <Tabs.Trigger
@@ -9337,7 +9010,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
               {#if activeAgentSettingsTab === "tools"}
               <AgentMcpDefaultsCard
                 agentId={selectedAgentId === CREATE_AGENT_SENTINEL ? null : selectedAgentId}
-                toolHostScope={getPrimaryToolHostScope(basicForm.agentType)}
+                subjectKind="primary"
+                toolHostScope={getPrimaryToolHostScope()}
                 userId={data?.user?.id ?? null}
                 accordionName="agent-tools-cards"
                 toolGridTitle="Agent Tool Grid Settings"
@@ -9347,6 +9021,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                 cliToolIdsExplicit={cliToolIdsExplicit}
                 dcmDisplaySettings={dcmDisplaySettings}
                 mcpSaveState={mcpSaveState}
+                enableSaveState={basicSaveScope === "tools" ? basicSaveState : "idle"}
+                enableSaveError={basicSaveScope === "tools" ? basicSaveError ?? basicValidationError : null}
                 mcpSaveError={mcpSaveError}
                 mcpLastSaved={mcpLastSaved}
                 mcpRenderNonce={mcpRenderNonce}
@@ -9355,27 +9031,34 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                 }
                 nativeCliToolsEnabled={getNativeToolToggle("cliToolsEnabled", true)}
                 nativeToolSettings={getNativeToolsSettings("agent")}
-                isCodexMode={isCliProvider}
-                onGatewaysChange={guardPrimaryChoice(handleMcpGatewaysChange)}
-                onDcmDisplaySettingsChange={guardPrimaryChoice(handleMcpDcmDisplaySettingsChange)}
-                onCliToolIdsChange={guardPrimaryChoice(handleCliToolSelectionsChange)}
+                getEnableControl={id => getToolGridEnableControl(id, "agent")}
+                discoveryReadOnly={cliPairBlocked("agent")}
+                onGatewaysChange={guardPrimaryChoice(handleMcpGatewaysChange, true)}
+                onDcmDisplaySettingsChange={guardPrimaryChoice(handleMcpDcmDisplaySettingsChange, true)}
+                onCliToolIdsChange={guardPrimaryChoice(handleCliToolSelectionsChange, true)}
                 getToolZipOverride={getMcpToolZipOverride}
                 onToolZipOverrideChange={guardPrimaryChoice(handleMcpToolZipOverrideChange)}
                 showZipControls={true}
                 zipAiViewMode={zipForm.zip_ai_view_mode}
                 zipToolNotesEnabled={zipForm.zip_tool_notes_enabled}
+                liveFileReads={zipForm.live_file_reads}
+                liveFileReadsUnavailableReason={refreshedFileReadsAvailability.unavailableReason}
+                liveFileReadsWarn={refreshedFileReadsAvailability.warn}
+                liveFileReadsNote={refreshedFileReadsAvailability.note}
                 nonMcpZipRows={NON_MCP_ZIP_ROW_ORDER}
                 getNonMcpZipOverride={getNonMcpZipOverrideById}
                 onNonMcpZipOverrideChange={guardPrimaryChoice(handleNonMcpZipOverrideChangeById)}
                 onZipAiViewModeChange={guardPrimaryChoice(handleZipAiViewModeChange)}
                 onZipToolNotesChange={guardPrimaryChoice(handleZipToolNotesChange)}
+                onLiveFileReadsChange={guardPrimaryChoice(handleLiveFileReadsChange)}
                 onResetToGlobalSettings={resetToolGridToGlobalSettings}
                 zipSaveState={zipSaveState}
                 zipSaveError={zipSaveError}
                 zipValidationError={zipValidationError}
                 zipLastSaved={zipLastSaved}
                 fullWidthTable={true}
-              />
+              >
+              </AgentMcpDefaultsCard>
               {/if}
 
               <SettingsAccordionCard
@@ -9434,12 +9117,12 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                 <Copy  />
                               </Button>
                             </div>
-                            <div class="batshit-settings-identity-meta-item">
-                              <span class="whitespace-nowrap">Agent Type:</span>
-                              <span class={primaryTypeBadgeClass(basicForm.agentType)}>
-                                {formatPrimaryAgentTypeLabel(basicForm.agentType)}
-                              </span>
-                            </div>
+                            {#if isRetiredPrimaryAgentType(basicForm.agentType)}
+                              <!-- SA-139 R4 (D14): a leftover of a removed Primary type is refused; Delete is its only action. -->
+                              <div class="batshit-settings-identity-meta-item" data-testid="primary-retired-type-notice">
+                                <span class="batshit-settings-caption">{retiredPrimaryDetails(basicForm)}</span>
+                              </div>
+                            {/if}
                           </div>
                         </div>
 
@@ -9471,6 +9154,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                   <Select.Root
                                     type="single"
                                     value={(selectedModelId ?? "") as unknown as string}
+                                    disabled={primaryModelSelectionBlocked || primaryModelConnectionsBlocked}
                                     onValueChange={guardPrimaryChoice((value) =>
                                       handleAgentModelChange(
                                         Array.isArray(value) ? value[0] : value,
@@ -9535,11 +9219,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                                   <Lock class="h-3 w-3 shrink-0" />
                                                   <span class="truncate">{availability.reason}</span>
                                                 </span>
-                                              {:else if isCliLoginSetupConnectionOption(availability.connectionOption)}
-                                                <span class="ml-auto flex max-w-[140px] items-center gap-1 truncate text-[11px] text-amber-600 dark:text-amber-400">
-                                                  <AlertCircle class="h-3 w-3 shrink-0" />
-                                                  <span class="truncate">Login needed</span>
-                                                </span>
                                               {/if}
                                             </div>
                                           </Select.Item>
@@ -9560,8 +9239,15 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                     class={`${savedModelsLoading || modelConnectionOptionsLoading ? "animate-spin" : ""}`}
                                   />
                                 </Button>
+                                <Button variant="ghost" size="icon" class="batshit-button-shrink-0" title="Clear Saved Model" aria-label="Clear Saved Model"
+                                  disabled={!canClearModelSelection('agent')} onclick={() => { if (canClearModelSelection('agent')) clearAgentModelSelection(); }}>
+                                  <X class="h-4 w-4" aria-hidden="true" />
+                                </Button>
                               </div>
 
+                              {#if modelClearEligibility('agent').unreadable}
+                                <p class="batshit-settings-form-meta is-warning">Saved Model clear is unavailable because the saved model selection is unreadable.</p>
+                              {/if}
                               {#if selectedModelId}
                                 {#if selectedPrimaryModelAvailability?.disabled}
                                   <p class="batshit-settings-form-meta is-warning">
@@ -9569,73 +9255,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                   </p>
                                 {/if}
                               {/if}
-                              {#each cliConnectionSetups as cliConnectionSetup (cliConnectionSetup.id)}
-                                {@const cliLoginCommandLabel = `${cliConnectionSetup.label} login command`}
-                                {@const cliLoginNote = formatCliLoginNote(cliConnectionSetup)}
-                                <div class="batshit-settings-inline-alert is-dashed space-y-2">
-                                  <div>
-                                    <p class="batshit-settings-parent-label">{cliConnectionSetup.label} login needed</p>
-                                    <p class="batshit-settings-form-meta">
-                                      {formatCliLoginHelp(
-                                        cliConnectionSetup.setupContext,
-                                        cliConnectionSetup.setupWorkingDirectory,
-                                      )}
-                                    </p>
-                                    {#if cliConnectionSetup.setupContext === "docker" && cliConnectionSetup.setupWorkingDirectory}
-                                      <p class="batshit-settings-form-meta">
-                                        Run from:
-                                        <code class="break-all rounded px-1 py-0.5">
-                                          {cliConnectionSetup.setupWorkingDirectory}
-                                        </code>
-                                      </p>
-                                    {/if}
-                                    {#if cliLoginNote}
-                                      <p class="batshit-settings-form-meta is-warning">
-                                        {cliLoginNote}
-                                      </p>
-                                    {/if}
-                                  </div>
-                                  <div class="flex items-center gap-2">
-                                    <code class="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded px-2 py-1 text-[11px]">
-                                      {cliConnectionSetup.setupCommand}
-                                    </code>
-                                    <Button
-                                      type="button"
-                                      variant="ghost"
-                                      size="icon"
-                                      class="h-8 w-8 shrink-0"
-                                      title={`Copy ${cliLoginCommandLabel}`}
-                                      aria-label={`Copy ${cliLoginCommandLabel}`}
-                                      onclick={() =>
-                                        copyId(
-                                          cliConnectionSetup.setupCommand,
-                                          cliLoginCommandLabel,
-                                        )}
-                                    >
-                                      <Copy class="h-4 w-4" />
-                                    </Button>
-                                  </div>
-                                </div>
-                              {/each}
-                              {#if isCliPrimaryAgentType(basicForm.agentType)}
-                                {#if isCodexProvider || !isClaudeCliProvider}
-                                  <CliRuntimeManagerCard
-                                    runtime="codex"
-                                    onChanged={refreshModelPickerData}
-                                  />
-                                {/if}
-                                {#if isClaudeCliProvider || !isCodexProvider}
-                                  <CliRuntimeManagerCard
-                                    runtime="claude"
-                                    onChanged={refreshModelPickerData}
-                                  />
-                                {/if}
-                              {/if}
-                              {#if isManagedPrimaryAgentType(basicForm.agentType) && modelConnectionOptionsLoading}
+                              {#if isApiPrimaryAgentType(basicForm.agentType) && modelConnectionOptionsLoading}
                                 <p class="batshit-settings-form-meta">
                                   Loading connection status…
                                 </p>
-                              {:else if isManagedPrimaryAgentType(basicForm.agentType) && modelConnectionOptionsError}
+                              {:else if isApiPrimaryAgentType(basicForm.agentType) && modelConnectionOptionsError}
                                 <p class="batshit-settings-form-meta is-error">{modelConnectionOptionsError}</p>
                               {/if}
                               {#if savedModelsError}
@@ -9645,7 +9269,13 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                           </div>
                         </div>
 
-                        {#if isManagedPrimaryAgentType(basicForm.agentType)}
+                        {#if basicForm.agentType === 'api' && selectedAgentId}
+                          <ModelReasoningControl agentId={selectedAgentId} preset={selectedPrimaryModel} surface="settings"
+                            disabled={primaryCaptureBlocked || primaryOwnedSaveInFlightUi}
+                            canEdit={() => !primaryCaptureBlocked && !primaryOwnedSaveInFlightUi} />
+                        {/if}
+
+                        {#if isApiPrimaryAgentType(basicForm.agentType)}
                           <div class="batshit-settings-toggle-row is-spine-toggle">
                             <div class="flex min-w-0 items-center gap-1.5">
                               <span class="batshit-settings-parent-label">Display Reasoning</span>
@@ -9661,39 +9291,22 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                   side="bottom"
                                   class={SETTINGS_INFO_CONTENT_CLASS}
                                 >
-                                  When enabled, Batshit streams reasoning summaries into chat in a collapsed section whenever the model provides them, then saves them with the message so they remain visible after refresh. When disabled, supported runtimes may still capture reasoning internally only to recover an unfinished response after you interrupt it.
+                                  Shows available reasoning in a collapsed section. Batshit saves the reasoning the model exposes independently of this display preference. Reasoning Retention below controls whether completed replies' reasoning enters later model context. This does not change how much reasoning the model generates.
                                 </DropdownMenu.Content>
                               </DropdownMenu.Root>
                             </div>
                             <Switch.Root
-                              bind:checked={basicForm.show_reasoning}
-                              disabled={!isManagedPrimaryAgentType(basicForm.agentType)}
+                              checked={basicForm.show_reasoning}
+                              onCheckedChange={guardPrimaryChoice((checked: boolean) => {
+                                basicForm = { ...basicForm, show_reasoning: checked };
+                              })}
                             />
                           </div>
 
-                          {#if basicForm.show_reasoning}
-                            <div class="batshit-settings-toggle-row is-child is-spine-toggle">
-                              <div class="flex min-w-0 items-center gap-1.5">
-                                <span class="batshit-settings-child-label">Preserve Reasoning In Chat History</span>
-                                <DropdownMenu.Root>
-                                  <DropdownMenu.Trigger
-                                    class={SETTINGS_INFO_TRIGGER_CLASS}
-                                    aria-label="About Preserving Reasoning In Chat History"
-                                  >
-                                    <Info class="h-3.5 w-3.5" />
-                                  </DropdownMenu.Trigger>
-                                  <DropdownMenu.Content
-                                    align="start"
-                                    side="bottom"
-                                    class={SETTINGS_INFO_CONTENT_CLASS}
-                                  >
-                                    Reasoning shown in chat is always saved and still appears after refresh. Turn this on to also include this agent's prior reasoning in later model requests and in the Execution Viewer's Compiled Messages. Leaving it off keeps completed-turn reasoning visible to you but hidden from the agent's later context, which saves tokens. If you interrupt a response, Batshit temporarily gives that unfinished reasoning back to the same agent until it completes one successful response, regardless of this setting.
-                                  </DropdownMenu.Content>
-                                </DropdownMenu.Root>
-                              </div>
-                              <Switch.Root bind:checked={basicForm.preserve_reasoning} />
-                            </div>
-                          {/if}
+                          <ReasoningRetentionFields value={basicForm}
+                            ownerId={selectedAgentId ?? ''}
+                            disabled={primaryCaptureBlocked || primaryOwnedSaveInFlightUi}
+                            onChange={guardPrimaryChoice((patch: AgentReasoningRetention) => { basicForm = { ...basicForm, ...patch }; basicSaveScope = 'core'; })} />
                         {/if}
 
                         <div class={`batshit-settings-form-row ${assignableGoons.length === 0 ? "is-tall" : ""}`}>
@@ -9733,18 +9346,28 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                           </div>
                         </div>
 
+                        {#if autoCompactNotice}
+                          <div class="batshit-settings-note is-dashed flex items-center gap-2" data-testid="auto-compact-notice" role="status">
+                            <span>{autoCompactNotice}</span>
+                            <Button variant="outline" size="sm" disabled={primaryOwnedWritePendingUi} onclick={useSavedAutoCompact}>Use Saved Auto Compact</Button>
+                          </div>
+                        {/if}
+                        <fieldset class="contents" disabled={autoCompactBlocked} inert={autoCompactBlocked}>
                         <AgentAutoCompactSettingsCard
                           settings={basicForm.auto_compact_settings}
                           {savedModels}
                           {savedModelsLoading}
                           {savedModelsError}
                           onRefreshModels={refreshModelPickerData}
-                          onChange={guardPrimaryChoice((nextSettings) =>
-                            (basicForm = {
+                          onChange={guardPrimaryChoice((nextSettings) => {
+                            if (autoCompactBlocked) return;
+                            basicForm = {
                               ...basicForm,
                               auto_compact_settings: nextSettings,
-                            }))}
+                            };
+                          })}
                         />
+                        </fieldset>
 
                         <AgentMemorySettingsCard
                           draft={basicForm.memory_settings}
@@ -9761,6 +9384,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                           dmSenderScope={basicForm.dm_sender_scope}
                           dmSenderAgentIds={basicForm.dm_sender_agent_ids}
                           senderCandidates={dmSenderCandidates}
+                          fabricUtilitiesEnabled={primaryFabricUtilitiesEnabled}
                           onDmsEnabledChange={guardPrimaryChoice((enabled) =>
                             (basicForm = { ...basicForm, dms_enabled: enabled }))}
                           onDmSenderScopeChange={guardPrimaryChoice((scope) =>
@@ -9785,15 +9409,16 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                         />
 
                         <AgentJevJuiceSettingsCard
-                          skillToolHintsEnabled={basicForm.jev_juice_skill_tool_hints}
+                          skillSessionMode={basicForm.jev_juice_skill_tool_hints}
                           judgeToolEnabled={basicForm.jev_juice_judge_tool}
                           memoryRerankEnabled={basicForm.jev_juice_memory_rerank}
                           memoryRecallEnabled={basicForm.jev_juice_memory_recall}
                           replyCheckEnabled={basicForm.jev_juice_reply_check}
                           styleCoachEnabled={basicForm.jev_juice_style_coach}
                           memoryEnabled={basicForm.memory_settings?.enabled === true}
-                          onSkillToolHintsEnabledChange={guardPrimaryChoice((enabled) =>
-                            (basicForm = { ...basicForm, jev_juice_skill_tool_hints: enabled }))}
+                          fabricUtilitiesEnabled={primaryFabricUtilitiesEnabled}
+                          onSkillSessionModeChange={guardPrimaryChoice((mode) =>
+                            (basicForm = { ...basicForm, jev_juice_skill_tool_hints: mode }))}
                           onJudgeToolEnabledChange={guardPrimaryChoice((enabled) =>
                             (basicForm = { ...basicForm, jev_juice_judge_tool: enabled }))}
                           onMemoryRerankEnabledChange={guardPrimaryChoice((enabled) =>
@@ -9874,188 +9499,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                   </div>
 
               </SettingsAccordionCard>
-          {#if isClaudeCliProvider}
-            <SettingsAccordionCard
-              name="agent-core-cards"
-              title="Claude Code CLI Defaults"
-              batshitIcon="cli-tools"
-              class={hiddenUnless("core")}
-              onfocusin={() => (claudeSaveScope = "core")}
-              onpointerdown={() => (claudeSaveScope = "core")}
-            >
-              {#snippet actions()}
-                {#if claudeSaveScope === "core"}
-                  <SettingsSaveStatus
-                    state={claudeSaveError ? "error" : claudeSaveState}
-                    error={claudeSaveError}
-                    savingLabel="Saving Claude defaults..."
-                    savedLabel="Saved"
-                  />
-                {/if}
-              {/snippet}
-                <div class="batshit-settings-form-stack">
-                  <div class="batshit-settings-form-row">
-                    <div class="batshit-settings-form-copy">
-                      <div class="batshit-settings-form-label-line">
-                        <Label.Root class="batshit-settings-form-label">Default Claude Model</Label.Root>
-                        <DropdownMenu.Root>
-                          <DropdownMenu.Trigger
-                            class={SETTINGS_INFO_TRIGGER_CLASS}
-                            aria-label="About Default Claude Model"
-                          >
-                            <Info class="h-3.5 w-3.5" />
-                          </DropdownMenu.Trigger>
-                          <DropdownMenu.Content
-                            align="start"
-                            side="bottom"
-                            class={SETTINGS_INFO_CONTENT_CLASS}
-                          >
-                            Passed to <code>claude --model</code>. Choose CLI default to let Claude decide.
-                          </DropdownMenu.Content>
-                        </DropdownMenu.Root>
-                      </div>
-                    </div>
-                    <div class="batshit-settings-form-control">
-                      <Select.Root
-                        type="single"
-                        value={claudeForm.model.length ? claudeForm.model : "default"}
-                        onValueChange={guardPrimaryChoice((value) => {
-                          const nextValue = (Array.isArray(value) ? value[0] : value) as string;
-                          updateClaudeForm((current) => ({
-                            ...current,
-                            model: nextValue === "default" ? "" : nextValue,
-                          }));
-                        })}
-                      >
-                        <Select.Trigger class="w-full">
-                          {@const label = claudeForm.model.length
-                            ? CLAUDE_CLI_MODEL_CHOICES.find((option) => option.value === claudeForm.model)?.label ?? claudeForm.model
-                            : "CLI default"}
-                          <div class="flex items-center gap-2">
-                            <ModelProviderIcon
-                              modelId={claudeForm.model.length ? claudeForm.model : "claude"}
-                              modelName={label}
-                              provider="claude"
-                              badgeProvider="anthropic"
-                              size="sm"
-                              showOverlay={true}
-                            />
-                            <span class="truncate">{label}</span>
-                          </div>
-                        </Select.Trigger>
-                        <Select.Content>
-                          <Select.Item value="default">
-                            <div class="flex items-center gap-2">
-                              <ModelProviderIcon
-                                modelId="claude"
-                                modelName="CLI default"
-                                provider="claude"
-                                badgeProvider="anthropic"
-                                size="sm"
-                                showOverlay={true}
-                              />
-                              <span>CLI default</span>
-                            </div>
-                          </Select.Item>
-                          {#each CLAUDE_CLI_MODEL_CHOICES as option}
-                            <Select.Item value={option.value}>
-                              <div class="flex items-center gap-2">
-                                <ModelProviderIcon
-                                  modelId={option.value}
-                                  modelName={option.label}
-                                  provider="claude"
-                                  badgeProvider="anthropic"
-                                  size="sm"
-                                  showOverlay={true}
-                                />
-                                <span class="truncate">{option.label}</span>
-                              </div>
-                            </Select.Item>
-                          {/each}
-                        </Select.Content>
-                      </Select.Root>
-                      <RetiredCliModelNotice runtime="claude" model={claudeForm.model} />
-                    </div>
-                  </div>
-
-                  <div class="batshit-settings-toggle-row">
-                    <div class="flex min-w-0 items-center gap-1.5">
-                      <span class="batshit-settings-parent-label">Always Enable Extended Thinking</span>
-                      <DropdownMenu.Root>
-                        <DropdownMenu.Trigger
-                          class={SETTINGS_INFO_TRIGGER_CLASS}
-                          aria-label="About Always Enable Extended Thinking"
-                        >
-                          <Info class="h-3.5 w-3.5" />
-                        </DropdownMenu.Trigger>
-                        <DropdownMenu.Content
-                          align="start"
-                          side="bottom"
-                          class={SETTINGS_INFO_CONTENT_CLASS}
-                        >
-                          Turns on Claude Code&apos;s extended thinking for this agent.
-                        </DropdownMenu.Content>
-                      </DropdownMenu.Root>
-                    </div>
-                    <Switch.Root
-                      checked={claudeForm.alwaysThinkingEnabled}
-                      onCheckedChange={guardPrimaryChoice((checked) =>
-                        updateClaudeForm((current) => ({
-                          ...current,
-                          alwaysThinkingEnabled: checked === true,
-                          maxThinkingTokens:
-                            checked === true
-                              ? current.maxThinkingTokens.trim().length > 0
-                                ? current.maxThinkingTokens
-                                : String(CLAUDE_DEFAULT_MAX_THINKING_TOKENS)
-                              : "",
-                        })))} />
-                  </div>
-
-                  {#if claudeForm.alwaysThinkingEnabled}
-                    <div class="batshit-settings-form-row">
-                      <div class="batshit-settings-form-copy">
-                        <div class="batshit-settings-form-label-line">
-                          <Label.Root class="batshit-settings-form-label">
-                            Thinking Token Budget
-                          </Label.Root>
-                          <DropdownMenu.Root>
-                            <DropdownMenu.Trigger
-                              class={SETTINGS_INFO_TRIGGER_CLASS}
-                              aria-label="About Thinking Token Budget"
-                            >
-                              <Info class="h-3.5 w-3.5" />
-                            </DropdownMenu.Trigger>
-                            <DropdownMenu.Content
-                              align="start"
-                              side="bottom"
-                              class={SETTINGS_INFO_CONTENT_CLASS}
-                            >
-                              Uses <code>{CLAUDE_DEFAULT_MAX_THINKING_TOKENS}</code> when left blank.
-                            </DropdownMenu.Content>
-                          </DropdownMenu.Root>
-                        </div>
-                      </div>
-                      <div class="batshit-settings-form-control">
-                        <Input
-                          type="number"
-                          min="1"
-                          placeholder={String(CLAUDE_DEFAULT_MAX_THINKING_TOKENS)}
-                          value={claudeForm.maxThinkingTokens}
-                          oninput={(event) => {
-                            const nextValue = (event.target as HTMLInputElement).value;
-                            updateClaudeForm((current) => ({
-                              ...current,
-                              maxThinkingTokens: nextValue,
-                            }));
-                          }}
-                        />
-                      </div>
-                    </div>
-                  {/if}
-                </div>
-            </SettingsAccordionCard>
-          {/if}
 
           {#if basicForm.agentType === "api"}
             <SettingsAccordionCard
@@ -10239,7 +9682,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                             </span>
                           {/each}
                           <span class="mt-2 block">
-                            Only primary agents can ask for extra approval. n8n automation stays non-interactive.
+                            Only primary agents can ask for extra approval.
                           </span>
                           <span class="mt-2 block">
                             Approval Policy only matters in <span class="batshit-settings-inline-strong">Agent</span> mode.
@@ -10326,8 +9769,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                       <div class="batshit-settings-card-subtle-frame is-compact space-y-2">
                         <div class="flex items-center gap-1.5">
                           <Label.Label class="batshit-settings-form-label">Always Block List</Label.Label>
-                          <SettingsInfoMenu ariaLabel="About Always Block List">
-                            Rules in this list are blocked for all modes, including Batshit Crazy.
+                          <SettingsInfoMenu ariaLabel="About Always Block List" contentClass="w-80">
+                            <p>Rules in this list are blocked for all modes, including Batshit Crazy.</p>
+                            <p class="mt-2">{TYPED_FILE_TOOLS_BLOCK_LIST_SENTENCE}</p>
                           </SettingsInfoMenu>
                         </div>
                         <div class="flex items-start justify-between gap-3 batshit-settings-muted-panel">
@@ -10429,219 +9873,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
             </SettingsAccordionCard>
           {/if}
 
-          {#if isCodexProvider}
-            <SettingsAccordionCard
-              name="agent-core-cards"
-              title="Codex CLI Defaults"
-              batshitIcon="cli-tools"
-              class={hiddenUnless("core")}
-              onfocusin={() => (codexSaveScope = "core")}
-              onpointerdown={() => (codexSaveScope = "core")}
-            >
-              {#snippet actions()}
-                {#if codexSaveScope === "core"}
-                  <SettingsSaveStatus
-                    state={codexSaveError ? "error" : codexSaveState}
-                    error={codexSaveError}
-                    savingLabel="Saving Codex defaults..."
-                    savedLabel="Saved"
-                  />
-                {/if}
-              {/snippet}
-
-                <div class="batshit-settings-form-stack">
-                  <div class="batshit-settings-form-row">
-                    <div class="batshit-settings-form-copy">
-                      <div class="batshit-settings-form-label-line">
-                        <Label.Root class="batshit-settings-form-label">Default Codex Model</Label.Root>
-                        <DropdownMenu.Root>
-                          <DropdownMenu.Trigger
-                            class={SETTINGS_INFO_TRIGGER_CLASS}
-                            aria-label="About Default Codex Model"
-                          >
-                            <Info class="h-3.5 w-3.5" />
-                          </DropdownMenu.Trigger>
-                          <DropdownMenu.Content
-                            align="start"
-                            side="bottom"
-                            class={SETTINGS_INFO_CONTENT_CLASS}
-                          >
-                            Passed directly to <code>codex --model</code> for this agent.
-                          </DropdownMenu.Content>
-                        </DropdownMenu.Root>
-                      </div>
-                    </div>
-                    <div class="batshit-settings-form-control">
-                      <Select.Root
-                        type="single"
-                        value={codexForm.model}
-                        onValueChange={guardPrimaryChoice((value) =>
-                          updateCodexForm((current) =>
-                            codexFormForPickedModel(
-                              current,
-                              Array.isArray(value)
-                                ? (value[0] as string)
-                                : (value as string),
-                            ),
-                          ))}
-                      >
-                        <Select.Trigger class="w-full">
-                          {@const label = CODEX_SUBMODEL_CHOICES.find((option) => option.value === codexForm.model)?.label ?? codexForm.model}
-                          <div class="flex items-center gap-2 min-w-0">
-                            <ModelProviderIcon
-                              modelId={codexForm.model}
-                              modelName={label}
-                              provider="openai"
-                              size="sm"
-                              badgeProvider="codex"
-                            />
-                            <span class="truncate">{label}</span>
-                          </div>
-                        </Select.Trigger>
-                        <Select.Content>
-                          {#each CODEX_SUBMODEL_CHOICES as option}
-                            <Select.Item value={option.value}>
-                              <div class="flex items-center gap-2 min-w-0">
-                                <ModelProviderIcon
-                                  modelId={option.value}
-                                  modelName={option.label}
-                                  provider="openai"
-                                  size="sm"
-                                  badgeProvider="codex"
-                                />
-                                <span class="truncate">{option.label}</span>
-                              </div>
-                            </Select.Item>
-                        {/each}
-                        </Select.Content>
-                      </Select.Root>
-                      <RetiredCliModelNotice runtime="codex" model={codexForm.model} />
-                    </div>
-                  </div>
-
-                  <div class="batshit-settings-form-row">
-                    <div class="batshit-settings-form-copy">
-                      <div class="batshit-settings-form-label-line">
-                        <Label.Root class="batshit-settings-form-label">Reasoning Effort</Label.Root>
-                        <DropdownMenu.Root>
-                          <DropdownMenu.Trigger
-                            class={SETTINGS_INFO_TRIGGER_CLASS}
-                            aria-label="About Reasoning Effort"
-                          >
-                            <Info class="h-3.5 w-3.5" />
-                          </DropdownMenu.Trigger>
-                          <DropdownMenu.Content
-                            align="start"
-                            side="bottom"
-                            class={SETTINGS_INFO_CONTENT_CLASS}
-                          >
-                            Mirrors Codex <code>model_reasoning_effort</code>.
-                          </DropdownMenu.Content>
-                        </DropdownMenu.Root>
-                      </div>
-                    </div>
-                    <div class="batshit-settings-form-control">
-                      <Select.Root
-                        type="single"
-                        value={codexForm.reasoningEffort}
-                        onValueChange={guardPrimaryChoice((value) =>
-                          updateCodexForm((current) => ({
-                            ...current,
-                            reasoningEffort: (Array.isArray(value)
-                              ? value[0]
-                              : value) as CodexFormOptions["reasoningEffort"],
-                          })))}
-                      >
-                        <Select.Trigger class="w-full">
-                          {@const label = CODEX_REASONING_OPTIONS.find((option) => option.value === codexForm.reasoningEffort)?.label ?? "Auto"}
-                          <div class="flex items-center gap-2 min-w-0">
-                            <Brain class="h-4 w-4 shrink-0 text-muted-foreground" />
-                            <span class="truncate">{label}</span>
-                          </div>
-                        </Select.Trigger>
-                        <Select.Content>
-                          {#each CODEX_REASONING_OPTIONS as option}
-                            {#if option.value !== "xhigh" || supportsCodexXhighReasoning(codexForm.model)}
-                              <Select.Item value={option.value}>
-                                <div class="flex items-start gap-2 min-w-0">
-                                  <Brain class="h-4 w-4 shrink-0 text-muted-foreground" />
-                                  <div class="flex flex-col min-w-0">
-                                    <span class="truncate">{option.label}</span>
-                                    <span class="batshit-settings-child-label truncate">
-                                      {option.helper}
-                                    </span>
-                                  </div>
-                                </div>
-                              </Select.Item>
-                            {/if}
-                          {/each}
-                        </Select.Content>
-                      </Select.Root>
-                    </div>
-                  </div>
-
-                  <div class="batshit-settings-form-row">
-                    <div class="batshit-settings-form-copy">
-                      <div class="batshit-settings-form-label-line">
-                        <Label.Root class="batshit-settings-form-label">Service Tier</Label.Root>
-                        <DropdownMenu.Root>
-                          <DropdownMenu.Trigger
-                            class={SETTINGS_INFO_TRIGGER_CLASS}
-                            aria-label="About Service Tier"
-                          >
-                            <Info class="h-3.5 w-3.5" />
-                          </DropdownMenu.Trigger>
-                          <DropdownMenu.Content
-                            align="start"
-                            side="bottom"
-                            class={SETTINGS_INFO_CONTENT_CLASS}
-                          >
-                            Writes Codex <code>service_tier</code>. Fast is currently supported on GPT-5.5 and GPT-5.4.
-                          </DropdownMenu.Content>
-                        </DropdownMenu.Root>
-                      </div>
-                    </div>
-                    <div class="batshit-settings-form-control">
-                      <Select.Root
-                        type="single"
-                        value={codexForm.serviceTier}
-                        onValueChange={guardPrimaryChoice((value) =>
-                          updateCodexForm((current) => ({
-                            ...current,
-                            serviceTier: (Array.isArray(value)
-                              ? value[0]
-                              : value) as CodexServiceTier,
-                          })))}
-                      >
-                        <Select.Trigger class="w-full">
-                          <span>
-                            {CODEX_SERVICE_TIER_OPTIONS.find((option) =>
-                              option.value === codexForm.serviceTier
-                            )?.label ?? codexForm.serviceTier}
-                          </span>
-                        </Select.Trigger>
-                        <Select.Content>
-                          {#each CODEX_SERVICE_TIER_OPTIONS as option}
-                            {#if option.value !== "fast" || supportsCodexFastMode(codexForm.model)}
-                              <Select.Item value={option.value}>
-                                <div class="flex flex-col min-w-0">
-                                  <span class="truncate">{option.label}</span>
-                                  <span class="batshit-settings-child-label truncate">
-                                    {option.helper}
-                                  </span>
-                                </div>
-                              </Select.Item>
-                            {/if}
-                          {/each}
-                        </Select.Content>
-                      </Select.Root>
-                    </div>
-                  </div>
-                </div>
-            </SettingsAccordionCard>
-          {/if}
-
-          {#if !isCliProvider}
           <SettingsAccordionCard
             name="agent-access-cards"
             title="Projects"
@@ -10665,20 +9896,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                     savingLabel="Saving project settings..."
                     savedLabel="Saved"
                   />
-                {:else if isCodexProvider && codexSaveScope === "projects"}
-                  <SettingsSaveStatus
-                    state={codexSaveError ? "error" : codexSaveState}
-                    error={codexSaveError}
-                    savingLabel="Saving project settings..."
-                    savedLabel="Saved"
-                  />
-                {:else if isClaudeCliProvider && claudeSaveScope === "projects"}
-                  <SettingsSaveStatus
-                    state={claudeSaveError ? "error" : claudeSaveState}
-                    error={claudeSaveError}
-                    savingLabel="Saving project settings..."
-                    savedLabel="Saved"
-                  />
                 {/if}
             {/snippet}
               <div
@@ -10688,8 +9905,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                 <div class="flex items-center gap-1.5 px-4 pt-3">
                   <Label.Label>Default Project</Label.Label>
                   <SettingsInfoMenu ariaLabel="About Default Project">
-                    Used when no project is selected in the sidebar. Precedence is:
-                    active project, then this agent default, then the user Default Project Path.
+                    The Projects sidebar shows this project for this agent. A project picked in the sidebar
+                    is used instead until you save a new default here. Use Global Default Project uses the
+                    Default Project from Settings > Projects.
                   </SettingsInfoMenu>
                 </div>
                 <Select.Root
@@ -10727,1239 +9945,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                   <p class="batshit-settings-form-help is-danger">{projectOptionsError}</p>
                 {/if}
               </div>
-
-              {#if isCodexProvider}
-                <div
-                  class="space-y-2 batshit-settings-muted-panel"
-                  onfocusin={() => (codexSaveScope = "projects")}
-                >
-                  <div class="flex items-center gap-1.5">
-                    <Label.Root class="batshit-settings-form-label">
-                      Codex Additional Writable Directories
-                    </Label.Root>
-                    <SettingsInfoMenu ariaLabel="About Codex Additional Writable Directories">
-                      Extra directories extend where Codex can read and write inside this Batshit-managed session.
-                    </SettingsInfoMenu>
-                  </div>
-                  <div class="flex gap-2">
-                    <Input
-                      placeholder="/path/to/allow"
-                      bind:value={codexDirDraft}
-                      onkeydown={(event: KeyboardEvent) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          addCodexListValue("addDirs", codexDirDraft);
-                          codexDirDraft = "";
-                        }
-                      }}
-                    />
-                    <Button
-                      variant="secondary"
-                      onclick={() => {
-                        addCodexListValue("addDirs", codexDirDraft);
-                        codexDirDraft = "";
-                      }}
-                    >
-                      <Plus aria-hidden="true" />
-
-                      Add
-                    </Button>
-                  </div>
-                  {#if codexForm.addDirs.length > 0}
-                    <div class="flex flex-wrap gap-2">
-                      {#each codexForm.addDirs as dir, idx}
-                        <span class="batshit-settings-pill">
-                          {dir}
-                          <button
-                            class="text-muted-foreground hover:text-foreground"
-                            type="button"
-                            onclick={() => removeCodexListValue("addDirs", idx)}
-                          >
-                            ×
-                          </button>
-                        </span>
-                      {/each}
-                    </div>
-                  {/if}
-                </div>
-              {/if}
-
-              {#if isClaudeCliProvider}
-                <div
-                  class="space-y-2 batshit-settings-muted-panel"
-                  onfocusin={() => (claudeSaveScope = "projects")}
-                >
-                  <div class="flex items-center gap-1.5">
-                    <Label.Root class="batshit-settings-form-label">
-                      Claude Additional Directories
-                    </Label.Root>
-                    <SettingsInfoMenu ariaLabel="About Claude Additional Directories">
-                      Extra directories extend Claude's project access but do not turn those folders into full config roots.
-                    </SettingsInfoMenu>
-                  </div>
-                  <div class="flex gap-2">
-                    <Input
-                      placeholder="/path/to/allow"
-                      bind:value={claudeDirDraft}
-                      onkeydown={(event: KeyboardEvent) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          addClaudeListValue("addDirs", claudeDirDraft);
-                          claudeDirDraft = "";
-                        }
-                      }}
-                    />
-                    <Button
-                      variant="secondary"
-                      onclick={() => {
-                        addClaudeListValue("addDirs", claudeDirDraft);
-                        claudeDirDraft = "";
-                      }}
-                    >
-                      <Plus aria-hidden="true" />
-
-                      Add
-                    </Button>
-                  </div>
-                  {#if claudeForm.addDirs.length > 0}
-                    <div class="flex flex-wrap gap-2">
-                      {#each claudeForm.addDirs as dir, idx}
-                        <span class="batshit-settings-pill">
-                          {dir}
-                          <button
-                            class="text-muted-foreground hover:text-foreground"
-                            type="button"
-                            onclick={() => removeClaudeListValue("addDirs", idx)}
-                          >
-                            ×
-                          </button>
-                        </span>
-                      {/each}
-                    </div>
-                  {/if}
-                </div>
-              {/if}
           </SettingsAccordionCard>
-          {/if}
-
-          {#if isClaudeCliProvider}
-            <SettingsAccordionCard
-              name="agent-instructions-cards"
-              title="Claude Instructions"
-              batshitIcon="instructions"
-              class={hiddenUnless("instructions")}
-              contentClass="space-y-4"
-              onfocusin={() => (claudeSaveScope = "instructions")}
-              onpointerdown={() => (claudeSaveScope = "instructions")}
-            >
-              {#snippet info()}
-                <SettingsInfoMenu ariaLabel="About Claude Instructions">
-                  Controls how Claude's own instruction sources mix with Batshit-managed prompting.
-                </SettingsInfoMenu>
-              {/snippet}
-              {#snippet actions()}
-                {#if claudeSaveScope === "instructions"}
-                  <SettingsSaveStatus
-                    state={claudeSaveError ? "error" : claudeSaveState}
-                    error={claudeSaveError}
-                    savingLabel="Saving Claude instructions..."
-                    savedLabel="Saved"
-                  />
-                {/if}
-              {/snippet}
-              <div class="batshit-settings-form-stack">
-                <div class="batshit-settings-toggle-row">
-                  <div>
-                    <div class="flex items-center gap-1.5">
-                      <p class="batshit-settings-parent-label">Use Project CLAUDE.md When Found</p>
-                      <SettingsInfoMenu ariaLabel="About Project CLAUDE.md">
-                        On lets Claude read project <code>CLAUDE.md</code> files inside this
-                        Batshit-managed chat. Off ignores those project instruction files for this agent.
-                      </SettingsInfoMenu>
-                    </div>
-                  </div>
-                  <Switch.Root
-                    checked={claudeForm.includeProjectInstructions}
-                    onCheckedChange={guardPrimaryChoice((checked) =>
-                      updateClaudeForm((current) => ({
-                        ...current,
-                        includeProjectInstructions: checked === true,
-                      })))}
-                  />
-                </div>
-
-                <div class="batshit-settings-toggle-row">
-                  <div>
-                    <div class="flex items-center gap-1.5">
-                      <p class="batshit-settings-parent-label">Include Claude's Built-In System Prompt</p>
-                      <SettingsInfoMenu ariaLabel="About Claude Built-in System Prompt">
-                        Off keeps Batshit's plain helper replacement. On removes that override so
-                        Claude Code uses its own built-in prompt too.
-                      </SettingsInfoMenu>
-                    </div>
-                  </div>
-                  <Switch.Root
-                    checked={claudeForm.includeCoreSystemPrompt}
-                    onCheckedChange={guardPrimaryChoice((checked) =>
-                      updateClaudeForm((current) => ({
-                        ...current,
-                        includeCoreSystemPrompt: checked === true,
-                        systemPromptMode: checked === true ? "default" : "replace",
-                        systemPrompt:
-                          checked === true ? "" : MODE4_PRELAUNCH_REPLACEMENT_PROMPT,
-                        systemPromptFile: "",
-                      })))}
-                  />
-                </div>
-              </div>
-            </SettingsAccordionCard>
-          {/if}
-
-          {#if isCodexProvider}
-            <SettingsAccordionCard
-              name="agent-instructions-cards"
-              title="Codex Instructions"
-              batshitIcon="instructions"
-              class={hiddenUnless("instructions")}
-              contentClass="space-y-4"
-              onfocusin={() => (codexSaveScope = "instructions")}
-              onpointerdown={() => (codexSaveScope = "instructions")}
-            >
-              {#snippet info()}
-                <SettingsInfoMenu ariaLabel="About Codex Instructions">
-                  Controls whether Codex also reads project instruction files in this managed session.
-                </SettingsInfoMenu>
-              {/snippet}
-              {#snippet actions()}
-                {#if codexSaveScope === "instructions"}
-                  <SettingsSaveStatus
-                    state={codexSaveError ? "error" : codexSaveState}
-                    error={codexSaveError}
-                    savingLabel="Saving Codex instructions..."
-                    savedLabel="Saved"
-                  />
-                {/if}
-              {/snippet}
-              <div class="batshit-settings-form-stack">
-                <div class="batshit-settings-toggle-row">
-                  <div>
-                    <div class="flex items-center gap-1.5">
-                      <p class="batshit-settings-parent-label">Use Project AGENTS.md When Found</p>
-                      <SettingsInfoMenu ariaLabel="About Project AGENTS.md">
-                        On lets Codex also read the project's <code>AGENTS.md</code> inside this
-                        Batshit-managed chat. Off uses Batshit's managed replacement instructions file instead.
-                      </SettingsInfoMenu>
-                    </div>
-                  </div>
-                  <Switch.Root
-                    checked={codexForm.includeProjectInstructions}
-                    onCheckedChange={guardPrimaryChoice((checked) =>
-                      updateCodexForm((current) => ({
-                        ...current,
-                        includeProjectInstructions: checked === true,
-                      })))}
-                  />
-                </div>
-              </div>
-            </SettingsAccordionCard>
-          {/if}
-
-          {#if isClaudeCliProvider}
-            <SettingsAccordionCard
-              name="agent-access-cards"
-              title="Claude Permissions & Boundaries"
-              batshitIcon="access"
-              class={hiddenUnless("access")}
-              contentClass="space-y-4"
-              onfocusin={() => (claudeSaveScope = "permissions")}
-              onpointerdown={() => (claudeSaveScope = "permissions")}
-            >
-              {#snippet info()}
-                <SettingsInfoMenu ariaLabel="About Claude Permissions">
-                  Controls how freely Claude can act when tools are enabled.
-                </SettingsInfoMenu>
-              {/snippet}
-              {#snippet actions()}
-                  {#if basicSaveScope === "approvals" &&
-                    (basicSaveState !== "idle" || basicSaveError || basicValidationError)}
-                    <SettingsSaveStatus
-                      state={basicSaveError || basicValidationError ? "error" : basicSaveState}
-                      error={basicSaveError ?? basicValidationError}
-                      savingLabel="Saving approval policy..."
-                      savedLabel="Saved"
-                    />
-                  {:else if claudeSaveScope === "permissions"}
-                    <SettingsSaveStatus
-                      state={claudeSaveError ? "error" : claudeSaveState}
-                      error={claudeSaveError}
-                      savingLabel="Saving Claude access settings..."
-                      savedLabel="Saved"
-                    />
-                  {/if}
-              {/snippet}
-                <div class="space-y-2">
-                  <div class="flex items-center gap-1.5">
-                    <Label.Root class="batshit-settings-section-title"
-                      >Permissions Mode</Label.Root
-                    >
-                    <SettingsInfoMenu ariaLabel="About Claude permissions mode">
-                      {#each CLAUDE_PERMISSION_OPTIONS as option}
-                        <span class="mt-1 block">
-                          <span class="batshit-settings-inline-strong">{option.label}</span>: {option.helper}
-                        </span>
-                      {/each}
-                    </SettingsInfoMenu>
-                  </div>
-                  <ToggleGroup.Root
-                    type="single"
-                    value={claudeForm.permissionMode}
-                    variant="outline"
-                    size="lg"
-                    class="batshit-settings-permission-toggle-group"
-                    aria-label="Claude permissions mode"
-                    onValueChange={guardPrimaryChoice((value) => {
-                      const next = Array.isArray(value) ? value[0] : value;
-                      if (!next) return;
-                      setClaudePermissionMode(next as ClaudePermissionMode);
-                    })}
-                  >
-                    {#each CLAUDE_PERMISSION_OPTIONS as option}
-                      <ToggleGroup.Item
-                        value={option.value}
-                        class={SETTINGS_PERMISSION_TOGGLE_ITEM_CLASS}
-                      >
-                        {@const OptionIcon = option.icon}
-                        <OptionIcon class="h-4 w-4 shrink-0" />
-                        <span class="batshit-settings-form-label truncate">{option.label}</span>
-                      </ToggleGroup.Item>
-                    {/each}
-                  </ToggleGroup.Root>
-                  {#if isDockerNativeRuntime()}
-                    <p class="batshit-settings-form-meta is-warning">
-                      Docker runs Claude Code as non-root batshit-cli so Bypass Permissions can
-                      work. If you see a root-runtime warning, rebuild the Docker app image and
-                      rerun the Claude login command shown above.
-                    </p>
-                  {/if}
-                </div>
-
-                <div class="batshit-settings-form-stack">
-                  <div class="batshit-settings-form-row">
-                    <div class="batshit-settings-form-copy">
-                      <div class="batshit-settings-form-label-line">
-                        <Label.Root class="batshit-settings-form-label"
-                          >Approval Policy</Label.Root
-                        >
-                        <SettingsInfoMenu ariaLabel="About Claude approval policy">
-                          {#each PRIMARY_TOOL_APPROVAL_OPTIONS as option}
-                            <span class="mt-1 block">
-                              <span class="batshit-settings-inline-strong">{option.label}</span>: {option.helper}
-                            </span>
-                          {/each}
-                          <span class="mt-2 block">
-                            This controls requests from Claude's own tools in <span class="batshit-settings-inline-strong">Edit Automatically</span> or an effective Default mode. Batshit helpers do not ask through this policy: the Bash helper follows its saved Work mode and allow/never-allow rules. Fabric controls may have separate approvals. Claude Plan and Bypass Permissions do not ask.
-                          </span>
-                        </SettingsInfoMenu>
-                      </div>
-                    </div>
-                    <div class="batshit-settings-form-control">
-                      <Select.Root
-                        type="single"
-                        value={basicForm.tool_approval_mode}
-                        onValueChange={guardPrimaryChoice((value) => {
-                          const next = (Array.isArray(value) ? value[0] : value) as "off" | "all";
-                          basicSaveScope = "approvals";
-                          basicForm = {
-                            ...basicForm,
-                            tool_approval_mode: next,
-                          };
-                        })}
-                      >
-                        <Select.Trigger>
-                          <span>{getPrimaryApprovalPolicyLabel(basicForm.tool_approval_mode)}</span>
-                        </Select.Trigger>
-                        <Select.Content>
-                          {#each PRIMARY_TOOL_APPROVAL_OPTIONS as option}
-                            <Select.Item value={option.value}>
-                              <div class="flex flex-col min-w-0">
-                                <span class="truncate">{option.label}</span>
-                                <span class="batshit-settings-child-label">
-                                  {option.helper}
-                                </span>
-                              </div>
-                            </Select.Item>
-                          {/each}
-                        </Select.Content>
-                      </Select.Root>
-                    </div>
-                  </div>
-                </div>
-
-                <Collapsible.Root bind:open={claudeConfigOverridesOpen}>
-                  <div class="batshit-settings-disclosure-row">
-                    <Collapsible.Trigger class={SETTINGS_DISCLOSURE_TRIGGER_CLASS}>
-                      <span class="batshit-settings-form-label flex items-center gap-1.5">
-                        <span>Custom settings.json entries</span>
-                        <SettingsInfoMenu ariaLabel="About Custom settings.json entries">
-                          Add advanced Claude settings using JSON paths like <code>cleanupPeriodDays</code>,
-                          <code>env.FOO</code>, or <code>hooks.PreToolUse</code>. Batshit-managed keys stay protected,
-                          and manual JSON outside those managed paths is preserved on sync.
-                        </SettingsInfoMenu>
-                      </span>
-                      <ChevronDown
-                        class={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${claudeConfigOverridesOpen ? "rotate-180" : ""}`}
-                      />
-                    </Collapsible.Trigger>
-                    <Collapsible.Content class="batshit-settings-disclosure-content">
-                      {#if claudeForm.configOverrides.length > 0}
-                        <div class="space-y-2">
-                          {#each claudeForm.configOverrides as row (row.id)}
-                            <div class="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
-                              <Input
-                                placeholder="JSON path"
-                                value={row.key}
-                                oninput={(event) =>
-                                  updateClaudeConfig(row.id, "key", (event.target as HTMLInputElement).value)}
-                              />
-                              <Input
-                                placeholder={"JSON value (30, true, [\"foo\"], {\"bar\":1})"}
-                                value={row.value}
-                                oninput={(event) =>
-                                  updateClaudeConfig(row.id, "value", (event.target as HTMLInputElement).value)}
-                              />
-                              <Button type="button" variant="ghost" onclick={() => removeClaudeConfig(row.id)}>
-                                <Trash2 aria-hidden="true" />
-
-                                Remove
-                              </Button>
-                            </div>
-                          {/each}
-                        </div>
-                      {/if}
-                      <Button class="mt-2" variant="outline" size="sm" onclick={() => addClaudeConfig()}>
-                        <Plus aria-hidden="true" />
-
-                        Add config row
-                      </Button>
-                    </Collapsible.Content>
-                  </div>
-                </Collapsible.Root>
-
-                <div class="batshit-settings-action-row">
-                  <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div class="flex items-center gap-1.5">
-                      <p class="batshit-settings-form-label">Managed settings.json</p>
-                      <DropdownMenu.Root>
-                        <DropdownMenu.Trigger
-                          class={SETTINGS_INFO_TRIGGER_CLASS}
-                          aria-label="About Managed settings.json"
-                        >
-                          <Info class="h-3.5 w-3.5" />
-                        </DropdownMenu.Trigger>
-                        <DropdownMenu.Content
-                          align="start"
-                          side="bottom"
-                          class={SETTINGS_INFO_CONTENT_CLASS}
-                        >
-                          View the exact Batshit-managed Claude settings file for this agent.
-                        </DropdownMenu.Content>
-                      </DropdownMenu.Root>
-                    </div>
-                    <div class="flex flex-wrap gap-2">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        onclick={() => openManagedConfigViewer("claude")}
-                      >
-                        <Eye aria-hidden="true" />
-
-                        View settings.json
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        onclick={() => copyManagedConfigPath("claude")}
-                      >
-                        <Copy aria-hidden="true" />
-
-                        Copy path
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-            </SettingsAccordionCard>
-          {/if}
-
-          {#if isCodexProvider}
-            <SettingsAccordionCard
-              name="agent-access-cards"
-              title="Codex Permissions & Boundaries"
-              batshitIcon="access"
-              class={hiddenUnless("access")}
-              contentClass="space-y-5"
-              onfocusin={() => (codexSaveScope = "permissions")}
-              onpointerdown={() => (codexSaveScope = "permissions")}
-            >
-              {#snippet info()}
-                <SettingsInfoMenu ariaLabel="About Codex Permissions">
-                  A chat send uses the tighter of the mode and this Sandbox Level.
-                  Choosing a mode sets its own level.
-                </SettingsInfoMenu>
-              {/snippet}
-              {#snippet actions()}
-                  {#if basicSaveScope === "approvals" &&
-                    (basicSaveState !== "idle" || basicSaveError || basicValidationError)}
-                    <SettingsSaveStatus
-                      state={basicSaveError || basicValidationError ? "error" : basicSaveState}
-                      error={basicSaveError ?? basicValidationError}
-                      savingLabel="Saving approval policy..."
-                      savedLabel="Saved"
-                    />
-                  {:else if codexSaveScope === "permissions"}
-                    <SettingsSaveStatus
-                      state={codexSaveError ? "error" : codexSaveState}
-                      error={codexSaveError}
-                      savingLabel="Saving Codex access settings..."
-                      savedLabel="Saved"
-                    />
-                  {/if}
-              {/snippet}
-                <div class="space-y-2">
-                  <div class="flex items-center gap-1.5">
-                    <Label.Root class="batshit-settings-section-title"
-                      >Permissions Mode</Label.Root
-                    >
-                    <SettingsInfoMenu ariaLabel="About Codex permissions mode">
-                      {#each CODEX_PERMISSION_OPTIONS as option}
-                        <span class="mt-1 block">
-                          <span class="batshit-settings-inline-strong">{option.label}</span>: {option.helper}
-                        </span>
-                      {/each}
-                    </SettingsInfoMenu>
-                  </div>
-                    <ToggleGroup.Root
-                      type="single"
-                      value={codexForm.permissionMode}
-                      variant="outline"
-                      size="lg"
-                      class="batshit-settings-permission-toggle-group"
-                      aria-label="Codex permissions mode"
-                      onValueChange={guardPrimaryChoice((value) => {
-                        const next = Array.isArray(value) ? value[0] : value;
-                        if (!next) return;
-                        setCodexPermissionMode(next as CodexPermissionMode);
-                      })}
-                    >
-                      {#each CODEX_PERMISSION_OPTIONS as option}
-                        <ToggleGroup.Item
-                          value={option.value}
-                          class={SETTINGS_PERMISSION_TOGGLE_ITEM_CLASS}
-                        >
-                          {@const OptionIcon = option.icon}
-                          <OptionIcon class="h-4 w-4 shrink-0" />
-                          <span class="batshit-settings-form-label truncate">{option.label}</span>
-                        </ToggleGroup.Item>
-                      {/each}
-                    </ToggleGroup.Root>
-                  </div>
-
-                <div class="batshit-settings-form-stack">
-                    <div class="batshit-settings-form-row">
-                      <div class="batshit-settings-form-copy">
-                        <div class="batshit-settings-form-label-line">
-                          <Label.Root class="batshit-settings-form-label"
-                            >Sandbox Level</Label.Root
-                          >
-                        </div>
-                      </div>
-                    <div class="batshit-settings-form-control">
-                      <Select.Root
-                        type="single"
-                        value={codexForm.sandbox}
-                        disabled={codexForm.permissionMode === "agent_full"}
-                        onValueChange={guardPrimaryChoice((value) =>
-                          updateCodexForm((current) => ({
-                            ...current,
-                            sandbox: (Array.isArray(value)
-                              ? value[0]
-                              : value) as CodexSandbox,
-                          })))}
-                      >
-                        <Select.Trigger>
-                          <span>
-                            {CODEX_SANDBOX_OPTIONS.find((option) =>
-                              option.value === codexForm.sandbox
-                            )?.label ?? codexForm.sandbox}
-                          </span>
-                        </Select.Trigger>
-                        <Select.Content>
-                          {#each CODEX_SANDBOX_OPTIONS as option}
-                            <Select.Item value={option.value}>{option.label}</Select.Item>
-                          {/each}
-                        </Select.Content>
-                      </Select.Root>
-                    </div>
-                  </div>
-                  {#if codexForm.permissionMode === "agent_full"}
-                    <div class="batshit-settings-note" data-testid="agent-codex-full-sandbox-note">
-                      {#if codexForm.sandbox !== CODEX_PERMISSION_PRESETS.agent_full.sandbox}
-                        This agent keeps its saved {CODEX_SANDBOX_LABELS[codexForm.sandbox]} Sandbox Level.
-                      {/if}
-                      To limit the sandbox, pick Agent.
-                    </div>
-                  {/if}
-                  <div class="batshit-settings-form-row">
-                    <div class="batshit-settings-form-copy">
-                      <div class="batshit-settings-form-label-line">
-                        <Label.Root class="batshit-settings-form-label"
-                          >Approval Policy</Label.Root
-                        >
-                        <SettingsInfoMenu ariaLabel="About Codex approval policy">
-                          {#each PRIMARY_TOOL_APPROVAL_OPTIONS as option}
-                            <span class="mt-1 block">
-                              <span class="batshit-settings-inline-strong">{option.label}</span>: {option.helper}
-                            </span>
-                          {/each}
-                          <span class="mt-2 block">
-                            Codex only uses this in <span class="batshit-settings-inline-strong">Agent</span> mode.
-                            Chat and Agent (full access) never prompt.
-                          </span>
-                        </SettingsInfoMenu>
-                      </div>
-                    </div>
-                    <div class="batshit-settings-form-control">
-                      <Select.Root
-                        type="single"
-                        value={basicForm.tool_approval_mode}
-                        onValueChange={guardPrimaryChoice((value) => {
-                          const next = (Array.isArray(value) ? value[0] : value) as "off" | "all";
-                          basicSaveScope = "approvals";
-                          basicForm = {
-                            ...basicForm,
-                            tool_approval_mode: next,
-                          };
-                        })}
-                      >
-                        <Select.Trigger>
-                          <span>
-                            {getPrimaryApprovalPolicyLabel(basicForm.tool_approval_mode)}
-                          </span>
-                        </Select.Trigger>
-                        <Select.Content>
-                          {#each PRIMARY_TOOL_APPROVAL_OPTIONS as option}
-                            <Select.Item value={option.value}>
-                              <div class="flex flex-col min-w-0">
-                                <span class="truncate">{option.label}</span>
-                                <span class="batshit-settings-child-label">
-                                  {option.helper}
-                                </span>
-                              </div>
-                            </Select.Item>
-                          {/each}
-                        </Select.Content>
-                      </Select.Root>
-                    </div>
-                  </div>
-                </div>
-
-                <Collapsible.Root bind:open={codexConfigOverridesOpen}>
-                  <div class="batshit-settings-disclosure-row">
-                    <Collapsible.Trigger class={SETTINGS_DISCLOSURE_TRIGGER_CLASS}>
-                      <span class="batshit-settings-form-label flex items-center gap-1.5">
-                        <span>Custom config.toml entries</span>
-                        <SettingsInfoMenu ariaLabel="About Custom config.toml entries">
-                          Add advanced Codex config rows for settings Batshit does not manage directly,
-                          like <code>model_context_window</code>. Batshit-managed keys stay protected.
-                        </SettingsInfoMenu>
-                      </span>
-                      <ChevronDown
-                        class={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${codexConfigOverridesOpen ? "rotate-180" : ""}`}
-                      />
-                    </Collapsible.Trigger>
-                    <Collapsible.Content class="batshit-settings-disclosure-content">
-                      {#if codexForm.configOverrides.length > 0}
-                        <div class="space-y-2">
-                          {#each codexForm.configOverrides as row (row.id)}
-                            <div class="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
-                              <Input
-                                placeholder="key"
-                                value={row.key}
-                                oninput={(event) =>
-                                  updateCodexConfig(row.id, "key", (event.target as HTMLInputElement).value)}
-                              />
-                              <Input
-                                placeholder="value"
-                                value={row.value}
-                                oninput={(event) =>
-                                  updateCodexConfig(row.id, "value", (event.target as HTMLInputElement).value)}
-                              />
-                              <Button type="button" variant="ghost" onclick={() => removeCodexConfig(row.id)}>
-                                <Trash2 aria-hidden="true" />
-
-                                Remove
-                              </Button>
-                            </div>
-                          {/each}
-                        </div>
-                      {/if}
-                      <Button class="mt-2" variant="outline" size="sm" onclick={() => addCodexConfig()}>
-                        <Plus aria-hidden="true" />
-
-                        Add config row
-                      </Button>
-                    </Collapsible.Content>
-                  </div>
-                </Collapsible.Root>
-
-                <div class="batshit-settings-action-row">
-                  <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div class="flex items-center gap-1.5">
-                      <p class="batshit-settings-form-label">Managed config.toml</p>
-                      <DropdownMenu.Root>
-                        <DropdownMenu.Trigger
-                          class={SETTINGS_INFO_TRIGGER_CLASS}
-                          aria-label="About Managed config.toml"
-                        >
-                          <Info class="h-3.5 w-3.5" />
-                        </DropdownMenu.Trigger>
-                        <DropdownMenu.Content
-                          align="start"
-                          side="bottom"
-                          class={SETTINGS_INFO_CONTENT_CLASS}
-                        >
-                          View the exact Batshit-managed Codex config file for this agent.
-                        </DropdownMenu.Content>
-                      </DropdownMenu.Root>
-                    </div>
-                    <div class="flex flex-wrap gap-2">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        onclick={() => openManagedConfigViewer("codex")}
-                      >
-                        <Eye aria-hidden="true" />
-
-                        View config.toml
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        onclick={() => copyManagedConfigPath("codex")}
-                      >
-                        <Copy aria-hidden="true" />
-
-                        Copy path
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-            </SettingsAccordionCard>
-          {/if}
-
-          {#if isCliProvider}
-            <SettingsAccordionCard
-              name="agent-access-cards"
-              title="Projects"
-              batshitIcon="projects"
-              class={hiddenUnless("access")}
-              contentClass="space-y-5"
-            >
-              {#snippet info()}
-                <SettingsInfoMenu ariaLabel="About Agent Projects">
-                  Choose the default project context for this agent and any extra working directories
-                  the runtime may access.
-                </SettingsInfoMenu>
-              {/snippet}
-              {#snippet actions()}
-                  {#if basicSaveScope === "projects"}
-                    <SettingsSaveStatus
-                      state={basicSaveError || basicValidationError ? "error" : basicSaveState}
-                      error={basicSaveError ?? basicValidationError}
-                      savingLabel="Saving project settings..."
-                      savedLabel="Saved"
-                    />
-                  {:else if isCodexProvider && codexSaveScope === "projects"}
-                    <SettingsSaveStatus
-                      state={codexSaveError ? "error" : codexSaveState}
-                      error={codexSaveError}
-                      savingLabel="Saving project settings..."
-                      savedLabel="Saved"
-                    />
-                  {:else if isClaudeCliProvider && claudeSaveScope === "projects"}
-                    <SettingsSaveStatus
-                      state={claudeSaveError ? "error" : claudeSaveState}
-                      error={claudeSaveError}
-                      savingLabel="Saving project settings..."
-                      savedLabel="Saved"
-                    />
-                  {/if}
-              {/snippet}
-                <div
-                  class="space-y-2"
-                  onfocusin={() => (basicSaveScope = "projects")}
-                >
-                  <div class="flex items-center gap-1.5">
-                    <Label.Label>Default Project</Label.Label>
-                    <SettingsInfoMenu ariaLabel="About Default Project">
-                      Used when no project is selected in the sidebar. Precedence is:
-                      active project, then this agent default, then the user Default Project Path.
-                    </SettingsInfoMenu>
-                  </div>
-                  <Select.Root
-                    type="single"
-                    value={basicForm.default_project_id || "none"}
-                    onValueChange={guardPrimaryChoice((value: string) =>
-                      (basicForm = {
-                        ...basicForm,
-                        default_project_id: value === "none" ? null : value,
-                      }))}
-                  >
-                    <Select.Trigger class="w-full sm:w-[420px]">
-                      {#if basicForm.default_project_id}
-                        {projectOptions.find((project) => project.id === basicForm.default_project_id)?.name ||
-                          "Select project"}
-                      {:else}
-                        {getGlobalDefaultProjectLabel()}
-                      {/if}
-                    </Select.Trigger>
-                    <Select.Content>
-                      <Select.Item value="none">{getGlobalDefaultProjectLabel()}</Select.Item>
-                      {#each projectOptions as project}
-                        <Select.Item value={project.id}>{project.name}</Select.Item>
-                      {/each}
-                    </Select.Content>
-                  </Select.Root>
-                  {#if projectOptionsLoading}
-                    <p class="batshit-settings-form-label">Loading available projects…</p>
-                  {:else if projectOptions.length === 0}
-                    <p class="batshit-settings-form-label">
-                      No projects found yet. Create one in Settings → Projects.
-                    </p>
-                  {/if}
-                  {#if projectOptionsError}
-                    <p class="batshit-settings-form-help is-danger">{projectOptionsError}</p>
-                  {/if}
-                </div>
-
-                {#if isCodexProvider}
-                  <div
-                    class="space-y-2 batshit-settings-muted-panel"
-                    onfocusin={() => (codexSaveScope = "projects")}
-                  >
-                    <div class="flex items-center gap-1.5">
-                      <Label.Root class="batshit-settings-form-label">
-                        Codex Additional Writable Directories
-                      </Label.Root>
-                      <SettingsInfoMenu ariaLabel="About Codex Additional Writable Directories">
-                        Extra directories extend where Codex can read and write inside this Batshit-managed session.
-                      </SettingsInfoMenu>
-                    </div>
-                    <div class="flex gap-2">
-                      <Input
-                        placeholder="/path/to/allow"
-                        bind:value={codexDirDraft}
-                        onkeydown={(event: KeyboardEvent) => {
-                          if (event.key === "Enter") {
-                            event.preventDefault();
-                            addCodexListValue("addDirs", codexDirDraft);
-                            codexDirDraft = "";
-                          }
-                        }}
-                      />
-                      <Button
-                        variant="secondary"
-                        onclick={() => {
-                          addCodexListValue("addDirs", codexDirDraft);
-                          codexDirDraft = "";
-                        }}
-                      >
-                        <Plus aria-hidden="true" />
-
-                        Add
-                      </Button>
-                    </div>
-                    {#if codexForm.addDirs.length > 0}
-                      <div class="flex flex-wrap gap-2">
-                        {#each codexForm.addDirs as dir, idx}
-                          <span class="batshit-settings-pill">
-                            {dir}
-                            <button
-                              class="text-muted-foreground hover:text-foreground"
-                              type="button"
-                              onclick={() => removeCodexListValue("addDirs", idx)}
-                            >
-                              ×
-                            </button>
-                          </span>
-                        {/each}
-                      </div>
-                    {/if}
-                  </div>
-                {/if}
-
-                {#if isClaudeCliProvider}
-                  <div
-                    class="space-y-2 batshit-settings-muted-panel"
-                    onfocusin={() => (claudeSaveScope = "projects")}
-                  >
-                    <div class="flex items-center gap-1.5">
-                      <Label.Root class="batshit-settings-form-label">
-                        Claude Additional Directories
-                      </Label.Root>
-                      <SettingsInfoMenu ariaLabel="About Claude Additional Directories">
-                        Extra directories extend Claude's project access but do not turn those folders into full config roots.
-                      </SettingsInfoMenu>
-                    </div>
-                    <div class="flex gap-2">
-                      <Input
-                        placeholder="/path/to/allow"
-                        bind:value={claudeDirDraft}
-                        onkeydown={(event: KeyboardEvent) => {
-                          if (event.key === "Enter") {
-                            event.preventDefault();
-                            addClaudeListValue("addDirs", claudeDirDraft);
-                            claudeDirDraft = "";
-                          }
-                        }}
-                      />
-                      <Button
-                        variant="secondary"
-                        onclick={() => {
-                          addClaudeListValue("addDirs", claudeDirDraft);
-                          claudeDirDraft = "";
-                        }}
-                      >
-                        <Plus aria-hidden="true" />
-
-                        Add
-                      </Button>
-                    </div>
-                    {#if claudeForm.addDirs.length > 0}
-                      <div class="flex flex-wrap gap-2">
-                        {#each claudeForm.addDirs as dir, idx}
-                          <span class="batshit-settings-pill">
-                            {dir}
-                            <button
-                              class="text-muted-foreground hover:text-foreground"
-                              type="button"
-                              onclick={() => removeClaudeListValue("addDirs", idx)}
-                            >
-                              ×
-                            </button>
-                          </span>
-                        {/each}
-                      </div>
-                    {/if}
-                  </div>
-                {/if}
-            </SettingsAccordionCard>
-          {/if}
-
-          {#if isClaudeCliProvider}
-            <SettingsAccordionCard
-              name="agent-tools-cards"
-              title="Claude Tools"
-              icon={Wrench}
-              class={hiddenUnless("tools")}
-              contentClass="space-y-5"
-              onfocusin={() => (claudeSaveScope = "tools")}
-              onpointerdown={() => (claudeSaveScope = "tools")}
-            >
-              {#snippet info()}
-                <SettingsInfoMenu ariaLabel="About Claude Tools">
-                  Controls Claude-specific built-in tools for this agent.
-                </SettingsInfoMenu>
-              {/snippet}
-              {#snippet actions()}
-                {#if claudeSaveScope === "tools"}
-                  <SettingsSaveStatus
-                    state={claudeSaveError ? "error" : claudeSaveState}
-                    error={claudeSaveError}
-                    savingLabel="Saving Claude tools..."
-                    savedLabel="Saved"
-                  />
-                {/if}
-              {/snippet}
-                <div class="batshit-settings-form-stack">
-                <div class="batshit-settings-toggle-row">
-                  <div class="min-w-0">
-                    <div class="flex items-center gap-1.5">
-                      <p class="batshit-settings-parent-label">Enable Chrome Integration</p>
-                      <SettingsInfoMenu ariaLabel="About Claude Chrome Integration">
-                        Toggles Claude Code's Chrome automation.
-                      </SettingsInfoMenu>
-                    </div>
-                  </div>
-                  <Switch.Root
-                    checked={claudeForm.chrome}
-                    onCheckedChange={guardPrimaryChoice((checked) =>
-                      updateClaudeForm((current) => ({
-                        ...current,
-                        chrome: checked === true,
-                      })))}
-                  />
-                </div>
-
-                <div class="batshit-settings-toggle-row">
-                  <div class="min-w-0">
-                    <div class="flex items-center gap-1.5">
-                      <p class="batshit-settings-parent-label">Allow Claude Web Search</p>
-                      <SettingsInfoMenu ariaLabel="About Claude Web Search">
-                        Convenience toggle for Claude's <code>WebSearch</code> built-in tool.
-                      </SettingsInfoMenu>
-                    </div>
-                  </div>
-                  <Switch.Root
-                    checked={getClaudeToolEnabled("WebSearch")}
-                    onCheckedChange={guardPrimaryChoice((checked) => setClaudeToolEnabled("WebSearch", checked === true))}
-                  />
-                </div>
-                </div>
-
-                <details class="batshit-settings-card-subtle-frame is-compact">
-                  <summary class="batshit-settings-form-label cursor-pointer">
-                    Advanced Tool Rules
-                  </summary>
-                  <div class="mt-3 grid gap-4 md:grid-cols-2">
-                    <div class="space-y-2">
-                      <Label.Root class="batshit-settings-form-label"
-                        >Allowed Tools</Label.Root
-                      >
-                      <div class="flex gap-2">
-                        <Input
-                          placeholder="Read, Edit, Bash..."
-                          bind:value={claudeAllowedToolDraft}
-                          onkeydown={(event: KeyboardEvent) => {
-                            if (event.key === "Enter") {
-                              event.preventDefault();
-                              addClaudeListValue("allowedTools", claudeAllowedToolDraft);
-                              claudeAllowedToolDraft = "";
-                            }
-                          }}
-                        />
-                        <Button
-                          variant="secondary"
-                          onclick={() => {
-                            addClaudeListValue("allowedTools", claudeAllowedToolDraft);
-                            claudeAllowedToolDraft = "";
-                          }}
-                        >
-                          <Plus aria-hidden="true" />
-
-                          Add
-                        </Button>
-                      </div>
-                      {#if claudeForm.allowedTools.length > 0}
-                        <div class="flex flex-wrap gap-2">
-                          {#each claudeForm.allowedTools as tool, idx}
-                            <span class="batshit-settings-pill is-success">
-                              {tool}
-                              <button
-                                type="button"
-                                onclick={() => removeClaudeListValue("allowedTools", idx)}
-                              >×</button>
-                            </span>
-                          {/each}
-                        </div>
-                      {/if}
-                    </div>
-                    <div class="space-y-2">
-                      <Label.Root class="batshit-settings-form-label"
-                        >Disallowed Tools</Label.Root
-                      >
-                      <div class="flex gap-2">
-                        <Input
-                          placeholder="WebSearch, WebFetch..."
-                          bind:value={claudeDisallowedToolDraft}
-                          onkeydown={(event: KeyboardEvent) => {
-                            if (event.key === "Enter") {
-                              event.preventDefault();
-                              addClaudeListValue("disallowedTools", claudeDisallowedToolDraft);
-                              claudeDisallowedToolDraft = "";
-                            }
-                          }}
-                        />
-                        <Button
-                          variant="secondary"
-                          onclick={() => {
-                            addClaudeListValue("disallowedTools", claudeDisallowedToolDraft);
-                            claudeDisallowedToolDraft = "";
-                          }}
-                        >
-                          <Plus aria-hidden="true" />
-
-                          Add
-                        </Button>
-                      </div>
-                      {#if claudeForm.disallowedTools.length > 0}
-                        <div class="flex flex-wrap gap-2">
-                          {#each claudeForm.disallowedTools as tool, idx}
-                            <span class="batshit-settings-pill is-danger">
-                              {tool}
-                              <button
-                                type="button"
-                                onclick={() => removeClaudeListValue("disallowedTools", idx)}
-                              >×</button>
-                            </span>
-                          {/each}
-                        </div>
-                      {/if}
-                    </div>
-                  </div>
-                </details>
-            </SettingsAccordionCard>
-          {/if}
-
-          {#if isCodexProvider}
-            <SettingsAccordionCard
-              name="agent-tools-cards"
-              title="Codex Tools"
-              icon={Wrench}
-              class={hiddenUnless("tools")}
-              contentClass="space-y-5"
-              onfocusin={() => (codexSaveScope = "tools")}
-              onpointerdown={() => (codexSaveScope = "tools")}
-            >
-              {#snippet info()}
-                <SettingsInfoMenu ariaLabel="About Codex Tools">
-                  Controls Codex-specific built-in capabilities and advanced feature flags.
-                </SettingsInfoMenu>
-              {/snippet}
-              {#snippet actions()}
-                {#if codexSaveScope === "tools"}
-                  <SettingsSaveStatus
-                    state={codexSaveError ? "error" : codexSaveState}
-                    error={codexSaveError}
-                    savingLabel="Saving Codex tools..."
-                    savedLabel="Saved"
-                  />
-                {/if}
-              {/snippet}
-                <div class="batshit-settings-form-stack">
-                  <div class="batshit-settings-toggle-row">
-                    <div class="min-w-0">
-                      <div class="flex items-center gap-1.5">
-                        <p class="batshit-settings-parent-label">Allow Codex Web Search</p>
-                        <SettingsInfoMenu ariaLabel="About Codex Web Search">
-                          Enables Codex live web search for CLI runs via the managed <code>web_search</code> setting.
-                        </SettingsInfoMenu>
-                      </div>
-                    </div>
-                    <Switch.Root
-                      checked={codexForm.search}
-                      onCheckedChange={guardPrimaryChoice((checked) =>
-                        updateCodexForm((current) => ({
-                          ...current,
-                          search: checked === true,
-                        })))}
-                    />
-                  </div>
-
-                  <Collapsible.Root bind:open={codexAdvancedOpen}>
-                    <div class="batshit-settings-disclosure-row is-form-line">
-                      <Collapsible.Trigger class={SETTINGS_DISCLOSURE_TRIGGER_CLASS}>
-                        <span class="batshit-settings-form-label">Advanced Feature Flags</span>
-                        <ChevronDown
-                          class={`h-4 w-4 text-muted-foreground transition-transform ${codexAdvancedOpen ? "rotate-180" : ""}`}
-                        />
-                      </Collapsible.Trigger>
-                      <Collapsible.Content class="batshit-settings-disclosure-content space-y-4">
-                      <div class="grid gap-4 md:grid-cols-2">
-                        <div class="space-y-2">
-                          <Label.Root class="batshit-settings-form-label"
-                            >Enable Feature Flags</Label.Root
-                          >
-                          <div class="flex gap-2">
-                            <Input
-                              placeholder="browser_use"
-                              bind:value={codexEnableDraft}
-                              onkeydown={(event: KeyboardEvent) => {
-                                if (event.key === "Enter") {
-                                  event.preventDefault();
-                                  addCodexListValue("enableFeatures", codexEnableDraft);
-                                  codexEnableDraft = "";
-                                }
-                              }}
-                            />
-                            <Button
-                              variant="secondary"
-                              onclick={() => {
-                                addCodexListValue("enableFeatures", codexEnableDraft);
-                                codexEnableDraft = "";
-                              }}
-                            >
-                              <Plus aria-hidden="true" />
-
-                              Add
-                            </Button>
-                          </div>
-                          <div class="flex flex-wrap gap-2">
-                            {#if codexForm.enableFeatures.length > 0}
-                              {#each codexForm.enableFeatures as feature, idx}
-                                <span class="batshit-settings-pill is-success">
-                                  {feature}
-                                  <button
-                                    type="button"
-                                    onclick={() => removeCodexListValue("enableFeatures", idx)}
-                                  >×</button>
-                                </span>
-                              {/each}
-                            {/if}
-                          </div>
-                        </div>
-                        <div class="space-y-2">
-                          <Label.Root class="batshit-settings-form-label"
-                            >Disable Feature Flags</Label.Root
-                          >
-                          <div class="flex gap-2">
-                            <Input
-                              placeholder="browser_use"
-                              bind:value={codexDisableDraft}
-                              onkeydown={(event: KeyboardEvent) => {
-                                if (event.key === "Enter") {
-                                  event.preventDefault();
-                                  addCodexListValue("disableFeatures", codexDisableDraft);
-                                  codexDisableDraft = "";
-                                }
-                              }}
-                            />
-                            <Button
-                              variant="secondary"
-                              onclick={() => {
-                                addCodexListValue("disableFeatures", codexDisableDraft);
-                                codexDisableDraft = "";
-                              }}
-                            >
-                              <Plus aria-hidden="true" />
-
-                              Add
-                            </Button>
-                          </div>
-                          <div class="flex flex-wrap gap-2">
-                            {#if codexForm.disableFeatures.length > 0}
-                              {#each codexForm.disableFeatures as feature, idx}
-                                <span class="batshit-settings-pill is-danger">
-                                  {feature}
-                                  <button
-                                    type="button"
-                                    onclick={() => removeCodexListValue("disableFeatures", idx)}
-                                  >×</button>
-                                </span>
-                              {/each}
-                            {/if}
-                          </div>
-                        </div>
-                      </div>
-                      </Collapsible.Content>
-                    </div>
-                  </Collapsible.Root>
-                </div>
-            </SettingsAccordionCard>
-          {/if}
 
           <SettingsAccordionCard
             name="agent-instructions-cards"
@@ -11998,7 +9984,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                           type="button"
                           variant="outline"
                         size="sm"
-                        onclick={() => (agentPromptEditorOpen = true)}
+                        disabled={primaryInstructionsPromptBlocked}
+                        onclick={() => { if (!primaryInstructionsPromptBlocked) agentPromptEditorOpen = true; }}
                       >
                         <Pencil aria-hidden="true" />
 
@@ -12017,559 +10004,17 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                         </SettingsInfoMenu>
                       </div>
                     </div>
-                    <Switch.Root bind:checked={basicForm.include_global_prompt} />
+                    <Switch.Root bind:checked={basicForm.include_global_prompt} disabled={primaryInstructionsIncludeBlocked} />
                   </div>
+                  {#if primaryInstructionsNotice}
+                    <div class="batshit-settings-note is-dashed" data-testid="primary-instructions-notice" role="status">
+                      <p class="batshit-settings-caption">{primaryInstructionsNotice}</p>
+                      <Button type="button" variant="outline" size="sm" disabled={primaryCaptureBlocked || promptSaves.busy(selectedAgentId ?? '')} onclick={() => void useSavedInstructions('agent')}>Use Saved Instructions</Button>
+                    </div>
+                  {/if}
                 </div>
           </SettingsAccordionCard>
-          {#if isManagedPrimaryAgentType(basicForm.agentType)}
-            <SettingsAccordionCard
-              name="agent-tools-cards"
-              title="Batshit Tools"
-              icon={Wrench}
-              class={hiddenUnless("tools")}
-              contentClass="space-y-4"
-              onfocusin={() => (basicSaveScope = "tools")}
-              onpointerdown={() => (basicSaveScope = "tools")}
-            >
-                {#snippet info()}
-                  <SettingsInfoMenu ariaLabel="About Batshit Tools">
-                    Configure Batshit built-in tools and dynamic tool families for this agent.
-                    {#if basicForm.agentType === "api"}
-                    API agents use native Batshit tools directly.
-                  {:else}
-                    CLI agents use managed Batshit MCP helper tools.
-                  {/if}
-                </SettingsInfoMenu>
-              {/snippet}
-              {#snippet actions()}
-                  {#if basicSaveScope === "tools"}
-                    <SettingsSaveStatus
-                      state={basicSaveError || basicValidationError ? "error" : basicSaveState}
-                      error={basicSaveError ?? basicValidationError}
-                      savingLabel="Saving tool settings..."
-                      savedLabel="Saved"
-                    />
-                  {/if}
-              {/snippet}
-                {@const primaryBashAvailable = isNativeToolUiAvailable("bash")}
-                {@const primaryWebSearchAvailable = isNativeToolUiAvailable("web-search")}
-                {@const primaryFabricAvailable = isNativeToolUiAvailable("fabric")}
 
-                <div class="batshit-settings-form-stack">
-                <div class="batshit-settings-toggle-row">
-                  <div class="min-w-0">
-                    <div class="flex items-center gap-1.5">
-                      <p class="batshit-settings-parent-label">Bash Tool</p>
-                      <SettingsInfoMenu ariaLabel="About Bash Tool">
-                        {#if primaryBashAvailable}
-                          Enables <code>{getBashToolName()}</code> for terminal command execution.
-                          Uses the active Project (sidebar) or your Default Project Directory.
-                          If neither is set, execution is blocked. Execution environment,
-                          permissions mode, timeout, and safety boundaries live in the
-                          <span class="batshit-settings-inline-strong">Access</span> tab.
-                        {:else}
-                          {getNativeToolUiUnavailableMessage("bash")}
-                        {/if}
-                      </SettingsInfoMenu>
-                    </div>
-                  </div>
-                  <Switch.Root
-                    checked={primaryBashAvailable && getNativeToolToggle("bashEnabled", true)}
-                    onCheckedChange={guardPrimaryChoice((checked) =>
-                      updateNativeToolSetting("bashEnabled", checked === true))}
-                    disabled={!primaryBashAvailable}
-                  />
-                </div>
-
-                <div class="batshit-settings-toggle-row">
-                  <div class="min-w-0">
-                    <div class="flex items-center gap-1.5">
-                        <p class="batshit-settings-parent-label">MCP Tools</p>
-                        <SettingsInfoMenu ariaLabel="About MCP Tools">
-                          Lets Dynamic Tool Search surface enabled MCP Source tools for this agent.
-                          Individual MCP sources, groups, and tools are controlled in the Tool Grid.
-                        </SettingsInfoMenu>
-                    </div>
-                  </div>
-                  <Switch.Root
-                    checked={getNativeToolToggle("dynamicMcpEnabled", true)}
-                    onCheckedChange={guardPrimaryChoice((checked) =>
-                      updateNativeToolSetting("dynamicMcpEnabled", checked === true))}
-                  />
-                </div>
-
-                <div class="batshit-settings-toggle-row">
-                  <div class="min-w-0">
-                    <div class="flex items-center gap-1.5">
-                        <p class="batshit-settings-parent-label">CLI Tools</p>
-                        <SettingsInfoMenu ariaLabel="About CLI Tools">
-                          Lets Dynamic Tool Search surface saved CLI tools for this agent.
-                          Individual CLI tools are controlled in the Tool Grid.
-                        </SettingsInfoMenu>
-                    </div>
-                  </div>
-                  <Switch.Root
-                    checked={getNativeToolToggle("cliToolsEnabled", true)}
-                    onCheckedChange={guardPrimaryChoice((checked) =>
-                      updateNativeToolSetting("cliToolsEnabled", checked === true))}
-                  />
-                </div>
-
-                <div class="batshit-settings-toggle-row">
-                  <div class="min-w-0">
-                    <div class="flex items-center gap-1.5">
-                        <p class="batshit-settings-parent-label">Artifact Tools</p>
-                        <SettingsInfoMenu ariaLabel="About Artifact Tools">
-                          Lets Dynamic Tool Search surface published artifacts this agent can use
-                          as tools.
-                        </SettingsInfoMenu>
-                    </div>
-                  </div>
-                    <Switch.Root
-                      checked={getNativeToolToggle("artifactRuntimeEnabled", true)}
-                      onCheckedChange={guardPrimaryChoice((checked) =>
-                        updateNativeToolSetting("artifactRuntimeEnabled", checked === true))}
-                    />
-                  </div>
-
-                  <div class="batshit-settings-toggle-row">
-                    <div class="min-w-0">
-                      <div class="flex items-center gap-1.5">
-                        <p class="batshit-settings-parent-label">Fabric Controls</p>
-                          <SettingsInfoMenu ariaLabel="About Fabric Controls">
-                            {#if primaryFabricAvailable}
-                              Lets Dynamic Tool Search surface Fabric control-plane actions for
-                              Batshit management.
-                            {:else}
-                            {getNativeToolUiUnavailableMessage("fabric")}
-                          {/if}
-                        </SettingsInfoMenu>
-                      </div>
-                    </div>
-                    <Switch.Root
-                      checked={primaryFabricAvailable && getNativeToolToggle("batshitToolsEnabled", true)}
-                      onCheckedChange={guardPrimaryChoice((checked) =>
-                        updateNativeToolSetting("batshitToolsEnabled", checked === true))}
-                      disabled={!primaryFabricAvailable}
-                    />
-                  </div>
-
-                  <AgentWebSearchDefaultsDisclosure
-                    bind:open={primaryWebSearchDefaultsOpen}
-                    entityLabel="agent"
-                    titleInfoAriaLabel="About Web Search"
-                    defaultsInfoAriaLabel="About Web Search Defaults"
-                    providerInfoAriaLabel="About Default Web Search Provider"
-                    exaInfoAriaLabel="About Exa Search Type"
-                    perplexityInfoAriaLabel="About Perplexity Max Tokens Per Page"
-                    available={primaryWebSearchAvailable}
-                    enabled={getNativeToolToggle("webSearchEnabled", true)}
-                    toolName={getWebSearchToolName()}
-                    unavailableMessage={getNativeToolUiUnavailableMessage("web-search")}
-                    providerValue={getNativeWebSearchProviderValue()}
-                    providerLabel={getNativeWebSearchProviderLabel(getNativeWebSearchProviderValue())}
-                    providerInheritValue={NATIVE_WEB_SEARCH_PROVIDER_INHERIT}
-                    providerInheritLabel={getNativeWebSearchProviderLabel(NATIVE_WEB_SEARCH_PROVIDER_INHERIT)}
-                    providerOptions={nativeWebSearchProviderOptions}
-                    providerLoading={webSearchProviderAvailabilityLoading}
-                    providerError={webSearchProviderAvailabilityError}
-                    exaTypeValue={getNativeWebSearchExaTypeValue()}
-                    exaTypeLabel={getNativeWebSearchExaTypeLabel(getNativeWebSearchExaTypeValue())}
-                    exaTypeInheritValue={NATIVE_WEB_SEARCH_EXA_TYPE_INHERIT}
-                    exaTypeInheritLabel={getNativeWebSearchExaTypeLabel(NATIVE_WEB_SEARCH_EXA_TYPE_INHERIT)}
-                    exaTypeOptions={[
-                      { value: "auto", label: NATIVE_WEB_SEARCH_EXA_TYPE_LABELS.auto },
-                      { value: "fast", label: NATIVE_WEB_SEARCH_EXA_TYPE_LABELS.fast },
-                      { value: "neural", label: NATIVE_WEB_SEARCH_EXA_TYPE_LABELS.neural },
-                      { value: "deep", label: NATIVE_WEB_SEARCH_EXA_TYPE_LABELS.deep }
-                    ]}
-                    perplexityValue={String(getNativeWebSearchPerplexityMaxTokensPerPageValue())}
-                    perplexityLabel={getNativeWebSearchPerplexityMaxTokensPerPageLabel(
-                      getNativeWebSearchPerplexityMaxTokensPerPageValue()
-                    )}
-                    perplexityInheritValue={NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_INHERIT}
-                    perplexityInheritLabel={getNativeWebSearchPerplexityMaxTokensPerPageLabel(
-                      NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_INHERIT
-                    )}
-                    perplexityOptions={NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_OPTIONS}
-                    onEnabledChange={guardPrimaryChoice((enabled) => updateNativeToolSetting("webSearchEnabled", enabled))}
-                    onProviderValueChange={guardPrimaryChoice((next) => {
-                      if (next === NATIVE_WEB_SEARCH_PROVIDER_INHERIT) {
-                        updateNativeToolSetting("webSearchProvider", null);
-                        return;
-                      }
-                      const provider = normalizeNativeWebSearchProvider(next);
-                      updateNativeToolSetting("webSearchProvider", provider);
-                    })}
-                    onExaTypeValueChange={guardPrimaryChoice((next) => {
-                      if (next === NATIVE_WEB_SEARCH_EXA_TYPE_INHERIT) {
-                        updateNativeToolSetting("webSearchExaType", null);
-                        return;
-                      }
-                      const normalized = normalizeNativeExaSearchType(next);
-                      updateNativeToolSetting("webSearchExaType", normalized);
-                    })}
-                    onPerplexityMaxTokensValueChange={guardPrimaryChoice((next) => {
-                      if (next === NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_INHERIT) {
-                        updateNativeToolSetting("webSearchPerplexityMaxTokensPerPage", null);
-                        return;
-                      }
-                      const normalized = normalizePerplexityMaxTokensPerPage(next);
-                      updateNativeToolSetting("webSearchPerplexityMaxTokensPerPage", normalized);
-                    })}
-                  />
-                  <Collapsible.Root bind:open={primaryAgentBrowserDefaultsOpen}>
-                    <div class="batshit-settings-toggle-disclosure-row">
-                      <div class="batshit-settings-toggle-disclosure-header">
-                        <div class="batshit-settings-toggle-disclosure-copy">
-                          <div class="flex items-center gap-1.5">
-                            <p class="batshit-settings-parent-label">Agent Browser</p>
-                            <SettingsInfoMenu ariaLabel="About Agent Browser">
-                              Native browser automation powered by Vercel Agent Browser (Playwright under the hood). No MCP setup required.
-                              {#if basicForm.agentType === "cli"}
-                                For CLI agents, Dynamic Tool Search can surface Agent Browser
-                                actions when detailed schemas are needed.
-                              {:else}
-                            These defaults auto-apply when the agent runs <code>native_bash_execute</code> with <code>agent-browser ...</code> commands.
-                          {/if}
-                          {#if agentBrowserRuntimeStatus?.version}
-                              Runtime version: <code>{agentBrowserRuntimeStatus.version}</code>
-                            {/if}
-                            </SettingsInfoMenu>
-                          </div>
-                        {#if agentBrowserRuntimeStatusLoading}
-                          <p class="batshit-settings-form-help">Checking runtime installation...</p>
-                        {:else if agentBrowserRuntimeStatus?.supportLevel === "docker-sidecar" && !isAgentBrowserRuntimeInstalled()}
-                        <p class="batshit-settings-form-help">
-                          Docker Agent Browser sidecar is stopped. Start it in <code>Settings -> Admin -> Agent Browser Runtime</code> first.
-                        </p>
-                        {:else if agentBrowserRuntimeStatus?.dockerUnsupported}
-                        <p class="batshit-settings-form-help">
-                          Agent Browser is unavailable in this runtime.
-                        </p>
-                        {:else if !isAgentBrowserRuntimeInstalled()}
-                        <p class="batshit-settings-form-help">
-                          Runtime not installed. Install it in <code>Settings -> Admin -> Agent Browser Runtime</code> first.
-                        </p>
-                      {/if}
-                        {#if agentBrowserRuntimeStatusError}
-                          <p class="batshit-settings-form-help is-danger">{agentBrowserRuntimeStatusError}</p>
-                        {/if}
-                        </div>
-                        <div class="batshit-settings-toggle-disclosure-control">
-                          <Switch.Root
-                            checked={getNativeAgentBrowserEnabledForUi()}
-                            onCheckedChange={guardPrimaryChoice((checked) => {
-                              updateNativeToolSetting("agentBrowserEnabled", checked === true);
-                              if (checked !== true) {
-                                primaryAgentBrowserDefaultsOpen = false;
-                              }
-                            })}
-                            disabled={agentBrowserRuntimeStatusLoading || !isAgentBrowserRuntimeInstalled()}
-                          />
-                          {#if getNativeAgentBrowserEnabledForUi()}
-                            <Collapsible.Trigger class="batshit-settings-toggle-disclosure-trigger">
-                              <span class="batshit-settings-toggle-disclosure-label">Agent Browser Defaults</span>
-                              <SettingsInfoMenu ariaLabel="About Agent Browser Defaults">
-                                {#if isAgentBrowserDockerSidecarRuntime()}
-                                  Docker sidecar mode exposes timeout, cloud provider, and extra CLI flag defaults.
-                                {:else}
-                                  Runtime mode, timeout, session memory, and optional provider overrides.
-                                {/if}
-                              </SettingsInfoMenu>
-                              <ChevronDown
-                                class={`batshit-settings-toggle-disclosure-chevron ${primaryAgentBrowserDefaultsOpen ? "is-open" : ""}`}
-                              />
-                            </Collapsible.Trigger>
-                          {/if}
-                        </div>
-                      </div>
-
-                    {#if getNativeAgentBrowserEnabledForUi()}
-                          <Collapsible.Content class="batshit-settings-disclosure-content batshit-settings-subitem-lines">
-                            <div class="batshit-settings-form-stack">
-                            {#if isAgentBrowserDockerSidecarRuntime()}
-                              <div class="batshit-settings-muted-panel space-y-1">
-                                <p class="batshit-settings-form-label">Docker Sidecar Runtime</p>
-                                <p class="batshit-settings-code-caption">
-                                  Runs headless in the Agent Browser sidecar's bundled Chromium. Host Chrome/CDP, live visibility,
-                                  executable path, session name, and host profile path are not used in Docker.
-                                </p>
-                              </div>
-                            {/if}
-
-                            {#if !isAgentBrowserDockerSidecarRuntime()}
-                            <div class="batshit-settings-toggle-row">
-                              <div class="flex items-center gap-1.5">
-                                <p class="batshit-settings-parent-label">Live Browser Visibility</p>
-                                <SettingsInfoMenu ariaLabel="About Live Browser Visibility">
-                                  When enabled by default, browser actions run in headed mode so you can watch them live.
-                                  Disable for hidden/headless execution.
-                                </SettingsInfoMenu>
-                              </div>
-                              <Switch.Root
-                                checked={getNativeAgentBrowserLiveViewEnabled()}
-                                onCheckedChange={guardPrimaryChoice((checked) =>
-                                  updateNativeToolSetting("agentBrowserLiveViewEnabled", checked === true))}
-                              />
-                            </div>
-
-                            <div class="batshit-settings-form-row">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Browser Runtime Mode</Label.Label>
-                                  <SettingsInfoMenu ariaLabel="About Browser Runtime Mode">
-                                    Use Chrome CDP when you want Batshit to drive your existing Chrome session
-                                    with the usual debug port <code>9222</code>.
-                                  </SettingsInfoMenu>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control">
-                                <Select.Root
-                                  type="single"
-                                  value={getNativeAgentBrowserRuntimeMode() as unknown as string}
-                                  onValueChange={guardPrimaryChoice((value) => {
-                                    const next = Array.isArray(value) ? value[0] : value;
-                                    const normalized = normalizeNativeAgentBrowserRuntimeMode(next) ?? "chromium";
-                                    updateNativeToolSetting("agentBrowserRuntimeMode", normalized);
-                                  })}
-                                >
-                                  <Select.Trigger class="justify-between">
-                                    <span class="truncate">
-                                      {NATIVE_AGENT_BROWSER_RUNTIME_MODE_LABELS[getNativeAgentBrowserRuntimeMode()]}
-                                    </span>
-                                  </Select.Trigger>
-                                  <Select.Content>
-                                    {#each NATIVE_AGENT_BROWSER_RUNTIME_MODE_OPTIONS as option}
-                                      <Select.Item value={option}>
-                                        {NATIVE_AGENT_BROWSER_RUNTIME_MODE_LABELS[option]}
-                                      </Select.Item>
-                                    {/each}
-                                  </Select.Content>
-                                </Select.Root>
-                              </div>
-                            </div>
-
-                            {#if getNativeAgentBrowserRuntimeMode() === "chrome-cdp"}
-                              <div class="batshit-settings-form-row">
-                                <div class="batshit-settings-form-copy">
-                                  <div class="batshit-settings-form-label-line">
-                                    <Label.Label class="batshit-settings-form-label">Chrome CDP port</Label.Label>
-                                    <SettingsInfoMenu ariaLabel="About Chrome CDP Port">
-                                      Start Chrome with remote debugging enabled, for example:
-                                      <code>--remote-debugging-port=9222</code>
-                                    </SettingsInfoMenu>
-                                  </div>
-                                </div>
-                                <div class="batshit-settings-form-control">
-                                  <Input
-                                    type="number"
-                                    min="1"
-                                    max="65535"
-                                    step="1"
-                                    value={String(getNativeAgentBrowserCdpPort())}
-                                    oninput={(event) => {
-                                      const parsed = Number.parseInt((event.target as HTMLInputElement).value, 10);
-                                      updateNativeToolSetting(
-                                        "agentBrowserCdpPort",
-                                        Number.isFinite(parsed) ? Math.min(65535, Math.max(1, parsed)) : DEFAULT_NATIVE_AGENT_BROWSER_CDP_PORT,
-                                      );
-                                    }}
-                                  />
-                                </div>
-                              </div>
-                            {/if}
-                            {/if}
-
-                              <div class="batshit-settings-form-row">
-                                <div class="batshit-settings-form-copy">
-                                  <div class="batshit-settings-form-label-line">
-                                    <Label.Label class="batshit-settings-form-label">Agent Browser Timeout</Label.Label>
-                                  </div>
-                                </div>
-                                <div class="batshit-settings-form-control">
-                                <Select.Root
-                                  type="single"
-                                  value={String(getNativeAgentBrowserTimeoutMs()) as unknown as string}
-                                  onValueChange={guardPrimaryChoice((value) => {
-                                    const next = Array.isArray(value) ? value[0] : value;
-                                    const parsed = Number.parseInt(String(next ?? ""), 10);
-                                    updateNativeToolSetting(
-                                      "agentBrowserTimeoutMs",
-                                      Number.isFinite(parsed) ? parsed : DEFAULT_NATIVE_AGENT_BROWSER_TIMEOUT_MS,
-                                    );
-                                  })}
-                                >
-                                  <Select.Trigger class="justify-between">
-                                    <span class="truncate">{Math.round(getNativeAgentBrowserTimeoutMs() / 1000)} seconds</span>
-                                  </Select.Trigger>
-                                  <Select.Content>
-                                    {#each NATIVE_AGENT_BROWSER_TIMEOUT_OPTIONS as timeoutMsValue}
-                                      <Select.Item value={String(timeoutMsValue)}>
-                                        {Math.round(timeoutMsValue / 1000)} seconds
-                                      </Select.Item>
-                                    {/each}
-                                  </Select.Content>
-                                </Select.Root>
-                              </div>
-                            </div>
-
-                            <div class="batshit-settings-form-row">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Cloud Provider (Optional)</Label.Label>
-                                  <SettingsInfoMenu ariaLabel="About Agent Browser Cloud Provider">
-                                    Power-user option. <code>local</code> is the default. Cloud providers need credentials saved in API Keys.
-                                    {#if isAgentBrowserDockerSidecarRuntime()}
-                                      In Docker, Batshit passes those credentials to the Agent Browser sidecar.
-                                    {/if}
-                                  </SettingsInfoMenu>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control">
-                                <Select.Root
-                                  type="single"
-                                  value={getNativeAgentBrowserProvider() as unknown as string}
-                                  onValueChange={guardPrimaryChoice((value) => {
-                                    const next = Array.isArray(value) ? value[0] : value;
-                                    const normalized = normalizeNativeAgentBrowserProvider(next) ?? "local";
-                                    updateNativeToolSetting("agentBrowserProvider", normalized);
-                                  })}
-                                >
-                                  <Select.Trigger class="justify-between">
-                                    <span class="truncate">
-                                      {NATIVE_AGENT_BROWSER_PROVIDER_LABELS[getNativeAgentBrowserProvider()]}
-                                    </span>
-                                  </Select.Trigger>
-                                  <Select.Content>
-                                    {#each NATIVE_AGENT_BROWSER_PROVIDER_OPTIONS as option}
-                                      <Select.Item value={option}>
-                                        {NATIVE_AGENT_BROWSER_PROVIDER_LABELS[option]}
-                                      </Select.Item>
-                                    {/each}
-                                  </Select.Content>
-                                </Select.Root>
-                              </div>
-                            </div>
-
-                            {#if !isAgentBrowserDockerSidecarRuntime()}
-                            <div class="batshit-settings-form-row">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Browser Executable Path (Optional)</Label.Label>
-                                  <SettingsInfoMenu ariaLabel="About Browser Executable Path">
-                                    Override the browser binary path when local defaults are not ideal.
-                                  </SettingsInfoMenu>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control is-wide">
-                                <Input
-                                  placeholder="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-                                  value={getNativeAgentBrowserExecutablePath()}
-                                  oninput={(event) =>
-                                    updateNativeToolSetting(
-                                      "agentBrowserExecutablePath",
-                                      (event.target as HTMLInputElement).value.trim() || null,
-                                    )}
-                                />
-                              </div>
-                            </div>
-
-                            <div class="batshit-settings-form-row">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Default Session Name (Optional)</Label.Label>
-                                  <SettingsInfoMenu ariaLabel="About Default Session Name">
-                                    Auto-adds <code>--session &lt;name&gt;</code> to Agent Browser bash commands
-                                    unless the command already provides one.
-                                  </SettingsInfoMenu>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control">
-                                <Input
-                                  placeholder="default"
-                                  value={getNativeAgentBrowserSession()}
-                                  oninput={(event) =>
-                                    updateNativeToolSetting(
-                                      "agentBrowserSession",
-                                      (event.target as HTMLInputElement).value.trim() || null,
-                                    )}
-                                />
-                              </div>
-                            </div>
-
-                            <div class="batshit-settings-form-row">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Default Profile Path (Optional)</Label.Label>
-                                  <SettingsInfoMenu ariaLabel="About Default Profile Path">
-                                    Auto-adds <code>--profile &lt;path&gt;</code> for persistent cookies or login state
-                                    unless already set in the command.
-                                  </SettingsInfoMenu>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control is-wide">
-                                <Input
-                                  placeholder="~/.batshit/ab-profile"
-                                  value={getNativeAgentBrowserProfilePath()}
-                                  oninput={(event) =>
-                                    updateNativeToolSetting(
-                                      "agentBrowserProfilePath",
-                                      (event.target as HTMLInputElement).value.trim() || null,
-                                    )}
-                                />
-                              </div>
-                            </div>
-                            {/if}
-
-                            <div class="batshit-settings-form-row is-tall">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Extra CLI Flags (Advanced)</Label.Label>
-                                  <SettingsInfoMenu ariaLabel="About Extra CLI Flags">
-                                    For power users. Flags are automatically appended to <code>agent-browser</code> bash commands before execution.
-                                  </SettingsInfoMenu>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control">
-                                <div class="flex items-start justify-between gap-3 batshit-settings-muted-panel">
-                                  <div class="min-w-0 flex-1 space-y-1">
-                                    <p class="batshit-settings-form-label">
-                                      {getMultilineEntryCountLabel(
-                                        getNativeAgentBrowserExtraFlagsText(),
-                                        "flag",
-                                        "flags",
-                                        "No extra flags saved",
-                                      )}
-                                    </p>
-                                    <p class="batshit-settings-code-caption line-clamp-3">
-                                      {getMultilinePreviewText(
-                                        getNativeAgentBrowserExtraFlagsText(),
-                                        "Open the editor to add extra Agent Browser CLI flags.",
-                                      )}
-                                    </p>
-                                  </div>
-                                  <Button
-                                    type="button"
-                                    variant="outline"
-                                    size="sm"
-                                    onclick={() => (agentBrowserFlagsEditorOpen = true)}
-                                  >
-                                    <Pencil aria-hidden="true" />
-
-                                    Edit
-                                  </Button>
-                                </div>
-                              </div>
-                            </div>
-                            </div>
-                          </Collapsible.Content>
-                    {/if}
-                    </div>
-                  </Collapsible.Root>
-                  </div>
-            </SettingsAccordionCard>
-          {/if}
 
           <div class={`batshit-settings-muted-panel is-loose batshit-voice-lane-map space-y-3 ${hiddenUnless("voice")}`}>
             <div class="flex flex-wrap items-start justify-between gap-3">
@@ -12714,6 +10159,13 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
             </div>
           </div>
 
+          {#if ttsNotice}
+            <div class={`batshit-settings-note is-dashed flex items-center gap-2 ${hiddenUnless("voice")}`} data-testid="tts-selection-notice" role="status">
+              <span>{ttsNotice}</span>
+              <Button size="sm" variant="outline" disabled={primaryOwnedSaveInFlightUi} onclick={useSavedTts}>Use Saved Reply Voice</Button>
+            </div>
+          {/if}
+          <fieldset class="contents" disabled={ttsBlocked} inert={ttsBlocked}>
           <SettingsAccordionCard
             name="agent-voice-cards"
             title="Transcribe Mode (STT)"
@@ -12752,7 +10204,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.sttProvider || VOICE_PROVIDER_INHERIT) as unknown as string}
-                      onValueChange={guardPrimaryChoice((value) => {
+                      onValueChange={guardVoiceChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         basicForm = {
                           ...basicForm,
@@ -12798,6 +10250,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                         {/each}
                       </Select.Content>
                     </Select.Root>
+                    {#if voiceTranscriptionModelNotice(basicForm.voice_profile.sttProvider, basicForm.voice_profile.sttModel)}
+                      <p class="batshit-settings-form-meta is-warning">{voiceTranscriptionModelNotice(basicForm.voice_profile.sttProvider, basicForm.voice_profile.sttModel)}</p>
+                    {/if}
                   </div>
                 </div>
 
@@ -12811,7 +10266,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.sttModel || "") as unknown as string}
-                      onValueChange={guardPrimaryChoice((value) =>
+                      onValueChange={guardVoiceChoice((value) =>
                         (basicForm = {
                           ...basicForm,
                           voice_profile: {
@@ -12914,7 +10369,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.voiceSessionRuntime || VOICE_PROVIDER_INHERIT) as unknown as string}
-                      onValueChange={guardPrimaryChoice((value) => {
+                      onValueChange={guardVoiceChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         basicForm = {
                           ...basicForm,
@@ -12970,7 +10425,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.voiceModeInputMode || VOICE_PROVIDER_INHERIT) as unknown as string}
-                      onValueChange={guardPrimaryChoice((value) => {
+                      onValueChange={guardVoiceChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         basicForm = {
                           ...basicForm,
@@ -13041,7 +10496,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.voiceModeSubmitMode || VOICE_PROVIDER_INHERIT) as unknown as string}
-                      onValueChange={guardPrimaryChoice((value) => {
+                      onValueChange={guardVoiceChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         if (next === "manual" && !agentManualTurnAvailable) return;
                         basicForm = {
@@ -13131,7 +10586,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.realtimeSttProvider || VOICE_PROVIDER_INHERIT) as unknown as string}
-                      onValueChange={guardPrimaryChoice((value) => {
+                      onValueChange={guardVoiceChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         basicForm = {
                           ...basicForm,
@@ -13191,7 +10646,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.realtimeSttModel || "") as unknown as string}
-                      onValueChange={guardPrimaryChoice((value) =>
+                      onValueChange={guardVoiceChoice((value) =>
                         (basicForm = {
                           ...basicForm,
                           voice_profile: {
@@ -13261,7 +10716,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                       <Select.Root
                         type="single"
                         value={(basicForm.voice_profile.provider || VOICE_PROVIDER_INHERIT) as unknown as string}
-                        onValueChange={guardPrimaryChoice((value) =>
+                        onValueChange={guardVoiceChoice((value) =>
                           handleVoiceProviderChange(Array.isArray(value) ? value[0] : value))}
                         disabled={voiceModeLockedBySpeechToSpeech}
                       >
@@ -13299,6 +10754,12 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                           {/each}
                         </Select.Content>
                       </Select.Root>
+                      {#if effectiveVoiceModelNotice}
+                        <p class="batshit-settings-form-meta is-warning">{effectiveVoiceModelNotice}</p>
+                      {/if}
+                      {#if voiceModelCatalogNotice(selectedVoiceProvider, ['tts-batch', 'tts-direct-stream'], basicForm.voice_profile.model)}
+                        <p class="batshit-settings-form-meta is-warning">{voiceModelCatalogNotice(selectedVoiceProvider, ['tts-batch', 'tts-direct-stream'], basicForm.voice_profile.model)}</p>
+                      {/if}
                       {#if voiceProvidersError}
                         <p class="batshit-settings-form-meta is-warning">{voiceProvidersError}</p>
                       {/if}
@@ -13318,7 +10779,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                         <Select.Root
                           type="single"
                           value={(basicForm.voice_profile.model || "") as unknown as string}
-                          onValueChange={guardPrimaryChoice((value) =>
+                          onValueChange={guardVoiceChoice((value) =>
                             (basicForm = {
                               ...basicForm,
                               voice_profile: {
@@ -13332,7 +10793,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                             <span class="truncate">
                               {basicForm.voice_profile.model
                                 ? basicForm.voice_profile.model
-                                : `Use Default${selectedVoiceDefaultModel ? ` (${selectedVoiceDefaultModel})` : ""}`}
+                                : `Use Default${defaultAgentTtsModel ? ` (${defaultAgentTtsModel})` : ""}`}
                             </span>
                             <Badge variant="outline" class={`${selectedAgentTtsBadgeClass} shrink-0`}>
                               {selectedAgentTtsLaneLabel}
@@ -13341,9 +10802,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                           <Select.Content>
                             <Select.Item value="">
                               <div class="flex items-center justify-between gap-2">
-                                <span>Use Default{selectedVoiceDefaultModel ? ` (${selectedVoiceDefaultModel})` : ""}</span>
-                                <Badge variant="outline" class={`${selectedAgentTtsBadgeClass} shrink-0`}>
-                                  {selectedAgentTtsLaneLabel}
+                                <span>Use Default{defaultAgentTtsModel ? ` (${defaultAgentTtsModel})` : ""}</span>
+                                <Badge variant="outline" class={`${getTtsBadgeClass(selectedAgentTtsProviderForBadge, defaultAgentTtsModel)} shrink-0`}>
+                                  {getTtsLaneLabel(selectedAgentTtsProviderForBadge, defaultAgentTtsModel)}
                                 </Badge>
                               </div>
                             </Select.Item>
@@ -13351,8 +10812,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                               <Select.Item value={model}>
                                 <div class="flex items-center justify-between gap-2">
                                   <span>{model}</span>
-                                  <Badge variant="outline" class={getTtsBadgeClass(selectedVoiceProvider)}>
-                                    {getTtsLaneLabel(selectedVoiceProvider)}
+                                  <Badge variant="outline" class={getTtsBadgeClass(selectedVoiceProvider, model)}>
+                                    {getTtsLaneLabel(selectedVoiceProvider, model)}
                                   </Badge>
                                 </div>
                               </Select.Item>
@@ -13410,7 +10871,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                           <Select.Root
                             type="single"
                             value={(basicForm.voice_profile.voiceId || "") as unknown as string}
-                            onValueChange={guardPrimaryChoice((value) => {
+                            onValueChange={guardVoiceChoice((value) => {
                               const voiceId = Array.isArray(value) ? value[0] : value;
                               const selected = agentVoiceOptions.find(
                                 (option) => option.id === voiceId,
@@ -13436,12 +10897,12 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                   ? agentVoiceOptions.find(
                                       (option) => option.id === basicForm.voice_profile.voiceId,
                                     )?.name ?? "Selected voice"
-                                  : `Use Default${selectedVoiceProvider?.defaultVoice ? ` (${selectedVoiceProvider.defaultVoice})` : ""}`}
+                                  : agentVoiceUsesModelSpecificVoices ? "Use inherited voice" : `Use Default${selectedVoiceProvider?.defaultVoice ? ` (${selectedVoiceProvider.defaultVoice})` : ""}`}
                               </span>
                             </Select.Trigger>
                             <Select.Content>
                               <Select.Item value="">
-                                Use Default{selectedVoiceProvider?.defaultVoice ? ` (${selectedVoiceProvider.defaultVoice})` : ""}
+                                {agentVoiceUsesModelSpecificVoices ? "Use inherited voice" : `Use Default${selectedVoiceProvider?.defaultVoice ? ` (${selectedVoiceProvider.defaultVoice})` : ""}`}
                               </Select.Item>
                               {#each agentVoiceOptions as voice (voice.id)}
                                 <Select.Item value={voice.id}>
@@ -13539,7 +11000,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                       type="single"
                       value={(basicForm.voice_profile.ttsItalicNarrationBehavior ||
                         VOICE_ITALIC_NARRATION_INHERIT) as unknown as string}
-                      onValueChange={guardPrimaryChoice((value) => {
+                      onValueChange={guardVoiceChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         basicForm = {
                           ...basicForm,
@@ -13631,20 +11092,23 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
               </Button>
             </div>
           </SettingsAccordionCard>
+          </fieldset>
 
+          {#if selectedAgentId}
+            {#key selectedAgentId}
+              <AgentAppActionsAccessCard agentId={selectedAgentId} sectionClass={hiddenUnless("access")} active={activeAgentSettingsTab === "access"} />
+            {/key}
+          {/if}
           <AgentAccessAssignmentsSection
             sectionClass={hiddenUnless("access")}
             {subagentsLoading}
             {subagents}
             {selectedSubagentIds}
             {selectedAgentId}
-            primaryAgentLabel={getPrimaryAgentDisplayLabel(basicForm.agentType)}
-            compatibleSubagentTypesLabel={formatCompatibleSubagentTypes(basicForm.agentType)}
             {assignmentSaveState}
             {assignmentSaveError}
             workersEnabled={basicForm.workers_enabled}
             workersMaxConcurrent={WORKERS_MAX_CONCURRENT}
-            workersMaxRunsPerTurn={WORKERS_MAX_RUNS_PER_TURN}
             onWorkersEnabledChange={guardPrimaryChoice((enabled) => {
               basicForm = { ...basicForm, workers_enabled: enabled };
             })}
@@ -13665,6 +11129,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
             onSubagentToggle={handleSubagentToggle}
             onSlashCommandToggle={toggleSlashCommandAccess}
             onArtifactToggle={toggleArtifactAccess}
+            onAccessRetry={() => void loadAccessResources(true)}
             onAccessSaveScopeChange={(scope) => {
               accessSaveScope = scope
             }}
@@ -13675,8 +11140,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
             sectionClass={hiddenUnless("core")}
             title="Delete Primary Agent"
             paragraphs={[
-              basicForm.agentType === "n8n"
-                ? "This saved record uses the retired n8n Primary Agent type. Deleting it is the only supported action; create an API or CLI agent for chat."
+              isRetiredPrimaryAgentType(basicForm.agentType)
+                ? "This saved record uses a Primary Agent type that Batshit removed. Deleting it is the only supported action; create a new Primary Agent for chat."
                 : "Permanently removes this Primary Agent’s settings, zip overrides, MCP defaults, and avatar pictures. The confirm dialog asks whether to delete its own chats too; group chats stay.",
               "Subagent assignments and MCP selections are cleared during deletion."
             ]}
@@ -13691,16 +11156,26 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
     {:else if selectedEntity?.kind === "subagent" && selectedEditableSubagentId}
       <!-- Subagent Settings Start -->
       <div class="batshit-settings-surface space-y-6">
+              {#if subagentModelSelectionNotice && !subagentDetailLoading}
+                <div class="batshit-settings-note is-dashed flex items-center gap-2" data-testid="subagent-model-selection-notice" role="status">
+                  <AlertCircle class="h-4 w-4" />
+                  <span>{subagentModelSelectionNotice}</span>
+                  <Button variant="outline" size="sm" disabled={subagentOwnedWritePendingUi} onclick={() => useSavedModelSelection('subagent')}>Use Saved Model</Button>
+                </div>
+              {/if}
               {#if subagentSettingsReadWaiting || subagentOwnedSaveInFlightUi}
                 <div class="batshit-settings-note is-dashed flex items-center gap-2" data-testid="subagent-settings-read-wait" role="status">
                   {#if subagentReadWaitError || subagentSaveWaitExpiredUi}
                     <AlertCircle class="h-4 w-4" />
                     <span>{subagentReadWaitError ?? "Your last change to this subagent did not confirm within 30 seconds. Batshit does not know if it was saved. Retry reads the record."}</span>
+                  {:else if subagentDeferredDraftOnly}
+                    <Info class="h-4 w-4" />
+                    <span>Your unsaved edits are being kept.</span>
                   {:else}
                     <Loader2 class="h-4 w-4 animate-spin" />
                     <span>Waiting for saved subagent settings…</span>
                   {/if}
-                  <Button variant="outline" size="sm" onclick={retrySubagentSettingsRead}>Retry</Button>
+                  {#if !subagentDeferredDraftOnly}<Button variant="outline" size="sm" onclick={retrySubagentSettingsRead}>Retry</Button>{/if}
                 </div>
               {/if}
               <fieldset disabled={subagentOwnedSaveInFlightUi} inert={subagentOwnedSaveInFlightUi} class="min-w-0 space-y-6 border-0 p-0 m-0">
@@ -13713,6 +11188,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                 </div>
               {/if}
 
+              <!-- SA-139 R5 (D14): a leftover of a removed Subagent type shows only its identity,
+                   its retired line and its Delete; every other section and tab is hidden. -->
+              {#if !retiredSubagentDetails}
               <Tabs.Root bind:value={activeSubagentSettingsTab} class="w-full">
                 <Tabs.List class="flex w-full flex-wrap gap-2">
                   <Tabs.Trigger
@@ -13749,7 +11227,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
               {#if activeSubagentSettingsTab === "tools"}
                 <AgentMcpDefaultsCard
                   agentId={selectedEditableSubagentId}
-                  toolHostScope={getSubagentToolHostScope(subagentForm.subagentType)}
+                  subjectKind="subagent"
+                  toolHostScope={getSubagentToolHostScope()}
                   userId={data?.user?.id ?? null}
                   accordionName="subagent-tools-cards"
                   toolGridTitle="Tool Settings Grid"
@@ -13767,10 +11246,11 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                   }
                   nativeCliToolsEnabled={getNativeToolToggle("cliToolsEnabled", true, "subagent")}
                   nativeToolSettings={getNativeToolsSettings("subagent")}
-                  isCodexMode={isCodexCliSubagentProvider}
-                  onGatewaysChange={guardSubagentChoice(handleSubagentMcpGatewaysChange)}
-                  onDcmDisplaySettingsChange={guardSubagentChoice(handleSubagentMcpDcmDisplaySettingsChange)}
-                  onCliToolIdsChange={guardSubagentChoice(handleSubagentCliToolSelectionsChange)}
+                  getEnableControl={id => getToolGridEnableControl(id, "subagent")}
+                  discoveryReadOnly={cliPairBlocked("subagent")}
+                  onGatewaysChange={guardSubagentChoice(handleSubagentMcpGatewaysChange, true)}
+                  onDcmDisplaySettingsChange={guardSubagentChoice(handleSubagentMcpDcmDisplaySettingsChange, true)}
+                  onCliToolIdsChange={guardSubagentChoice(handleSubagentCliToolSelectionsChange, true)}
                   getToolZipOverride={getMcpToolZipOverride}
                   onToolZipOverrideChange={guardSubagentChoice(handleMcpToolZipOverrideChange)}
                   showZipControls={false}
@@ -13781,6 +11261,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                   onZipAiViewModeChange={guardSubagentChoice(handleZipAiViewModeChange)}
                   fullWidthTable={true}
                 />
+              {/if}
               {/if}
 
               <SettingsAccordionCard
@@ -13819,6 +11300,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                               <Input
                                 id="subagent-display"
                                 placeholder="Subagent name"
+                                disabled={Boolean(retiredSubagentDetails)}
                                 bind:value={subagentForm.displayName}
                               />
                             </div>
@@ -13838,15 +11320,16 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                 <Copy  />
                               </Button>
                             </div>
-                            <div class="batshit-settings-identity-meta-item">
-                              <span class="whitespace-nowrap">Subagent Type:</span>
-                              <span class={subagentTypeBadgeClass(subagentForm.subagentType)}>
-                                {formatSubagentTypeLabel(subagentForm.subagentType)}
-                              </span>
-                            </div>
+                            {#if retiredSubagentDetails}
+                              <!-- SA-139 R5 (D14): a leftover of a removed Subagent type is refused; Delete is its only action. -->
+                              <div class="batshit-settings-identity-meta-item" data-testid="subagent-retired-type-notice">
+                                <span class="batshit-settings-caption">{retiredSubagentDetails}</span>
+                              </div>
+                            {/if}
                           </div>
                         </div>
 
+                        {#if !retiredSubagentDetails}
                         <div class="batshit-settings-form-row">
                           <div class="batshit-settings-form-copy">
                             <div class="batshit-settings-form-label-line">
@@ -13863,32 +11346,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                   side="bottom"
                                   class={SETTINGS_INFO_CONTENT_CLASS}
                                 >
-                                  {#if subagentForm.subagentType === "api"}
-                                    This model is used directly by Batshit when this API Subagent runs.
-                                  {:else if subagentForm.subagentType === "cli"}
-                                    This model decides whether this CLI Subagent runs through Codex or Claude.
-                                  {:else}
-                                    This model is used automatically for this Subagent when the workflow resolves model settings through the usual n8n expressions.
-                                  {/if}
+                                  This model is used directly by Batshit when this Subagent runs.
                                 </DropdownMenu.Content>
                               </DropdownMenu.Root>
-                              {#if unsupportedSubagentModelParams.length}
-                                <DropdownMenu.Root>
-                                  <DropdownMenu.Trigger
-                                    class="batshit-settings-info-trigger is-amber inline-flex shrink-0 items-center justify-center"
-                                    aria-label="About Ignored Subagent Model Settings"
-                                  >
-                                    <Info class="h-3.5 w-3.5" />
-                                  </DropdownMenu.Trigger>
-                                  <DropdownMenu.Content
-                                    align="start"
-                                    side="bottom"
-                                    class="batshit-settings-info-content batshit-settings-card-elevated is-amber z-[var(--z-popover)] w-72"
-                                  >
-                                    {unsupportedSubagentModelParams.join(", ")} will be ignored inside this n8n workflow.
-                                  </DropdownMenu.Content>
-                                </DropdownMenu.Root>
-                              {/if}
                             </div>
                           </div>
                           <div class="batshit-settings-form-control">
@@ -13898,6 +11358,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                   <Select.Root
                                     type="single"
                                     value={(selectedSubagentModelId ?? "") as unknown as string}
+                                    disabled={subagentModelSelectionBlocked}
                                     onValueChange={guardSubagentChoice((value) =>
                                       handleSubagentModelChange(
                                         Array.isArray(value) ? value[0] : value,
@@ -13974,15 +11435,22 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                     class={`${savedModelsLoading || modelConnectionOptionsLoading ? "animate-spin" : ""}`}
                                   />
                                 </Button>
+                                <Button variant="ghost" size="icon" class="batshit-button-shrink-0" title="Clear Saved Model" aria-label="Clear Saved Model"
+                                  disabled={!canClearModelSelection('subagent')} onclick={() => { if (canClearModelSelection('subagent')) clearSubagentModelSelection(); }}>
+                                  <X class="h-4 w-4" aria-hidden="true" />
+                                </Button>
                               </div>
 
+                              {#if modelClearEligibility('subagent').unreadable}
+                                <p class="batshit-settings-form-meta is-warning">Saved Model clear is unavailable because the saved model selection is unreadable.</p>
+                              {/if}
                               {#if selectedSubagentModelId}
                                 {@const selected =
                                   savedModels.find((item) => item.id === selectedSubagentModelId) ?? null}
                                 {@const availability = selected
                                   ? getModelPresetAvailability({
                                       model: selected,
-                                      agentType: getSubagentToolHostScope(subagentForm.subagentType),
+                                      agentType: getSubagentToolHostScope(),
                                       connectionOptions: null,
                                     })
                                   : null}
@@ -14018,56 +11486,64 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                                   side="bottom"
                                   class={SETTINGS_INFO_CONTENT_CLASS}
                                 >
-                                  Leave blank to use the type default: 180 seconds for API and n8n Workflow Subagents, or 300 seconds for CLI Subagents. Custom values can be 10 to 600 seconds. This covers the call itself, not time spent waiting for a turn: Batshit runs one call per Subagent at a time so its thread stays intact, so a call made while this Subagent is already busy waits first and can take up to about twice this long overall. Batshit says so in the result when that happens. Use Workers for work that should genuinely run at the same time.
+                                  Leave blank for no time limit: the call runs until it is done, and Stop always ends it. Batshit still stops a call that shows no progress for 10 minutes (a tool that is still running, like a long build, counts as progress). To set a limit, enter seconds from 10 to 86400 (24 hours). This covers the call itself, not time spent waiting for a turn: Batshit runs one call per Subagent at a time so its thread stays intact, so a call made while this Subagent is already busy waits for the earlier call to finish first. Batshit says so in the result when that happens. Use Workers for work that should genuinely run at the same time.
+                                </DropdownMenu.Content>
+                              </DropdownMenu.Root>
+                            </div>
+                            {#if normalizeSubagentTimeoutSeconds(subagentForm.timeout_seconds) !== undefined}
+                              <p class="batshit-settings-form-meta">
+                                {formatDelegationDuration(Number(subagentForm.timeout_seconds))}
+                              </p>
+                            {/if}
+                          </div>
+                          <div class="batshit-settings-form-control">
+                            <Input
+                              id="subagent-timeout"
+                              type="number"
+                              min={MIN_SUBAGENT_TIMEOUT_SECONDS}
+                              max={MAX_SUBAGENT_TIMEOUT_SECONDS}
+                              step="1"
+                              placeholder="No limit"
+                              bind:value={subagentForm.timeout_seconds}
+                            />
+                          </div>
+                        </div>
+
+                        <div class="batshit-settings-form-row">
+                          <div class="batshit-settings-form-copy">
+                            <div class="batshit-settings-form-label-line">
+                              <Label.Label class="batshit-settings-form-label" for="subagent-max-tool-steps">
+                                Max Tool Steps
+                              </Label.Label>
+                              <DropdownMenu.Root>
+                                <DropdownMenu.Trigger
+                                  class={SETTINGS_INFO_TRIGGER_CLASS}
+                                  aria-label="About Subagent Max Tool Steps"
+                                >
+                                  <Info class="h-3.5 w-3.5" />
+                                </DropdownMenu.Trigger>
+                                <DropdownMenu.Content
+                                  align="start"
+                                  side="bottom"
+                                  class={SETTINGS_INFO_CONTENT_CLASS}
+                                >
+                                  Leave blank for no limit. Otherwise, the most tool calls this Subagent may make in one call (1 to 10000). At the limit Batshit stops it and returns its work so far, marked partial, and the Primary Agent can resume it to continue. Workers copied from this Subagent follow the same limit.
                                 </DropdownMenu.Content>
                               </DropdownMenu.Root>
                             </div>
                           </div>
                           <div class="batshit-settings-form-control">
                             <Input
-                              id="subagent-timeout"
+                              id="subagent-max-tool-steps"
                               type="number"
-                              min="10"
-                              max="600"
+                              min={MIN_SUBAGENT_MAX_TOOL_STEPS}
+                              max={MAX_SUBAGENT_MAX_TOOL_STEPS}
                               step="1"
-                              placeholder={subagentForm.subagentType === "cli" ? "300" : "180"}
-                              bind:value={subagentForm.timeout_seconds}
+                              placeholder="No limit"
+                              bind:value={subagentForm.max_tool_steps}
                             />
                           </div>
                         </div>
-
-                        {#if isWorkflowBackedSubagentType(subagentForm.subagentType)}
-                          <div class="batshit-settings-form-row">
-                            <div class="batshit-settings-form-copy">
-                              <div class="batshit-settings-form-label-line">
-                                <Label.Label class="batshit-settings-form-label" for="subagent-webhook">
-                                  Production Webhook URL
-                                </Label.Label>
-                                <DropdownMenu.Root>
-                                  <DropdownMenu.Trigger
-                                    class={SETTINGS_INFO_TRIGGER_CLASS}
-                                    aria-label="About Subagent Production Webhook URL"
-                                  >
-                                    <Info class="h-3.5 w-3.5" />
-                                  </DropdownMenu.Trigger>
-                                  <DropdownMenu.Content
-                                    align="start"
-                                    side="bottom"
-                                    class={SETTINGS_INFO_CONTENT_CLASS}
-                                  >
-                                    Use the Production Webhook URL, not the Test Webhook URL.
-                                  </DropdownMenu.Content>
-                                </DropdownMenu.Root>
-                              </div>
-                            </div>
-                            <div class="batshit-settings-form-control is-wide">
-                              <Input
-                                id="subagent-webhook"
-                                placeholder="https://localhost:5678/webhook/..."
-                                bind:value={subagentForm.webhook_url}
-                              />
-                            </div>
-                          </div>
                         {/if}
                       </div>
                     </div>
@@ -14084,6 +11560,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                             class="batshit-settings-avatar-preview"
                             iconClass="text-muted-foreground"
                           />
+                          <!-- SA-139 R5: a leftover is never saved, so its avatar is shown without
+                               the upload, icon and remove controls (an upload writes a file first). -->
+                          {#if !retiredSubagentDetails}
                           <div class="w-full space-y-2">
                             <div class="flex flex-wrap items-center gap-2">
                               <Button
@@ -14130,526 +11609,14 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                             bind:this={subagentAvatarInput}
                             onchange={handleSubagentAvatarUpload}
                           />
+                          {/if}
                         </div>
                       </div>
                     </div>
                   </div>
               </SettingsAccordionCard>
 
-              {#if subagentForm.subagentType === "cli" && isClaudeCliSubagentProvider}
-                <SettingsAccordionCard
-                  name="subagent-core-cards"
-                  title="Claude Code CLI Defaults"
-                  batshitIcon="cli-tools"
-                  class={hiddenUnlessSubagent("core")}
-                  onfocusin={() => (subagentClaudeSaveScope = "core")}
-                  onpointerdown={() => (subagentClaudeSaveScope = "core")}
-                >
-                  {#snippet actions()}
-                      {#if subagentClaudeSaveScope === "core"}
-                        <SettingsSaveStatus
-                          state={subagentClaudeSaveError ? "error" : subagentClaudeSaveState}
-                          error={subagentClaudeSaveError}
-                          savingLabel="Saving Claude defaults..."
-                          savedLabel="Saved"
-                        />
-                      {/if}
-                  {/snippet}
-                    <div class="batshit-settings-form-stack">
-                      <div class="batshit-settings-form-row">
-                        <div class="batshit-settings-form-copy">
-                          <div class="batshit-settings-form-label-line">
-                            <Label.Root class="batshit-settings-form-label">Default Claude Model</Label.Root>
-                            <DropdownMenu.Root>
-                              <DropdownMenu.Trigger
-                                class={SETTINGS_INFO_TRIGGER_CLASS}
-                                aria-label="About Subagent Default Claude Model"
-                              >
-                                <Info class="h-3.5 w-3.5" />
-                              </DropdownMenu.Trigger>
-                              <DropdownMenu.Content
-                                align="start"
-                                side="bottom"
-                                class={SETTINGS_INFO_CONTENT_CLASS}
-                              >
-                                Passed to <code>claude --model</code>. Choose CLI default to let Claude decide.
-                              </DropdownMenu.Content>
-                            </DropdownMenu.Root>
-                          </div>
-                        </div>
-                        <div class="batshit-settings-form-control">
-                          <Select.Root
-                            type="single"
-                            value={subagentClaudeForm.model.length ? subagentClaudeForm.model : "default"}
-                            onValueChange={guardSubagentChoice((value) => {
-                              const nextValue = (Array.isArray(value) ? value[0] : value) as string;
-                              updateClaudeForm((current) => ({
-                                ...current,
-                                model: nextValue === "default" ? "" : nextValue,
-                              }), "subagent");
-                            })}
-                          >
-                            <Select.Trigger class="w-full">
-                              {@const label = subagentClaudeForm.model.length
-                                ? CLAUDE_CLI_MODEL_CHOICES.find((option) => option.value === subagentClaudeForm.model)?.label ?? subagentClaudeForm.model
-                                : "CLI default"}
-                              <div class="flex items-center gap-2">
-                                <ModelProviderIcon
-                                  modelId={subagentClaudeForm.model.length ? subagentClaudeForm.model : "claude"}
-                                  modelName={label}
-                                  provider="claude"
-                                  badgeProvider="anthropic"
-                                  size="sm"
-                                  showOverlay={true}
-                                />
-                                <span class="truncate">{label}</span>
-                              </div>
-                            </Select.Trigger>
-                            <Select.Content>
-                              <Select.Item value="default">
-                                <div class="flex items-center gap-2">
-                                  <ModelProviderIcon
-                                    modelId="claude"
-                                    modelName="CLI default"
-                                    provider="claude"
-                                    badgeProvider="anthropic"
-                                    size="sm"
-                                    showOverlay={true}
-                                  />
-                                  <span>CLI default</span>
-                                </div>
-                              </Select.Item>
-                              {#each CLAUDE_CLI_MODEL_CHOICES as option}
-                                <Select.Item value={option.value}>
-                                  <div class="flex items-center gap-2">
-                                    <ModelProviderIcon
-                                      modelId={option.value}
-                                      modelName={option.label}
-                                      provider="claude"
-                                      badgeProvider="anthropic"
-                                      size="sm"
-                                      showOverlay={true}
-                                    />
-                                    <span class="truncate">{option.label}</span>
-                                  </div>
-                                </Select.Item>
-                              {/each}
-                            </Select.Content>
-                          </Select.Root>
-                          <RetiredCliModelNotice runtime="claude" model={subagentClaudeForm.model} />
-                        </div>
-                      </div>
-
-                      <div class="batshit-settings-toggle-row">
-                        <div class="flex min-w-0 items-center gap-1.5">
-                          <span class="batshit-settings-parent-label">Always Enable Extended Thinking</span>
-                          <DropdownMenu.Root>
-                            <DropdownMenu.Trigger
-                              class={SETTINGS_INFO_TRIGGER_CLASS}
-                              aria-label="About Subagent Always Enable Extended Thinking"
-                            >
-                              <Info class="h-3.5 w-3.5" />
-                            </DropdownMenu.Trigger>
-                            <DropdownMenu.Content
-                              align="start"
-                              side="bottom"
-                              class={SETTINGS_INFO_CONTENT_CLASS}
-                            >
-                              Turns on Claude Code&apos;s extended thinking for this subagent.
-                            </DropdownMenu.Content>
-                          </DropdownMenu.Root>
-                        </div>
-                        <Switch.Root
-                          checked={subagentClaudeForm.alwaysThinkingEnabled}
-                          onCheckedChange={guardSubagentChoice((checked) =>
-                            updateClaudeForm((current) => ({
-                              ...current,
-                              alwaysThinkingEnabled: checked === true,
-                              maxThinkingTokens:
-                                checked === true
-                                  ? current.maxThinkingTokens.trim().length > 0
-                                    ? current.maxThinkingTokens
-                                    : String(CLAUDE_DEFAULT_MAX_THINKING_TOKENS)
-                                  : "",
-                            }), "subagent"))} />
-                      </div>
-
-                      {#if subagentClaudeForm.alwaysThinkingEnabled}
-                        <div class="batshit-settings-form-row">
-                          <div class="batshit-settings-form-copy">
-                            <div class="batshit-settings-form-label-line">
-                              <Label.Root class="batshit-settings-form-label">
-                                Thinking Token Budget
-                              </Label.Root>
-                              <DropdownMenu.Root>
-                                <DropdownMenu.Trigger
-                                  class={SETTINGS_INFO_TRIGGER_CLASS}
-                                  aria-label="About Subagent Thinking Token Budget"
-                                >
-                                  <Info class="h-3.5 w-3.5" />
-                                </DropdownMenu.Trigger>
-                                <DropdownMenu.Content
-                                  align="start"
-                                  side="bottom"
-                                  class={SETTINGS_INFO_CONTENT_CLASS}
-                                >
-                                  Uses <code>{CLAUDE_DEFAULT_MAX_THINKING_TOKENS}</code> when left blank.
-                                </DropdownMenu.Content>
-                              </DropdownMenu.Root>
-                            </div>
-                          </div>
-                          <div class="batshit-settings-form-control">
-                            <Input
-                              type="number"
-                              min="1"
-                              placeholder={String(CLAUDE_DEFAULT_MAX_THINKING_TOKENS)}
-                              value={subagentClaudeForm.maxThinkingTokens}
-                              oninput={(event) => {
-                                const nextValue = (event.target as HTMLInputElement).value;
-                                updateClaudeForm((current) => ({
-                                  ...current,
-                                  maxThinkingTokens: nextValue,
-                                }), "subagent");
-                              }}
-                            />
-                          </div>
-                        </div>
-                      {/if}
-                    </div>
-                </SettingsAccordionCard>
-              {/if}
-
-              {#if subagentForm.subagentType === "cli" && isCodexCliSubagentProvider}
-                <SettingsAccordionCard
-                  name="subagent-core-cards"
-                  title="Codex CLI Defaults"
-                  batshitIcon="cli-tools"
-                  class={hiddenUnlessSubagent("core")}
-                  onfocusin={() => (subagentCodexSaveScope = "core")}
-                  onpointerdown={() => (subagentCodexSaveScope = "core")}
-                >
-                  {#snippet actions()}
-                      {#if subagentCodexSaveScope === "core"}
-                        <SettingsSaveStatus
-                          state={subagentCodexSaveError ? "error" : subagentCodexSaveState}
-                          error={subagentCodexSaveError}
-                          savingLabel="Saving Codex defaults..."
-                          savedLabel="Saved"
-                        />
-                      {/if}
-                  {/snippet}
-                    <div class="batshit-settings-form-stack">
-                      <div class="batshit-settings-form-row">
-                        <div class="batshit-settings-form-copy">
-                          <div class="batshit-settings-form-label-line">
-                            <Label.Root class="batshit-settings-form-label">Default Codex Model</Label.Root>
-                            <DropdownMenu.Root>
-                              <DropdownMenu.Trigger
-                                class={SETTINGS_INFO_TRIGGER_CLASS}
-                                aria-label="About Subagent Default Codex Model"
-                              >
-                                <Info class="h-3.5 w-3.5" />
-                              </DropdownMenu.Trigger>
-                              <DropdownMenu.Content
-                                align="start"
-                                side="bottom"
-                                class={SETTINGS_INFO_CONTENT_CLASS}
-                              >
-                                Passed directly to <code>codex --model</code> for this subagent.
-                              </DropdownMenu.Content>
-                            </DropdownMenu.Root>
-                          </div>
-                        </div>
-                        <div class="batshit-settings-form-control">
-                          <Select.Root
-                            type="single"
-                            value={subagentCodexForm.model}
-                            onValueChange={guardSubagentChoice((value) =>
-                              updateCodexForm((current) => ({
-                                ...current,
-                                model: Array.isArray(value)
-                                  ? (value[0] as string)
-                                  : (value as string),
-                              }), "subagent"))}
-                          >
-                            <Select.Trigger class="w-full">
-                              {@const label = CODEX_SUBMODEL_CHOICES.find((option) => option.value === subagentCodexForm.model)?.label ?? subagentCodexForm.model}
-                              <div class="flex items-center gap-2 min-w-0">
-                                <ModelProviderIcon
-                                  modelId={subagentCodexForm.model}
-                                  modelName={label}
-                                  provider="openai"
-                                  size="sm"
-                                  badgeProvider="codex"
-                                />
-                                <span class="truncate">{label}</span>
-                              </div>
-                            </Select.Trigger>
-                            <Select.Content>
-                              {#each CODEX_SUBMODEL_CHOICES as option}
-                                <Select.Item value={option.value}>
-                                  <div class="flex items-center gap-2 min-w-0">
-                                    <ModelProviderIcon
-                                      modelId={option.value}
-                                      modelName={option.label}
-                                      provider="openai"
-                                      size="sm"
-                                      badgeProvider="codex"
-                                    />
-                                    <span class="truncate">{option.label}</span>
-                                  </div>
-                                </Select.Item>
-                              {/each}
-                            </Select.Content>
-                          </Select.Root>
-                          <RetiredCliModelNotice runtime="codex" model={subagentCodexForm.model} />
-                        </div>
-                      </div>
-
-                      <div class="batshit-settings-form-row">
-                        <div class="batshit-settings-form-copy">
-                          <div class="batshit-settings-form-label-line">
-                            <Label.Root class="batshit-settings-form-label">Reasoning Effort</Label.Root>
-                            <DropdownMenu.Root>
-                              <DropdownMenu.Trigger
-                                class={SETTINGS_INFO_TRIGGER_CLASS}
-                                aria-label="About Subagent Reasoning Effort"
-                              >
-                                <Info class="h-3.5 w-3.5" />
-                              </DropdownMenu.Trigger>
-                              <DropdownMenu.Content
-                                align="start"
-                                side="bottom"
-                                class={SETTINGS_INFO_CONTENT_CLASS}
-                              >
-                                Mirrors Codex <code>model_reasoning_effort</code>.
-                              </DropdownMenu.Content>
-                            </DropdownMenu.Root>
-                          </div>
-                        </div>
-                        <div class="batshit-settings-form-control">
-                          <Select.Root
-                            type="single"
-                            value={subagentCodexForm.reasoningEffort}
-                            onValueChange={guardSubagentChoice((value) =>
-                              updateCodexForm((current) => ({
-                                ...current,
-                                reasoningEffort: (Array.isArray(value)
-                                  ? value[0]
-                                  : value) as CodexFormOptions["reasoningEffort"],
-                              }), "subagent"))}
-                          >
-                            <Select.Trigger class="w-full">
-                              {@const label = CODEX_REASONING_OPTIONS.find((option) => option.value === subagentCodexForm.reasoningEffort)?.label ?? "Auto"}
-                              <div class="flex items-center gap-2 min-w-0">
-                                <Brain class="h-4 w-4 shrink-0 text-muted-foreground" />
-                                <span class="truncate">{label}</span>
-                              </div>
-                            </Select.Trigger>
-                            <Select.Content>
-                              {#each CODEX_REASONING_OPTIONS as option}
-                                {#if option.value !== "xhigh" || supportsCodexXhighReasoning(subagentCodexForm.model)}
-                                  <Select.Item value={option.value}>
-                                    <div class="flex items-start gap-2 min-w-0">
-                                      <Brain class="h-4 w-4 shrink-0 text-muted-foreground" />
-                                      <div class="flex flex-col min-w-0">
-                                        <span class="truncate">{option.label}</span>
-                                        <span class="batshit-settings-child-label truncate">
-                                          {option.helper}
-                                        </span>
-                                      </div>
-                                    </div>
-                                  </Select.Item>
-                                {/if}
-                              {/each}
-                            </Select.Content>
-                          </Select.Root>
-                        </div>
-                      </div>
-
-                      <div class="batshit-settings-form-row">
-                        <div class="batshit-settings-form-copy">
-                          <div class="batshit-settings-form-label-line">
-                            <Label.Root class="batshit-settings-form-label">Service Tier</Label.Root>
-                            <DropdownMenu.Root>
-                              <DropdownMenu.Trigger
-                                class={SETTINGS_INFO_TRIGGER_CLASS}
-                                aria-label="About Subagent Service Tier"
-                              >
-                                <Info class="h-3.5 w-3.5" />
-                              </DropdownMenu.Trigger>
-                              <DropdownMenu.Content
-                                align="start"
-                                side="bottom"
-                                class={SETTINGS_INFO_CONTENT_CLASS}
-                              >
-                                Writes Codex <code>service_tier</code>. Fast is currently supported on GPT-5.5 and GPT-5.4.
-                              </DropdownMenu.Content>
-                            </DropdownMenu.Root>
-                          </div>
-                        </div>
-                        <div class="batshit-settings-form-control">
-                          <Select.Root
-                            type="single"
-                            value={subagentCodexForm.serviceTier}
-                            onValueChange={guardSubagentChoice((value) =>
-                              updateCodexForm((current) => ({
-                                ...current,
-                                serviceTier: (Array.isArray(value)
-                                  ? value[0]
-                                  : value) as CodexServiceTier,
-                              }), "subagent"))}
-                          >
-                            <Select.Trigger class="w-full">
-                              <span>
-                                {CODEX_SERVICE_TIER_OPTIONS.find((option) =>
-                                  option.value === subagentCodexForm.serviceTier
-                                )?.label ?? subagentCodexForm.serviceTier}
-                              </span>
-                            </Select.Trigger>
-                            <Select.Content>
-                              {#each CODEX_SERVICE_TIER_OPTIONS as option}
-                                {#if option.value !== "fast" || supportsCodexFastMode(subagentCodexForm.model)}
-                                  <Select.Item value={option.value}>
-                                    <div class="flex flex-col min-w-0">
-                                      <span class="truncate">{option.label}</span>
-                                      <span class="batshit-settings-child-label truncate">
-                                        {option.helper}
-                                      </span>
-                                    </div>
-                                  </Select.Item>
-                                {/if}
-                              {/each}
-                            </Select.Content>
-                          </Select.Root>
-                        </div>
-                      </div>
-                    </div>
-                </SettingsAccordionCard>
-              {/if}
-
-              {#if subagentForm.subagentType === "cli" && isClaudeCliSubagentProvider}
-                <SettingsAccordionCard
-                  name="subagent-instructions-cards"
-                  title="Claude Instructions"
-                  batshitIcon="instructions"
-                  class={hiddenUnlessSubagent("instructions")}
-                  contentClass="space-y-4"
-                  onfocusin={() => (subagentClaudeSaveScope = "instructions")}
-                  onpointerdown={() => (subagentClaudeSaveScope = "instructions")}
-                >
-                  {#snippet info()}
-                        <SettingsInfoMenu ariaLabel="About Subagent Claude Instructions">
-                          Controls how Claude's own instruction sources mix with Batshit-managed prompting.
-                        </SettingsInfoMenu>
-                  {/snippet}
-                  {#snippet actions()}
-                      {#if subagentClaudeSaveScope === "instructions"}
-                        <SettingsSaveStatus
-                          state={subagentClaudeSaveError ? "error" : subagentClaudeSaveState}
-                          error={subagentClaudeSaveError}
-                          savingLabel="Saving Claude instructions..."
-                          savedLabel="Saved"
-                        />
-                      {/if}
-                  {/snippet}
-                      <div class="batshit-settings-form-stack">
-                        <div class="batshit-settings-toggle-row">
-                          <div>
-                            <div class="flex items-center gap-1.5">
-                              <p class="batshit-settings-parent-label">Use Project CLAUDE.md When Found</p>
-                              <SettingsInfoMenu ariaLabel="About Subagent Project CLAUDE.md">
-                                On lets Claude read project <code>CLAUDE.md</code> files inside this
-                                Batshit-managed chat. Off ignores those project instruction files for this subagent.
-                              </SettingsInfoMenu>
-                            </div>
-                          </div>
-                          <Switch.Root
-                            checked={subagentClaudeForm.includeProjectInstructions}
-                            onCheckedChange={guardSubagentChoice((checked) =>
-                              updateClaudeForm((current) => ({
-                                ...current,
-                                includeProjectInstructions: checked === true,
-                              }), "subagent"))}
-                          />
-                        </div>
-
-                        <div class="batshit-settings-toggle-row">
-                          <div>
-                            <div class="flex items-center gap-1.5">
-                              <p class="batshit-settings-parent-label">Include Claude's Built-In System Prompt</p>
-                              <SettingsInfoMenu ariaLabel="About Subagent Claude Built-in System Prompt">
-                                Off keeps Batshit's plain helper replacement. On removes that override so
-                                Claude Code uses its own built-in prompt too.
-                              </SettingsInfoMenu>
-                            </div>
-                          </div>
-                          <Switch.Root
-                            checked={subagentClaudeForm.includeCoreSystemPrompt}
-                            onCheckedChange={guardSubagentChoice((checked) =>
-                              updateClaudeForm((current) => ({
-                                ...current,
-                                includeCoreSystemPrompt: checked === true,
-                                systemPromptMode: checked === true ? "default" : "replace",
-                                systemPrompt:
-                                  checked === true ? "" : MODE4_PRELAUNCH_REPLACEMENT_PROMPT,
-                                systemPromptFile: "",
-                              }), "subagent"))}
-                          />
-                        </div>
-                      </div>
-                </SettingsAccordionCard>
-              {/if}
-
-              {#if subagentForm.subagentType === "cli" && isCodexCliSubagentProvider}
-                <SettingsAccordionCard
-                  name="subagent-instructions-cards"
-                  title="Codex Instructions"
-                  batshitIcon="instructions"
-                  class={hiddenUnlessSubagent("instructions")}
-                  contentClass="space-y-4"
-                  onfocusin={() => (subagentCodexSaveScope = "instructions")}
-                  onpointerdown={() => (subagentCodexSaveScope = "instructions")}
-                >
-                  {#snippet info()}
-                        <SettingsInfoMenu ariaLabel="About Subagent Codex Instructions">
-                          Controls whether Codex also reads project instruction files in this managed session.
-                        </SettingsInfoMenu>
-                  {/snippet}
-                  {#snippet actions()}
-                      {#if subagentCodexSaveScope === "instructions"}
-                        <SettingsSaveStatus
-                          state={subagentCodexSaveError ? "error" : subagentCodexSaveState}
-                          error={subagentCodexSaveError}
-                          savingLabel="Saving Codex instructions..."
-                          savedLabel="Saved"
-                        />
-                      {/if}
-                  {/snippet}
-                      <div class="batshit-settings-form-stack">
-                        <div class="batshit-settings-toggle-row">
-                          <div>
-                            <div class="flex items-center gap-1.5">
-                              <p class="batshit-settings-parent-label">Use Project AGENTS.md When Found</p>
-                              <SettingsInfoMenu ariaLabel="About Subagent Project AGENTS.md">
-                                On lets Codex also read the project's <code>AGENTS.md</code> inside this
-                                Batshit-managed chat. Off uses Batshit's managed replacement instructions file instead.
-                              </SettingsInfoMenu>
-                            </div>
-                          </div>
-                          <Switch.Root
-                            checked={subagentCodexForm.includeProjectInstructions}
-                            onCheckedChange={guardSubagentChoice((checked) =>
-                              updateCodexForm((current) => ({
-                                ...current,
-                                includeProjectInstructions: checked === true,
-                              }), "subagent"))}
-                          />
-                        </div>
-                      </div>
-                </SettingsAccordionCard>
-              {/if}
-
+              {#if !retiredSubagentDetails}
             <SettingsAccordionCard
               name="subagent-instructions-cards"
               title="Instructions"
@@ -14687,7 +11654,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                           type="button"
                           variant="outline"
                         size="sm"
-                        onclick={() => (subagentPromptEditorOpen = true)}
+                        disabled={subagentInstructionsPromptBlocked}
+                        onclick={() => { if (!subagentInstructionsPromptBlocked) subagentPromptEditorOpen = true; }}
                       >
                         <Pencil aria-hidden="true" />
 
@@ -14706,1234 +11674,18 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                         </SettingsInfoMenu>
                       </div>
                     </div>
-                    <Switch.Root bind:checked={subagentForm.include_global_prompt} />
+                    <Switch.Root bind:checked={subagentForm.include_global_prompt} disabled={subagentInstructionsIncludeBlocked} />
                   </div>
-                </div>
-          </SettingsAccordionCard>
-              {#if subagentForm.subagentType === "cli" && isClaudeCliSubagentProvider}
-                <SettingsAccordionCard
-                  name="subagent-tools-cards"
-                  title="Claude Tools"
-                  icon={Wrench}
-                  class={hiddenUnlessSubagent("tools")}
-                  contentClass="space-y-5"
-                  onfocusin={() => (subagentClaudeSaveScope = "tools")}
-                  onpointerdown={() => (subagentClaudeSaveScope = "tools")}
-                >
-                  {#snippet info()}
-                        <SettingsInfoMenu ariaLabel="About Subagent Claude Tools">
-                          Controls Claude-specific built-in tools for this subagent.
-                        </SettingsInfoMenu>
-                  {/snippet}
-                  {#snippet actions()}
-                      {#if subagentClaudeSaveScope === "tools"}
-                        <SettingsSaveStatus
-                          state={subagentClaudeSaveError ? "error" : subagentClaudeSaveState}
-                          error={subagentClaudeSaveError}
-                          savingLabel="Saving Claude tools..."
-                          savedLabel="Saved"
-                        />
-                      {/if}
-                  {/snippet}
-                    <div class="flex items-center justify-between gap-4 batshit-settings-muted-panel">
-                      <div>
-                        <div class="flex items-center gap-1.5">
-                          <p class="batshit-settings-form-label">Enable Chrome Integration</p>
-                          <SettingsInfoMenu ariaLabel="About Subagent Claude Chrome Integration">
-                            Toggles Claude Code's Chrome automation.
-                          </SettingsInfoMenu>
-                        </div>
-                      </div>
-                      <Switch.Root
-                        checked={subagentClaudeForm.chrome}
-                        onCheckedChange={guardSubagentChoice((checked) =>
-                          updateClaudeForm((current) => ({
-                            ...current,
-                            chrome: checked === true,
-                          }), "subagent"))}
-                      />
-                    </div>
-
-                    <div class="flex items-center justify-between gap-4 batshit-settings-muted-panel">
-                      <div>
-                        <div class="flex items-center gap-1.5">
-                          <p class="batshit-settings-form-label">Allow Claude Web Search</p>
-                          <SettingsInfoMenu ariaLabel="About Subagent Claude Web Search">
-                            Convenience toggle for Claude's <code>WebSearch</code> built-in tool.
-                          </SettingsInfoMenu>
-                        </div>
-                      </div>
-                      <Switch.Root
-                        checked={getClaudeToolEnabled("WebSearch", "subagent")}
-                        onCheckedChange={guardSubagentChoice((checked) =>
-                          setClaudeToolEnabled("WebSearch", checked === true, "subagent"))}
-                      />
-                    </div>
-
-                    <details class="batshit-settings-muted-panel">
-                      <summary class="batshit-settings-form-label cursor-pointer">
-                        Advanced Tool Rules
-                      </summary>
-                      <div class="mt-3 grid gap-4 md:grid-cols-2">
-                        <div class="space-y-2">
-                          <Label.Root class="batshit-settings-form-label"
-                            >Allowed Tools</Label.Root
-                          >
-                          <div class="flex gap-2">
-                            <Input
-                              placeholder="Read, Edit, Bash..."
-                              bind:value={subagentClaudeAllowedToolDraft}
-                              onkeydown={(event: KeyboardEvent) => {
-                                if (event.key === "Enter") {
-                                  event.preventDefault();
-                                  addClaudeListValue("allowedTools", subagentClaudeAllowedToolDraft, "subagent");
-                                  subagentClaudeAllowedToolDraft = "";
-                                }
-                              }}
-                            />
-                            <Button
-                              variant="secondary"
-                              onclick={() => {
-                                addClaudeListValue("allowedTools", subagentClaudeAllowedToolDraft, "subagent");
-                                subagentClaudeAllowedToolDraft = "";
-                              }}
-                            >
-                              <Plus aria-hidden="true" />
-
-                              Add
-                            </Button>
-                          </div>
-                          {#if subagentClaudeForm.allowedTools.length > 0}
-                            <div class="flex flex-wrap gap-2">
-                              {#each subagentClaudeForm.allowedTools as tool, idx}
-                                <span class="batshit-settings-pill is-success">
-                                  {tool}
-                                  <button
-                                    type="button"
-                                    onclick={() => removeClaudeListValue("allowedTools", idx, "subagent")}
-                                  >×</button>
-                                </span>
-                              {/each}
-                            </div>
-                          {/if}
-                        </div>
-                        <div class="space-y-2">
-                          <Label.Root class="batshit-settings-form-label"
-                            >Disallowed Tools</Label.Root
-                          >
-                          <div class="flex gap-2">
-                            <Input
-                              placeholder="WebSearch, WebFetch..."
-                              bind:value={subagentClaudeDisallowedToolDraft}
-                              onkeydown={(event: KeyboardEvent) => {
-                                if (event.key === "Enter") {
-                                  event.preventDefault();
-                                  addClaudeListValue("disallowedTools", subagentClaudeDisallowedToolDraft, "subagent");
-                                  subagentClaudeDisallowedToolDraft = "";
-                                }
-                              }}
-                            />
-                            <Button
-                              variant="secondary"
-                              onclick={() => {
-                                addClaudeListValue("disallowedTools", subagentClaudeDisallowedToolDraft, "subagent");
-                                subagentClaudeDisallowedToolDraft = "";
-                              }}
-                            >
-                              <Plus aria-hidden="true" />
-
-                              Add
-                            </Button>
-                          </div>
-                          {#if subagentClaudeForm.disallowedTools.length > 0}
-                            <div class="flex flex-wrap gap-2">
-                              {#each subagentClaudeForm.disallowedTools as tool, idx}
-                                <span class="batshit-settings-pill is-danger">
-                                  {tool}
-                                  <button
-                                    type="button"
-                                    onclick={() => removeClaudeListValue("disallowedTools", idx, "subagent")}
-                                  >×</button>
-                                </span>
-                              {/each}
-                            </div>
-                          {/if}
-                        </div>
-                      </div>
-                    </details>
-                </SettingsAccordionCard>
-              {/if}
-
-              {#if subagentForm.subagentType === "cli" && isCodexCliSubagentProvider}
-                <SettingsAccordionCard
-                  name="subagent-tools-cards"
-                  title="Codex Tools"
-                  icon={Wrench}
-                  class={hiddenUnlessSubagent("tools")}
-                  contentClass="space-y-5"
-                  onfocusin={() => (subagentCodexSaveScope = "tools")}
-                  onpointerdown={() => (subagentCodexSaveScope = "tools")}
-                >
-                  {#snippet info()}
-                        <SettingsInfoMenu ariaLabel="About Subagent Codex Tools">
-                          Controls Codex-specific built-in capabilities and advanced feature flags.
-                        </SettingsInfoMenu>
-                  {/snippet}
-                  {#snippet actions()}
-                      {#if subagentCodexSaveScope === "tools"}
-                        <SettingsSaveStatus
-                          state={subagentCodexSaveError ? "error" : subagentCodexSaveState}
-                          error={subagentCodexSaveError}
-                          savingLabel="Saving Codex tools..."
-                          savedLabel="Saved"
-                        />
-                      {/if}
-                  {/snippet}
-                    <div class="batshit-settings-form-stack">
-                      <div class="batshit-settings-toggle-row">
-                        <div class="min-w-0">
-                          <div class="flex items-center gap-1.5">
-                            <p class="batshit-settings-parent-label">Allow Codex Web Search</p>
-                            <SettingsInfoMenu ariaLabel="About Subagent Codex Web Search">
-                              Enables Codex live web search for CLI subagent runs via the managed <code>web_search</code> setting.
-                            </SettingsInfoMenu>
-                          </div>
-                        </div>
-                        <Switch.Root
-                          checked={subagentCodexForm.search}
-                          onCheckedChange={guardSubagentChoice((checked) =>
-                            updateCodexForm((current) => ({
-                              ...current,
-                              search: checked === true,
-                            }), "subagent"))}
-                        />
-                      </div>
-
-                      <Collapsible.Root bind:open={subagentCodexAdvancedOpen}>
-                        <div class="batshit-settings-disclosure-row is-form-line">
-                          <Collapsible.Trigger class={SETTINGS_DISCLOSURE_TRIGGER_CLASS}>
-                            <span class="batshit-settings-form-label">Advanced Feature Flags</span>
-                            <ChevronDown
-                              class={`h-4 w-4 text-muted-foreground transition-transform ${subagentCodexAdvancedOpen ? "rotate-180" : ""}`}
-                            />
-                          </Collapsible.Trigger>
-                          <Collapsible.Content class="batshit-settings-disclosure-content space-y-4">
-                          <div class="grid gap-4 md:grid-cols-2">
-                            <div class="space-y-2">
-                              <Label.Root class="batshit-settings-form-label"
-                                >Enable Feature Flags</Label.Root
-                              >
-                              <div class="flex gap-2">
-                                <Input
-                                  placeholder="browser_use"
-                                  bind:value={subagentCodexEnableDraft}
-                                  onkeydown={(event: KeyboardEvent) => {
-                                    if (event.key === "Enter") {
-                                      event.preventDefault();
-                                      addCodexListValue("enableFeatures", subagentCodexEnableDraft, "subagent");
-                                      subagentCodexEnableDraft = "";
-                                    }
-                                  }}
-                                />
-                                <Button
-                                  variant="secondary"
-                                  onclick={() => {
-                                    addCodexListValue("enableFeatures", subagentCodexEnableDraft, "subagent");
-                                    subagentCodexEnableDraft = "";
-                                  }}
-                                >
-                                  <Plus aria-hidden="true" />
-
-                                  Add
-                                </Button>
-                              </div>
-                              <div class="flex flex-wrap gap-2">
-                                {#if subagentCodexForm.enableFeatures.length > 0}
-                                  {#each subagentCodexForm.enableFeatures as feature, idx}
-                                    <span class="batshit-settings-pill is-success">
-                                      {feature}
-                                      <button
-                                        type="button"
-                                        onclick={() => removeCodexListValue("enableFeatures", idx, "subagent")}
-                                      >×</button>
-                                    </span>
-                                  {/each}
-                                {/if}
-                              </div>
-                            </div>
-                            <div class="space-y-2">
-                              <Label.Root class="batshit-settings-form-label"
-                                >Disable Feature Flags</Label.Root
-                              >
-                              <div class="flex gap-2">
-                                <Input
-                                  placeholder="browser_use"
-                                  bind:value={subagentCodexDisableDraft}
-                                  onkeydown={(event: KeyboardEvent) => {
-                                    if (event.key === "Enter") {
-                                      event.preventDefault();
-                                      addCodexListValue("disableFeatures", subagentCodexDisableDraft, "subagent");
-                                      subagentCodexDisableDraft = "";
-                                    }
-                                  }}
-                                />
-                                <Button
-                                  variant="secondary"
-                                  onclick={() => {
-                                    addCodexListValue("disableFeatures", subagentCodexDisableDraft, "subagent");
-                                    subagentCodexDisableDraft = "";
-                                  }}
-                                >
-                                  <Plus aria-hidden="true" />
-
-                                  Add
-                                </Button>
-                              </div>
-                              <div class="flex flex-wrap gap-2">
-                                {#if subagentCodexForm.disableFeatures.length > 0}
-                                  {#each subagentCodexForm.disableFeatures as feature, idx}
-                                    <span class="batshit-settings-pill is-danger">
-                                      {feature}
-                                      <button
-                                        type="button"
-                                        onclick={() => removeCodexListValue("disableFeatures", idx, "subagent")}
-                                      >×</button>
-                                    </span>
-                                  {/each}
-                                {/if}
-                              </div>
-                            </div>
-                          </div>
-                          </Collapsible.Content>
-                        </div>
-                      </Collapsible.Root>
-                    </div>
-                </SettingsAccordionCard>
-              {/if}
-
-            <SettingsAccordionCard
-              name="subagent-tools-cards"
-              title="Batshit Tools"
-              icon={Wrench}
-              class={hiddenUnlessSubagent("tools")}
-              contentClass="space-y-4"
-            onfocusin={() => (subagentSaveScope = "tools")}
-            onpointerdown={() => (subagentSaveScope = "tools")}
-          >
-            {#snippet info()}
-                    <SettingsInfoMenu ariaLabel="About Subagent Native Tools">
-                        {#if subagentForm.subagentType === "cli"}
-                          Configure Batshit built-in tools and dynamic tool families for this CLI Subagent. Codex or Claude built-ins live in the dedicated CLI cards above.
-                        Permission boundaries are managed by the CLI runtime itself, and broad Fabric controls stay unavailable for subagent runs.
-                      {:else}
-                      Configure native tool behavior for this subagent when it runs.
-                      Workflow-backed subagents use these helpers through
-                      <code>Batshit Tools</code>, and managed subagents use the same helpers directly through their runtime lane.
-                        Permission boundaries live in <code>Access</code>.
-                      {/if}
-                    </SettingsInfoMenu>
-            {/snippet}
-            {#snippet actions()}
-                {#if subagentSaveScope === "tools"}
-                  <SettingsSaveStatus
-                    state={subagentEditSaveError || subagentValidationError ? "error" : subagentEditSaveState}
-                    error={subagentEditSaveError ?? subagentValidationError}
-                    savingLabel="Saving subagent tools..."
-                    savedLabel="Saved"
-                  />
-                {/if}
-            {/snippet}
-              {@const subagentBashAvailable = isNativeToolUiAvailable("bash", "subagent")}
-                {@const subagentWebSearchAvailable = isNativeToolUiAvailable("web-search", "subagent")}
-                {@const subagentFabricAvailable = isNativeToolUiAvailable("fabric", "subagent")}
-
-                <div class="batshit-settings-form-stack">
-                <div class="batshit-settings-toggle-row">
-                  <div>
-                    <div class="flex items-center gap-1.5">
-                      <p class="batshit-settings-parent-label">Bash Tool</p>
-                    <SettingsInfoMenu ariaLabel="About Subagent Bash Tool">
-                      {#if subagentBashAvailable}
-                        Enables <code>{getBashToolName("subagent")}</code> for terminal command execution.
-                        Execution environment, permissions mode, command timeout, and safety rules live in
-                        <code>Access</code>.
-                      {:else}
-                        {getNativeToolUiUnavailableMessage("bash", "subagent")}
-                      {/if}
-                    </SettingsInfoMenu>
-                  </div>
-                </div>
-                <Switch.Root
-                  checked={subagentBashAvailable && getNativeToolToggle("bashEnabled", true, "subagent")}
-                  onCheckedChange={guardSubagentChoice((checked) =>
-                    updateNativeToolSetting("bashEnabled", checked === true, "subagent"))}
-                  disabled={!subagentBashAvailable}
-                />
-              </div>
-
-                <div class="batshit-settings-toggle-row">
-                  <div>
-                    <div class="flex items-center gap-1.5">
-                        <p class="batshit-settings-parent-label">MCP Tools</p>
-                      <SettingsInfoMenu ariaLabel="About Subagent MCP Tools">
-                        Lets Dynamic Tool Search surface enabled MCP Source tools for this subagent.
-                        Individual MCP sources, groups, and tools are controlled in the Tool Grid.
-                      </SettingsInfoMenu>
-                  </div>
-                </div>
-                <Switch.Root
-                  checked={getNativeToolToggle("dynamicMcpEnabled", true, "subagent")}
-                  onCheckedChange={guardSubagentChoice((checked) =>
-                    updateNativeToolSetting("dynamicMcpEnabled", checked === true, "subagent"))}
-                />
-              </div>
-
-                <div class="batshit-settings-toggle-row">
-                  <div>
-                    <div class="flex items-center gap-1.5">
-                        <p class="batshit-settings-parent-label">CLI Tools</p>
-                      <SettingsInfoMenu ariaLabel="About Subagent CLI Tools">
-                        Lets Dynamic Tool Search surface saved CLI tools for this subagent.
-                        Individual CLI tools are controlled in the Tool Grid.
-                      </SettingsInfoMenu>
-                  </div>
-                </div>
-                <Switch.Root
-                  checked={getNativeToolToggle("cliToolsEnabled", true, "subagent")}
-                  onCheckedChange={guardSubagentChoice((checked) =>
-                    updateNativeToolSetting("cliToolsEnabled", checked === true, "subagent"))}
-                />
-              </div>
-
-                <div class="batshit-settings-toggle-row">
-                  <div>
-                    <div class="flex items-center gap-1.5">
-                        <p class="batshit-settings-parent-label">Artifact Tools</p>
-                      <SettingsInfoMenu ariaLabel="About Subagent Artifact Tools">
-                        Lets Dynamic Tool Search surface published artifacts this subagent can use
-                        as tools.
-                      </SettingsInfoMenu>
-                  </div>
-                </div>
-                  <Switch.Root
-                    checked={getNativeToolToggle("artifactRuntimeEnabled", true, "subagent")}
-                    onCheckedChange={guardSubagentChoice((checked) =>
-                      updateNativeToolSetting("artifactRuntimeEnabled", checked === true, "subagent"))}
-                  />
-                </div>
-
-                <div class="batshit-settings-toggle-row">
-                  <div>
-                    <div class="flex items-center gap-1.5">
-                      <p class="batshit-settings-parent-label">Fabric Controls</p>
-                        <SettingsInfoMenu ariaLabel="About Subagent Fabric Controls">
-                          {#if subagentFabricAvailable}
-                            Lets Dynamic Tool Search surface Fabric control-plane actions for
-                            Batshit management.
-                          {:else}
-                          {getNativeToolUiUnavailableMessage("fabric", "subagent")}
-                        {/if}
-                      </SettingsInfoMenu>
-                    </div>
-                  </div>
-                  <Switch.Root
-                    checked={subagentFabricAvailable && getNativeToolToggle("batshitToolsEnabled", true, "subagent")}
-                    onCheckedChange={guardSubagentChoice((checked) =>
-                      updateNativeToolSetting("batshitToolsEnabled", checked === true, "subagent"))}
-                    disabled={!subagentFabricAvailable}
-                  />
-                </div>
-
-                  <AgentWebSearchDefaultsDisclosure
-                    bind:open={subagentWebSearchDefaultsOpen}
-                    entityLabel="subagent"
-                    titleInfoAriaLabel="About Subagent Web Search"
-                    defaultsInfoAriaLabel="About Subagent Web Search Defaults"
-                    providerInfoAriaLabel="About Subagent Default Web Search Provider"
-                    exaInfoAriaLabel="About Subagent Exa Search Type"
-                    perplexityInfoAriaLabel="About Subagent Perplexity Max Tokens Per Page"
-                    available={subagentWebSearchAvailable}
-                    enabled={getNativeToolToggle("webSearchEnabled", true, "subagent")}
-                    toolName={getWebSearchToolName("subagent")}
-                    unavailableMessage={getNativeToolUiUnavailableMessage("web-search", "subagent")}
-                    providerValue={getNativeWebSearchProviderValue("subagent")}
-                    providerLabel={getNativeWebSearchProviderLabel(
-                      getNativeWebSearchProviderValue("subagent")
-                    )}
-                    providerInheritValue={NATIVE_WEB_SEARCH_PROVIDER_INHERIT}
-                    providerInheritLabel={getNativeWebSearchProviderLabel(NATIVE_WEB_SEARCH_PROVIDER_INHERIT)}
-                    providerOptions={nativeWebSearchProviderOptions}
-                    providerLoading={webSearchProviderAvailabilityLoading}
-                    providerError={webSearchProviderAvailabilityError}
-                    exaTypeValue={getNativeWebSearchExaTypeValue("subagent")}
-                    exaTypeLabel={getNativeWebSearchExaTypeLabel(getNativeWebSearchExaTypeValue("subagent"))}
-                    exaTypeInheritValue={NATIVE_WEB_SEARCH_EXA_TYPE_INHERIT}
-                    exaTypeInheritLabel={getNativeWebSearchExaTypeLabel(NATIVE_WEB_SEARCH_EXA_TYPE_INHERIT)}
-                    exaTypeOptions={[
-                      { value: "auto", label: NATIVE_WEB_SEARCH_EXA_TYPE_LABELS.auto },
-                      { value: "fast", label: NATIVE_WEB_SEARCH_EXA_TYPE_LABELS.fast },
-                      { value: "neural", label: NATIVE_WEB_SEARCH_EXA_TYPE_LABELS.neural },
-                      { value: "deep", label: NATIVE_WEB_SEARCH_EXA_TYPE_LABELS.deep }
-                    ]}
-                    perplexityValue={String(getNativeWebSearchPerplexityMaxTokensPerPageValue("subagent"))}
-                    perplexityLabel={getNativeWebSearchPerplexityMaxTokensPerPageLabel(
-                      getNativeWebSearchPerplexityMaxTokensPerPageValue("subagent")
-                    )}
-                    perplexityInheritValue={NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_INHERIT}
-                    perplexityInheritLabel={getNativeWebSearchPerplexityMaxTokensPerPageLabel(
-                      NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_INHERIT
-                    )}
-                    perplexityOptions={NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_OPTIONS}
-                    onEnabledChange={guardSubagentChoice((enabled) =>
-                      updateNativeToolSetting("webSearchEnabled", enabled, "subagent"))}
-                    onProviderValueChange={guardSubagentChoice((next) => {
-                      if (next === NATIVE_WEB_SEARCH_PROVIDER_INHERIT) {
-                        updateNativeToolSetting("webSearchProvider", null, "subagent");
-                        return;
-                      }
-                      const provider = normalizeNativeWebSearchProvider(next);
-                      updateNativeToolSetting("webSearchProvider", provider, "subagent");
-                    })}
-                    onExaTypeValueChange={guardSubagentChoice((next) => {
-                      if (next === NATIVE_WEB_SEARCH_EXA_TYPE_INHERIT) {
-                        updateNativeToolSetting("webSearchExaType", null, "subagent");
-                        return;
-                      }
-                      const normalized = normalizeNativeExaSearchType(next);
-                      updateNativeToolSetting("webSearchExaType", normalized, "subagent");
-                    })}
-                    onPerplexityMaxTokensValueChange={guardSubagentChoice((next) => {
-                      if (next === NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_INHERIT) {
-                        updateNativeToolSetting(
-                          "webSearchPerplexityMaxTokensPerPage",
-                          null,
-                          "subagent"
-                        );
-                        return;
-                      }
-                      const normalized = normalizePerplexityMaxTokensPerPage(next);
-                      updateNativeToolSetting(
-                        "webSearchPerplexityMaxTokensPerPage",
-                        normalized,
-                        "subagent"
-                      );
-                    })}
-                  />
-
-                <Collapsible.Root bind:open={subagentAgentBrowserDefaultsOpen}>
-                  <div class="batshit-settings-toggle-disclosure-row">
-                    <div class="batshit-settings-toggle-disclosure-header">
-                      <div class="batshit-settings-toggle-disclosure-copy">
-                        <div class="flex items-center gap-1.5">
-                          <p class="batshit-settings-parent-label">Agent Browser</p>
-                          <SettingsInfoMenu ariaLabel="About Subagent Agent Browser">
-                            Native browser automation powered by Vercel Agent Browser (Playwright under the hood).
-                            Workflow-backed subagents reach it through
-                            <code>Batshit Tools</code>, and managed subagents call the same browser helpers directly.
-                            {#if agentBrowserRuntimeStatus?.version}
-                              Runtime version: <code>{agentBrowserRuntimeStatus.version}</code>
-                            {/if}
-                          </SettingsInfoMenu>
-                        </div>
-                        {#if agentBrowserRuntimeStatusLoading}
-                          <p class="batshit-settings-form-help">Checking runtime installation...</p>
-                        {:else if agentBrowserRuntimeStatus?.supportLevel === "docker-sidecar" && !isAgentBrowserRuntimeInstalled()}
-                          <p class="batshit-settings-form-help">
-                            Docker Agent Browser sidecar is stopped. Start it in <code>Settings -> Admin -> Agent Browser Runtime</code> first.
-                          </p>
-                        {:else if agentBrowserRuntimeStatus?.dockerUnsupported}
-                          <p class="batshit-settings-form-help">
-                            Agent Browser is unavailable in this runtime.
-                          </p>
-                        {:else if !isAgentBrowserRuntimeInstalled()}
-                          <p class="batshit-settings-form-help">
-                            Runtime not installed. Install it in <code>Settings -> Admin -> Agent Browser Runtime</code> first.
-                          </p>
-                        {/if}
-                        {#if agentBrowserRuntimeStatusError}
-                          <p class="batshit-settings-form-help is-danger">{agentBrowserRuntimeStatusError}</p>
-                        {/if}
-                      </div>
-                      <div class="batshit-settings-toggle-disclosure-control">
-                        <Switch.Root
-                          checked={isAgentBrowserRuntimeInstalled() && getNativeToolToggle("agentBrowserEnabled", true, "subagent")}
-                          onCheckedChange={guardSubagentChoice((checked) => {
-                            updateNativeToolSetting("agentBrowserEnabled", checked === true, "subagent");
-                            if (checked !== true) {
-                              subagentAgentBrowserDefaultsOpen = false;
-                            }
-                          })}
-                          disabled={agentBrowserRuntimeStatusLoading || !isAgentBrowserRuntimeInstalled()}
-                        />
-                        {#if isAgentBrowserRuntimeInstalled() && getNativeToolToggle("agentBrowserEnabled", true, "subagent")}
-                          <Collapsible.Trigger class="batshit-settings-toggle-disclosure-trigger">
-                            <span class="batshit-settings-toggle-disclosure-label">Agent Browser Defaults</span>
-                            <SettingsInfoMenu ariaLabel="About Subagent Agent Browser Defaults">
-                              {#if isAgentBrowserDockerSidecarRuntime()}
-                                Docker sidecar mode exposes timeout, cloud provider, and extra CLI flag defaults.
-                              {:else}
-                                Runtime mode, timeout, session memory, live visibility, and optional provider overrides.
-                              {/if}
-                            </SettingsInfoMenu>
-                            <ChevronDown
-                              class={`batshit-settings-toggle-disclosure-chevron ${subagentAgentBrowserDefaultsOpen ? "is-open" : ""}`}
-                            />
-                          </Collapsible.Trigger>
-                        {/if}
-                      </div>
-                    </div>
-                      {#if isAgentBrowserRuntimeInstalled() && getNativeToolToggle("agentBrowserEnabled", true, "subagent")}
-                        <Collapsible.Content class="batshit-settings-disclosure-content batshit-settings-subitem-lines">
-                          <div class="batshit-settings-form-stack">
-                            {#if isAgentBrowserDockerSidecarRuntime()}
-                              <div class="batshit-settings-muted-panel space-y-1">
-                                <p class="batshit-settings-form-label">Docker Sidecar Runtime</p>
-                                <p class="batshit-settings-code-caption">
-                                  Runs headless in the Agent Browser sidecar's bundled Chromium. Host Chrome/CDP, live visibility,
-                                  executable path, session name, and host profile path are not used in Docker.
-                                </p>
-                              </div>
-                            {/if}
-
-                            {#if !isAgentBrowserDockerSidecarRuntime()}
-                            <div class="batshit-settings-toggle-row">
-                              <div class="flex items-center gap-1.5">
-                                <p class="batshit-settings-parent-label">Live Browser Visibility</p>
-                                <SettingsInfoMenu ariaLabel="About Subagent Live Browser Visibility">
-                                  When enabled by default, browser actions run in headed mode so you can watch them live.
-                                  Disable for hidden/headless execution.
-                                </SettingsInfoMenu>
-                              </div>
-                              <Switch.Root
-                                checked={getNativeAgentBrowserLiveViewEnabled("subagent")}
-                                onCheckedChange={guardSubagentChoice((checked) =>
-                                  updateNativeToolSetting("agentBrowserLiveViewEnabled", checked === true, "subagent"))}
-                              />
-                            </div>
-
-                            <div class="batshit-settings-form-row">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Browser Runtime Mode</Label.Label>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control">
-                                <Select.Root
-                                  type="single"
-                                  value={getNativeAgentBrowserRuntimeMode("subagent") as unknown as string}
-                                  onValueChange={guardSubagentChoice((value) => {
-                                    const next = Array.isArray(value) ? value[0] : value;
-                                    const normalized = normalizeNativeAgentBrowserRuntimeMode(next) ?? "chromium";
-                                    updateNativeToolSetting("agentBrowserRuntimeMode", normalized, "subagent");
-                                  })}
-                                >
-                                  <Select.Trigger class="justify-between">
-                                    <span class="truncate">
-                                      {NATIVE_AGENT_BROWSER_RUNTIME_MODE_LABELS[getNativeAgentBrowserRuntimeMode("subagent")]}
-                                    </span>
-                                  </Select.Trigger>
-                                  <Select.Content>
-                                    {#each NATIVE_AGENT_BROWSER_RUNTIME_MODE_OPTIONS as option}
-                                      <Select.Item value={option}>
-                                        {NATIVE_AGENT_BROWSER_RUNTIME_MODE_LABELS[option]}
-                                      </Select.Item>
-                                    {/each}
-                                  </Select.Content>
-                                </Select.Root>
-                              </div>
-                            </div>
-
-                            {#if getNativeAgentBrowserRuntimeMode("subagent") === "chrome-cdp"}
-                              <div class="batshit-settings-form-row">
-                                <div class="batshit-settings-form-copy">
-                                  <div class="batshit-settings-form-label-line">
-                                    <Label.Label class="batshit-settings-form-label">Chrome CDP port</Label.Label>
-                                  </div>
-                                </div>
-                                <div class="batshit-settings-form-control">
-                                  <Input
-                                    type="number"
-                                    min="1"
-                                    max="65535"
-                                    step="1"
-                                    value={String(getNativeAgentBrowserCdpPort("subagent"))}
-                                    oninput={(event) => {
-                                      const parsed = Number.parseInt((event.target as HTMLInputElement).value, 10);
-                                      updateNativeToolSetting(
-                                        "agentBrowserCdpPort",
-                                        Number.isFinite(parsed) ? Math.min(65535, Math.max(1, parsed)) : DEFAULT_NATIVE_AGENT_BROWSER_CDP_PORT,
-                                        "subagent",
-                                      );
-                                    }}
-                                  />
-                                </div>
-                              </div>
-                            {/if}
-                            {/if}
-
-                            <div class="batshit-settings-form-row">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Agent Browser Timeout</Label.Label>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control">
-                                <Select.Root
-                                  type="single"
-                                  value={String(getNativeAgentBrowserTimeoutMs("subagent")) as unknown as string}
-                                  onValueChange={guardSubagentChoice((value) => {
-                                    const next = Array.isArray(value) ? value[0] : value;
-                                    const parsed = Number.parseInt(String(next ?? ""), 10);
-                                    updateNativeToolSetting(
-                                      "agentBrowserTimeoutMs",
-                                      Number.isFinite(parsed) ? parsed : DEFAULT_NATIVE_AGENT_BROWSER_TIMEOUT_MS,
-                                      "subagent",
-                                    );
-                                  })}
-                                >
-                                  <Select.Trigger class="justify-between">
-                                    <span class="truncate">{Math.round(getNativeAgentBrowserTimeoutMs("subagent") / 1000)} seconds</span>
-                                  </Select.Trigger>
-                                  <Select.Content>
-                                    {#each NATIVE_AGENT_BROWSER_TIMEOUT_OPTIONS as timeoutMsValue}
-                                      <Select.Item value={String(timeoutMsValue)}>
-                                        {Math.round(timeoutMsValue / 1000)} seconds
-                                      </Select.Item>
-                                    {/each}
-                                  </Select.Content>
-                                </Select.Root>
-                              </div>
-                            </div>
-
-                            <div class="batshit-settings-form-row">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Cloud Provider (Optional)</Label.Label>
-                                  <SettingsInfoMenu ariaLabel="About Subagent Agent Browser Cloud Provider">
-                                    Power-user option. <code>local</code> is the default. Cloud providers need credentials saved in API Keys.
-                                    {#if isAgentBrowserDockerSidecarRuntime()}
-                                      In Docker, Batshit passes those credentials to the Agent Browser sidecar.
-                                    {/if}
-                                  </SettingsInfoMenu>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control">
-                                <Select.Root
-                                  type="single"
-                                  value={getNativeAgentBrowserProvider("subagent") as unknown as string}
-                                  onValueChange={guardSubagentChoice((value) => {
-                                    const next = Array.isArray(value) ? value[0] : value;
-                                    const normalized = normalizeNativeAgentBrowserProvider(next) ?? "local";
-                                    updateNativeToolSetting("agentBrowserProvider", normalized, "subagent");
-                                  })}
-                                >
-                                  <Select.Trigger class="justify-between">
-                                    <span class="truncate">
-                                      {NATIVE_AGENT_BROWSER_PROVIDER_LABELS[getNativeAgentBrowserProvider("subagent")]}
-                                    </span>
-                                  </Select.Trigger>
-                                  <Select.Content>
-                                    {#each NATIVE_AGENT_BROWSER_PROVIDER_OPTIONS as option}
-                                      <Select.Item value={option}>
-                                        {NATIVE_AGENT_BROWSER_PROVIDER_LABELS[option]}
-                                      </Select.Item>
-                                    {/each}
-                                  </Select.Content>
-                                </Select.Root>
-                              </div>
-                            </div>
-
-                            {#if !isAgentBrowserDockerSidecarRuntime()}
-                            <div class="batshit-settings-form-row">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Browser Executable Path (Optional)</Label.Label>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control is-wide">
-                                <Input
-                                  placeholder="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-                                  value={getNativeAgentBrowserExecutablePath("subagent")}
-                                  oninput={(event) =>
-                                    updateNativeToolSetting(
-                                      "agentBrowserExecutablePath",
-                                      (event.target as HTMLInputElement).value.trim() || null,
-                                      "subagent",
-                                    )}
-                                />
-                              </div>
-                            </div>
-
-                            <div class="batshit-settings-form-row">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Default Session Name (Optional)</Label.Label>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control">
-                                <Input
-                                  placeholder="default"
-                                  value={getNativeAgentBrowserSession("subagent")}
-                                  oninput={(event) =>
-                                    updateNativeToolSetting(
-                                      "agentBrowserSession",
-                                      (event.target as HTMLInputElement).value.trim() || null,
-                                      "subagent",
-                                    )}
-                                />
-                              </div>
-                            </div>
-
-                            <div class="batshit-settings-form-row">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Default Profile Path (Optional)</Label.Label>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control is-wide">
-                                <Input
-                                  placeholder="~/.batshit/ab-profile"
-                                  value={getNativeAgentBrowserProfilePath("subagent")}
-                                  oninput={(event) =>
-                                    updateNativeToolSetting(
-                                      "agentBrowserProfilePath",
-                                      (event.target as HTMLInputElement).value.trim() || null,
-                                      "subagent",
-                                    )}
-                                />
-                              </div>
-                            </div>
-                            {/if}
-
-                            <div class="batshit-settings-form-row is-tall">
-                              <div class="batshit-settings-form-copy">
-                                <div class="batshit-settings-form-label-line">
-                                  <Label.Label class="batshit-settings-form-label">Extra CLI Flags (Advanced)</Label.Label>
-                                </div>
-                              </div>
-                              <div class="batshit-settings-form-control">
-                                <div class="flex items-start justify-between gap-3 batshit-settings-muted-panel">
-                                  <div class="min-w-0 flex-1 space-y-1">
-                                    <p class="batshit-settings-form-label">
-                                      {getMultilineEntryCountLabel(
-                                        getNativeAgentBrowserExtraFlagsText("subagent"),
-                                        "flag",
-                                        "flags",
-                                        "No extra flags saved",
-                                      )}
-                                    </p>
-                                    <p class="batshit-settings-code-caption line-clamp-3">
-                                      {getMultilinePreviewText(
-                                        getNativeAgentBrowserExtraFlagsText("subagent"),
-                                        "Open the editor to add extra Agent Browser CLI flags.",
-                                      )}
-                                    </p>
-                                  </div>
-                                  <Button
-                                    type="button"
-                                    variant="outline"
-                                    size="sm"
-                                    onclick={() => (subagentBrowserFlagsEditorOpen = true)}
-                                  >
-                                    <Pencil aria-hidden="true" />
-
-                                    Edit
-                                  </Button>
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                        </Collapsible.Content>
-                      {/if}
-                  </div>
-                </Collapsible.Root>
-                </div>
-
-            </SettingsAccordionCard>
-              {#if subagentForm.subagentType === "cli" && isClaudeCliSubagentProvider}
-                <SettingsAccordionCard
-                  name="subagent-access-cards"
-                  title="Claude Permissions & Boundaries"
-                  batshitIcon="access"
-                  class={hiddenUnlessSubagent("access")}
-                  contentClass="space-y-4"
-                  onfocusin={() => (subagentClaudeSaveScope = "permissions")}
-                  onpointerdown={() => (subagentClaudeSaveScope = "permissions")}
-                >
-                  {#snippet info()}
-                        <SettingsInfoMenu ariaLabel="About Subagent Claude Permissions">
-                          Controls how freely Claude can act when tools are enabled.
-                        </SettingsInfoMenu>
-                  {/snippet}
-                  {#snippet actions()}
-                      {#if subagentClaudeSaveScope === "permissions"}
-                        <SettingsSaveStatus
-                          state={subagentClaudeSaveError ? "error" : subagentClaudeSaveState}
-                          error={subagentClaudeSaveError}
-                          savingLabel="Saving Claude access settings..."
-                          savedLabel="Saved"
-                        />
-                      {/if}
-                  {/snippet}
-                    <div class="space-y-2">
-                      <div class="flex items-center gap-1.5">
-                        <Label.Root class="batshit-settings-form-label"
-                          >Permissions Mode</Label.Root
-                        >
-                        <SettingsInfoMenu ariaLabel="About Subagent Claude permissions mode">
-                          {#each CLAUDE_PERMISSION_OPTIONS as option}
-                            <span class="mt-1 block">
-                              <span class="batshit-settings-inline-strong">{option.label}</span>: {option.helper}
-                            </span>
-                          {/each}
-                        </SettingsInfoMenu>
-                      </div>
-                        <ToggleGroup.Root
-                          type="single"
-                          value={subagentClaudeForm.permissionMode}
-                          variant="outline"
-                          size="lg"
-                          class="batshit-settings-permission-toggle-group"
-                          aria-label="Subagent Claude permissions mode"
-                          onValueChange={guardSubagentChoice((value) => {
-                            const next = Array.isArray(value) ? value[0] : value;
-                            if (!next) return;
-                            setClaudePermissionMode(next as ClaudePermissionMode, "subagent");
-                          })}
-                        >
-                          {#each CLAUDE_PERMISSION_OPTIONS as option}
-                            <ToggleGroup.Item
-                              value={option.value}
-                              class={SETTINGS_PERMISSION_TOGGLE_ITEM_CLASS}
-                            >
-                              {@const OptionIcon = option.icon}
-                              <OptionIcon class="h-4 w-4 shrink-0" />
-                              <span class="batshit-settings-form-label truncate">{option.label}</span>
-                            </ToggleGroup.Item>
-                          {/each}
-                        </ToggleGroup.Root>
-                        {#if isDockerNativeRuntime()}
-                          <p class="batshit-settings-form-meta is-warning">
-                            Docker runs Claude Code as non-root batshit-cli so Bypass Permissions can
-                            work. If you see a root-runtime warning, rebuild the Docker app image and
-                            rerun the Claude login command shown above.
-                          </p>
-                        {/if}
-                      </div>
-
-                    <div class="batshit-settings-muted-panel batshit-settings-caption">
-                      CLI subagents never pause for approval. Anything outside the saved boundaries fails instead.
-                    </div>
-
-                    <Collapsible.Root bind:open={subagentClaudeConfigOverridesOpen}>
-                      <div class="batshit-settings-muted-panel">
-                        <Collapsible.Trigger class={SETTINGS_DISCLOSURE_TRIGGER_CLASS}>
-                          <span class="batshit-settings-form-label flex items-center gap-1.5">
-                            <span>Custom settings.json entries</span>
-                            <SettingsInfoMenu ariaLabel="About Subagent Custom settings.json entries">
-                              Add advanced Claude settings using JSON paths like <code>cleanupPeriodDays</code>,
-                              <code>env.FOO</code>, or <code>hooks.PreToolUse</code>. Batshit-managed keys stay protected,
-                              and manual JSON outside those managed paths is preserved on sync.
-                            </SettingsInfoMenu>
-                          </span>
-                          <ChevronDown
-                            class={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${subagentClaudeConfigOverridesOpen ? "rotate-180" : ""}`}
-                          />
-                        </Collapsible.Trigger>
-                        <Collapsible.Content class="space-y-3 pt-3">
-                          {#if subagentClaudeForm.configOverrides.length > 0}
-                            <div class="space-y-2">
-                              {#each subagentClaudeForm.configOverrides as row (row.id)}
-                                <div class="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
-                                  <Input
-                                    placeholder="JSON path"
-                                    value={row.key}
-                                    oninput={(event) =>
-                                      updateClaudeConfig(row.id, "key", (event.target as HTMLInputElement).value, "subagent")}
-                                  />
-                                  <Input
-                                    placeholder={"JSON value (30, true, [\"foo\"], {\"bar\":1})"}
-                                    value={row.value}
-                                    oninput={(event) =>
-                                      updateClaudeConfig(row.id, "value", (event.target as HTMLInputElement).value, "subagent")}
-                                  />
-                                  <Button type="button" variant="ghost" onclick={() => removeClaudeConfig(row.id, "subagent")}>
-                                    <Trash2 aria-hidden="true" />
-
-                                    Remove
-                                  </Button>
-                                </div>
-                              {/each}
-                            </div>
-                          {/if}
-                          <Button class="mt-2" variant="outline" size="sm" onclick={() => addClaudeConfig("subagent")}>
-                            <Plus aria-hidden="true" />
-
-                            Add config row
-                          </Button>
-                        </Collapsible.Content>
-                      </div>
-                    </Collapsible.Root>
-
-                    <div class="batshit-settings-muted-panel">
-                      <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                        <div class="flex items-center gap-1.5">
-                          <p class="batshit-settings-form-label">Managed settings.json</p>
-                          <DropdownMenu.Root>
-                            <DropdownMenu.Trigger
-                              class={SETTINGS_INFO_TRIGGER_CLASS}
-                              aria-label="About Subagent Managed settings.json"
-                            >
-                              <Info class="h-3.5 w-3.5" />
-                            </DropdownMenu.Trigger>
-                            <DropdownMenu.Content
-                              align="start"
-                              side="bottom"
-                              class={SETTINGS_INFO_CONTENT_CLASS}
-                            >
-                              View the exact Batshit-managed Claude settings file for this subagent.
-                            </DropdownMenu.Content>
-                          </DropdownMenu.Root>
-                        </div>
-                        <div class="flex flex-wrap gap-2">
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            onclick={() => openManagedConfigViewer("claude")}
-                          >
-                            <Eye aria-hidden="true" />
-
-                            View settings.json
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            onclick={() => copyManagedConfigPath("claude")}
-                          >
-                            <Copy aria-hidden="true" />
-
-                            Copy path
-                          </Button>
-                        </div>
-                      </div>
-                    </div>
-                </SettingsAccordionCard>
-              {/if}
-
-              {#if subagentForm.subagentType === "cli" && isCodexCliSubagentProvider}
-                <SettingsAccordionCard
-                  name="subagent-access-cards"
-                  title="Codex Permissions & Boundaries"
-                  batshitIcon="access"
-                  class={hiddenUnlessSubagent("access")}
-                  contentClass="space-y-5"
-                  onfocusin={() => (subagentCodexSaveScope = "permissions")}
-                  onpointerdown={() => (subagentCodexSaveScope = "permissions")}
-                >
-                  {#snippet info()}
-                        <SettingsInfoMenu ariaLabel="About Subagent Codex Permissions">
-                          Sandbox Level is saved with this Subagent. Choosing a mode sets its own level.
-                        </SettingsInfoMenu>
-                  {/snippet}
-                  {#snippet actions()}
-                      {#if subagentCodexSaveScope === "permissions"}
-                        <SettingsSaveStatus
-                          state={subagentCodexSaveError ? "error" : subagentCodexSaveState}
-                          error={subagentCodexSaveError}
-                          savingLabel="Saving Codex access settings..."
-                          savedLabel="Saved"
-                        />
-                      {/if}
-                  {/snippet}
-                    <div class="space-y-2">
-                      <div class="flex items-center gap-1.5">
-                        <Label.Root class="batshit-settings-form-label"
-                          >Permissions Mode</Label.Root
-                        >
-                        <SettingsInfoMenu ariaLabel="About Subagent Codex permissions mode">
-                          {#each CODEX_PERMISSION_OPTIONS as option}
-                            <span class="mt-1 block">
-                              <span class="batshit-settings-inline-strong">{option.label}</span>: {option.helper}
-                            </span>
-                          {/each}
-                        </SettingsInfoMenu>
-                      </div>
-                        <ToggleGroup.Root
-                          type="single"
-                          value={subagentCodexForm.permissionMode}
-                          variant="outline"
-                          size="lg"
-                          class="batshit-settings-permission-toggle-group"
-                          aria-label="Subagent Codex permissions mode"
-                          onValueChange={guardSubagentChoice((value) => {
-                            const next = Array.isArray(value) ? value[0] : value;
-                            if (!next) return;
-                            setCodexPermissionMode(next as CodexPermissionMode, "subagent");
-                          })}
-                        >
-                          {#each CODEX_PERMISSION_OPTIONS as option}
-                            <ToggleGroup.Item
-                              value={option.value}
-                              class={SETTINGS_PERMISSION_TOGGLE_ITEM_CLASS}
-                            >
-                              {@const OptionIcon = option.icon}
-                              <OptionIcon class="h-4 w-4 shrink-0" />
-                              <span class="batshit-settings-form-label truncate">{option.label}</span>
-                            </ToggleGroup.Item>
-                          {/each}
-                        </ToggleGroup.Root>
-                      </div>
-
-                      <div class="batshit-settings-form-stack">
-                        <div class="batshit-settings-form-row">
-                          <div class="batshit-settings-form-copy">
-                            <div class="batshit-settings-form-label-line">
-                              <Label.Root class="batshit-settings-form-label"
-                                >Sandbox Level</Label.Root
-                              >
-                            </div>
-                          </div>
-                          <div class="batshit-settings-form-control">
-                            <Select.Root
-                              type="single"
-                              value={subagentCodexForm.sandbox}
-                              disabled={subagentCodexForm.permissionMode === "agent_full"}
-                              onValueChange={guardSubagentChoice((value) =>
-                                updateCodexForm((current) => ({
-                                  ...current,
-                                  sandbox: (Array.isArray(value)
-                                    ? value[0]
-                                    : value) as CodexSandbox,
-                                }), "subagent"))}
-                            >
-                              <Select.Trigger>
-                                <span>
-                                  {CODEX_SANDBOX_OPTIONS.find((option) =>
-                                    option.value === subagentCodexForm.sandbox
-                                  )?.label ?? subagentCodexForm.sandbox}
-                                </span>
-                              </Select.Trigger>
-                              <Select.Content>
-                                {#each CODEX_SANDBOX_OPTIONS as option}
-                                  <Select.Item value={option.value}>{option.label}</Select.Item>
-                                {/each}
-                              </Select.Content>
-                            </Select.Root>
-                          </div>
-                        </div>
-                  {#if subagentCodexForm.permissionMode === "agent_full"}
-                    <div class="batshit-settings-note" data-testid="subagent-codex-full-sandbox-note">
-                      {#if subagentCodexForm.sandbox !== CODEX_PERMISSION_PRESETS.agent_full.sandbox}
-                        This Subagent keeps its saved {CODEX_SANDBOX_LABELS[subagentCodexForm.sandbox]} Sandbox Level.
-                      {/if}
-                      To limit the sandbox, pick Agent.
+                  {#if subagentInstructionsNotice}
+                    <div class="batshit-settings-note is-dashed" data-testid="subagent-instructions-notice" role="status">
+                      <p class="batshit-settings-caption">{subagentInstructionsNotice}</p>
+                      <Button type="button" variant="outline" size="sm" disabled={subagentCaptureBlocked} onclick={() => void useSavedInstructions('subagent')}>Use Saved Instructions</Button>
                     </div>
                   {/if}
-                      </div>
-
-                    <div class="batshit-settings-muted-panel batshit-settings-caption">
-                      CLI subagents never pause for approval. Anything outside the saved boundaries fails instead.
-                    </div>
-
-                    <Collapsible.Root bind:open={subagentCodexConfigOverridesOpen}>
-                      <div class="batshit-settings-muted-panel">
-                        <Collapsible.Trigger class={SETTINGS_DISCLOSURE_TRIGGER_CLASS}>
-                          <span class="batshit-settings-form-label flex items-center gap-1.5">
-                            <span>Custom config.toml entries</span>
-                            <SettingsInfoMenu ariaLabel="About Subagent Custom config.toml entries">
-                              Add advanced Codex config rows for settings Batshit does not manage directly,
-                              like <code>model_context_window</code>. Batshit-managed keys stay protected.
-                            </SettingsInfoMenu>
-                          </span>
-                          <ChevronDown
-                            class={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${subagentCodexConfigOverridesOpen ? "rotate-180" : ""}`}
-                          />
-                        </Collapsible.Trigger>
-                        <Collapsible.Content class="space-y-3 pt-3">
-                          {#if subagentCodexForm.configOverrides.length > 0}
-                            <div class="space-y-2">
-                              {#each subagentCodexForm.configOverrides as row (row.id)}
-                                <div class="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
-                                  <Input
-                                    placeholder="key"
-                                    value={row.key}
-                                    oninput={(event) =>
-                                      updateCodexConfig(row.id, "key", (event.target as HTMLInputElement).value, "subagent")}
-                                  />
-                                  <Input
-                                    placeholder="value"
-                                    value={row.value}
-                                    oninput={(event) =>
-                                      updateCodexConfig(row.id, "value", (event.target as HTMLInputElement).value, "subagent")}
-                                  />
-                                  <Button type="button" variant="ghost" onclick={() => removeCodexConfig(row.id, "subagent")}>
-                                    <Trash2 aria-hidden="true" />
-
-                                    Remove
-                                  </Button>
-                                </div>
-                              {/each}
-                            </div>
-                          {/if}
-                          <Button class="mt-2" variant="outline" size="sm" onclick={() => addCodexConfig("subagent")}>
-                            <Plus aria-hidden="true" />
-
-                            Add config row
-                          </Button>
-                        </Collapsible.Content>
-                      </div>
-                    </Collapsible.Root>
-
-                    <div class="batshit-settings-muted-panel">
-                      <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                        <div class="flex items-center gap-1.5">
-                          <p class="batshit-settings-form-label">Managed config.toml</p>
-                          <DropdownMenu.Root>
-                            <DropdownMenu.Trigger
-                              class={SETTINGS_INFO_TRIGGER_CLASS}
-                              aria-label="About Subagent Managed config.toml"
-                            >
-                              <Info class="h-3.5 w-3.5" />
-                            </DropdownMenu.Trigger>
-                            <DropdownMenu.Content
-                              align="start"
-                              side="bottom"
-                              class={SETTINGS_INFO_CONTENT_CLASS}
-                            >
-                              View the exact Batshit-managed Codex config file for this subagent.
-                            </DropdownMenu.Content>
-                          </DropdownMenu.Root>
-                        </div>
-                        <div class="flex flex-wrap gap-2">
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            onclick={() => openManagedConfigViewer("codex")}
-                          >
-                            <Eye aria-hidden="true" />
-
-                            View config.toml
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            onclick={() => copyManagedConfigPath("codex")}
-                          >
-                            <Copy aria-hidden="true" />
-
-                            Copy path
-                          </Button>
-                        </div>
-                      </div>
-                    </div>
-                </SettingsAccordionCard>
+                </div>
+          </SettingsAccordionCard>
               {/if}
-
-              {#if subagentForm.subagentType !== "cli"}
+              {#if !retiredSubagentDetails}
             <SettingsAccordionCard
               name="subagent-access-cards"
               title="Batshit Permissions & Boundaries"
@@ -16148,8 +11900,9 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
                     <div class="space-y-2 batshit-settings-muted-panel">
                       <div class="flex items-center gap-1.5">
                         <Label.Label class="batshit-settings-form-label">Always Block List</Label.Label>
-                        <SettingsInfoMenu ariaLabel="About Subagent Always Block List">
-                          Rules in this list are blocked for all modes, including Batshit Crazy.
+                        <SettingsInfoMenu ariaLabel="About Subagent Always Block List" contentClass="w-80">
+                          <p>Rules in this list are blocked for all modes, including Batshit Crazy.</p>
+                          <p class="mt-2">{TYPED_FILE_TOOLS_BLOCK_LIST_SENTENCE}</p>
                         </SettingsInfoMenu>
                       </div>
                       <div class="flex items-start justify-between gap-3 batshit-settings-muted-panel">
@@ -16236,6 +11989,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
             </SettingsAccordionCard>
               {/if}
 
+          {#if !retiredSubagentDetails}
           <SubagentAccessAssignmentsSection
             sectionClass={hiddenUnlessSubagent("access")}
             selectedSubagentId={selectedEditableSubagentId}
@@ -16253,18 +12007,20 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
             {getArtifactPlacementLabel}
             onSlashCommandToggle={toggleSlashCommandAccess}
             onArtifactToggle={toggleArtifactAccess}
+            onAccessRetry={() => void loadAccessResources(true)}
             onAccessSaveScopeChange={(scope) => {
               accessSaveScope = scope
             }}
           />
+          {/if}
 
           <AgentDeleteDisclosure
             bind:open={subagentDeleteOpen}
             sectionClass={hiddenUnlessSubagent("core")}
             title="Delete Subagent"
             paragraphs={[
-              subagentForm.subagentType === "n8n-subnode"
-                ? "This saved record uses the retired n8n Subnode Subagent type. Deleting it is the only supported action; n8n Workflow Subagents remain supported."
+              retiredSubagentDetails
+                ? "This saved record uses a Subagent type that Batshit removed. Deleting it is the only supported action; it also removes its managed CLI settings folder. Create a new Subagent to keep working."
                 : "Removes this Subagent, its avatar reference, and any assignments from every Primary Agent. Conversations remain in Redis.",
               "Primary Agents will immediately stop referencing it."
             ]}
@@ -16291,6 +12047,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   title="Agent Custom System Prompt"
   description="Agent-specific Custom System Prompt. This adds to the agent's compiled prompt stack."
   value={promptValue}
+  baseline={primaryInstructionsBaseline}
   placeholder="Custom system prompt for this agent"
   width="large"
   onSave={saveAgentPromptFromEditor}
@@ -16340,13 +12097,14 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
   title="Subagent Custom System Prompt"
   description="Subagent-specific Custom System Prompt. This adds to the subagent's compiled prompt stack."
   value={subagentForm.system_prompt}
+  baseline={subagentInstructionsBaseline}
   placeholder="Custom instructions for this Subagent"
   width="large"
-  onSave={async (value) =>
+  onSave={async (value, baseline) =>
     saveSubagentMultilineEditor("instructions", (current) => ({
       ...current,
       system_prompt: value,
-    }))}
+    }), baseline)}
 />
 
 <SettingsTextEditor
@@ -16474,8 +12232,7 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
               <div class="batshit-settings-form-label-line">
                 <Label.Label class="batshit-settings-form-label" for="create-slug">ID (Slug)</Label.Label>
                 <SettingsInfoMenu ariaLabel="About Create Agent Slug">
-                  Lowercase letters, numbers, and underscores only. Used in Redis keys,
-                  webhook payloads, and in n8n expressions.
+                  Lowercase letters, numbers, and underscores only. Used in Redis keys.
                 </SettingsInfoMenu>
               </div>
             </div>
@@ -16497,40 +12254,6 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
           </div>
 
           {#if createEntityForm.kind === "agent"}
-            <div class="batshit-settings-form-row">
-              <div class="batshit-settings-form-copy">
-                <Label.Label class="batshit-settings-form-label">Primary Agent Type</Label.Label>
-              </div>
-              <div class="batshit-settings-form-inline-actions">
-                <Button
-                  type="button"
-                  variant={createEntityForm.agentType === "api" ? "default" : "outline"}
-                  size="sm"
-                  onclick={() =>
-                    (createEntityForm = {
-                      ...createEntityForm,
-                      agentType: "api",
-                    })}
-                >
-                  <Brain aria-hidden="true" />
-                  API agent
-                </Button>
-                <Button
-                  type="button"
-                  variant={createEntityForm.agentType === "cli" ? "default" : "outline"}
-                  size="sm"
-                  onclick={() =>
-                    (createEntityForm = {
-                      ...createEntityForm,
-                      agentType: "cli",
-                    })}
-                >
-                  <TerminalSquare aria-hidden="true" />
-                  CLI agent
-                </Button>
-              </div>
-            </div>
-
             <div class="batshit-settings-toggle-row">
               <div class="min-w-0">
                 <div class="flex items-center gap-1.5">
@@ -16542,74 +12265,8 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
               </div>
               <Switch.Root bind:checked={createEntityForm.include_global_prompt} />
             </div>
-          {:else}
-            <div class="batshit-settings-form-row">
-              <div class="batshit-settings-form-copy">
-                <Label.Label class="batshit-settings-form-label">Subagent Type</Label.Label>
-              </div>
-              <div class="batshit-settings-form-inline-actions">
-                <Button
-                  type="button"
-                  variant={createEntityForm.subagentType === "n8n-workflow" ? "default" : "outline"}
-                  size="sm"
-                  onclick={() =>
-                    (createEntityForm = {
-                      ...createEntityForm,
-                      subagentType: "n8n-workflow",
-                    })}
-                >
-                  <Package aria-hidden="true" />
-                  n8n Workflow
-                </Button>
-                <Button
-                  type="button"
-                  variant={createEntityForm.subagentType === "api" ? "default" : "outline"}
-                  size="sm"
-                  onclick={() =>
-                    (createEntityForm = {
-                      ...createEntityForm,
-                      subagentType: "api",
-                    })}
-                >
-                  <Brain aria-hidden="true" />
-                  API
-                </Button>
-                <Button
-                  type="button"
-                  variant={createEntityForm.subagentType === "cli" ? "default" : "outline"}
-                  size="sm"
-                  onclick={() =>
-                    (createEntityForm = {
-                      ...createEntityForm,
-                      subagentType: "cli",
-                    })}
-                >
-                  <TerminalSquare aria-hidden="true" />
-                  CLI
-                </Button>
-              </div>
-            </div>
-
-            {#if isWorkflowBackedSubagentType(createEntityForm.subagentType)}
-              <div class="batshit-settings-form-row">
-                <div class="batshit-settings-form-copy">
-                  <div class="batshit-settings-form-label-line">
-                    <Label.Label class="batshit-settings-form-label" for="create-subagent-webhook">Production Webhook URL</Label.Label>
-                    <SettingsInfoMenu ariaLabel="About Create Subagent Webhook URL">
-                      Use the Production Webhook URL, not the Test Webhook URL.
-                    </SettingsInfoMenu>
-                  </div>
-                </div>
-                <div class="batshit-settings-form-control is-wide">
-                  <Input
-                    id="create-subagent-webhook"
-                    placeholder="http://localhost:5678/webhook/batshit_n8n_workflow_subagent"
-                    bind:value={createEntityForm.webhook_url}
-                  />
-                </div>
-              </div>
-            {/if}
           {/if}
+          <!-- SA-139 R6 (D16): one Subagent kind, so the create dialog has no type choice; a Subagent is created as `api`. -->
         </div>
 
         {#if createEntityError}
@@ -16640,53 +12297,5 @@ import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
         </Button>
       </Dialog.Footer>
     </form>
-  </Dialog.Content>
-</Dialog.Root>
-
-<Dialog.Root bind:open={managedConfigDialogOpen}>
-  <Dialog.Content class="sm:max-w-[960px] max-h-[85vh] flex flex-col">
-    <Dialog.Header>
-      <Dialog.Title>{getManagedConfigDialogTitle()}</Dialog.Title>
-      <Dialog.Description>
-        Read-only view of the exact managed config file Batshit is writing for this agent.
-      </Dialog.Description>
-    </Dialog.Header>
-
-    <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden">
-      <div class="flex flex-col gap-3 batshit-settings-muted-panel sm:flex-row sm:items-center sm:justify-between">
-        <div class="min-w-0 space-y-1">
-          <p class="batshit-settings-form-label">Path</p>
-          <p class="batshit-settings-code-caption truncate">
-            {managedConfigPath || "Loading managed config path…"}
-          </p>
-        </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled={!managedConfigPath}
-          onclick={() => copyId(managedConfigPath, `${managedConfigFileName} path`)}
-        >
-          <Copy aria-hidden="true" />
-
-          Copy path
-        </Button>
-      </div>
-
-      {#if managedConfigLoading}
-        <div class="batshit-settings-note is-dashed flex items-center gap-2">
-          <Loader2 class="h-4 w-4 animate-spin" />
-          Loading managed config…
-        </div>
-      {:else if managedConfigError}
-        <div class="batshit-settings-inline-alert is-danger">
-          {managedConfigError}
-        </div>
-      {:else}
-        <div class="min-h-0 flex-1 batshit-settings-table-frame">
-          <pre class="batshit-settings-code-block">{managedConfigContents}</pre>
-        </div>
-      {/if}
-    </div>
   </Dialog.Content>
 </Dialog.Root>

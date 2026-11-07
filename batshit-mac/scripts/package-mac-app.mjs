@@ -12,7 +12,7 @@ import { packager } from '@electron/packager';
 
 const macRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 // The Electron the package is built with; it must be the `electron` devDependency installed here.
-export const electronVersion = '43.7.10';
+export const electronVersion = '43.8.3';
 const entitlementsPath = join(macRoot, 'macos.entitlements');
 const localEntitlementsPath = join(macRoot, 'macos.local.entitlements');
 const childEntitlementsPath = join(macRoot, 'macos.child.entitlements');

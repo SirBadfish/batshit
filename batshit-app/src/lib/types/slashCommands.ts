@@ -1,4 +1,4 @@
-export type SlashCommandSource = 'batshit' | 'claude' | 'codex'
+export type SlashCommandSource = 'batshit'
 export type SlashCommandScope = 'global' | 'managed' | 'project'
 
 export interface SlashCommandDescriptor {

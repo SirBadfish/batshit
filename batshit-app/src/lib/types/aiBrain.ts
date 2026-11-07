@@ -30,13 +30,6 @@ export interface ThinkRequest {
   /** Model selection (e.g., 'claude-sonnet-4-5', 'gpt-5', 'gemini-2.5') */
   model: string
 
-  /** Available tools from n8n */
-  availableTools?: Array<{
-    name: string
-    description: string
-    schema: Record<string, any>
-  }>
-
   /** Image inputs - URLs or data URLs are safe when kept out of prompt text. */
   images?: Array<{
     url: string
@@ -86,6 +79,18 @@ export interface ThoughtResponse {
 
   /** Model that was actually used (after routing/fallback) */
   modelUsed: string
+
+  /**
+   * A delegated API run (`processNativeMode`) its Subagent's tool-step limit stopped while the
+   * model still wanted tools: the limit and the tool calls made. Absent when the run finished.
+   */
+  delegatedStepLimitReached?: { limit: number; toolCalls: number }
+
+  /**
+   * BL-2356: a delegated API run (`processNativeMode`) whose last model call stopped at its output
+   * limit (finish reason `length`), so its last words may be cut off. Absent when the run finished.
+   */
+  delegatedOutputLimitReached?: true
 
   /** Token usage statistics */
   usage?: {

@@ -2,13 +2,9 @@
 
 Welcome. These are the launch-facing user docs for Batshit.
 
-Batshit is an alpha self-hosted AI workspace for people who want `API` and `CLI` agents, tools, artifacts, voice, local AI (Ollama, LM Studio, oMLX, and more), and project-aware work in one place, with n8n workflows as tools when you want them. It's powerful, broad, and still early. These docs are written to save you setup time and to be honest when a feature needs careful configuration.
+Batshit is an alpha self-hosted AI workspace for AI agents on the models you choose, tools, artifacts, voice, Local AI and project-aware work, with n8n workflows as tools when you want them. These docs help you set it up and explain visible limitations.
 
-## Watch first
-
-[![Informal Alpha Release: Introduction to Batshit playlist card with the Batshit logo and six videos](/docs-images/batshit-youtube-intro-playlist.png)](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D)
-
-Start with the [intro playlist on YouTube](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D), then keep the [Batshit YouTube channel](https://www.youtube.com/@batshit-ai/) handy for walkthroughs and alpha updates.
+Start with the [Quick start](quick-start/overview.md), and see the [alpha.4 release notes](reference/release-notes.md) for current features and limits.
 
 ## Alpha expectations
 
@@ -34,34 +30,32 @@ Read [Bug reports and diagnostics](troubleshooting/bug-reports-and-diagnostics.m
 
 If you're installing Batshit for the first time:
 
-1. [Choose Mac app or Docker](installation/choose-mac-app-or-docker.md)
-2. Read either [Install Mac app](installation/install-mac-app.md) or [Install Docker](installation/install-docker.md), depending on the path you chose.
+1. [Choose how to install Batshit](installation/choose-mac-app-or-docker.md)
+2. Read [Install Mac app](installation/install-mac-app.md), [Install Docker](installation/install-docker.md), or [Install with Pinokio](installation/install-pinokio.md), depending on the path you chose.
 3. Continue with [First run](installation/first-run.md).
 4. Add [API keys and models](providers/api-keys-and-models.md).
-5. Connect [n8n](primary-agents/connect-n8n.md) when you want workflow tools or n8n Workflow Subagents.
+5. Connect [n8n](primary-agents/connect-n8n.md) when you want workflow tools.
 6. Read [Backup and restore](admin/backup-and-restore.md) before you depend on the instance.
 7. Read [Updating Batshit](installation/updating-batshit.md) before installing a newer alpha release.
 
 You don't need every feature on day one. A good first setup is:
 
-1. Pick Mac app or Docker.
+1. Pick the Mac app, Docker, or a supported Pinokio setup.
 2. Start Batshit.
 3. Create the first admin account.
-4. Use the first-time setup wizard: add one provider key, create one model preset, then create one `API` Primary Agent.
+4. Use the first-time setup wizard: add one provider key, create one model preset, then create one Primary Agent.
 5. Send a simple message.
 6. Add n8n after the basic chat path works.
 
-## Download, videos, and community
+## Download and community
 
 - [Download Batshit for Mac](https://github.com/SirBadfish/batshit/releases/latest)
 - [Install with Docker](installation/install-docker.md)
-- [Watch the informal alpha walkthrough playlist](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D)
+- [Install with Pinokio](installation/install-pinokio.md)
 - [Batshit on GitHub](https://github.com/SirBadfish/batshit)
 - [Batshit on X](https://x.com/batshit_ai)
 - [Batshit YouTube channel](https://www.youtube.com/@batshit-ai/)
 - [Join the Discord](https://discord.gg/8cgK2qaN2c)
-
-The alpha videos are informal and aimed at AI enthusiasts, builders, and people who have used tools like Codex before.
 
 ## Explore by subject
 
@@ -69,14 +63,14 @@ These docs are grouped by subject — everything about a feature lives in one pl
 
 **Core setup**
 
-- [Installation](installation/choose-mac-app-or-docker.md) — Mac app or Docker, first run, and the Docker runtime and add-ons.
-- [Updating Batshit](installation/updating-batshit.md) — backup first, then update the Mac app or Docker install.
+- [Installation](installation/choose-mac-app-or-docker.md) — Mac app, Docker or Pinokio, first run, and runtime setup.
+- [Updating Batshit](installation/updating-batshit.md) — backup first, then update your installation using its own update path.
 - [Providers](providers/api-keys-and-models.md) — API keys and model presets.
 - [Security & trust](security/overview.md) — what's safe, what isn't, and the habits that keep your instance yours.
 
 **Agents and orchestration**
 
-- [Primary Agents](primary-agents/overview.md) — the `API` and `CLI` agent types, plus [connecting n8n](primary-agents/connect-n8n.md) for workflow tools and Workflow Subagents.
+- [Primary Agents](primary-agents/overview.md) — one kind of agent on your chosen model, plus [n8n workflow tools](primary-agents/connect-n8n.md).
 - [Agent DMs and wake-ups](primary-agents/agent-dms-and-wake-ups.md) — agents writing to each other, and chats Batshit starts on its own.
 - [Subagents](subagents/overview.md) — specialist helpers a Primary Agent can call.
 - [Groups](groups/overview.md) — multi-agent group chat with a single-speaker queue.
@@ -101,7 +95,6 @@ These docs are grouped by subject — everything about a feature lives in one pl
 - [Judge Juice](judge-juice/overview.md) — optional cloud judgments from TypeSafe's Jev model, off by default, with every call shown in the Execution Viewer.
 - [Chat](chat/execution-viewer.md) — the chat workspace, including the Execution Viewer.
 - [Admin](admin/backup-and-restore.md) — backup and restore.
-- [Resources](resources/n8n-workflow-templates.md) — n8n workflow templates and downloads.
 
 A lot of these are genuinely new ideas — Zips, Clips, the Tool Grid, Group Chat's single-speaker queue, the Execution Viewer, Goons. If a concept is unfamiliar, that's expected; the page explains why it exists before how to use it.
 
@@ -129,12 +122,12 @@ For checking exact terms, ports, template locations, and configuration names:
 
 ## Core concepts at a glance
 
-Batshit has two Primary Agent types—peer choices, not quality tiers:
+Every Primary Agent runs in Batshit on the saved model you pick: an API key (the simplest first path), a Local AI runtime, your ChatGPT plan or your Claude plan.
 
-- **`API`** — Batshit talks directly to model providers (needs a provider key or Local AI runtime). The simplest first path.
-- **`CLI`** — Batshit runs a managed CLI agent like Codex or Claude Code (needs the CLI installed and logged in).
+n8n is the workflow automation and tool platform: your agents call n8n workflows as tools, and an n8n workflow can wake an agent.
 
-n8n is the workflow automation and tool platform: `API` and `CLI` agents call n8n workflows as tools or n8n Workflow Subagents.
+
+n8n is the workflow automation and tool platform: agents call n8n workflows as tools, and an n8n workflow can wake an agent.
 
 Subagents are specialist helpers a Primary Agent can call. Full detail in [Primary Agents](primary-agents/overview.md) and [Subagents](subagents/overview.md).
 
@@ -165,4 +158,4 @@ Neither path is magically safer. Docker gives clearer boundaries for the core ap
 
 These pages are the canonical public UserDocs source. The generated site at `docs.batshit.ai`, raw Markdown copies, LLM text bundles, and template downloads are all generated from this folder.
 
-The official n8n templates under `docs/user-docs/user-templates/batshit-official-n8n-workflow-templates/` are the current public-safe workflow templates. If a guide, template, or setup note isn't linked from this index or the [Templates](reference/templates.md) page, treat it as outside the public UserDocs set.
+The official n8n template under `docs/user-docs/user-templates/batshit-official-n8n-workflow-templates/` is the current public-safe workflow template. If a guide, template, or setup note isn't linked from this index or the [Templates](reference/templates.md) page, treat it as outside the public UserDocs set.

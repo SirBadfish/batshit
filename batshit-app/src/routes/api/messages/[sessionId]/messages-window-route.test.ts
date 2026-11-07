@@ -63,3 +63,28 @@ describe('GET /api/messages/[sessionId]', () => {
     expect(await load(full, 1)).toEqual(['m3'])
   })
 })
+
+describe('SA-137 (D7, R1): a paused reply\'s replay fields never reach a tab', () => {
+  it('the window has the reply without its replay fields; the stored record keeps them', async () => {
+    const sessionId = await chatWith(1)
+    const replay = { schema_version: 1, compileId: 'c1', copies: [{ zipId: 'z', status: 'refreshed', text: 'secret file text', parts: [], promptTokens: 3 }] }
+    await redis.saveMessage({
+      id: 'paused',
+      session_id: sessionId,
+      user_id: USER,
+      agent_id: 'agent-1',
+      role: 'assistant',
+      content: 'paused at a card',
+      metadata: { toolApprovals: { pending: true }, liveFileReadSnapshot: replay, whiteboardContextSnapshot: { dcmLines: ['board'] } }
+    } as any)
+    const url = new URL(`http://localhost/api/messages/${sessionId}`)
+    const response = await GET({ params: { sessionId }, url, locals: { user: { id: USER } } } as any)
+    const body = await response.text()
+    expect(body).toContain('paused at a card')
+    expect(body).not.toContain('secret file text')
+    expect(body).not.toContain('liveFileReadSnapshot')
+    expect(body).not.toContain('whiteboardContextSnapshot')
+    const stored = await redis.execute((client: any) => client.json.get(`message:${sessionId}:paused`))
+    expect(stored.metadata.liveFileReadSnapshot).toEqual(replay)
+  })
+})

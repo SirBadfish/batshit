@@ -1,3 +1,4 @@
+import { projectPluginCommand, pluginForCommand, refusePluginMemberWrite, AgentPluginError } from '$lib/server/services/agentPlugins'
 import { json, type RequestHandler } from '@sveltejs/kit'
 
 import { redis } from '$lib/server/redis'
@@ -16,7 +17,8 @@ import { parseIconRef, type IconRef } from '$lib/icons/iconTypes'
 import { normalizeOptionalIconRef } from '$lib/icons/iconLegacy'
 import type { SlashCommandRow } from '$lib/types/database'
 import { sanitizeId } from '$lib/utils/idSanitizer'
-import { writeSlashCommandRecord } from '$lib/server/services/agentAccessLists'
+import { parseAccessAgentIds, writeSlashCommandRecord } from '$lib/server/services/agentAccessLists'
+import { beginSlashCommandWrite, captureSlashCommandWriteBasis, isSlashCommandMutationError, COMMAND_ACCESS_FIELDS, deleteSlashCommandRecord } from '$lib/server/services/slashCommandRevision'
 
 function normalizeInvocation(value: string) {
   const trimmed = value.trim()
@@ -58,14 +60,6 @@ function sanitizeParameters(input: unknown): SlashCommandRow['parameters'] {
   }
 
   return result
-}
-
-function sanitizeAgentIds(input: unknown): string[] {
-  if (!Array.isArray(input)) return []
-  const normalized = input
-    .map((value) => sanitizeId(String(value ?? '').trim()))
-    .filter((value) => value.length > 0)
-  return Array.from(new Set(normalized))
 }
 
 function normalizeCommandType(input: unknown): SlashCommandRow['type'] | null {
@@ -212,6 +206,8 @@ export const GET: RequestHandler = async ({ params, locals }) => {
   }
 
   try {
+    const preparation = beginSlashCommandWrite(locals.user.id)
+    const basis = await captureSlashCommandWriteBasis(preparation, [params.id ?? ''])
     const key = `slash_command:${locals.user.id}:${params.id}`
     let command = (await redis.json.get(key)) as SlashCommandRow | null
 
@@ -219,7 +215,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
       return json({ error: 'Slash command not found' }, { status: 404 })
     }
 
-    if (command.type === 'skill' && command.skill_id) {
+    if (!(await pluginForCommand(locals.user.id, command)) && command.type === 'skill' && command.skill_id) {
       const skill = await getSkill(locals.user.id, command.skill_id).catch((error) => {
         console.warn('[slash-commands/:id GET] Failed to refresh skill metadata for command:', command?.id, error)
         return null
@@ -234,7 +230,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
           synchronized.updated_at = new Date().toISOString()
           // BL-544: a metadata refresh never changes who may use the skill. The per-agent list is
           // kept as stored at the write, not the copy read before the skill files were read.
-          const storedCommand = await writeSlashCommandRecord(key, synchronized, { keepAgentAccess: true })
+          const storedCommand = await writeSlashCommandRecord(key, synchronized, { keepAgentAccess: true, preserveAccess: COMMAND_ACCESS_FIELDS }, basis)
           if (!storedCommand) {
             return json({ error: 'Slash command not found' }, { status: 404 })
           }
@@ -243,8 +239,10 @@ export const GET: RequestHandler = async ({ params, locals }) => {
       }
     }
 
-    return json({ slashCommand: command })
+    return json({ slashCommand: await projectPluginCommand(locals.user.id, command) })
   } catch (error) {
+    if (error instanceof AgentPluginError) return json({ error: error.message, code: error.code }, { status: error.status })
+    if (isSlashCommandMutationError(error)) return json({ error: error.message, code: error.code }, { status: error.status })
     console.error('Error getting slash command:', error)
     return json({ error: 'Failed to get slash command' }, { status: 500 })
   }
@@ -257,14 +255,21 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
   }
 
   try {
+    const preparation = beginSlashCommandWrite(locals.user.id)
     const updates = (await request.json()) as Record<string, unknown>
+    const requestedAgentIds = updates.enabled_agent_ids === undefined ? undefined : parseAccessAgentIds(updates.enabled_agent_ids)
     const commandKey = `slash_command:${locals.user.id}:${params.id}`
 
+    const basis = await captureSlashCommandWriteBasis(preparation, [params.id ?? ''])
     const command = (await redis.json.get(commandKey)) as SlashCommandRow | null
 
     if (!command) {
       return json({ error: 'Slash command not found' }, { status: 404 })
     }
+    await refusePluginMemberWrite(locals.user.id, command)
+    if (typeof updates.skill_id === 'string') await refusePluginMemberWrite(locals.user.id, { id: command.id, skill_id: sanitizeId(updates.skill_id) })
+    const payloadSkill = updates.skill && typeof updates.skill === 'object' ? updates.skill as Record<string, unknown> : null
+    if (payloadSkill) await refusePluginMemberWrite(locals.user.id, { id: command.id, skill_id: normalizeSkillId(typeof payloadSkill.id === 'string' ? payloadSkill.id : command.skill_id, typeof payloadSkill.name === 'string' ? payloadSkill.name : command.name) })
     const now = new Date().toISOString()
 
     const requestedType = normalizeCommandType(updates.type)
@@ -301,6 +306,7 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     let nextHasReferences = command.has_references
     let nextHasAssets = command.has_assets
 
+    await refusePluginMemberWrite(locals.user.id, command)
     if (command.is_system) {
       const restrictedKeys = getRestrictedSystemUpdateKeys(command, updates)
       if (restrictedKeys.length > 0) {
@@ -528,10 +534,10 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     const nextName =
       typeof updates.name === 'string' && updates.name.trim() ? updates.name.trim() : command.name
     const enabledAgentIds =
-      updates.enabled_agent_ids !== undefined
-        ? sanitizeAgentIds(updates.enabled_agent_ids)
+      requestedAgentIds !== undefined
+        ? requestedAgentIds
         : Array.isArray(command.enabled_agent_ids)
-          ? sanitizeAgentIds(command.enabled_agent_ids)
+          ? command.enabled_agent_ids
           : []
     const enabledForAllAgents =
       updates.enabled_for_all_agents !== undefined
@@ -624,8 +630,9 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     // as stored at the moment of the write: Settings > Agents > Access may have turned an agent
     // on or off after this record was read (the skill files were written in between).
     const storedCommand = await writeSlashCommandRecord(commandKey, updatedCommand, {
-      keepAgentAccess: updates.enabled_agent_ids === undefined
-    })
+      keepAgentAccess: updates.enabled_agent_ids === undefined,
+      preserveAccess: COMMAND_ACCESS_FIELDS.filter(field => updates[field] === undefined)
+    }, basis)
     if (!storedCommand) {
       return json(
         { error: 'Slash command not found: it was deleted while this change was saved.' },
@@ -639,6 +646,8 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 
     return json({ slashCommand: storedCommand })
   } catch (error) {
+    if (error instanceof AgentPluginError) return json({ error: error.message, code: error.code }, { status: error.status })
+    if (isSlashCommandMutationError(error)) return json({ error: error.message, code: error.code }, { status: error.status })
     // BL-369: a user skill whose files are missing is named, never a generic 500.
     if (isSkillFilesMissingError(error)) {
       return json({ error: error.message, code: error.code }, { status: 409 })
@@ -658,18 +667,21 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
   }
 
   try {
+    const preparation = beginSlashCommandWrite(locals.user.id)
     const commandKey = `slash_command:${locals.user.id}:${params.id}`
+    const basis = await captureSlashCommandWriteBasis(preparation, [params.id ?? ''])
     const command = (await redis.json.get(commandKey)) as SlashCommandRow | null
 
     if (!command) {
       return json({ error: 'Slash command not found' }, { status: 404 })
     }
 
+    await refusePluginMemberWrite(locals.user.id, command)
     if (command.is_system) {
       return json({ error: 'Cannot delete system commands' }, { status: 403 })
     }
 
-    await redis.del(commandKey)
+    await deleteSlashCommandRecord(locals.user.id, params.id ?? '', basis)
 
     if (command.skill_id) {
       await deleteSkillIfOrphaned(locals.user.id, command.skill_id, command.id)
@@ -677,6 +689,8 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 
     return json({ success: true })
   } catch (error) {
+    if (error instanceof AgentPluginError) return json({ error: error.message, code: error.code }, { status: error.status })
+    if (isSlashCommandMutationError(error)) return json({ error: error.message, code: error.code }, { status: error.status })
     console.error('Error deleting slash command:', error)
     return json({ error: 'Failed to delete slash command' }, { status: 500 })
   }

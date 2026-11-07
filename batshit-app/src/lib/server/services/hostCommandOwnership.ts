@@ -1,11 +1,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash, randomUUID } from 'node:crypto'
-import { realpathSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { HostCommandRecordStore, type HostCommandRecord } from './hostCommandRecords'
+import { HostCommandRecordStore, type HostCommandRecord, type HostOriginalRequestRecord } from './hostCommandRecords'
 import { readHostBootIdentity, readHostProcessTable, type HostProcessIdentity } from './hostProcessIdentity'
-import { assertManagedCodexProfileId, MANAGED_CODEX_ROOT_DIR } from './codexManagedHome'
+import { getManagedAgentRootDir } from './batshitHome'
+import { managedProfileResource } from './managedProfileResource'
 
 export type HostCommandOwner = { userId: string; kind: 'agent' | 'subagent' | 'host'; id: string }
 export type HostCommandPin = {
@@ -43,20 +43,9 @@ export function hostOwnerResource(owner: HostCommandOwner): string {
   if (!owner.userId || !owner.id || !['agent', 'subagent', 'host'].includes(owner.kind)) throw new Error('Command ownership needs a server-vouched owner.')
   return JSON.stringify(['owner', owner.userId, owner.kind, owner.id])
 }
-export function hostProfileResource(profileId: string, root = MANAGED_CODEX_ROOT_DIR): string {
-  // Different runtime roots are different physical profiles; aliases of an existing root
-  // must still share one gate. Resolve the nearest existing ancestor for first-run folders.
-  let ancestor = path.resolve(root)
-  const tail: string[] = []
-  for (;;) {
-    try { ancestor = realpathSync.native(ancestor); break }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || path.dirname(ancestor) === ancestor) throw error
-      tail.unshift(path.basename(ancestor))
-      ancestor = path.dirname(ancestor)
-    }
-  }
-  return JSON.stringify(['profile', path.join(ancestor, ...tail, assertManagedCodexProfileId(profileId))])
+const MANAGED_AGENT_ROOT_DIR = getManagedAgentRootDir()
+export function hostProfileResource(profileId: string, root = MANAGED_AGENT_ROOT_DIR): string {
+  return managedProfileResource(profileId, root)
 }
 
 /** Pin before asynchronous profile/setup work. Deletion changes the generation permanently. */
@@ -95,7 +84,7 @@ export class HostCommandLease {
 
 /** Commit before spawn; an empty prepared record is unknown after a crash, never proof of exit. */
 export async function prepareHostCommand(pin: HostCommandPin, input: {
-  kind: 'codex' | 'guardian'
+  kind: 'guardian'
   program: string
   sessionId?: string | null
   messageId?: string | null
@@ -127,7 +116,9 @@ async function reconcileRecords(store: HostCommandRecordStore, resources: string
   const notices: string[] = []
   const boot = await readHostBootIdentity()
   let table: Awaited<ReturnType<typeof readHostProcessTable>> | undefined
+  const leftoverRequests: HostOriginalRequestRecord[] = []
   for (const record of store.records(resources)) {
+    if (record.kind === 'p5-original-request') { leftoverRequests.push(record); continue }
     const live = runtime().live.get(record.runId)
     if (record.instanceId === runtime().instanceId && live && cleanupOwners.has(hostOwnerResource(record.owner))) {
       await live()
@@ -154,23 +145,27 @@ async function reconcileRecords(store: HostCommandRecordStore, resources: string
         throw new HostCommandDeleteRefusedError('The old command group is not verified empty. Batshit will not signal a saved process number. Restart the computer and retry deletion.')
       }
     } else {
-      // The host notice exists even when this run had no chat/reply, or its reply was deleted.
-      // Publish and persist before forgetting the process evidence. A removed reply is not
-      // recreated, and a failed write leaves the run record for a later retry.
+      // A `codex` run left by the retired Codex CLI lane. The host notice exists even when this
+      // run had no chat/reply, or its reply was deleted. Persist it before forgetting the process
+      // evidence; a failed write leaves the run record for a later retry.
       store.saveRecoveryNotice(record, recoveryNotice)
-      if (record.sessionId && record.messageId) {
-        const { recordRecoveredCodexCleanupWarning } = await import('./codexCleanupWarnings')
-        await recordRecoveredCodexCleanupWarning({ userId: record.owner.userId, sessionId: record.sessionId, messageId: record.messageId })
-      }
       notices.push(recoveryNotice)
     }
     store.complete(record)
+  }
+  // A `p5-original-request` receipt was written only by the retired Codex-parent MCP request
+  // owner, whose custody lived in the memory of the app process that wrote it. Its recorded
+  // child runs were reconciled above by their own process evidence; the receipt is retired
+  // only once none of them remains. Nothing it recorded is repeated or reported as saved.
+  for (const record of leftoverRequests) {
+    store.retireOriginalRequest(record)
+    console.warn('[Command ownership] Retired a leftover Codex MCP request receipt:', record.runId)
   }
   return [...new Set(notices)]
 }
 
 // A route's owner guard and its nested physical-profile guards share the same lifetime.
-// Profile deletes can run concurrently (Codex and Claude); one promise acquires that lease.
+// Nested profile deletes can run concurrently; one promise acquires that lease.
 type DeleteContext = {
   leases: Map<string, Promise<{ store: HostCommandRecordStore; lease: ReturnType<HostCommandRecordStore['beginDelete']> }>>
   notices: string[]

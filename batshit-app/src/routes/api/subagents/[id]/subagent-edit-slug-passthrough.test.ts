@@ -7,23 +7,10 @@ import { redis } from '$lib/server/redis'
  * the existing record and keeps only `id`, `user_id`, and `created_at` as they were. A hand-made
  * request with a `slug` field (the panel sends none) changed the stored slug, and
  * `resolveSubagentSlug` reads `slug` ahead of `id`/`displayName`, so the edit renamed the
- * Subagent's managed CLI profile folder. Fix: `slug` is kept like `id`.
+ * Subagent's managed CLI profile folder. Fix: `slug` is kept like `id`. SA-139 R5: an edit is of
+ * an API Subagent (a leftover CLI one is delete-only); the slug still names its chat threads
+ * (BL-391).
  */
-
-const syncManagedCliSubagentProfile = vi.hoisted(() => vi.fn())
-vi.mock('$lib/server/services/cliSubagentProfileSync', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('$lib/server/services/cliSubagentProfileSync')>()
-  return { ...actual, syncManagedCliSubagentProfile }
-})
-vi.mock('$lib/server/services/codexProfileManager', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('$lib/server/services/codexProfileManager')>()
-  return { ...actual, syncAgentCodexProfiles: vi.fn(async () => {}) }
-})
-vi.mock('$lib/server/services/claudeProfileManager', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('$lib/server/services/claudeProfileManager')>()
-  return { ...actual, syncAgentClaudeProfiles: vi.fn(async () => {}) }
-})
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({ runTrackedN8nCompatibilitySync: vi.fn() }))
 
 useRedisTestServer()
 
@@ -37,9 +24,9 @@ async function seedSubagent() {
     user_id: USER,
     displayName: 'zcsubag slug route',
     slug: 'zcsubag_slug_original',
-    subagentType: 'cli',
-    primary_model_provider: 'openai-codex',
-    primary_model_name: 'codex-cli',
+    subagentType: 'api',
+    primary_model_provider: 'openai',
+    primary_model_name: 'gpt-5.5',
     created_at: '2026-09-28T00:00:00.000Z',
     updated_at: '2026-09-28T00:00:00.000Z'
   })
@@ -70,8 +57,6 @@ beforeEach(() => {
       throw new Error(`unexpected batshit-server call ${method} ${url}`)
     })
   )
-  syncManagedCliSubagentProfile.mockReset()
-  syncManagedCliSubagentProfile.mockImplementation(async () => ({ runtime: 'codex', profileId: 'p', written: true }))
 })
 
 afterEach(async () => {

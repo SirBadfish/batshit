@@ -32,6 +32,7 @@ import {
   deleteSessionAfterItsTurn,
   isStoppedForSessionDelete
 } from '$lib/server/services/sessionDeleteTurnStop'
+import { listClaudePlanRuns, registerClaudePlanRun, resetClaudePlanRunRegistryForTests } from '$lib/server/services/claudePlanRunRegistry'
 
 // Watched, never run: the delete leaves the chat's sandboxes to the reply's own run-end sweep.
 const sandboxRemoval = vi.hoisted(() => vi.fn(async (_sessionId: string) => [] as string[]))
@@ -430,5 +431,66 @@ describe('deleteSessionAfterItsTurn', () => {
 
     await expect(deleteSessionAfterItsTurn(SESSION, failing)).rejects.toThrow('redis down')
     expect(isSessionDeleting(SESSION)).toBe(false)
+  })
+})
+
+/** A Claude plan run as the registry sees it: `stop` ends it and its settlement follows. */
+function claudePlanRun(sessionId: string, order: string[], settlement: 'exited' | 'unknown' = 'exited') {
+  let settle!: (value: 'exited' | 'unknown') => void
+  const run = {
+    owner: { userId: 'user-1', sessionId, agentId: 'agent-1', kind: 'primary' as const },
+    settled: new Promise<'exited' | 'unknown'>(resolve => { settle = resolve }),
+    exited: new Promise<void>(() => {}),
+    isEnded: false,
+    stopReason: null as unknown,
+    stop(reason: unknown) {
+      run.stopReason = reason
+      run.isEnded = true
+      order.push(`stopped ${sessionId}`)
+      settle(settlement)
+    }
+  }
+  registerClaudePlanRun(run as any)
+  return run
+}
+
+describe('SA-139 (D10): a deleted chat\'s Claude plan runs', () => {
+  beforeEach(() => resetClaudePlanRunRegistryForTests())
+  afterEach(() => resetClaudePlanRunRegistryForTests())
+
+  it('end and settle before the sweep; another chat\'s run is left alone', async () => {
+    const order: string[] = []
+    const mine = claudePlanRun(SESSION, order)
+    const other = claudePlanRun('another-chat', order)
+    await expect(deleteSessionAfterItsTurn(SESSION, async () => { order.push('sweep') })).resolves.toEqual({ kind: 'no_turn' })
+    expect(order).toEqual([`stopped ${SESSION}`, 'sweep'])
+    expect(String((mine.stopReason as Error).message)).toBe('This chat was deleted.')
+    expect(other.isEnded).toBe(false)
+  })
+
+  it('end after a stopped reply lets go, before the sweep', async () => {
+    vi.useFakeTimers()
+    const { turn } = streamingReply()
+    const { record } = startDelete()
+    claudePlanRun(SESSION, record.order)
+    await vi.advanceTimersByTimeAsync(0)
+    clearStreamAbort(SESSION, 'msg_reply')
+    record.order.push('released')
+    releaseSessionTurn(SESSION, turn.turnId)
+    await vi.advanceTimersByTimeAsync(150)
+    expect(record.order).toEqual(['released', `stopped ${SESSION}`, 'sweep'])
+    expect(record.outcome).toMatchObject({ kind: 'stopped' })
+  })
+
+  it('keep the chat (409) while a Claude Code exit cannot be confirmed, and nothing is swept', async () => {
+    const order: string[] = []
+    claudePlanRun(SESSION, order, 'unknown')
+    const sweep = vi.fn(async () => undefined)
+    await expect(deleteSessionAfterItsTurn(SESSION, sweep)).rejects.toMatchObject({ code: 'session_turn_still_stopping', status: 409 })
+    expect(sweep).not.toHaveBeenCalled()
+    expect(isSessionDeleting(SESSION)).toBe(false)
+    // A retry still refuses while that exit stays unconfirmed.
+    await expect(deleteSessionAfterItsTurn(SESSION, sweep)).rejects.toBeInstanceOf(SessionDeleteRefusedError)
+    expect(listClaudePlanRuns({ sessionId: SESSION })).toHaveLength(1)
   })
 })

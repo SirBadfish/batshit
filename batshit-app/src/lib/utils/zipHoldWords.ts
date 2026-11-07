@@ -7,7 +7,7 @@
  *
  * - the one steady line an expanded, held file read carries in the prompt (never a countdown,
  *   because a line that changed on every send would re-bill the prompt cache from there);
- * - the `Current Zip State` line of the DCM, which is cache-free and may carry the live count;
+ * - the Zip Holds line of the Zip Index, which is rewritten every turn and may carry the live count;
  * - the badge and Zip Manager words for the user.
  *
  * The automatic "recovery hold" (a run that died mid-task keeps its results open) is a different
@@ -19,6 +19,7 @@ import { DEAD_COPY_REASON_TEXT, describeHeldPath, type DeadCopyReason } from './
 import { TOOL_RESULT_SIZE_REASON_TEXT, type ToolResultSizeGuard } from './toolResultSizeGuard'
 
 /** An expanded read the agent that is being compiled for holds. */
+export const SKILL_OPEN_HINT = 'Skill open. Close it when its task is done.'
 export const HELD_BY_YOU_HINT = 'Held by you: stays open until you release it.'
 /** An expanded read the user holds until they release it. */
 export const HELD_BY_USER_HINT = 'Held by the user: stays open until they release it.'
@@ -43,14 +44,15 @@ export function isAgentHold(item: Pick<UnzippedItem, 'source' | 'path'> | null |
 
 /**
  * The line an expanded `read_file` or `skill_read` transcript carries while someone holds it
- * (DL-03), or null when the record is not a hold: a Judge Juice open (the DCM tells the agent) or
- * a parked zip-control unzip.
+ * (DL-03), or null when the record is not a hold: a Judge Juice open (the Zip Index lists it) or
+ * an unzip left by the retired agent zip control.
  */
 export function describeHeldReadHint(
   item: UnzippedItem | null | undefined,
   compilingAgentId: string | null
 ): string | null {
   if (!item) return null
+  if (item.skillSession?.automatic) return SKILL_OPEN_HINT
   if (isAgentHold(item)) {
     return item.agentId && compilingAgentId && item.agentId === compilingAgentId
       ? HELD_BY_YOU_HINT
@@ -64,7 +66,8 @@ export function describeHeldReadHint(
 }
 
 /**
- * One `Current Zip State` line of the DCM. The DCM is the cache-free tail of the prompt, so it
+ * One Zip Holds line of the Zip Index (decision 5, 2026-10-23; the DCM's `Current Zip State` until
+ * then). The Zip Index is in the prompt's tail, rewritten every turn like the DCM, so it
  * may carry the live count of a "Hold for N messages" and whether a held copy was compressed as a
  * dead copy (an agent's hold stays on a copy it edited since, until its next whole read).
  */
@@ -81,6 +84,9 @@ function describeStoredUnzippedItemForDcm(
   options: { agentId: string | null; deadCopy?: DeadCopyReason | null }
 ): string {
   const label = item.name || item.description || 'zip'
+  if (item.skillSession?.automatic) {
+    return `- ${describeHeldPath(item.path || item.skillSession.skillId)} | ${item.zipId} | skill open | until the skill closes${options.deadCopy ? ` | compressed (${DEAD_COPY_REASON_TEXT[options.deadCopy]})` : ''}`
+  }
   if (isAgentHold(item)) {
     const path = describeHeldPath(item.path as string)
     const mine = Boolean(item.agentId && options.agentId && item.agentId === options.agentId)
@@ -114,10 +120,11 @@ function describeStoredUnzippedItemForDcm(
  * "Held by <agent name>". Null when the record is not a hold.
  */
 export function describeHoldForUser(
-  item: Pick<UnzippedItem, 'source' | 'path' | 'permanent' | 'duration' | 'messageCount' | 'agentId'> | null | undefined,
+  item: Pick<UnzippedItem, 'source' | 'path' | 'permanent' | 'duration' | 'messageCount' | 'agentId' | 'skillSession'> | null | undefined,
   agentName: string | null | undefined
 ): string | null {
   if (!item) return null
+  if (item.skillSession?.automatic) return `Skill open for ${agentName?.trim() || 'the agent'}`
   if (isAgentHold(item)) return `Held by ${agentName?.trim() || 'the agent'}`
   if (!isUserHold(item)) return null
   if (!item.permanent && typeof item.duration === 'number') {

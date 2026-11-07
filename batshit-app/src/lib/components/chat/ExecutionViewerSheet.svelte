@@ -19,6 +19,7 @@
   import { getUserSettings } from '$lib/stores/userSettings.svelte'
   import { approximateTokenCount } from '$lib/utils/tokenCounter'
   import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+  import { CLAUDE_PLAN_LABEL, isClaudePlanConnection } from '$lib/utils/claudePlanConnection'
   import {
     truncateExecutionViewerBase64,
     truncateExecutionViewerBase64InValue
@@ -28,6 +29,7 @@
     type ExecutionToolActivityEntry,
   } from './executionViewerToolActivity'
   import { formatBatshitToolTargetDisplayName } from '$lib/utils/toolNameFormatter'
+  import type { DelegatedRunStatus } from '$lib/types/delegation'
   import type {
     ExecutionAvailabilityLevel,
     ExecutionFieldAvailability,
@@ -761,6 +763,11 @@
     return typeof value === 'string' && value.trim().length > 0 ? value : unavailableText
   }
 
+  /** SA-139 (D12): a Claude plan run (provider or connection, any spelling) reads as the plan, never as a paid Anthropic provider. */
+  function formatProviderValue(value: string | null | undefined, unavailableText: string, connectionId?: string | null): string {
+    return isClaudePlanConnection(value) || isClaudePlanConnection(connectionId) ? CLAUDE_PLAN_LABEL : formatOptionalValue(value, unavailableText)
+  }
+
   function formatRuntimeCapability(
     value: boolean | undefined,
     unavailableText: string
@@ -873,13 +880,15 @@
     return null
   }
 
-  function delegatedStatusLabel(status: 'completed' | 'failed' | 'timed_out'): string {
+  function delegatedStatusLabel(status: DelegatedRunStatus): string {
     if (status === 'timed_out') return 'Timed out'
+    // A step limit or an output limit (BL-2356) stopped it; the result's own note says which.
+    if (status === 'partial') return 'Partial'
     if (status === 'failed') return 'Failed'
     return 'Completed'
   }
 
-  function delegatedStatusClasses(status: 'completed' | 'failed' | 'timed_out'): string {
+  function delegatedStatusClasses(status: DelegatedRunStatus): string {
     return status === 'completed'
       ? 'execution-viewer-tool-status-success'
       : 'execution-viewer-tool-status-error'
@@ -913,11 +922,14 @@
 	    if ((runtime.runtimeId as string) === 'n8n') {
 	      return 'n8n Workflow (retired)'
 	    }
+	    // SA-139 R1: Codex CLI was removed. Only snapshots recorded before then carry `codex`.
 	    if (runtime.runtimeId === 'codex') {
-	      return 'Codex CLI (GPT Plus/Pro)'
+	      return 'Codex CLI (removed)'
 	    }
+	    // SA-139 R5: the Claude Code CLI Subagent was removed. Only snapshots recorded before then
+	    // carry `claude` (a Claude plan run is an API run).
 	    if (runtime.runtimeId === 'claude') {
-	      return 'Claude Code CLI (Pro/Max)'
+	      return 'Claude Code CLI (removed)'
 	    }
     return 'Vercel AI SDK'
   }
@@ -1321,7 +1333,7 @@
                   <div class="execution-viewer-stack-xs">
                     <div class="execution-viewer-eyebrow">Provider</div>
                     <div class="execution-viewer-text-sm">
-                      {formatOptionalValue(runtimeDetails.providerId, 'Provider was not recorded.')}
+                      {formatProviderValue(runtimeDetails.providerId, 'Provider was not recorded.', runtimeDetails.connectionId)}
                       {#if runtimeDetails.connectionId}
                         <span class="execution-viewer-muted"> · {runtimeDetails.connectionId}</span>
                       {/if}
@@ -1456,7 +1468,7 @@
                   {/if}
                 </div>
                 <span class="execution-viewer-helper">
-                  Exact for API agents (Vercel). Best-effort for CLI agents.
+                  Exact for API connections. Claude plan: best effort.
                 </span>
               </div>
               <div class="execution-viewer-inline-row">
@@ -1928,7 +1940,7 @@
                           </td>
                           <td class="execution-viewer-table-cell">
                             <div class="execution-viewer-value">{run.model ?? 'Unknown'}</div>
-                            <div class="execution-viewer-helper">{run.provider ?? 'Unknown provider'}</div>
+                            <div class="execution-viewer-helper">{formatProviderValue(run.provider, 'Unknown provider')}</div>
                           </td>
                           <td class="execution-viewer-table-cell">
                             {formatTokenValue(delegatedTokenTotal(run.observedUsage != null || run.observedUsageUnavailable != null ? null : run.usage))}

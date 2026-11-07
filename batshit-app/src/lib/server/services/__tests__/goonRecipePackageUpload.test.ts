@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   createTrustedRecipeArchiveReceipt,
+  inspectStoredRecipeArchive,
   uploadConstructedRecipePackage
 } from '../goonRecipePackageUpload.server'
 
@@ -81,6 +82,21 @@ describe('server-owned Recipe package upload', () => {
       manifest: result.archiveReceipt.members.find((member) => member.role === 'manifest')?.extracted
     })
     expect(result.live.model.ref).toBe('/uploads/goon_custom_models/avatar.glb')
+  })
+
+  it('uses the authenticated file owner for inspection and rejects malformed measurements', async () => {
+    const measured = { contract: 'recipe-archive-inspection/v1',
+      archive: { sha256: sha('a'), bytes: 300 },
+      members: [{ role: 'manifest', sha256: sha('b'), bytes: 40 },
+        { role: 'model', sha256: sha('c'), bytes: 200 }] }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json(measured))
+    await expect(inspectStoredRecipeArchive('current.bgoon')).resolves.toEqual(measured)
+    expect(fetchMock).toHaveBeenCalledWith('http://batshit-server.test/api/upload/goon-custom-package/inspect',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ filename: 'current.bgoon' }),
+        headers: { 'x-batshit-service-token': 'service-token', 'Content-Type': 'application/json' } }))
+    await expect(inspectStoredRecipeArchive('../escape.bgoon')).rejects.toThrow('filename is invalid')
+    fetchMock.mockResolvedValue(Response.json({ ...measured, members: [measured.members[0], measured.members[0]] }))
+    await expect(inspectStoredRecipeArchive('current.bgoon')).rejects.toThrow('members are malformed')
   })
 
   it('fails closed without internal service authentication', async () => {

@@ -1,5 +1,5 @@
 import { render, waitFor } from '@testing-library/svelte'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { jsonResponse } from '$lib/test-utils/userSettingsRoute'
 
 /**
@@ -21,6 +21,11 @@ vi.mock('$lib/services/userChannel', async (original) => ({
 const AGENT = 'a1y_memory_agent'
 let record: Record<string, unknown>
 let agentReads: string[] = []
+let Panel: typeof import('./MemorySettingsPanel.svelte').default
+
+beforeAll(async () => {
+  Panel = (await import('./MemorySettingsPanel.svelte')).default
+}, 60_000)
 
 function ensureBrowserStubs() {
   if (typeof globalThis.ResizeObserver === 'undefined') {
@@ -79,7 +84,7 @@ function pickerName() {
 
 describe('the Memory panel and an agent saving its own Settings (SA-122 A-1y)', () => {
   it('reads a listed agent again and shows its new name; an agent it does not list is not read', async () => {
-    const { unmount } = render((await import('./MemorySettingsPanel.svelte')).default)
+    const { unmount } = render(Panel)
     await waitFor(() => expect(pickerName()).toBe('Memory probe'), { timeout: 10_000 })
 
     record = { ...record, displayName: 'Memory probe 2' }

@@ -20,7 +20,7 @@ import { hairImportCandidateIds } from './hairImportCandidateIdentity'
 import { sameHairCleanupFile, isHairCleanupFile, type HairCleanupContext } from './hairCleanupContext'
 import { parseHairAsset, parseHairRefitSource } from '$lib/goons/hairAssets'
 import { hairCleanupContextForTransport } from './hairCleanupTransport.server'
-import { clipHairUploadReferences, readClipReferenceRecord } from './clipHairReferences'
+import { clipClothingUploadReferences, clipHairUploadReferences, readClipReferenceRecord } from './clipHairReferences'
 
 export const GOON_UPLOAD_TYPES = [
   'goons',
@@ -98,6 +98,8 @@ export type GoonAssetCleanupResult = {
 }
 
 type RedisClientLike = {
+  type?(key: string): Promise<string>
+  get?(key: string): Promise<string | null>
   keys(pattern: string): Promise<string[]>
   sMembers(key: string): Promise<string[]>
   del(keys: string | string[]): Promise<number>
@@ -105,6 +107,21 @@ type RedisClientLike = {
     get(key: string, options?: unknown): Promise<unknown>
   }
 }
+
+async function readLegacyClosetUploadForAudit(client: RedisClientLike, key: string) {
+  let value: unknown
+  if (client.type && await client.type(key) === 'string') {
+    if (!client.get) throw new Error(`Legacy Closet upload ${key} cannot be read safely.`)
+    const raw = await client.get(key)
+    if (raw === null) throw new Error(`Legacy Closet upload ${key} disappeared during audit.`)
+    try { value = JSON.parse(raw) } catch { throw new Error(`Legacy Closet upload ${key} has unreadable metadata. It was preserved.`) }
+  } else value = await client.json.get(key)
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Legacy Closet upload ${key} has unknown metadata. It was preserved.`)
+  }
+  return value
+}
+
 
 type DeleteGoonUploadAsset = (uploadType: GoonUploadType, filename: string) => Promise<void | boolean>
 
@@ -425,7 +442,8 @@ function collectAnimationLibraryRefs(
 export async function collectGoonUploadReferencesForClient(
   client: RedisClientLike,
   userId: string,
-  includeHairBorrowers = false
+  includeHairBorrowers = false,
+  includeLegacyClosetBorrowers = false
 ): Promise<GoonAssetReferenceMap> {
   const references: GoonAssetReferenceMap = new Map()
 
@@ -489,11 +507,15 @@ export async function collectGoonUploadReferencesForClient(
         addReference(references, uploadKey.slice(7, typeEnd) as CustomGoonUploadType, uploadKey.slice(typeEnd + 1), key)
       }
     }
+  }
+  if (includeHairBorrowers || includeLegacyClosetBorrowers) {
     const clipKeys = new Set<string>([
       ...await client.keys(`clip:${escapeRedisGlob(userId)}:*`), ...await client.keys('clip:system:*')
     ])
     for (const key of [...clipKeys].sort()) {
-      for (const ref of clipHairUploadReferences(await readClipReferenceRecord(client, key))) {
+      const row = await readClipReferenceRecord(client, key)
+      for (const ref of [...(includeHairBorrowers ? clipHairUploadReferences(row) : []),
+        ...(includeLegacyClosetBorrowers ? clipClothingUploadReferences(row).filter(ref => ref.uploadType === 'goon_closet') : [])]) {
         addReference(references, ref.uploadType, ref.filename, key)
       }
     }
@@ -545,16 +567,18 @@ export async function auditGoonUploadAssetsForClient(
   userId: string
 ): Promise<GoonAssetAuditSummary> {
   const hairKeys = await client.keys('upload:goon_hair_assets:*')
+  const legacyClosetKeys = await client.keys('upload:goon_closet:*')
   const claimKeys = await client.keys('goon_asset_delete:*')
   const references = await collectGoonUploadReferencesForClient(client, userId, hairKeys.length > 0 ||
-    claimKeys.some((key) => /^goon_asset_delete:goon_hair_(?:assets|imports):/.test(key)))
+    claimKeys.some((key) => /^goon_asset_delete:goon_hair_(?:assets|imports):/.test(key)),
+    legacyClosetKeys.length > 0 || claimKeys.some(key => /^goon_asset_delete:goon_closet:/.test(key)))
   const entries: GoonAssetAuditEntry[] = []
 
   for (const uploadType of GOON_UPLOAD_TYPES.filter((type) => type !== 'goon_hair_imports')) {
     const keys = uploadType === 'goon_hair_assets' ? hairKeys : await client.keys(`upload:${uploadType}:*`)
     for (const redisKey of keys) {
       const filename = redisKey.slice(`upload:${uploadType}:`.length)
-      const payload = await client.json.get(redisKey)
+      const payload = uploadType === 'goon_closet' ? await readLegacyClosetUploadForAudit(client, redisKey) : await client.json.get(redisKey)
       const referenceContexts = references.get(referenceKey(uploadType, filename))
       const referenced = Boolean(referenceContexts)
       entries.push({
@@ -579,7 +603,7 @@ export async function auditGoonUploadAssetsForClient(
   // Expose every interrupted operation; its existing fenced owner decides
   // whether to keep the file/release a reservation or finish deletion.
   for (const key of claimKeys) {
-    const match = /^goon_asset_delete:(goon_custom_packages|goon_custom_models|goon_custom_manifests|goon_hair_assets|goon_hair_imports):([^/\\]+)$/.exec(key)
+    const match = /^goon_asset_delete:(goon_custom_packages|goon_custom_models|goon_custom_manifests|goon_hair_assets|goon_hair_imports|goon_closet):([^/\\]+)$/.exec(key)
     if (!match) throw new Error(`Invalid Goon cleanup claim key: ${key}`)
     const uploadType = match[1] as GoonUploadType
     const filename = match[2]
@@ -673,7 +697,8 @@ export async function collectAllGoonUploadReferencesForClient(
   ]
   const excluded = new Set(options.excludedRecordKeys ?? [])
   const checkingHair = options.candidateFiles?.some((file) => ['goon_hair_assets', 'goon_hair_imports'].includes(file.uploadType)) ?? false
-  if (checkingHair) patterns.push('clip:*')
+  const checkingLegacyCloset = options.candidateFiles?.some(file => file.uploadType === 'goon_closet') ?? false
+  if (checkingHair || checkingLegacyCloset) patterns.push('clip:*')
   const unknownHairOwner = (key: string): never => {
     throw Object.assign(new Error(`Hair ownership record ${key} could not be verified. Repair it before cleanup.`), { details: { recordKey: key } })
   }
@@ -763,7 +788,10 @@ export async function collectAllGoonUploadReferencesForClient(
         } else jobs.push({ key, value: job })
       }
       if (pattern === 'clip:*') {
-        for (const ref of clipHairUploadReferences(value)) addReference(references, ref.uploadType, ref.filename, key)
+        if (checkingHair) for (const ref of clipHairUploadReferences(value)) addReference(references, ref.uploadType, ref.filename, key)
+        if (checkingLegacyCloset) for (const ref of clipClothingUploadReferences(value)) {
+          if (ref.uploadType === 'goon_closet') addReference(references, ref.uploadType, ref.filename, key)
+        }
         continue
       }
       if (pattern === 'goon:*') collectGoonRefs(references, value as GoonRecord)

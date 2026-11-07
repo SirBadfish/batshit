@@ -1,18 +1,15 @@
+import { SubjectPopulationError } from '$lib/server/services/subjectPopulation'
+import { PresetReferenceWriteError } from '$lib/server/services/modelPresetReferenceGuard'
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
-import { syncAgentCodexProfiles } from '$lib/server/services/codexProfileManager'
-import { syncAgentClaudeProfiles } from '$lib/server/services/claudeProfileManager'
 import { validateDmSenderFields } from '$lib/utils/dmControl'
 import { validateJevJuiceAgentFields } from '$lib/utils/jevJuiceControl'
-import { getCodexConfigOverrideValidationError } from '$lib/server/services/codexSettings'
-import { getClaudeConfigOverrideValidationError } from '$lib/server/services/claudeSettings'
+import { CODEX_CLI_RETIRED_CODE, CODEX_CLI_RETIRED_DETAILS, CODEX_CLI_RETIRED_ERROR,
+  namesRetiredCodexCliModel, namesClaudeCliModel, CLAUDE_CLI_PRESET_REFUSAL } from '$lib/utils/cliRuntimeIdentity'
 import { resolveNewAgentId } from '$lib/server/services/agentIdRules' // Story 6.9c, BL-283
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
-import {
-  isManagedPrimaryAgentType,
-  normalizePrimaryAgentType
-} from '$lib/utils/primaryAgentType'
+import { isRetiredPrimaryAgentType, retiredPrimaryAgentRefusal } from '$lib/utils/primaryAgentType'
 
 // GET /api/agents - List all agents for the current user
 export const GET: RequestHandler = async ({ locals }) => {
@@ -39,37 +36,36 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     const body = await request.json()
     const requestedAgentType =
       typeof body.agentType === 'string' ? body.agentType.trim().toLowerCase() : ''
-    if (
-      Object.prototype.hasOwnProperty.call(body, 'agentType') &&
-      requestedAgentType !== 'api' &&
-      requestedAgentType !== 'cli'
-    ) {
+    // SA-139 R4 (D14): `api` is the one Primary Agent type. A retired type (the Claude Code CLI
+    // lane, n8n) gets the shared refusal; anything else is not a type.
+    if (Object.prototype.hasOwnProperty.call(body, 'agentType') && requestedAgentType !== 'api') {
+      const retired = isRetiredPrimaryAgentType(requestedAgentType)
+        ? retiredPrimaryAgentRefusal({ ...body, agentType: requestedAgentType })
+        : null
+      if (retired) return json(retired, { status: 409 })
       return json(
         {
-          error: 'Primary Agent type must be API or CLI.',
+          error: 'The Primary Agent type must be API.',
           code: 'primary_agent_type_invalid'
         },
         { status: 400 }
       )
     }
-    const agentType = normalizePrimaryAgentType(undefined, body.agentType)
-    if (!isManagedPrimaryAgentType(agentType)) {
+    // SA-139 R1: Codex CLI was removed; a new agent on it is refused.
+    if (namesRetiredCodexCliModel(body)) {
       return json(
-        {
-          error: 'Primary Agent type must be API or CLI.',
-          code: 'primary_agent_type_invalid'
-        },
-        { status: 400 }
+        { error: CODEX_CLI_RETIRED_ERROR, code: CODEX_CLI_RETIRED_CODE, details: CODEX_CLI_RETIRED_DETAILS },
+        { status: 409 }
       )
     }
-    const codexValidationError = getCodexConfigOverrideValidationError(body.codex_settings ?? null)
-    if (codexValidationError) {
-      return json({ error: codexValidationError }, { status: 400 })
+    // SA-139 R4 and R5: nothing runs a Claude Code CLI preset any more, so a Primary Agent never
+    // stores one (it would only fail at its first send).
+    if (namesClaudeCliModel(body)) {
+      return json({ error: CLAUDE_CLI_PRESET_REFUSAL }, { status: 400 })
     }
-    const claudeValidationError = getClaudeConfigOverrideValidationError(body.claude_settings ?? null)
-    if (claudeValidationError) {
-      return json({ error: claudeValidationError }, { status: 400 })
-    }
+    // The old CLI settings blocks are never stored on a new agent (R1: Codex, R4: Claude Code).
+    delete body.codex_settings
+    delete body.claude_settings
     // SA-113 P2 (DL-113-01): same refusal as the update route.
     const dmSenderValidationError = validateDmSenderFields(body)
     if (dmSenderValidationError) {
@@ -106,7 +102,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     const agent = await redis.createAgent({
       ...body,
-      agentType,
+      agentType: 'api',
       ...(Object.prototype.hasOwnProperty.call(body, 'avatar_icon_ref')
         ? { avatar_icon_ref: normalizeOptionalIconRefInput(body.avatar_icon_ref, 'avatar_icon_ref') }
         : {}),
@@ -123,20 +119,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       }
     })
 
-    try {
-      await syncAgentCodexProfiles(locals.user.id)
-    } catch (error) {
-      console.warn('[Agents API] Failed to sync Codex profiles after create:', error)
-    }
-    try {
-      await syncAgentClaudeProfiles(locals.user.id)
-    } catch (error) {
-      console.warn('[Agents API] Failed to sync Claude profiles after create:', error)
-    }
-
     return json(agent)
   } catch (error) {
     console.error('Error creating agent:', error)
+    if (error instanceof SubjectPopulationError || error instanceof PresetReferenceWriteError) return json({ error: error.message, code: error.code }, { status: error.status })
     return json(
       { error: error instanceof Error ? error.message : 'Failed to create agent' },
       { status: (error as any)?.status ?? 500 }

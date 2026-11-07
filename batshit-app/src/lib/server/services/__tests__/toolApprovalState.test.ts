@@ -213,8 +213,8 @@ describe('buildApprovalHistoryMessages', () => {
     expect(combined[0]?.metadata?.toolApprovals?.approvals).toHaveLength(1)
   })
 
-  it('takes the request copy when the persisted one has no approvals yet', () => {
-    const persisted = [{ id: 'msg_1', created_at: REQUESTED_AT, metadata: {} }]
+  it.each([{}, { toolApprovals: null }, { toolApprovals: { approvals: [] } }])('keeps a settled/absent stored summary over stale request metadata: %j', metadata => {
+    const persisted = [{ id: 'msg_1', created_at: REQUESTED_AT, metadata }]
     const fromRequest = [
       {
         id: 'msg_1',
@@ -224,7 +224,28 @@ describe('buildApprovalHistoryMessages', () => {
     ]
 
     const combined = buildApprovalHistoryMessages(fromRequest, persisted)
-    expect(combined[0]?.metadata?.toolApprovals?.approvals).toHaveLength(1)
+    expect(combined[0]?.metadata).toEqual(metadata)
+    expect(analyzeApprovalState(combined, FIVE_MINUTES_LATER).newlyExpired).toEqual([])
+  })
+
+  it('never treats request-only or idless request cards as approval authority', () => {
+    expect(buildApprovalHistoryMessages(messageWith(pendingEntry()), [])).toEqual([])
+    expect(buildApprovalHistoryMessages([{ metadata: messageWith(pendingEntry())[0].metadata }], [])).toEqual([])
+  })
+
+  it('returns approval leaf changes without carrying sibling metadata into a write', () => {
+    const messages = messageWith(pendingEntry())
+    messages[0].metadata!.zipIds = ['server-zip']
+    const update = analyzeApprovalState(messages, FIVE_MINUTES_LATER).updates[0]
+    expect(update).toEqual({ messageId: 'msg_assistant_1', changes: [{ index: 0, fields: {
+      status: 'expired', submitted: false, expiresAt: '2026-09-10T12:03:00.000Z', expiredAt: '2026-09-10T12:05:00.000Z'
+    } }] })
+  })
+
+  it('never expires or normalizes an answered approval even if its old entry still says pending', () => {
+    const messages = messageWith(pendingEntry())
+    messages[0].metadata!.answeredApprovalIds = ['aitxt-1']
+    expect(analyzeApprovalState(messages, FIVE_MINUTES_LATER)).toMatchObject({ newlyExpired: [], updates: [] })
   })
 })
 

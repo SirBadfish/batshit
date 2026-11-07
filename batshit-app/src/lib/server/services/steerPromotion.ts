@@ -1,9 +1,16 @@
+import { SERVER_REPLAY_FIELDS, withoutServerReplayFields } from '$lib/utils/serverReplayFields'
 import { redis } from '$lib/server/redis'
 import { generateMessageId } from '$lib/utils/messageId'
 import { internalServiceHeaders } from '$lib/server/services/internalRequestAuth'
 import type { ChatMessage } from '$lib/types/database'
 import type { SteerEntry } from '$lib/utils/steerControl'
-import { findHeldMessageAwaitingAnswer, type WaitsForApproval } from '$lib/utils/heldForApproval'
+import {
+  findHeldMessageAwaitingAnswer,
+  findUnansweredBesideHeldAnswer,
+  type WaitsForApproval
+} from '$lib/utils/heldForApproval'
+import { publishUserEvent } from '$lib/server/ssePublisher'
+import { pickSendFacts } from '$lib/utils/sendFacts'
 
 /**
  * SA-114 P1 (DL-114-07) — the server-owned promotion of a steer that could not land.
@@ -137,49 +144,6 @@ export function followUpTurnMetadata(metadata: unknown, steerIds: string[]): Rec
 }
 
 /**
- * BL-455 review (D1) — the facts of the send a turn belongs to, which a follow-up turn must run with.
- *
- * A follow-up in the request of an approval CLICK cannot take them from the request: a click posts
- * the paused REPLY's metadata (the card's message), which has no project, no voice mode, and no
- * tool choice. So every user message the server writes (a promoted or a held one) carries them at
- * the top of its metadata, as the page's own messages carry `projectPath`, `stt` and `tts`, and a
- * click recovers them from the user message of the turn that raised the card (`findPausedApprovalTurn`,
- * as the resume itself does for its project). A NEW send fact that a follow-up must keep is added
- * here; anything not named here does not follow the words.
- */
-export const SEND_FACT_KEYS = [
-  'projectPath',
-  'projectRules',
-  // Not `stt`: that says THIS message was spoken, and the words that wait were typed.
-  'tts',
-  'voiceMode',
-  'realtime',
-  'goonsEnabled',
-  'goonPresentationMode',
-  'selectedTools',
-  'selectedGateways',
-  'selectedMCPs',
-  'mcpToolSelections',
-  'toolApprovalMode',
-  'codexPermissionMode',
-  'claudePermissionMode',
-] as const
-
-export function pickSendFacts(metadata: unknown): Record<string, unknown> {
-  const source = metadata && typeof metadata === 'object' ? (metadata as Record<string, unknown>) : {}
-  const facts: Record<string, unknown> = {}
-  for (const key of SEND_FACT_KEYS) {
-    if (source[key] !== undefined && source[key] !== null) facts[key] = source[key]
-  }
-  // The page stores `voiceMode` on its own user message as a boolean (`tts || false`); a send and a
-  // run read it as 'voice' or 'text'.
-  if ('voiceMode' in facts && typeof facts.voiceMode !== 'string') {
-    facts.voiceMode = facts.voiceMode === true || facts.tts === true ? 'voice' : 'text'
-  }
-  return facts
-}
-
-/**
  * BL-455 — the reply stopped at an approval card, so the words wait for the user's click.
  *
  * A reply that stops at a card has not ended: it waits for the user, and the words the user typed
@@ -234,6 +198,8 @@ export async function readHeldMessageToAnswer(params: {
   sessionId: string
   cardMessageId: string
 }): Promise<{
+  /** The held message itself (BL-921: what stands beside it moves behind its answer). */
+  heldMessageId: string
   content: string
   assistantMessageId: string
   history: ChatMessage[]
@@ -258,6 +224,7 @@ export async function readHeldMessageToAnswer(params: {
     return null
   }
   return {
+    heldMessageId: String(last.id),
     content,
     assistantMessageId,
     history,
@@ -265,6 +232,73 @@ export async function readHeldMessageToAnswer(params: {
     steerIds: heldSteerIds(history, params.cardMessageId),
     sendFacts: pickSendFacts(last.metadata),
   }
+}
+
+/**
+ * BL-921 — once the answer to held words is saved, the unanswered messages that stood with the words
+ * (a send the chat's line kept at the same card) move behind the answer, so the chat reads held
+ * words, answer, kept message, and so does every later turn, whose history arrives from the browser.
+ *
+ * Called by the request that answered the words, after the answer's finalize saved it and
+ * published `end`, while that request still holds the chat (no other turn can write between). One
+ * move per message, in their order (`moveMessageToEnd`, one step each, dated now); a message with
+ * a reply never moves (`findUnansweredBesideHeldAnswer`). Every tab is told: the moved record as
+ * `user_message` with `movedToEnd` (an open tab moves its copy to the end), then one
+ * `session_messages_changed`; a closed tab reads the server's order when it opens the chat.
+ * Answers the ids it moved.
+ */
+export async function moveUnansweredBehindHeldAnswer(params: {
+  sessionId: string
+  userId: string
+  heldMessageId: string
+  answerMessageId: string
+  eventFetch: typeof fetch
+  request: Request
+}): Promise<string[]> {
+  const { sessionId, userId, heldMessageId, answerMessageId, eventFetch, request } = params
+  let stored: ChatMessage[]
+  try {
+    stored = await readFollowUpHistory(sessionId)
+  } catch {
+    return []
+  }
+  const toMove = findUnansweredBesideHeldAnswer(stored, heldMessageId, answerMessageId)
+  const moved: ChatMessage[] = []
+  for (const messageId of toMove) {
+    try {
+      const record = await redis.moveMessageToEnd(sessionId, messageId)
+      if (record) moved.push(record as unknown as ChatMessage)
+    } catch (error) {
+      console.error('[BL-921] Could not move a message that stood beside held words behind their answer:', {
+        sessionId,
+        messageId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      break
+    }
+  }
+  if (moved.length === 0) return []
+  for (const message of moved) {
+    try {
+      await eventFetch(new URL('/api/sse', request.url).toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-internal-sse-forward': '1', ...internalServiceHeaders() },
+        body: JSON.stringify({ type: 'user_message', sessionId, message, movedToEnd: true }),
+      })
+    } catch (error) {
+      console.warn('[BL-921] Could not tell the tabs a message moved behind the answer:', {
+        sessionId,
+        messageId: message.id,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  await publishUserEvent(userId, {
+    type: 'session_messages_changed',
+    sessionId,
+    reason: 'unanswered_moved_behind_held_answer',
+  })
+  return moved.map((message) => String(message.id))
 }
 
 /** The held server record, read BEFORE a CLI approval turn writes its new user message. */
@@ -318,7 +352,7 @@ export async function markHeldMessageCardExpired(params: {
   return markHeldMessageUnanswered({ ...params, reason: 'approval_expired' })
 }
 
-/** A recorded CLI Deny/expiry with no run terminates only the card's exact steers. */
+/** A settled card with no run terminates only that card's exact steers. */
 export async function markApprovalCardWithoutAnswer(params: {
   sessionId: string; userId: string; cardMessageId: string; eventFetch: typeof fetch; request: Request
   reason: 'approval_denied' | 'approval_expired'
@@ -333,13 +367,19 @@ export async function markApprovalCardWithoutAnswer(params: {
     ...(Array.isArray(metadata?.steers) ? metadata.steers.filter((entry: any) => entry?.source !== 'dm').map((entry: any) => entry.steerId) : []),
   ].filter((id): id is string => typeof id === 'string'))]
   if (!steerIds.length) return
-  const marked = { ...card, metadata: { ...metadata,
+  // A card that held steers and is answered with no resume is the reply's end: its replay fields go
+  // (SA-137 D7, the whiteboard precedent), and the tabs never receive them. With no steers nothing
+  // is written here at all.
+  const retired = Object.fromEntries(SERVER_REPLAY_FIELDS
+    .filter((field) => metadata && Object.prototype.hasOwnProperty.call(metadata, field))
+    .map((field) => [field, null]))
+  const marked = { ...card, metadata: { ...metadata, ...retired,
     steerPromoted: { steerIds, disposition: 'unanswered', reason: params.reason } } }
   await redis.updateMessage(String(card.id), params.sessionId, { metadata: marked.metadata }, params.userId)
   try {
     await params.eventFetch(new URL('/api/sse', params.request.url).toString(), {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-internal-sse-forward': '1', ...internalServiceHeaders() },
-      body: JSON.stringify({ type: 'complete_message', sessionId: params.sessionId, message: marked }),
+      body: JSON.stringify({ type: 'complete_message', sessionId: params.sessionId, message: withoutServerReplayFields(marked) }),
     })
   } catch (error) {
     console.warn('[BL-1291] Could not forward the saved no-resume disposition:', { sessionId: params.sessionId, error })

@@ -1,6 +1,8 @@
+import { TYPED_FILE_TOOLS_BLOCK_LIST_SENTENCE } from '$lib/utils/typedFileToolsGrant'
 import type { IconRef } from '$lib/icons/iconTypes'
 import {
   ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS,
+  FABRIC_TOOL_GRID_DISPLAY_NAME,
   FABRIC_TOOL_GRID_INFO_PARAGRAPHS
 } from '$lib/utils/toolGridBrokerFamilies'
 
@@ -32,9 +34,9 @@ export function formatToolGridZipBehaviorLabel(
 
 export type SharedNonMcpToolGridRowId =
   | 'image'
+  | 'typed_file_tools'
   | 'read_file'
   | 'search_files'
-  | 'skill_read'
   | 'write_file'
   | 'edit_file'
   | 'bash'
@@ -53,14 +55,27 @@ export type SharedNonMcpToolGridRowId =
 
 export const DYNAMIC_TOOL_SEARCH_INFO_PARAGRAPHS = [
   "Dynamic Tool Search is Batshit's search-then-use path for tool families that would be too noisy to list in every prompt.",
-  'When it is enabled, an agent can search enabled MCP tools, saved CLI Tools, published Artifact runtime tools, Fabric controls, and Agent Browser actions, then call the exact result it chooses.',
+  'When it is enabled, an agent can search enabled MCP tools, saved CLI Tools, published Artifact runtime tools, Fabric controls, neutral Batshit utilities, and Agent Browser actions, then call the exact result it chooses.',
   'Those families still keep their own normal enablement and permission settings; this row controls the broker that lets the agent find them on demand.',
   'Schema Hints can also let agents use known tools directly when enough detail is available, but Batshit still validates permissions before anything runs.'
 ]
 
+// SA-136 D1: the file rows are zip configuration, never an execution grant. The typed file tools
+// (`read_file`, `write_file`, `edit_file` on API agents) have their own grant and share these rows.
+export const TYPED_FILE_TOOL_ZIP_ROW_NOTE =
+  'This row sets zip behavior only. The Typed File Tools setting decides whether an agent gets read_file, write_file and edit_file; their results follow this row.'
+export const TYPED_FILE_TOOL_ZIP_ROW_IDS: readonly SharedNonMcpToolGridRowId[] = ['read_file', 'write_file', 'edit_file']
+
+// SA-129 P1 dead copies: the row's buffer covers the newest copy only. An agent's own hold
+// never keeps a dead copy open; a user's Hold does (zip-architecture.md §4). Zip columns only:
+// `NonMcpZipRowsSection` adds it, never the shared row config the Group sharing grid reads (SA-096).
+export const READ_FILE_ZIP_ROW_INFO_PARAGRAPHS = [
+  'Read File sets how long a live copy of a file stays open for the model after it was read.',
+  "Once the agent reads the whole file again or edits the file, the older copy compresses on the agent's next reply, whatever this row says. Only Off, or your Hold, keeps an older copy open. The edit's own result follows the Edit File row."
+]
+
 export const SHARED_NON_MCP_TOOL_GRID_BATSHIT_ROW_IDS: SharedNonMcpToolGridRowId[] = [
   'read_file',
-  'skill_read',
   'write_file',
   'edit_file',
   'search_files',
@@ -144,7 +159,7 @@ export const SHARED_NON_MCP_TOOL_GRID_CONFIG: Record<
     thresholdField: 'zip_threshold_read_file',
     autoField: 'auto_zip_read_file',
     minBuffer: 1,
-    defaultBuffer: 8,
+    defaultBuffer: 2,
     defaultThreshold: 0,
     defaultAutoZip: false
   },
@@ -159,17 +174,6 @@ export const SHARED_NON_MCP_TOOL_GRID_CONFIG: Record<
     defaultThreshold: 0,
     defaultAutoZip: true
   },
-  skill_read: {
-    id: 'skill_read',
-    label: 'Skill Read',
-    iconRef: { kind: 'batshit', id: 'skills' },
-    mode: 'custom',
-    toolName: 'skill_read',
-    minBuffer: 1,
-    defaultBuffer: 10,
-    defaultThreshold: 0,
-    defaultAutoZip: false
-  },
   write_file: {
     id: 'write_file',
     label: 'Write File',
@@ -181,7 +185,7 @@ export const SHARED_NON_MCP_TOOL_GRID_CONFIG: Record<
     minBuffer: 1,
     defaultBuffer: 2,
     defaultThreshold: 0,
-    defaultAutoZip: false
+    defaultAutoZip: true
   },
   edit_file: {
     id: 'edit_file',
@@ -194,7 +198,7 @@ export const SHARED_NON_MCP_TOOL_GRID_CONFIG: Record<
     minBuffer: 1,
     defaultBuffer: 2,
     defaultThreshold: 0,
-    defaultAutoZip: false
+    defaultAutoZip: true
   },
   bash: {
     id: 'bash',
@@ -207,7 +211,7 @@ export const SHARED_NON_MCP_TOOL_GRID_CONFIG: Record<
     minBuffer: 1,
     defaultBuffer: 1,
     defaultThreshold: 0,
-    defaultAutoZip: false
+    defaultAutoZip: true
   },
   list_files: {
     id: 'list_files',
@@ -242,7 +246,7 @@ export const SHARED_NON_MCP_TOOL_GRID_CONFIG: Record<
     minBuffer: 1,
     defaultBuffer: 1,
     defaultThreshold: 0,
-    defaultAutoZip: false
+    defaultAutoZip: true
   },
   dynamic_find: {
     id: 'dynamic_find',
@@ -290,9 +294,14 @@ export const SHARED_NON_MCP_TOOL_GRID_CONFIG: Record<
     defaultThreshold: 0,
     defaultAutoZip: true
   },
+  typed_file_tools: {
+    id: 'typed_file_tools', label: 'Typed File Tools', iconRef: { kind: 'lucide', id: 'files' },
+    mode: 'custom', toolName: 'typed_file_tools', minBuffer: 0, defaultBuffer: 0, defaultThreshold: 0, defaultAutoZip: false,
+    infoParagraphs: ['Enables Batshit\'s read_file, write_file and edit_file. Bash, parent-agent allowance and host sandbox availability still apply. The separate Read, Write and Edit rows configure result compression.', TYPED_FILE_TOOLS_BLOCK_LIST_SENTENCE]
+  },
   fabric_find: {
     id: 'fabric_find',
-    label: 'Fabric Controls',
+    label: FABRIC_TOOL_GRID_DISPLAY_NAME,
     iconRef: { kind: 'batshit', id: 'fabric' },
     infoParagraphs: FABRIC_TOOL_GRID_INFO_PARAGRAPHS,
     mode: 'custom',

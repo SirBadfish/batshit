@@ -6,14 +6,10 @@ const mockRedis = {
   expire: vi.fn()
 }
 
-const mockLoadN8nCompatibilitySnapshot = vi.fn()
 const mockGetRuntimeEnv = vi.fn()
 const mockRequireRuntimeEnv = vi.fn()
 
 vi.mock('$lib/server/redis', () => ({ redis: mockRedis }))
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({
-  loadN8nCompatibilitySnapshot: mockLoadN8nCompatibilitySnapshot
-}))
 vi.mock('$lib/server/services/runtimeEnv', () => ({
   getRuntimeEnv: mockGetRuntimeEnv,
   requireRuntimeEnv: mockRequireRuntimeEnv
@@ -56,7 +52,6 @@ describe('compatibility matrix loader precedence', () => {
     mockRedis.get.mockResolvedValue(null)
     mockRedis.set.mockResolvedValue('OK')
     mockRedis.expire.mockResolvedValue(1)
-    mockLoadN8nCompatibilitySnapshot.mockResolvedValue(null)
     mockRequireRuntimeEnv.mockResolvedValue(null)
     global.fetch = vi.fn()
   })

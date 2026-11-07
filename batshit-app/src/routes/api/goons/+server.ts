@@ -12,6 +12,7 @@ import {
   rewriteInternalBatshitServerUrlsInPayload
 } from '$lib/server/services/batshitServerUrls'
 import { normalizeGoonsSettings, resolveAutoEnabledCues, resolveKitchenCues } from '$lib/goons/resolve'
+import { isValidGoonInventoryEntry } from '$lib/goons/goonCompatibilityBasis'
 import { resolveStarterGoonAsset, type StarterGoonAsset } from '$lib/goons/starterAssets'
 import type {
   GoonCustomManifestSummary,
@@ -24,6 +25,8 @@ import type {
 } from '$lib/types/goons'
 
 const STARTER_GOON_DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024
+
+class GoonInventoryUnavailable extends Error {}
 
 async function readUploadError(response: Response) {
   const text = await response.text().catch(() => '')
@@ -122,13 +125,21 @@ export const GET: RequestHandler = async ({ locals }) => {
       const ids = await client.sMembers(`user:${locals.user!.id}:goons`)
       if (ids.length === 0) return []
 
+      // Prove the entire indexed list before returning current read-only rows.
+      // Private Closet materialization is not part of this public read owner.
+      for (const id of ids) {
+        const goon = await client.json.get(`goon:${id}`)
+        if (!isValidGoonInventoryEntry(goon, locals.user!.id, id)) throw new GoonInventoryUnavailable()
+      }
       const results: GoonRecord[] = []
       for (const id of ids) {
-        const goon = (await client.json.get(`goon:${id}`)) as unknown
-        if (goon && typeof goon === 'object' && (goon as any).user_id === locals.user!.id) {
-          results.push(goon as GoonRecord)
-        }
+        const goon = await client.json.get(`goon:${id}`)
+        if (!isValidGoonInventoryEntry(goon, locals.user!.id, id)) throw new GoonInventoryUnavailable()
+        results.push(goon)
       }
+      const currentIds = await client.sMembers(`user:${locals.user!.id}:goons`)
+      const previousIds = new Set(ids)
+      if (currentIds.length !== ids.length || currentIds.some((id) => !previousIds.has(id))) throw new GoonInventoryUnavailable()
 
       results.sort((a, b) => {
         const aTime = new Date(a.updated_at || a.created_at).getTime()
@@ -139,10 +150,13 @@ export const GET: RequestHandler = async ({ locals }) => {
       return results
     })
 
-    return json({ goons: resolveUploadUrlsForBrowserInPayload(goons) })
+    return json({ goons: resolveUploadUrlsForBrowserInPayload(goons), ownerId: locals.user.id })
   } catch (error) {
+    if (error instanceof GoonInventoryUnavailable) {
+      return json({ error: 'The saved Goon list is incomplete. Reload to confirm it; saved choices were kept.' }, { status: 409 })
+    }
     console.error('Error loading goons:', error)
-    return json({ error: 'Failed to load goons' }, { status: 500 })
+    return json({ error: error instanceof Error ? error.message : 'Failed to load goons' }, { status: 500 })
   }
 }
 
@@ -522,13 +536,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     const storageGoon = normalizeUploadUrlsForStorageInPayload(goon)
 
-    await redis.execute((client) => createOwnedGoonForClient({
+    const storedGoon = await redis.execute((client) => createOwnedGoonForClient({
       client,
       userId: locals.user!.id,
       goon: storageGoon
     }))
 
-    return json(resolveUploadUrlsForBrowserInPayload(storageGoon))
+    return json(resolveUploadUrlsForBrowserInPayload(storedGoon))
   } catch (error) {
     if (error instanceof GoonMutationError) {
       return json({ error: error.message, code: error.code }, { status: error.status })

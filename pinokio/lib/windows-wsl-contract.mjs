@@ -7,12 +7,12 @@ export const WSL_HOME = '/home/batshit';
 export const WSL_CODE = `${WSL_HOME}/batshit-code`;
 export const WSL_NODE_PREFIX = `${WSL_HOME}/.local/batshit-node`;
 export const WSL_NODE = `${WSL_NODE_PREFIX}/current/bin/node`;
-export const WSL_NODE_VERSION = 'v24.19.0';
+export const WSL_NODE_VERSION = 'v24.22.1';
 export const WSL_BOOTSTRAP_VERSION = 1;
 export const WSL_RUNTIME_OS = 'ubuntu-24.04';
 export const WSL_ASSETS = Object.freeze([
   { name: 'ubuntu-base', file: 'ubuntu-base-24.04.3-base-amd64.tar.gz', url: 'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.3/release/ubuntu-base-24.04.3-base-amd64.tar.gz', sha256: '6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9' },
-  { name: 'node', file: 'node-v24.19.0-linux-x64.tar.xz', url: 'https://nodejs.org/dist/v24.19.0/node-v24.19.0-linux-x64.tar.xz', sha256: '14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647' }
+  { name: 'node', file: 'node-v24.22.1-linux-x64.tar.xz', url: 'https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz', sha256: '6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6' }
 ]);
 
 export const WSL_ENV = Object.freeze({

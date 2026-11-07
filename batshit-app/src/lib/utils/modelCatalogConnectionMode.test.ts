@@ -6,9 +6,9 @@ import {
 } from './modelCatalogConnectionMode'
 
 describe('modelCatalogConnectionMode', () => {
-  it('keeps only providers without a live catalog in manual-entry mode', () => {
-    expect(isManualEntryDirectProvider('alibaba')).toBe(true)
-    expect(isManualEntryDirectProvider('stepfun')).toBe(true)
+  it('offers built-in Alibaba Cloud and StepFun catalogs without requiring manual entry', () => {
+    expect(isManualEntryDirectProvider('alibaba')).toBe(false)
+    expect(isManualEntryDirectProvider('stepfun')).toBe(false)
 
     for (const provider of [
       'togetherai',
@@ -25,8 +25,8 @@ describe('modelCatalogConnectionMode', () => {
   })
 
   it('uses the same provider rule for Settings connection selectors', () => {
-    expect(isManualEntryCatalogConnection('direct:alibaba')).toBe(true)
-    expect(isManualEntryCatalogConnection('direct:stepfun')).toBe(true)
+    expect(isManualEntryCatalogConnection('direct:alibaba')).toBe(false)
+    expect(isManualEntryCatalogConnection('direct:stepfun')).toBe(false)
     expect(isManualEntryCatalogConnection('direct:togetherai')).toBe(false)
     expect(isManualEntryCatalogConnection('direct:fireworks')).toBe(false)
     expect(isManualEntryCatalogConnection('direct:baseten')).toBe(false)

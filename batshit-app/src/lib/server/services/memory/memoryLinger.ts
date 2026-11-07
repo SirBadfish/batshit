@@ -1,3 +1,6 @@
+import { acquireSettingsMutation, captureSettingsLifecycle, type SettingsLifecycleSnapshot } from '../appActions/settings/lifecycle'
+import { MemoryMutationError } from './memoryMutation'
+import { readMemoryObservation, type MemoryOwnerProof } from './memoryOwnership'
 /**
  * SA-104 — session-scoped recall/linger state (`memlinger:{sessionId}`, DL-104-17).
  *
@@ -83,9 +86,19 @@ export async function setMemoryLingerState(
 export async function queuePendingMemoryRecalls(
   sessionId: string,
   agentId: string,
-  entries: Array<{ id: string; kind: MemoryRecallKind }>
+  entries: Array<{ id: string; kind: MemoryRecallKind }>,
+  options: { lifecycle?: SettingsLifecycleSnapshot; userId?: string; agentOwner?: MemoryOwnerProof; sessionOwner?: MemoryOwnerProof } = {}
 ): Promise<MemoryLingerRecord> {
-  const existing = await getMemoryLingerState(sessionId)
+  if (!entries.length) return await getMemoryLingerState(sessionId) ?? { pending: [], schema_version: MEMORY_SCHEMA_VERSION }
+  const lifecycle = options.lifecycle ?? captureSettingsLifecycle([`agent:${agentId}`, `session:${sessionId}`])
+  const lease = acquireSettingsMutation(lifecycle)
+  let issued = false
+  try {
+  await readMemoryObservation({ agentId, sessionId, userId: options.userId, lifecycle, expectedAgent: options.agentOwner, expectedSession: options.sessionOwner, requireEnabled: true })
+  const raw = await redis.json.getRaw(memoryLingerKey(sessionId), '$')
+  const parsed = raw === null ? null : JSON.parse(raw)
+  const existing = parsed === null ? null : Array.isArray(parsed) ? parsed[0] as MemoryLingerRecord : null
+  if (parsed !== null && (!existing || !Array.isArray(existing.pending))) throw new Error('The recall queue is unreadable; nothing was queued.')
   const requestedAt = new Date().toISOString()
   const requestedIds = entries.map((entry) => entry.id)
   const pending = (existing?.pending ?? []).filter(
@@ -107,6 +120,12 @@ export async function queuePendingMemoryRecalls(
     ...(typeof existing?.last_commit_ts === 'number' ? { last_commit_ts: existing.last_commit_ts } : {}),
     schema_version: MEMORY_SCHEMA_VERSION
   }
-  await setMemoryLingerState(sessionId, record)
+  const saved = await redis.json.setIfUnchanged(memoryLingerKey(sessionId), '$', raw ?? '', record, { beforeIssue() { lease.check(); issued = true } })
+  issued = false; lease.settle()
+  if (!saved) throw new MemoryMutationError('The recall queue changed; nothing from this call was queued.')
   return record
+  } catch (error) {
+    if (issued) { lease.unknown(); throw new MemoryMutationError('The recall queue write outcome is unknown; its original chat custody is retained.', true) }
+    lease.settle(); throw error
+  }
 }

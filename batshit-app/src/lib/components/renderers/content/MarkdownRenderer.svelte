@@ -6,6 +6,7 @@
   import { decorateFileMentionsForMarkdown, parseProjectQuickViewHrefTarget } from '$lib/utils/fileMentions'
   import { escapeHtml } from '$lib/utils/htmlEntities'
   import { CHAT_MARKDOWN_OPTIONS } from '$lib/utils/markdownCodeRegions'
+  import { escapeNonHtmlTags } from '$lib/utils/markdownHtmlTags'
   import { formatSkillInlineDisplayName } from '$lib/utils/skillInlineNotes'
 
   let { content, renderFileMentions = false } = $props<{
@@ -49,6 +50,11 @@
     // Markdown image rendering is intentionally disabled in chat.
     renderer.image = function image() {
       return ''
+    }
+    // A tag that is not HTML (`<error>`, `<batshit-memory>`, the `<void>` of `Promise<void>`) is
+    // words, not markup: the sanitizer below would drop it (BL-812).
+    renderer.html = function html(token: any) {
+      return escapeNonHtmlTags(token.text || '')
     }
     
     // Parse markdown synchronously

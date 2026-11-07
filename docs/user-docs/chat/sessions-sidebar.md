@@ -69,7 +69,7 @@ Locking is enforced in several places at once, so an accidental delete path can'
 
 ## Search and persistence
 
-The sidebar includes search so you can find a chat by name without scrolling. If a chat is running in the background — say a long `API` or `CLI` task you started, then switched away from — its row shows a status label so you can see it's still working.
+The sidebar includes search so you can find a chat by name without scrolling. If a chat is running in the background — say a long task you started, then switched away from — its row shows a status label so you can see it's still working.
 
 Because Sessions persist to your instance, your chat history survives reloads and restarts. If you ever switch a Session's selected agent and reopen the chat later, Batshit reselects the agent that last handled it (unless you change it yourself).
 

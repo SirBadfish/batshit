@@ -3,6 +3,8 @@ import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
 import { requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
 import { withZipStateLock } from '$lib/server/services/zipStateLock'
+import { closeSkillSessionFromZipAction, type SkillZipClosure } from '$lib/server/services/skillSessions'
+import { publishUserEvent } from '$lib/server/ssePublisher'
 
 // DELETE: Rezip an item (remove from unzipped set)
 export const DELETE: RequestHandler = async ({ params, url, locals }) => {
@@ -24,9 +26,13 @@ export const DELETE: RequestHandler = async ({ params, url, locals }) => {
   if (!sessionCheck.ok) return sessionCheck.response
 
   try {
+    let skillClosure: SkillZipClosure | null = null
     // One writer at a time per chat (SA-129 P2b, BL-352): a reply end's hold move or countdown
     // never writes back over this Release or "Zip now".
     const mode = await withZipStateLock(sessionId, async () => {
+      skillClosure = await closeSkillSessionFromZipAction({ userId: user.value.id, sessionId, zipId,
+        reason: returnToAutomatic ? 'release' : 'zip' })
+      if (skillClosure) return 'skill_closed' as const
       // Remove from unzipped set
       const unzippedKey = `unzipped:${sessionId}`
       await redis.sRem(unzippedKey, zipId)
@@ -53,7 +59,9 @@ export const DELETE: RequestHandler = async ({ params, url, locals }) => {
       return 'rezipped' as const
     })
 
-    return json({ success: true, mode })
+    if (skillClosure) await publishUserEvent(user.value.id, { type: 'zip_state_changed', sessionId, source: 'user',
+      opened: [], rezipped: (skillClosure as SkillZipClosure).changedZipIds })
+    return json({ success: true, mode, ...(skillClosure ? { skillClosure } : {}) })
   } catch (error) {
     console.error('Failed to rezip item:', error)
     return new Response('Failed to rezip item', { status: 500 })

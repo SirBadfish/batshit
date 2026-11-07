@@ -5,6 +5,7 @@
  */
 
 import { logger } from '$lib/utils/logger'
+import { normalizeId } from '$lib/utils/idNormalizer'
 import { redis } from './redis'
 import { resolveRedisConnectionUrl } from '$lib/server/redisConnection'
 import { createClient, type RedisClientType } from 'redis'
@@ -336,9 +337,10 @@ export async function getVisualState(
       return exists === 1
     })
     
-    // Check if unzipped for this session
+    // Check if unzipped for this session. BL-1515: the hold set holds state ids,
+    // `normalizeId(<raw id>)` (BL-476); only the raw id is normalized, once.
     const isUnzipped = await redis.execute(async (client) => {
-      const isMember = await client.sIsMember(`unzipped:${sessionId}`, zipId)
+      const isMember = await client.sIsMember(`unzipped:${sessionId}`, normalizeId(zipId))
       return isMember === 1
     })
     

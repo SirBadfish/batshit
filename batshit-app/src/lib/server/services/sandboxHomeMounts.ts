@@ -5,7 +5,7 @@ import { lstat, mkdir, realpath } from 'node:fs/promises'
 // Shared with the standalone Docker host operator. Runtime launch records and
 // Pinokio's data/secrets belong to the host, never an in-app sandbox (BL-368).
 import policy from './sandboxHomePolicy.json'
-import { macCustodyRoots } from './macCustodyPaths'
+import { credentialCustodyRoots, assertCredentialMountsSafe, resolveExistingPath } from './macCustodyPaths'
 export const SANDBOX_BATSHIT_WRITABLE_DIRS: readonly string[] = Object.freeze(policy.writableDirs)
 export const SANDBOX_BATSHIT_PROTECTED_DIRS: readonly string[] = Object.freeze(policy.protectedDirs)
 export const SANDBOX_MOUNT_VERSION = policy.mountVersion
@@ -24,10 +24,11 @@ function externalProtectedHome(): string[] {
 }
 
 export function sandboxProtectedHomeRoots(batshitHome = getBatshitHomeDir(), sharedHome = getDefaultBatshitHomeDir()): string[] {
+  assertCredentialMountsSafe()
   return [...new Set([
     ...[batshitHome, sharedHome, ...externalProtectedHome()].flatMap((root) => SANDBOX_BATSHIT_PROTECTED_DIRS.map((name) => path.join(root, name))),
     getManagedAgentRootDir(),
-    ...macCustodyRoots()
+    ...credentialCustodyRoots()
   ])]
 }
 
@@ -37,7 +38,7 @@ export function sandboxHomeMountIdentity(): string {
   const shared = getDefaultBatshitHomeDir()
   const agents = getManagedAgentRootDir()
   const protectedHome = externalProtectedHome()
-  const custody = macCustodyRoots()
+  const custody = credentialCustodyRoots()
   return home === shared && agents === path.join(shared, 'agents') && protectedHome.length === 0 && custody.length === 0 ? '' : JSON.stringify([home, shared, agents, ...protectedHome, ...custody])
 }
 
@@ -72,4 +73,29 @@ export async function ensureBatshitHomeSandboxMountPaths(
     }
   }
   return mounts
+}
+
+/**
+ * Read-only admission shared by real sandbox mounts and host-owned typed file custody. A
+ * workspace may not contain or enter a managed/credential root, including its resolved alias.
+ * Only ENOENT establishes an absent protected path; unreadable custody metadata refuses.
+ */
+export async function assertSandboxMountRootsSafe(
+  mounts: readonly string[],
+  batshitHome = getBatshitHomeDir(),
+  sharedHome = getDefaultBatshitHomeDir()
+): Promise<void> {
+  const resolvedMounts = await Promise.all(mounts.map(async (mount) => realpath(mount)))
+  const inside = (candidate: string, root: string) => {
+    const relative = path.relative(root, candidate)
+    return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  }
+  for (const protectedRoot of sandboxProtectedHomeRoots(batshitHome, sharedHome)) {
+    // A missing protected leaf may still have an aliased existing parent. Reuse the custody
+    // resolver's nearest-existing-parent walk; non-ENOENT metadata failures remain refusals.
+    const resolvedRoot = resolveExistingPath(protectedRoot)
+    if ([protectedRoot, resolvedRoot].some((root) =>
+      resolvedMounts.some((mount) => inside(root, mount) || inside(mount, root))
+    )) throw new Error('Sandbox workspace exposes managed agent homes or protected runtime/Pinokio data.')
+  }
 }

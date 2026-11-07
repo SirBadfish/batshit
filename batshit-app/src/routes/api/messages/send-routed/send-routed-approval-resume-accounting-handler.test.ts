@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { redis } from '$lib/server/redis'
@@ -35,7 +36,7 @@ const RESUME_USAGE = { inputTokens: 12_000, outputTokens: 500, totalTokens: 12_5
 const mocks = vi.hoisted(() => ({
   brainRuns: [] as string[],
   /** `reply`: words and a finish. `subagent-then-error`: a Subagent call and result, then a provider error. */
-  plan: 'reply' as 'reply' | 'subagent-then-error' | 'words-then-error' | 'acquire-error'
+  plan: 'reply' as 'reply' | 'subagent-then-error' | 'words-then-error' | 'words-then-stop' | 'acquire-error'
 }))
 
 vi.mock('$lib/server/services/nativeTools', async (importOriginal) => ({
@@ -48,9 +49,11 @@ vi.mock('$lib/server/services/nativeTools', async (importOriginal) => ({
 vi.mock('$lib/services/databaseRedis.server', async (importOriginal) => {
   const actual = await importOriginal<Record<string, any>>()
   class DatabaseService extends actual.DatabaseService {
-    async buildFormattedChatInput() {
+    async buildFormattedChatInput(sessionId: string, _history: unknown, agent: any, _current: unknown, _subagents: unknown, userId: string, options: any) {
       return {
         primarySystemPrompt: 'You are a test agent.',
+        whiteboardContextSnapshot: options?.whiteboardContextSnapshot ?? { schema_version: 1, userId, sessionId, agentId: agent.id, messageId: options?.whiteboardMessageId,
+          settings: { mode: 'neither', whiteboardEnabled: false, preserveReasoning: false, whiteboardBudgetTokens: 1500, showWhiteboard: true }, dcmLines: [] },
         structuredInput: { messages: [{ role: 'user', content: 'List the folder.' }], metadata: {} },
         resolvedProjectPath: null
       }
@@ -89,13 +92,18 @@ vi.mock('$lib/server/services/vercelBrain', () => ({
         }
         return { stream: failing(), steps: Promise.resolve([]), response: Promise.resolve({ messages: [] }) }
       }
-      if (mocks.plan === 'words-then-error') {
+      if (mocks.plan === 'words-then-error' || mocks.plan === 'words-then-stop') {
         async function* cutShort() {
           yield { type: 'start' }
           yield { type: 'start-step', request: {}, warnings: [] }
+          yield { type: 'raw', rawValue: { usage: { prompt_tokens: 12000, completion_tokens: 500, total_tokens: 12500 } } }
+          yield { type: 'finish-step', finishReason: 'tool-calls', usage: RESUME_USAGE, response: {} }
+          yield { type: 'start-step', request: {}, warnings: [] }
           yield { type: 'text-start', id: 't1' }
           yield { type: 'text-delta', id: 't1', text: 'The folder' }
-          yield { type: 'error', error: new Error('Provider exploded mid-reply.') }
+          const error = new Error('Provider exploded mid-reply.')
+          if (mocks.plan === 'words-then-stop') error.name = 'AbortError'
+          throw error
         }
         return { stream: cutShort(), steps: Promise.resolve([]), response: Promise.resolve({ messages: [] }) }
       }
@@ -125,6 +133,7 @@ useRedisTestServer()
 
 let POST: (event: any) => Promise<Response>
 let SESSION = ''
+useSendHandlerFixture({ sessionIds: () => [SESSION], postStartupMcpUsers: () => [USER] })
 let count = 0
 
 const model: SavedModel = {
@@ -168,6 +177,8 @@ const userMessage = () => ({
 const cardMetadata = () => ({
   model: 'claude-sonnet-5',
   agentType: 'api',
+  whiteboardContextSnapshot: { schema_version: 1, userId: USER, sessionId: SESSION, agentId: AGENT, messageId: CARD,
+    settings: { mode: 'neither', whiteboardEnabled: false, preserveReasoning: false, whiteboardBudgetTokens: 1500, showWhiteboard: true }, dcmLines: [] },
   usage: PAUSE_USAGE,
   performance: { schemaVersion: 1, source: 'ai-sdk', timeToFirstOutputMs: 900, outputTokensPerSecond: 40, responseTimeMs: 3000, modelCalls: 2 },
   reasoningSummary: 'Ask a helper, then list the folder.',
@@ -367,10 +378,14 @@ describe('send-routed: an approval resume counts both halves of the reply (BL-52
     expect(cost.delegatedCost).toBeCloseTo((4_000 / 1e6) * 3 + (400 / 1e6) * 15, 10)
   }, 30_000)
 
-  it('a resume that called the model and then failed leaves the reply\u2019s usage unknown, not the paused half\u2019s as exact', async () => {
-    mocks.plan = 'words-then-error'
+  it.each(['words-then-error', 'words-then-stop'] as const)('a resume %s keeps canonical usage unknown and the frozen prefix once (BL-1596)', async (plan) => {
+    mocks.plan = plan
     const response = await approve()
     expect(response.ok).toBe(false)
+    const stored = await redis.execute((client: any) => client.json.get(`message:${SESSION}:${CARD}`)) as any
+    expect(stored.metadata.usage).toBeNull()
+    expect(stored.content).toBe('Asking the helper first.\n\nThe folder')
+    expect(stored.metadata.observedUsage.parts).toEqual([{ source: 'run-usage-prefix', counts: PAUSE_USAGE }])
 
     const [snapshot] = await executionViewerService.getSnapshots(SESSION)
     expect(snapshot.id).toBe(CARD)

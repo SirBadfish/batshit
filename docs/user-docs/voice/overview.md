@@ -89,6 +89,8 @@ Treat voice clone files as sensitive. A voice sample can identify a person and m
 | Docker local engine health fails | The saved URL uses browser `localhost` from inside the app container. | Try `host.docker.internal` for server-side Docker calls. |
 | LiveKit appears unavailable | LiveKit is optional and needs a configured runtime. | Native: the Voice Runtimes LiveKit Install button. Docker: the LiveKit profile. External: saved LiveKit credentials. |
 
+Model choices and setup vary by provider. Fish Audio and supported Inworld models offer Direct streaming; Inworld TTS-2 Flash uses completed batch audio. Recorded Transcribe, recorded-turn Voice Mode and realtime microphone input are separate choices. See [Voice model settings](voice-settings.md#voice-model-lists).
+
 ## Related docs
 
 - [Voice settings](voice-settings.md)

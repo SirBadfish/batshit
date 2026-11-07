@@ -123,6 +123,48 @@ export function resolveDevToolsEnabled({
   return fileExists(resolveDevToolsOptInPath(env, homePath)) === true;
 }
 
+export function resolveNavigationDiagnosticsEnabled(env = process.env) {
+  return env.BATSHIT_MAC_NAVIGATION_DIAGNOSTICS === '1';
+}
+
+function navigationUrlCategory(value, allowedOrigins) {
+  const result = { present: value !== undefined && value !== null, type: value === null ? 'null' : typeof value };
+  if (typeof value !== 'string') return { ...result, category: result.present ? 'non-string' : 'missing' };
+  let parsed;
+  try { parsed = new URL(value); } catch { return { ...result, category: 'invalid' }; }
+  const route = new Map([
+    ['/', 'root'], ['/login', 'login'], ['/setup', 'setup'],
+    ['/auth/callback', 'auth-callback'], ['/desktop-goon', 'desktop-goon'],
+    ['/desktop-controls', 'desktop-controls']
+  ]).get(parsed.pathname) || 'other';
+  if (parsed.protocol === 'batshit-shell:' && parsed.hostname === 'app') {
+    return { ...result, category: 'shell', route: 'shell' };
+  }
+  const safeOrigin = normalizeLoopbackOrigin(value);
+  if (safeOrigin && allowedOrigins.has(safeOrigin)) return { ...result, category: 'approved-loopback', origin: safeOrigin, route };
+  return { ...result, category: safeOrigin ? 'other-loopback' : 'other', route: 'other' };
+}
+
+/** Opt-in local load evidence. Never retain raw URLs, paths, queries or errors. */
+export function createNavigationDiagnostic({
+  phase, role, legacyUrl, eventUrl, allowed, isMainFrame, isSameDocument,
+  defaultPrevented, errorCode, allowedOrigins = new Set()
+}) {
+  const phases = ['will-navigate', 'will-redirect', 'did-finish-load', 'did-fail-load'];
+  const roles = Object.values(DESKTOP_GOON_WINDOW_ROLES);
+  return {
+    phase: phases.includes(phase) ? phase : 'unknown',
+    role: roles.includes(role) ? role : 'unknown',
+    legacyArgument: navigationUrlCategory(legacyUrl, allowedOrigins),
+    eventUrl: navigationUrlCategory(eventUrl, allowedOrigins),
+    allowed: typeof allowed === 'boolean' ? allowed : null,
+    isMainFrame: typeof isMainFrame === 'boolean' ? isMainFrame : null,
+    isSameDocument: typeof isSameDocument === 'boolean' ? isSameDocument : null,
+    defaultPrevented: typeof defaultPrevented === 'boolean' ? defaultPrevented : null,
+    errorCode: Number.isSafeInteger(errorCode) ? errorCode : null
+  };
+}
+
 export const CUSTOM_CSS_FILENAME = 'custom.css';
 
 export function resolveCustomCssPath(env = process.env, homePath = '') {

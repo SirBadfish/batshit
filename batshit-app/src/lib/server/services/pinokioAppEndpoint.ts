@@ -1,154 +1,200 @@
-/**
- * SA-072 P2 (DL-10): where a Pinokio app answers RIGHT NOW.
- *
- * A Pinokio app artifact never stores a port as truth. Every call asks `pterm status <id>
- * --probe` (the probe is the reachability check; `ready` alone is Pinokio's launch-lifecycle
- * flag, P0) and uses the `ready_url` it reports. A good answer is kept for a few seconds so a
- * burst of panel requests (a ComfyUI run polls `/history` every second) does not spawn a
- * `pterm` per request; an offline or starting answer is never kept, so a start is seen at once.
- *
- * The address must be this machine or a private network host (the same rule the ComfyUI
- * proxy applies), `localhost` becomes `127.0.0.1` (Node resolves `localhost` to `::1` first
- * while Pinokio apps listen on IPv4), and only the origin is kept: the app's API lives at its
- * root, and a `ready_url` can carry a UI path or query.
- */
-
+/** Target-bound Pinokio app discovery. Saved control origins never become app origins. */
+import { Agent } from 'undici'
 import { getPinokioAppStatus, type PinokioAppState, type PinokioUnavailableReason } from './pinokioService'
+import { pinokioMachineService } from './pinokioMachineService'
+import { LOCAL_PINOKIO_MACHINE_ID, pinokioTargetKey, isPinokioControlHost } from '$lib/pinokio/machines'
 
 const ONLINE_CACHE_MS = 5_000
+const APP_PROBE_BUDGET_MS = 8_000
+// A dedicated direct dispatcher prevents environment proxy credentials or DNS retargeting.
+const appDispatcher = new Agent({ connect: { timeout: APP_PROBE_BUDGET_MS } })
 
-export type PinokioAppEndpointCode =
-  | 'app_offline'
-  | 'pinokio_unavailable'
-  | 'app_not_found'
-  | 'app_refused'
-  | 'pinokio_error'
-
-export type PinokioAppEndpoint =
-  | { ok: true; appId: string; title: string; baseUrl: string }
-  | {
-      ok: false
-      code: PinokioAppEndpointCode
-      /** The HTTP status a route answers with: 503 offline/unavailable, 404, 400, or 502. */
-      status: number
-      appId: string
-      title: string | null
-      /** `offline` or `starting` for `app_offline`. */
-      state?: PinokioAppState
-      reason?: PinokioUnavailableReason
-      message: string
-    }
-
-interface CachedEndpoint {
-  expiresAt: number
-  value: Extract<PinokioAppEndpoint, { ok: true }>
+export type PinokioAppEndpointCode = 'app_offline' | 'pinokio_unavailable' | 'app_not_found' | 'app_refused' | 'pinokio_error'
+export interface PinokioEndpointOptions {
+  userId?: string
+  machineId?: string
+  revision?: number
+  signal?: AbortSignal
+  /** Server-owned saved Artifact/actor admission, never taken from an HTTP body. */
+  admitFetch?: () => Promise<void>
 }
+interface OnlineEndpoint {
+  ok: true
+  appId: string
+  title: string
+  baseUrl: string
+  machineId?: string
+  machineRevision?: number
+  machineLabel?: string
+  /** Exact native aliases reported by this app, used only to normalize its file route. */
+  nativeReadyOrigins?: string[]
+  /** Present only for a remote target; every app request must use this pinned reader. */
+  fetch?: typeof fetch
+}
+export type PinokioAppEndpoint = OnlineEndpoint | {
+  ok: false
+  code: PinokioAppEndpointCode
+  status: number
+  appId: string
+  title: string | null
+  state?: PinokioAppState
+  reason?: PinokioUnavailableReason
+  machineId?: string
+  machineRevision?: number
+  machineLabel?: string
+  message: string
+}
+const endpointCache = new Map<string, { expiresAt: number; value: OnlineEndpoint }>()
 
-const endpointCache = new Map<string, CachedEndpoint>()
-
-/** Drops a kept address, for one app or for all (tests, and after Batshit starts an app). */
+/** Drop every machine-qualified entry for this app; restore drops the complete cache. */
 export function forgetPinokioAppEndpoint(appId?: string) {
-  if (appId) endpointCache.delete(appId.trim())
-  else endpointCache.clear()
+  if (!appId) return endpointCache.clear()
+  for (const [key, entry] of endpointCache) if (entry.value.appId === appId.trim()) endpointCache.delete(key)
 }
-
 function isPrivateIpv4(hostname: string): boolean {
-  const parts = hostname.split('.').map((part) => Number(part))
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false
-  if (parts[0] === 10 || parts[0] === 127) return true
-  if (parts[0] === 192 && parts[1] === 168) return true
-  return parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31
+  const parts = hostname.split('.').map(Number)
+  if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return false
+  return parts[0] === 127 || isPinokioControlHost(hostname)
 }
-
-function isAllowedPinokioAppHost(hostname: string): boolean {
-  const normalized = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '')
-  if (!normalized) return false
-  if (normalized === 'localhost' || normalized === '::1') return true
-  if (normalized.endsWith('.local')) return true
-  return isPrivateIpv4(normalized)
-}
-
-/** The origin Batshit calls for a `ready_url`, or `null` when it is not a local/private http(s) URL. */
+/** Preserve the accepted local ready_url policy, including its IPv4 localhost normalization. */
 export function pinokioReadyUrlToBase(readyUrl: string | null | undefined): string | null {
   if (typeof readyUrl !== 'string' || !readyUrl.trim()) return null
-  let parsed: URL
   try {
-    parsed = new URL(readyUrl.trim())
-  } catch {
-    return null
+    const url = new URL(readyUrl.trim())
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    if (!['http:', 'https:'].includes(url.protocol) || !(host === 'localhost' || host === '::1' || host.endsWith('.local') || isPrivateIpv4(host))) return null
+    if (host === 'localhost') url.hostname = '127.0.0.1'
+    return url.origin
+  } catch { return null }
+}
+function remoteAppUrl(raw: string, host: string): URL | null {
+  try {
+    const url = new URL(raw)
+    return ['http:', 'https:'].includes(url.protocol) && isPinokioControlHost(host) && url.hostname === host && !url.username && !url.password && !url.hash ? url : null
+  } catch { return null }
+}
+function nativeAlias(raw: string | null): string[] {
+  if (!raw) return []
+  try {
+    const url = new URL(raw)
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) return []
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    return ['localhost', '127.0.0.1', '0.0.0.0', '::1', '::'].includes(host) ? [url.origin] : []
+  } catch { return [] }
+}
+function refused(message: string): never { throw Object.assign(new Error(message), { status: 409 }) }
+function failureMessage(cause: unknown): string {
+  if (cause && typeof cause === 'object') {
+    const value = cause as { message?: unknown; body?: { message?: unknown } }
+    if (typeof value.message === 'string') return value.message
+    if (typeof value.body?.message === 'string') return value.body.message
   }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
-  if (!isAllowedPinokioAppHost(parsed.hostname)) return null
-  if (parsed.hostname.toLowerCase() === 'localhost') parsed.hostname = '127.0.0.1'
-  return parsed.origin
+  return 'The saved Pinokio target could not be admitted.'
 }
 
-export async function resolvePinokioAppEndpoint(appIdInput: string): Promise<PinokioAppEndpoint> {
+export async function resolvePinokioAppEndpoint(appIdInput: string, options: PinokioEndpointOptions = {}): Promise<PinokioAppEndpoint> {
   const appId = appIdInput.trim()
-  const cached = endpointCache.get(appId)
-  if (cached && cached.expiresAt > Date.now()) return cached.value
-  endpointCache.delete(appId)
-
-  const status = await getPinokioAppStatus({ appId, probe: true })
-  if (!status.ok) {
-    switch (status.kind) {
-      case 'unavailable':
-        return {
-          ok: false,
-          code: 'pinokio_unavailable',
-          status: 503,
-          appId,
-          title: null,
-          reason: status.reason,
-          message: status.message
+  const remote = options.machineId !== undefined && options.machineId !== LOCAL_PINOKIO_MACHINE_ID
+  let scope: { machineId?: string; machineRevision?: number; machineLabel?: string } = {}
+  try {
+    options.signal?.throwIfAborted()
+    await options.admitFetch?.()
+    options.signal?.throwIfAborted()
+    if (!remote && options.revision !== undefined && options.revision !== 0) refused('A target revision requires its saved Pinokio computer.')
+    if (!remote && options.machineId === undefined && options.revision !== undefined) refused('A target revision requires its saved Pinokio computer.')
+    if (remote && !options.userId) refused('A signed-in owner is required for a saved Pinokio computer.')
+    // Resolve before cache access, even when a previous run reached this app moments ago.
+    const target = remote
+      ? options.revision === undefined
+        ? await pinokioMachineService.resolveCurrent(options.userId!, options.machineId)
+        : await pinokioMachineService.resolve(options.userId!, { machineId: options.machineId!, revision: options.revision })
+      : null
+    options.signal?.throwIfAborted()
+    if (remote && target?.kind !== 'remote') refused('Choose a confirmed saved remote Pinokio computer.')
+    const saved = target?.kind === 'remote' ? target : null
+    if (saved) scope = { machineId: saved.id, machineRevision: saved.revision, machineLabel: saved.label }
+    const assertTarget = async () => {
+      options.signal?.throwIfAborted()
+      await options.admitFetch?.()
+      options.signal?.throwIfAborted()
+      if (saved) {
+        const current = await pinokioMachineService.resolve(options.userId!, { machineId: saved.id, revision: saved.revision })
+        options.signal?.throwIfAborted()
+        if (current.kind !== 'remote' || current.id !== saved.id || current.revision !== saved.revision || current.controlHost !== saved.controlHost || current.controlPort !== saved.controlPort || current.controlProtocol !== saved.controlProtocol) refused('This Pinokio computer changed during the run. Run the Artifact again.')
+      }
+      await options.admitFetch?.()
+      options.signal?.throwIfAborted()
+    }
+    const bind = (value: OnlineEndpoint): OnlineEndpoint => {
+      if (!saved) return value
+      const boundFetch: typeof fetch = async (resource, init = {}) => {
+        if (typeof resource !== 'string' && !(resource instanceof URL)) refused('Pinokio app requests must use a bound app URL.')
+        const raw = String(resource)
+        const url = new URL(raw, value.baseUrl)
+        if (url.origin !== value.baseUrl || url.username || url.password || url.hash || raw.startsWith('//')) refused('This request leaves the saved Pinokio app origin.')
+        await assertTarget()
+        const headers = new Headers(init.headers)
+        for (const name of ['authorization', 'cookie', 'proxy-authorization', 'x-batshit-service-token']) headers.delete(name)
+        const signal = init.signal && options.signal ? AbortSignal.any([init.signal, options.signal]) : init.signal ?? options.signal
+        signal?.throwIfAborted()
+        const response = await fetch(url.toString(), { ...init, signal, headers, credentials: 'omit', redirect: 'error', dispatcher: appDispatcher } as RequestInit)
+        if (signal?.aborted) { await response.body?.cancel().catch(() => {}); signal.throwIfAborted() }
+        if (response.status >= 300 && response.status < 400) {
+          await response.body?.cancel()
+          refused('The Pinokio app redirected its response; Batshit did not follow it.')
         }
-      case 'not_found':
-        return {
-          ok: false,
-          code: 'app_not_found',
-          status: 404,
-          appId,
-          title: null,
-          message: `Pinokio has no app "${appId}" on this computer. ${status.message}`.trim()
-        }
-      case 'refused':
-        return { ok: false, code: 'app_refused', status: 400, appId, title: null, message: status.message }
-      default:
-        return { ok: false, code: 'pinokio_error', status: 502, appId, title: null, message: status.message }
+        return response
+      }
+      return { ...value, fetch: boundFetch }
     }
-  }
-
-  const app = status.value
-  if (app.state !== 'online' || app.probe !== true) {
-    const starting = app.state === 'starting' || (app.state === 'online' && app.probe !== true)
-    return {
-      ok: false,
-      code: 'app_offline',
-      status: 503,
-      appId,
-      title: app.title,
-      state: starting ? 'starting' : 'offline',
-      message: starting
-        ? `${app.title} is still starting in Pinokio.`
-        : `${app.title} is not running in Pinokio.`
+    const key = pinokioTargetKey(options.userId ?? '', { machineId: saved?.id ?? LOCAL_PINOKIO_MACHINE_ID, revision: saved?.revision ?? 0, appId })
+    const cached = endpointCache.get(key)
+    if (cached && cached.expiresAt > Date.now()) {
+      await assertTarget()
+      return bind({ ...cached.value, ...scope })
     }
-  }
-
-  const baseUrl = pinokioReadyUrlToBase(app.readyUrl)
-  if (!baseUrl) {
-    return {
-      ok: false,
-      code: 'app_refused',
-      status: 400,
-      appId,
-      title: app.title,
-      message: `${app.title} reports an address Batshit will not call (${app.readyUrl ?? 'none'}): only this computer or a private network address.`
+    endpointCache.delete(key)
+    const status = await getPinokioAppStatus({ appId, probe: true, ...(saved ? { userId: options.userId, machineId: saved.id, revision: saved.revision, signal: options.signal } : {}) })
+    await assertTarget()
+    if (!status.ok) {
+      const code = status.kind === 'unavailable' ? 'pinokio_unavailable' : status.kind === 'not_found' ? 'app_not_found' : status.kind === 'refused' ? 'app_refused' : 'pinokio_error'
+      return { ok: false, code, status: status.kind === 'unavailable' ? 503 : status.kind === 'not_found' ? 404 : status.kind === 'refused' ? 400 : 502, appId, title: null, ...scope, message: status.message, ...(status.kind === 'unavailable' ? { reason: status.reason } : {}) }
     }
+    const app = status.value
+    if (app.state !== 'online' || (!saved && app.probe !== true)) {
+      const starting = app.state === 'starting' || app.state === 'online'
+      return { ok: false, code: 'app_offline', status: 503, appId, title: app.title, ...scope, state: starting ? 'starting' : 'offline', message: `${app.title} is ${starting ? 'still starting' : 'not running'} in Pinokio.` }
+    }
+    let value: OnlineEndpoint
+    if (!saved) {
+      const baseUrl = pinokioReadyUrlToBase(app.readyUrl)
+      if (!baseUrl) return { ok: false, code: 'app_refused', status: 400, appId, title: app.title, message: `${app.title} reports an address Batshit will not call (${app.readyUrl ?? 'none'}): only this computer or a private network address.` }
+      value = { ok: true, appId, title: app.title, baseUrl, nativeReadyOrigins: nativeAlias(app.readyUrl) }
+    } else {
+      const candidates = [...new Set(app.externalReadyUrls ?? [])].map(raw => remoteAppUrl(raw, saved.controlHost)).filter((url): url is URL => !!url)
+      const deadline = Date.now() + APP_PROBE_BUDGET_MS
+      let reached: URL | null = null
+      for (const candidate of candidates) {
+        if (Date.now() >= deadline) break
+        const probe = bind({ ok: true, appId, title: app.title, baseUrl: candidate.origin })
+        let response: Response | undefined
+        try {
+          response = await probe.fetch!(candidate.toString(), { method: 'GET', signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) })
+          if (response.ok) reached = candidate
+        } catch { options.signal?.throwIfAborted() }
+        finally { await response?.body?.cancel().catch(() => {}) }
+        await assertTarget()
+        if (reached) break
+      }
+      if (!reached) return { ok: false, code: 'app_offline', status: 503, appId, title: app.title, ...scope, state: 'starting', message: `${app.title} has no advertised app address reachable from Batshit on ${saved.label}.` }
+      value = { ok: true, appId, title: app.title, baseUrl: reached.origin, ...scope, nativeReadyOrigins: nativeAlias(app.readyUrl) }
+    }
+    endpointCache.set(key, { expiresAt: Date.now() + ONLINE_CACHE_MS, value })
+    return bind(value)
+  } catch (error) {
+    if (options.signal?.aborted) throw error
+    return { ok: false, code: 'app_refused', status: (error as {status?:number})?.status ?? 400, appId, title: null, ...scope, message: failureMessage(error) }
   }
-
-  const value = { ok: true as const, appId, title: app.title, baseUrl }
-  endpointCache.set(appId, { expiresAt: Date.now() + ONLINE_CACHE_MS, value })
-  return value
 }
 
 /**
@@ -156,8 +202,12 @@ export async function resolvePinokioAppEndpoint(appIdInput: string): Promise<Pin
  * and the exact next step (the start is the user's Approve click, DL-03).
  */
 export function pinokioEndpointAgentMessage(endpoint: Exclude<PinokioAppEndpoint, { ok: true }>): string {
+  const target = endpoint.machineId ? { machineId: endpoint.machineId, revision: endpoint.machineRevision } : {}
   if (endpoint.code === 'app_offline' && endpoint.state === 'starting') {
-    return `${endpoint.message} Check it with fabric:sys.pinokio.app_status (input: { "appId": "${endpoint.appId}" }) and run this artifact again once it is online.`
+    return `${endpoint.message} Check it with fabric:sys.pinokio.app_status (input: ${JSON.stringify({ appId: endpoint.appId, ...target })}) and run this artifact again once Batshit can reach its app.`
+  }
+  if (endpoint.code === 'app_offline' && endpoint.machineId) {
+    return `${endpoint.message} Read a fresh start preview with fabric:sys.pinokio.app_status (input: ${JSON.stringify({ appId: endpoint.appId, ...target, previewStart: true })}). Start this same saved computer with fabric:sys.pinokio.run using the preview's machineId, revision (machineRevision), launchFingerprint and alsoStarts. Batshit shows the user an Approve card, so do not ask in chat first. Then run this artifact again.`
   }
   if (endpoint.code === 'app_offline') {
     return `${endpoint.message} Start it now with fabric:sys.pinokio.run (input: { "appId": "${endpoint.appId}" }): Batshit shows the user an Approve card for the start, so do not ask in chat first. Then run this artifact again.`
@@ -199,7 +249,8 @@ async function getJson(fetchImpl: typeof fetch, url: string): Promise<Record<str
     if (!response.ok) return null
     const value = await response.json().catch(() => null)
     return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, any>) : null
-  } catch {
+  } catch (cause) {
+    if ((cause && typeof cause === 'object' && ('status' in cause || 'code' in cause)) || (cause instanceof Error && cause.name === 'AbortError')) throw cause
     return null
   }
 }
@@ -233,7 +284,8 @@ export function summarizeGradioInfo(info: Record<string, any>): Extract<PinokioA
  * named endpoints (`<api prefix>/info`), or that it is ComfyUI (`/system_stats`), or neither.
  * Read-only GETs against the address Pinokio reported; nothing starts.
  */
-export async function describePinokioAppApi(baseUrl: string, fetchImpl: typeof fetch = fetch): Promise<PinokioAppApiDescription> {
+export async function describePinokioAppApi(baseUrl: string, fetchImpl: typeof fetch = fetch, options: { machineId?: string } = {}): Promise<PinokioAppApiDescription> {
+  const targetHint = options.machineId ? ` For this saved computer set metadata.pinokio_machine_id to ${JSON.stringify(options.machineId)}; do not save a revision or address.` : ''
   const config = await getJson(fetchImpl, `${baseUrl}/config`)
   if (config && (typeof config.version === 'string' || Array.isArray(config.components))) {
     const rawPrefix = typeof config.api_prefix === 'string' ? config.api_prefix.trim() : ''
@@ -244,7 +296,7 @@ export async function describePinokioAppApi(baseUrl: string, fetchImpl: typeof f
       apiPrefix,
       endpoints: summarizeGradioInfo(info),
       hint:
-        'A Gradio app in Pinokio: build a Pinokio App artifact (brain_type "pinokio_app", metadata.runtime_manager "pinokio", metadata.pinokio_app_id, source_type "gradio"; agents can run it), not a Gradio embed. Its metadata.pinokio_runtime is { api_name, inputs: one entry per parameter, in order: { "field": "<fabricId>" } (add "file": true for an image or file parameter) or { "value": <fixed value> }, and outputs: the "position" of each returned value that is the result, such as [1] (leave out previews, status lines, and slider updates) }. The Artifact Creator\'s runtime-pinokio.md has the full recipe.'
+        'A Gradio app in Pinokio: build a Pinokio App artifact (brain_type "pinokio_app", metadata.runtime_manager "pinokio", metadata.pinokio_app_id, source_type "gradio"; agents can run it), not a Gradio embed. Its metadata.pinokio_runtime is { api_name, inputs: one entry per parameter, in order: { "field": "<fabricId>" } (add "file": true for an image or file parameter) or { "value": <fixed value> }, and outputs: the "position" of each returned value that is the result, such as [1] (leave out previews, status lines, and slider updates) }. The Artifact Creator\'s runtime-pinokio.md has the full recipe.' + targetHint
     }
   }
   const stats = await getJson(fetchImpl, `${baseUrl}/system_stats`)
@@ -252,11 +304,11 @@ export async function describePinokioAppApi(baseUrl: string, fetchImpl: typeof f
     return {
       kind: 'comfyui',
       comfyuiVersion: typeof stats.system.comfyui_version === 'string' ? stats.system.comfyui_version : null,
-      hint: `ComfyUI in Pinokio: build a Pinokio App artifact (brain_type "pinokio_app", metadata.runtime_manager "pinokio", metadata.pinokio_app_id, source_type "comfyui"; agents can run it), not a plain ComfyUI panel. List and load its saved workflows with fabric:sys.comfyui.workflows (baseUrl: "${baseUrl}"), then store the API-format workflow in metadata.pinokio_runtime.workflow with inputs mapping each fabricId to { node, input }. The Artifact Creator's runtime-pinokio.md has the full recipe.`
+      hint: `ComfyUI in Pinokio: build a Pinokio App artifact (brain_type "pinokio_app", metadata.runtime_manager "pinokio", metadata.pinokio_app_id, source_type "comfyui"; agents can run it), not a plain ComfyUI panel. List and load its saved workflows with fabric:sys.comfyui.workflows (baseUrl: "${baseUrl}"), then store the API-format workflow in metadata.pinokio_runtime.workflow with inputs mapping each fabricId to { node, input }. The Artifact Creator's runtime-pinokio.md has the full recipe.${targetHint}`
     }
   }
   return {
     kind: 'unknown',
-    hint: 'Neither ComfyUI nor Gradio answered. If the app has its own HTTP API, use metadata.source_type "custom" and a pinokio_runtime of { "method": "POST", "path": "/its/endpoint" }; the field values are sent as the JSON body.'
+    hint: 'Neither ComfyUI nor Gradio answered. If the app has its own HTTP API, use metadata.source_type "custom" and a pinokio_runtime of { "method": "POST", "path": "/its/endpoint" }; the field values are sent as the JSON body.' + targetHint
   }
 }

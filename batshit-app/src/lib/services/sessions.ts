@@ -83,7 +83,8 @@ export class SessionService {
   }
   
   // Create new session
-  async createSession(userId: string, folderId?: string, agentId?: string | null) {
+  async createSession(userId: string, folderId?: string, agentId?: string | null,
+    options?: { beforeSelect?: (created: ChatSession) => boolean | void }) {
     const sessionId = this.generateSessionId()
     const sessionName = this.generateSessionName()
     const initialAgentId = typeof agentId === 'string' && agentId.trim().length > 0
@@ -112,8 +113,11 @@ export class SessionService {
 
     try {
       const created = await this.db.createSession(newSession)
+      // A captured first send may transfer its local draft owner before this id
+      // becomes selected. Refusal preserves a newer selection, not a fake send ACK.
+      const maySelect = options?.beforeSelect?.(created as ChatSession) !== false
       sessionStore.addSession(created as ChatSession)
-      sessionStore.setCurrentSessionId(created.id)
+      if (maySelect) sessionStore.setCurrentSessionId(created.id)
       
       // Force a re-render by updating the session list
       const currentSessions = sessionStore.getSessions()

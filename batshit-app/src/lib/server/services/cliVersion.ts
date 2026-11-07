@@ -1,7 +1,6 @@
 /**
  * BL-268 — the version a CLI reports, compared with the version Batshit installs.
  *
- * `codex --version` answers `codex-cli 0.139.0` (or `codex-cli 0.158.0-alpha.2.1`), and
  * `claude --version` answers `2.1.280 (Claude Code)`. Only the first `major.minor.patch` is
  * read; a prerelease of a version counts as that version.
  */
@@ -11,6 +10,14 @@ export function parseCliVersion(text: string | null | undefined): [number, numbe
   const match = /(\d+)\.(\d+)\.(\d+)/.exec(text)
   if (!match) return null
   return [Number(match[1]), Number(match[2]), Number(match[3])]
+}
+
+/** Release-specific transport proof must accept the client's actual branded --version
+ * line, while refusing prereleases/newer or otherwise unqualified programs. */
+export function isExactCliReleaseVersion(runtime: 'claude', found: string | null | undefined, pinned: string): boolean {
+  if (!/^\d+\.\d+\.\d+$/.test(pinned) || typeof found !== 'string') return false
+  const value = found.trim()
+  return value === pinned || value === `${pinned} (Claude Code)`
 }
 
 /** True only when both versions read and `found` is older than `pinned`. */

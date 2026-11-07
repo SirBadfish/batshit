@@ -2,6 +2,8 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/sve
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import ArtifactSettingsPanel from './ArtifactSettingsPanel.svelte'
+import { LOCAL_PINOKIO_MACHINE } from '$lib/pinokio/machines'
+import { LIVE_SETTINGS_EVENTS } from '$lib/utils/liveSettingsEvents'
 
 // BL-545 / BL-546: Settings > Artifacts must never save a copy it did not load, and must never
 // send back fields the user did not change. The panel is driven against a small fake of the
@@ -103,6 +105,7 @@ function installArtifactRoutes(options: {
   stored: StoredArtifact
   others?: StoredArtifact[]
   detailGate?: Promise<void>
+  pinokioMachines?: () => unknown[]
 }) {
   const records = new Map<string, StoredArtifact>(
     [options.stored, ...(options.others ?? [])].map((record) => [record.id, record])
@@ -127,6 +130,12 @@ function installArtifactRoutes(options: {
 
     if (url.startsWith('/api/icons/library')) {
       return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
+    }
+    if (url === '/api/pinokio/machines') return jsonResponse({ machines: options.pinokioMachines?.() ?? [LOCAL_PINOKIO_MACHINE] })
+    if (url.startsWith('/api/pinokio/apps')) {
+      const target = new URL(url, 'http://localhost').searchParams
+      return jsonResponse({ available: true, apps: [{ appId: 'ocr.git', title: 'OCR', state: 'online' }],
+        machineId: target.get('machineId') ?? 'local', machineRevision: Number(target.get('revision') ?? 0) })
     }
     if (url.startsWith('/api/artifacts?')) {
       return jsonResponse([...records.values()].map(leanCopy))
@@ -210,6 +219,61 @@ describe('ArtifactSettingsPanel saves only what the user changed, on the copy it
   afterEach(() => {
     vi.restoreAllMocks()
     global.fetch = originalFetch
+  })
+
+  it('gates the mounted Pinokio picker on full detail and refreshes machine labels without autosaving', async () => {
+    const machineId = '11111111-1111-4111-8111-111111111111'
+    let machine = { id: machineId, label: 'Studio PC', controlHost: '192.168.1.90', controlPort: 42000,
+      controlProtocol: 'http', revision: 1, version: 1, bindingState: 'confirmed' }
+    const gate = deferred<void>()
+    const savedMetadata = { enforce_batshit_artifact_structure: false, source_type: 'gradio', runtime_manager: 'pinokio',
+      pinokio_machine_id: machineId, pinokio_app_id: 'ocr.git', pinokio_runtime: { api_name: '/predict', inputs: [] } }
+    const routes = installArtifactRoutes({ stored: storedArtifact({ brain_type: 'pinokio_app', metadata: savedMetadata }),
+      detailGate: gate.promise, pinokioMachines: () => [LOCAL_PINOKIO_MACHINE, machine] })
+    renderPanel()
+    const computer = await screen.findByRole('button', { name: 'Pinokio computer' })
+    expect(computer).toBeDisabled()
+    gate.resolve()
+    await waitFor(() => expect(computer).not.toBeDisabled())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Pinokio app' }).textContent).toContain('OCR · Studio PC'))
+    machine = { ...machine, label: 'Office PC', version: 2 }
+    window.dispatchEvent(new CustomEvent(LIVE_SETTINGS_EVENTS.pinokioMachinesUpdated))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Pinokio app' }).textContent).toContain('OCR · Office PC'))
+    await pause(1800)
+    expect(routes.puts).toEqual([])
+    expect(routes.state.stored.metadata).toEqual(savedMetadata)
+  })
+
+  it('serializes remote to local as a sparse explicit binding that survives metadata merge and reload', async () => {
+    const machineId = '11111111-1111-4111-8111-111111111111'
+    const machine = { id: machineId, label: 'Studio PC', controlHost: '192.168.1.90', controlPort: 42000,
+      controlProtocol: 'http', revision: 1, version: 1, bindingState: 'confirmed' }
+    const savedMetadata = { enforce_batshit_artifact_structure: false, source_type: 'gradio', runtime_manager: 'pinokio',
+      pinokio_machine_id: machineId, pinokio_app_id: 'ocr.git', pinokio_runtime: { api_name: '/predict', inputs: [] },
+      otherSavedSetting: 'keep this' }
+    const routes = installArtifactRoutes({ stored: storedArtifact({ brain_type: 'pinokio_app', metadata: savedMetadata }),
+      pinokioMachines: () => [LOCAL_PINOKIO_MACHINE, machine] })
+    const view = renderPanel()
+    const computer = await screen.findByRole('button', { name: 'Pinokio computer' })
+    await waitFor(() => expect(computer).not.toBeDisabled())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Pinokio app' }).textContent).toContain('OCR · Studio PC'))
+    await fireEvent.keyDown(computer, { key: 'ArrowDown' })
+    await fireEvent.pointerUp(await screen.findByRole('option', { name: 'This computer' }), { pointerType: 'mouse' })
+
+    // This is the actual JSON-parsed PUT from the mounted panel's sparse serializer, not the
+    // child's onChange object. The route fixture applies the service's verified shallow merge.
+    await waitFor(() => expect(routes.puts).toHaveLength(1), { timeout: 3000 })
+    expect(routes.puts[0]).toEqual({ metadata: { pinokio_machine_id: 'local' } })
+    expect(routes.state.stored.metadata).toEqual({ ...savedMetadata, pinokio_machine_id: 'local' })
+    view.unmount()
+
+    renderPanel()
+    await waitFor(() => expect(routes.detailReads).toHaveLength(2))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Pinokio computer' }).textContent).toContain('This computer'))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Pinokio app' }).textContent).toContain('OCR · This computer'))
+    await pause(1800)
+    expect(routes.puts).toHaveLength(1)
+    expect(routes.state.stored.metadata.pinokio_machine_id).toBe('local')
   })
 
   it('sends no save while the detail is loading, and none after, when the saved slug differs from the name (BL-545)', async () => {

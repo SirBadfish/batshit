@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Message } from '$lib/stores/messages.svelte'
+  import type { Snippet } from 'svelte'
   import MessageContent from './MessageContent.svelte'
   import MessageActionsRow from './MessageActionsRow.svelte'
   import JevJuiceFlagNotice from './JevJuiceFlagNotice.svelte'
@@ -7,14 +8,14 @@
   import JevJuiceQuickActionChip from './JevJuiceQuickActionChip.svelte'
   import JevJuiceGroupReplyChip from './JevJuiceGroupReplyChip.svelte'
   import { readGroupReplySkipped } from '$lib/utils/groupReplySkipped'
+  import { describeManagedPatchApproval } from '$lib/utils/managedApplyPatch'
   import { readQuickActionMark } from '$lib/utils/jevJuiceQuickActions'
   import type { WakeTurnRef } from '$lib/utils/jevJuice'
   import JevJuiceNote from './JevJuiceNote.svelte'
   import JevJuicePostTurnChip from './JevJuicePostTurnChip.svelte'
   import { getJevJuicePostTurnRecord } from '$lib/stores/jevJuicePostTurn.svelte'
-  import { getCodexCleanupWarning } from '$lib/stores/codexCleanupWarnings.svelte'
-  import { codexCleanupWarningText } from '$lib/utils/codexCleanupWarning'
   import { modeLimitedNoteText } from '$lib/utils/modeLimitedNote'
+  import { EMPTY_STOPPED_REPLY_NOTE, isEmptyStoppedReply } from '$lib/utils/stoppedReplyNote'
   import { jevJuiceGapDetail, jevJuiceGapText, readJevJuiceGaps, readJevJuiceNotes } from '$lib/utils/jevJuice'
   import { copyTextToClipboard } from '$lib/utils/clipboard'
   import MessageApprovalPanel from './MessageApprovalPanel.svelte'
@@ -33,6 +34,7 @@
   import * as chatRunRegistry from '$lib/stores/chatRunRegistry.svelte'
   import {
     describeControlApproval,
+    isRetiredSavedApproval,
     resolveApprovalSubmitSource,
     describeExpiredApprovalClick
   } from '$lib/utils/controlApprovalPresentation'
@@ -66,7 +68,7 @@
     getProviderOptionsFor,
     normalizeAgentVoiceProfile
   } from '$lib/utils/voiceSchema'
-  import { Archive, Brain, ChevronDown, TriangleAlert, Zap } from '@lucide/svelte'
+  import { Archive, Ban, Brain, ChevronDown, Info, TriangleAlert, Zap } from '@lucide/svelte'
   import { DEFAULT_AGENT_ICON_REF } from '$lib/icons/iconCatalog'
   import { normalizeIconRef } from '$lib/icons/iconLegacy'
 
@@ -86,7 +88,8 @@
     thinkingSubject = '',
     planSubject = {},
     voiceSettings,
-    wakeTurn = null
+    wakeTurn = null,
+    whiteboard
   } = $props<{ 
     message: Message
     messageIndex?: number
@@ -107,6 +110,8 @@
      * above it; on the user message that IS the wake-up message, for the flag under its text.
      */
     wakeTurn?: WakeTurnRef | null
+    /** The current saved board only; its owner and open state live in ChatArea. */
+    whiteboard?: Snippet
   }>()
   
   const isAI = $derived(message.role === 'assistant')
@@ -358,9 +363,6 @@
   const jevJuicePostTurn = $derived.by(() =>
     isAI ? getJevJuicePostTurnRecord(sessionId || message.session_id, message.id) : null
   )
-  const codexCleanupWarning = $derived.by(() =>
-    isAI ? getCodexCleanupWarning(sessionId || message.session_id, message.id) : null
-  )
   // BL-775: the server saved this reply from its own copy, because the live record of the stream
   // could not be had (a stream event did not reach it). The words are whole; the notice says why
   // the reply may look different from what streamed.
@@ -396,6 +398,10 @@
 
   const showPlan = $derived(
     isAI && (planItems.length > 0 || Boolean(planSummary))
+  )
+  // BL-934: a reply stopped before any of it arrived says so, instead of an empty bubble.
+  const emptyStoppedReply = $derived(
+    isEmptyStoppedReply(message) && !(showReasoning && reasoningSummary) && !showPlan
   )
   
   // The live settings store (a rename in Settings reaches a mounted bubble), then the page's
@@ -714,6 +720,17 @@
     const toolName = (approval?.toolName || '').toLowerCase()
     const command = extractCommandFromApproval(approval)
 
+    // SA-126 item 2: the API lane's Bash tool runs the commands after a patch once it applied, so
+    // the card's first line names them above the patch (the input below shows the whole command).
+    const patchThenRun = command && toolName === 'native_bash_execute' ? describeManagedPatchApproval(command) : null
+    if (patchThenRun) {
+      const files = patchThenRun.files.slice(0, 3).map((file) => `\`${file}\``).join(', ')
+      const moreFiles = patchThenRun.files.length > 3 ? ` and ${patchThenRun.files.length - 3} more` : ''
+      const moreLines = patchThenRun.moreLines > 0 ? ` (+${patchThenRun.moreLines} more line${patchThenRun.moreLines === 1 ? '' : 's'})` : ''
+      const run = patchThenRun.firstLine.length > 120 ? `${patchThenRun.firstLine.slice(0, 117)}...` : patchThenRun.firstLine
+      return `${actor} wants to apply a patch${files ? ` to ${files}${moreFiles}` : ''}, then run \`${run}\`${moreLines}.`
+    }
+
     if (command && (toolName.includes('bash') || toolName.includes('execute_command'))) {
       return `${actor} wants to ${summarizeBashCommand(command)}.`
     }
@@ -767,6 +784,9 @@
   }
 
   function resolveApprovalExpiryMs(approval: any): number | null {
+    // A saved CLI card is cleared explicitly, without posting a permission decision.
+    // Keep it actionable until the server confirms retirement.
+    if (isRetiredSavedApproval(approval, toolApprovalSummary?.source, message.metadata as any)) return null
     // SA-116 (DL-116-06): a control approval that waits for a resume turn has no three
     // minute clock. Its record lives 24 hours, and the CLI lanes cannot answer a card that
     // has already expired by the time the agent finishes speaking.
@@ -794,14 +814,14 @@
     return Math.ceil(remainingMs / 1000)
   }
 
-  async function submitToolApprovals(approvals: any[]) {
+  async function submitToolApprovals(approvals: any[], retiredApprovalId?: string) {
     if (!approvals.length) return
     if (approvalSubmitting) return
 
     // The entries this answer carries. The card keeps their marks once the server has recorded
     // the answer: from its acceptance on, whatever the resumed run does after; a refused or lost
     // answer puts them back to pending (`toolApprovalSubmit.ts`, `approvalAnswerWasRecorded`).
-    const unsentApprovals = collectUnsentApprovalDecisions(approvals)
+    const unsentApprovals = retiredApprovalId ? approvals : collectUnsentApprovalDecisions(approvals)
     if (unsentApprovals.length === 0) return
 
     approvalSubmitting = true
@@ -814,7 +834,7 @@
     if (session && !chatRunRegistry.isSessionBusy(session)) {
       chatRunRegistry.startRun({
         sessionId: session,
-        transport: normalizePrimaryAgentType(agentRecord as any) === 'cli' ? 'cli' : 'api',
+        transport: 'api',
         abortController: approvalAbortController
       })
     }
@@ -823,6 +843,7 @@
     let ok = false
     let code: string | null = null
     let failure = ''
+    let retiredIds: string[] = []
     try {
       try {
         // The card's answer runs the rest of the reply; `postSendRouted` waits for it over the live
@@ -838,7 +859,9 @@
             webhookUrl: agentRecord?.webhook_url ?? null,
             metadata: {
               ...(message.metadata ?? {}),
-              toolApprovalResponse: responses
+              toolApprovalResponse: retiredApprovalId ? undefined : responses,
+              tool_approval_response: undefined,
+              retireSavedApprovalId: retiredApprovalId
             }
           }),
           {
@@ -846,15 +869,16 @@
             // The server owns the turn and has recorded the answer before the run starts.
             onAccepted: () => {
               accepted = true
-              writeToolApprovals(markApprovalDecisionsSent(currentApprovalSummary()?.approvals ?? [], unsentApprovals))
+              if (!retiredApprovalId) writeToolApprovals(markApprovalDecisionsSent(currentApprovalSummary()?.approvals ?? [], unsentApprovals))
             }
           }
         )
         ok = response.ok
-        if (!ok) {
+        if (!ok || retiredApprovalId) {
           const errorPayload = await response.json().catch(() => ({}))
+          if (Array.isArray(errorPayload?.retiredApprovalIds)) retiredIds = errorPayload.retiredApprovalIds.filter((id: unknown): id is string => typeof id === 'string')
           code = typeof errorPayload?.code === 'string' ? errorPayload.code : null
-          failure = errorPayload?.error || 'Failed to submit tool approvals'
+          if (!ok) failure = errorPayload?.error || 'Failed to submit tool approvals'
         }
       } catch (error: any) {
         const messageText = error instanceof Error ? error.message : String(error ?? '')
@@ -862,11 +886,16 @@
       }
 
       const approvalsNow = currentApprovalSummary()?.approvals ?? []
-      writeToolApprovals(
-        approvalAnswerWasRecorded({ accepted, ok, code })
-          ? markApprovalDecisionsSent(approvalsNow, unsentApprovals)
-          : returnRefusedApprovalDecisions(approvalsNow, unsentApprovals)
-      )
+      if (retiredApprovalId) {
+        if (retiredIds.length) writeToolApprovals(approvalsNow.map(entry => retiredIds.includes(entry.approvalId)
+          ? { ...entry, status: 'expired', expiryReason: 'run_ended', submitted: false } : entry))
+      } else {
+        writeToolApprovals(
+          approvalAnswerWasRecorded({ accepted, ok, code })
+            ? markApprovalDecisionsSent(approvalsNow, unsentApprovals)
+            : returnRefusedApprovalDecisions(approvalsNow, unsentApprovals)
+        )
+      }
       if (!ok && !approvalAbortController.signal.aborted) {
         approvalError = failure
         toast.error(approvalError)
@@ -876,45 +905,6 @@
       if (session && chatRunRegistry.getRunState(session).abortController === approvalAbortController) {
         chatRunRegistry.releaseAbortController(session, approvalAbortController)
       }
-    }
-  }
-
-  async function submitClaudeApproval(approvalId: string, approved: boolean) {
-    if (!approvalId) return
-    if (approvalSubmitting) return
-
-    approvalSubmitting = true
-    approvalError = null
-
-    try {
-      const response = await fetch('/api/tool-approvals/respond', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          approvalId,
-          approved,
-          reason: approved ? 'User approved' : 'User denied',
-          sessionId: sessionId || message.session_id,
-          messageId: message.id
-        })
-      })
-
-      if (!response.ok) {
-        const errorPayload = await response.json().catch(() => ({}))
-        throw new Error(errorPayload.error || 'Failed to submit approval')
-      }
-    } catch (error: any) {
-      writeToolApprovals(
-        returnRefusedApprovalDecisions(toolApprovalSummary?.approvals ?? [], [
-          { approvalId, status: approved ? 'approved' : 'denied' }
-        ])
-      )
-      const messageText = error instanceof Error ? error.message : String(error ?? '')
-      approvalError = messageText || 'Failed to submit approval'
-      toast.error(approvalError)
-      return
-    } finally {
-      approvalSubmitting = false
     }
   }
 
@@ -995,6 +985,18 @@
       toast.error(approvalError)
       return
     }
+    if (selectedApproval && isRetiredSavedApproval(selectedApproval, toolApprovalSummary?.source, message.metadata as any)) {
+      // This request only retires the saved card; it does not submit an approval decision.
+      await submitToolApprovals([selectedApproval], approvalId)
+      return
+    }
+    // SA-139 R4: only the removed Claude Code CLI lane raised Claude cards, and their answer
+    // route went with it. A saved one is shown, never answered.
+    if (resolveApprovalSubmitSource(selectedApproval, toolApprovalSummary?.source) === 'claude') {
+      approvalError = 'This approval came from the Claude Code CLI lane, which Batshit removed, so it can no longer be answered.'
+      toast.error(approvalError)
+      return
+    }
 
     updateToolApprovalStatus(approvalId, approved ? 'approved' : 'denied')
 
@@ -1006,17 +1008,6 @@
         : entry
     )
 
-    // SA-116 P3: the ENTRY's own source decides, not the summary's (the rule and its
-    // reason live in `controlApprovalPresentation.ts`, where a test can reach them).
-    const approvalSource = resolveApprovalSubmitSource(
-      approvals.find((entry) => entry?.approvalId === approvalId),
-      summary.source
-    )
-    if (approvalSource === 'claude') {
-      await submitClaudeApproval(approvalId, approved)
-      return
-    }
-
     const allResolved = approvals.every(
       (entry) =>
         entry?.status === 'approved' || entry?.status === 'denied' || entry?.status === 'expired'
@@ -1024,6 +1015,10 @@
     if (allResolved) {
       await submitToolApprovals(approvals)
     }
+  }
+
+  function isRetiredApproval(approval: any): boolean {
+    return isRetiredSavedApproval(approval, toolApprovalSummary?.source, message.metadata as any)
   }
 
   $effect(() => {
@@ -1139,21 +1134,26 @@
     data-testid="{isAI ? 'ai-response' : 'user-message'}"
     class="message-shell {isAI ? 'is-ai' : 'is-user'}"
   >
-    <MessageHeader
-      {isAI}
-      {agentDisplayName}
-      {agentAvatarUrl}
-      {agentAvatarIconRef}
-      agentAvatarIconFit={agent?.avatar_icon_fit}
-      {userDisplayName}
-      {userAvatarUrl}
-      userAvatarIconRef={userSettings?.avatar_icon_ref}
-      userAvatarIconFit={userSettings?.avatar_icon_fit}
-      userInitialsSource={userSettingsName || userSettings?.email}
-      {timestamp}
-      {isSpeaking}
-      {messageModelBadge}
-    />
+    <div class="message-header-row" class:has-whiteboard={Boolean(whiteboard)}>
+      <MessageHeader
+        {isAI}
+        {agentDisplayName}
+        {agentAvatarUrl}
+        {agentAvatarIconRef}
+        agentAvatarIconFit={agent?.avatar_icon_fit}
+        {userDisplayName}
+        {userAvatarUrl}
+        userAvatarIconRef={userSettings?.avatar_icon_ref}
+        userAvatarIconFit={userSettings?.avatar_icon_fit}
+        userInitialsSource={userSettingsName || userSettings?.email}
+        {timestamp}
+        {isSpeaking}
+        {messageModelBadge}
+      />
+      {#if whiteboard}
+        <div class="message-whiteboard-affordance">{@render whiteboard()}</div>
+      {/if}
+    </div>
     
     <!-- Message bubble with backdrop -->
     <div
@@ -1216,6 +1216,11 @@
 
         {#if shouldShowLoading}
           <LoadingIndicator type="dots" text={showThinkingIndicator ? 'Thinking...' : ''} />
+        {:else if emptyStoppedReply}
+          <p class="message-stopped-note" data-testid="empty-stopped-reply">
+            <Ban class="message-stopped-note-icon" aria-hidden="true" />
+            {EMPTY_STOPPED_REPLY_NOTE}
+          </p>
         {:else}
           <MessageContent 
             content={message.content} 
@@ -1282,32 +1287,22 @@
         {/if}
 
         {#if modeLimitedNote && !shouldShowLoading}
-          <div class="message-failure-banner" data-testid="reply-mode-limited-by-agent-settings">
-            <div class="message-failure-heading">
-              <TriangleAlert class="message-failure-icon" aria-hidden="true" />
-              <span>{modeLimitedNote}</span>
-            </div>
-          </div>
-        {/if}
-
-        {#if codexCleanupWarning && !shouldShowLoading}
-          <div class="message-failure-banner" data-testid="codex-cleanup-warning" role="alert">
-            <div class="message-failure-heading">
-              <TriangleAlert class="message-failure-icon" aria-hidden="true" />
-              <span>{codexCleanupWarningText(codexCleanupWarning.kind)}</span>
-            </div>
-          </div>
+          <!-- BL-969 (a): information, not a failure: the reply's quiet status line (BL-934). -->
+          <p
+            class="message-stopped-note message-mode-limited-note"
+            role="note"
+            data-testid="reply-mode-limited-by-agent-settings"
+          >
+            <Info class="message-stopped-note-icon" aria-hidden="true" />
+            <span>{modeLimitedNote}</span>
+          </p>
         {/if}
 
         {#if hasControlErrors && !shouldShowLoading}
           <div class="message-control-error-banner" data-testid="message-control-error-banner">
             <div class="message-control-error-heading">
               <TriangleAlert class="message-control-error-icon" aria-hidden="true" />
-              <span>
-                {controlErrors.length === 1
-                  ? 'A control block in this response was malformed and did not apply'
-                  : 'Control blocks in this response were malformed and did not apply'}
-              </span>
+              <span>Batshit could not apply part of this reply</span>
             </div>
             {#each controlErrors as entry, idx (idx)}
               <p class="message-control-error-detail">
@@ -1474,6 +1469,7 @@
           {describeApproval}
           {formatApprovalInput}
           {getApprovalRemainingSeconds}
+          {isRetiredApproval}
           onApprovalAction={handleApprovalAction}
           wakeDmId={wakeTurn?.dmId ?? null}
         />
@@ -1718,6 +1714,31 @@
     padding: 0.75rem;
   }
 
+  /* BL-934: the quiet status line a steer receipt uses (SteerBubble's `.steer-status`), a step
+     smaller than the reply's text. Muted, not the failure banner: a Stop is the user's choice. */
+  .message-stopped-note {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    margin: 0;
+    font-size: 0.8125rem;
+    font-weight: 300;
+    color: var(--muted-foreground);
+  }
+
+  .message-stopped-note :global(.message-stopped-note-icon) {
+    width: 0.875rem;
+    height: 0.875rem;
+    flex-shrink: 0;
+  }
+
+  /* BL-969 (a): the same quiet line under a finished reply, spaced like the notes beside it, and
+     a block of its own (the empty stopped reply's note is inline-flex; review N1). */
+  .message-mode-limited-note {
+    display: flex;
+    margin-top: 0.75rem;
+  }
+
   .message-failure-banner {
     display: flex;
     flex-direction: column;
@@ -1797,6 +1818,10 @@
     gap: 0.375rem;
     margin-top: 0.5rem;
   }
+
+  .message-header-row { position: relative; box-sizing: border-box; width: 100%; min-width: 0; }
+  .message-header-row.has-whiteboard { padding-right: 2rem; }
+  .message-whiteboard-affordance { position: absolute; right: 0; bottom: 0.25rem; display: flex; }
 
   /* The chips are DropdownMenu triggers (click-open detail popovers, 2026-08-28),
      so the class rides a component prop and needs :global. */

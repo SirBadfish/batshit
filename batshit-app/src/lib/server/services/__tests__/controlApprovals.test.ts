@@ -22,6 +22,9 @@ import {
   listSessionApprovals,
   markApprovalExpired,
   summarizeControlInput,
+  createP5PendingWriteObservation, withP5PendingWriteObservation, readP5PendingWriteObservation,
+  observeP5PendingApprovalWrite, readP5PendingApprovalWrite, observeP5ApprovalDecisionWrite,
+  readP5ApprovalDecisionWrite, consumeP5ApprovalDecisionWrite,
   sweepSessionApprovals
 } from '../controlApprovals'
 
@@ -118,6 +121,35 @@ afterEach(() => {
  * ------------------------------------------------------------------ */
 
 describe('the approval record', () => {
+  it('keeps the actual pending acknowledgement before a later TTL failure and never vouches a reconstructed record', async () => {
+    const observation = createP5PendingWriteObservation()
+    vi.spyOn(redis, 'expire').mockRejectedValueOnce(new Error('later TTL unavailable'))
+    await expect(withP5PendingWriteObservation(observation, () => createPendingApproval({ userId: USER,
+      agentId: AGENT, sessionId: SESSION, messageId: 'msg_1', controlId: 'sys.memory.delete', controlTitle: 'Delete',
+      riskLevel: 'confirm', lane: 'api', input: { memory_id: 'mem_1' } }))).rejects.toThrow('later TTL')
+    const [receipt] = readP5PendingWriteObservation(observation)
+    const identity = readP5PendingApprovalWrite(receipt)
+    expect(identity).toMatchObject({ userId: USER, agentId: AGENT, sessionId: SESSION, controlId: 'sys.memory.delete' })
+    const persisted = (await getControlApproval(identity.id))!
+    expect(persisted.status).toBe('pending')
+    expect(observeP5PendingApprovalWrite(persisted)).toBeUndefined()
+    expect(() => readP5PendingApprovalWrite(structuredClone(receipt))).toThrow('unavailable')
+  })
+  it('issues a decision passage at the actual pending-to-decision write, retains it after a later failure and spends it once', async () => {
+    const record = await createPendingApproval({ userId: USER, agentId: AGENT, sessionId: SESSION, messageId: 'msg_1',
+      controlId: 'sys.memory.delete', controlTitle: 'Delete', riskLevel: 'confirm', lane: 'api', input: { memory_id: 'mem_1' } })
+    const pending = observeP5PendingApprovalWrite(record)!
+    await expect(decideApproval({ userId: USER, approvalId: record.id, approved: true, originalPending: pending,
+      mutate: async write => { await write(); throw new Error('later decision fence failed') } })).rejects.toThrow('later decision fence')
+    const receipt = observeP5ApprovalDecisionWrite(pending)!
+    expect(readP5ApprovalDecisionWrite(receipt)).toMatchObject({ pending, status: 'approved', identity: { id: record.id } })
+    expect((await getControlApproval(record.id))?.status).toBe('approved')
+    expect(() => readP5ApprovalDecisionWrite(structuredClone(receipt))).toThrow('unavailable')
+    consumeP5ApprovalDecisionWrite(receipt)
+    expect(() => readP5ApprovalDecisionWrite(receipt)).toThrow('already claimed')
+    await decideApproval({ userId: USER, approvalId: record.id, approved: true, originalPending: pending })
+    expect(observeP5ApprovalDecisionWrite(pending)).toBe(receipt) // An already-approved READ mints nothing.
+  })
   it('stores the record, indexes it by requestedAt, and expires both in 24 hours', async () => {
     const record = await createPendingApproval({
       userId: USER,
@@ -346,6 +378,21 @@ describe('deciding an approval', () => {
     })
   }
 
+  it('keeps a retired saved record readable and expirable but cannot decide it or seed a window', async () => {
+    const record = await pending({ controlId: 'sys.voice.engine.complete_local_setup', scopeKey: 'engine:retired' })
+    await redis.json.set(controlApprovalKey(record.id), '$.lane', 'cli')
+    await expect(decideApproval({ userId: USER, approvalId: record.id, approved: true })).resolves.toBeNull()
+    expect(await getControlApproval(record.id)).toMatchObject({ lane: 'cli', status: 'pending' })
+    expect(await listSessionApprovals(SESSION, USER)).toContainEqual(expect.objectContaining({ approvalId: record.id, lane: 'cli' }))
+    await expect(hasScopedRiskWindow({ userId: USER, agentId: AGENT,
+      controlId: record.controlId, scopeKey: 'engine:retired' })).resolves.toBe(false)
+    await expect(markApprovalExpired(record.id, { userId: OTHER_USER, sessionId: SESSION, lane: 'cli' })).resolves.toBe(false)
+    await expect(markApprovalExpired(record.id, { userId: USER, sessionId: 'another-session', lane: 'cli' })).resolves.toBe(false)
+    expect(await getControlApproval(record.id)).toMatchObject({ lane: 'cli', status: 'pending' })
+    await expect(markApprovalExpired(record.id, { userId: USER, sessionId: SESSION, lane: 'cli' })).resolves.toBe(true)
+    expect(await getControlApproval(record.id)).toMatchObject({ lane: 'cli', status: 'expired' })
+  })
+
   it('refuses a record belonging to another user', async () => {
     const record = await pending()
     await expect(
@@ -441,6 +488,16 @@ describe('matching and consuming', () => {
     controlId: 'sys.memory.delete',
     inputHash: hashControlInput({ memory_id: 'mem_1' }),
     ...overrides
+  })
+
+  it('cannot match or spend a previously approved retired record, including an explicit grant', async () => {
+    const record = await approved()
+    await redis.json.set(controlApprovalKey(record.id), '$.lane', 'cli')
+    await expect(findApprovedMatch(criteria())).resolves.toBeNull()
+    await expect(consumeApproval(record.id)).resolves.toBeNull()
+    const decision = await decideRiskGate(gateInput({ grant: { kind: 'sdk', approvalId: record.id, toolCallId: 'call' } }))
+    expect(decision.kind).toBe('pause')
+    expect(await getControlApproval(record.id)).toMatchObject({ lane: 'cli', status: 'approved' })
   })
 
   it('matches on every field that makes a call the same call', async () => {
@@ -661,9 +718,10 @@ describe('sweeping a session', () => {
       controlId: 'sys.skill.import',
       controlTitle: 'Import Skill',
       riskLevel: 'restricted',
-      lane: 'cli',
+      lane: 'api',
       input: { url: 'https://example.com' }
     })
+    await redis.json.set(controlApprovalKey(second.id), '$.lane', 'cli')
     const elsewhere = await createPendingApproval({
       userId: USER,
       sessionId: 'session-other',
@@ -712,6 +770,12 @@ describe('sweeping a session', () => {
  * ------------------------------------------------------------------ */
 
 describe('decideRiskGate', () => {
+  it.each(['cli', 'unknown'])('refuses untyped retired or invalid lane %s before creating a record or running', async (lane) => {
+    const input = gateInput({ lane, portableSkillScope: true })
+    await expect(decideRiskGate(input)).rejects.toThrow('Retired or invalid approval lane')
+    await expect(createPendingApproval(input)).rejects.toThrow('Retired or invalid approval lane')
+    expect(await listSessionApprovals(SESSION, USER)).toEqual([])
+  })
   it('pauses a risky control nobody approved, and records what the card needs', async () => {
     const decision = await decideRiskGate(gateInput())
     expect(decision.kind).toBe('pause')

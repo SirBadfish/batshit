@@ -7,6 +7,22 @@ import {
 const hash = (character: string) => character.repeat(64)
 
 describe('Recipe review external sibling contracts', () => {
+  it('refuses a held clothing-state sibling', () => {
+    expect(() => serializeRecipeExternalSiblingInputs([{
+      sourceStateId: 'clothingState',
+      targetStateId: 'clothingState',
+      validationSha256: hash('1'),
+      message: 'Clothing remains compatible.',
+      targetState: {
+        id: 'clothingState',
+        contract: 'clothing-state/v1',
+        definitionSha256: hash('c'),
+        stateSha256: hash('d'),
+        state: { schemaVersion: 'clothing-state/v1' }
+      }
+    }])).toThrow(/unsupported in this public release/)
+  })
+
   it('serializes external sibling validation in deterministic source-id order', () => {
     expect(
       serializeRecipeExternalSiblingInputs([

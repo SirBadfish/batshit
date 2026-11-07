@@ -841,7 +841,7 @@ function deriveNameFromSource(sourceRef: string) {
   return fromBasename && fromBasename !== 'SKILL' ? fromBasename : 'Imported Skill'
 }
 
-function deriveSkillDefinition(params: {
+export function deriveSkillDefinition(params: {
   markdown: string
   sourceRef: string
   sourceType: SkillImportSourceType

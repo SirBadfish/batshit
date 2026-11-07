@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict')
-const { mkdtemp, mkdir, realpath, rm, symlink, writeFile, readFile } = require('node:fs/promises')
+const { mkdtemp, mkdir, realpath, rm, symlink, link, writeFile, readFile } = require('node:fs/promises')
 const path = require('node:path')
 const os = require('node:os')
 // Keep workstation dotenv/config out of this real filesystem boundary proof.
@@ -21,6 +21,8 @@ test('real helper file reads deny caller-selected custody roots and symlink alia
     await writeFile(path.join(config, 'runtime.env'), 'synthetic-secret-sentinel')
     await writeFile(path.join(project, 'normal.txt'), 'ordinary project content')
     await symlink(path.join(config, 'runtime.env'), path.join(project, 'alias.txt'))
+    await link(path.join(config, 'runtime.env'), path.join(project, 'hard-alias.txt'))
+    await link(path.join(project, 'normal.txt'), path.join(project, 'normal-hardlink.txt'))
     const capitalConfig = path.join(data, 'CONFIG')
     // Prove this is a readable alias on the actual Mac volume, not a lexical
     // string comparison test. Case-sensitive platforms have no such alias.
@@ -30,7 +32,7 @@ test('real helper file reads deny caller-selected custody roots and symlink alia
     process.env.BATSHIT_CONTAINERIZED = '0'
     process.env.BATSHIT_MAC_DATA_DIR = data
     const service = new BuiltInService()
-    const reads = [[config, 'runtime.env'], [data, 'config/runtime.env'], [project, 'alias.txt']]
+    const reads = [[config, 'runtime.env'], [data, 'config/runtime.env'], [project, 'alias.txt'], [project, 'hard-alias.txt']]
     if (caseAliasReadable) reads.push([capitalConfig, 'RUNTIME.ENV'], [data, 'CONFIG/RUNTIME.ENV'], [project, 'case-alias.txt'])
     for (const [selectedRoot, filePath] of reads) {
       const result = await service.readFile(selectedRoot, { filePath })
@@ -39,6 +41,7 @@ test('real helper file reads deny caller-selected custody roots and symlink alia
       assert.equal(JSON.stringify(result).includes('synthetic-secret-sentinel'), false)
     }
     assert.equal((await service.readFile(project, { filePath: 'normal.txt' })).content, 'ordinary project content')
+    assert.equal((await service.readFile(project, { filePath: 'normal-hardlink.txt' })).content, 'ordinary project content')
   } finally {
     for (const key of ['BATSHIT_RUNTIME_OWNER', 'BATSHIT_CONTAINERIZED', 'BATSHIT_MAC_DATA_DIR', 'BATSHIT_SERVER_LOG_DIR']) {
       if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]

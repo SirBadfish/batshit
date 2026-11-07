@@ -7,7 +7,7 @@ import { sameJsonValue } from '$lib/utils/agentBlockFieldSettings'
  *
  * Agent Settings keeps a copy of the agent from when it opened. Other places change the same
  * record while that copy is on screen: the chat-bar model picker, the chat-bar Work mode and
- * Codex/Claude mode, the Goon dock. A save that sent the whole copy took those changes back with
+ * Claude mode, the Goon dock. A save that sent the whole copy took those changes back with
  * no word (a Plan-mode agent got write access again, a model picked in the chat bar went back to
  * the old one). So a save sends only what differs from the copy the form loaded or last saved,
  * the same rule Artifact Settings follows since BL-546.
@@ -62,6 +62,8 @@ export const AGENT_MODEL_FIELDS: readonly string[] = [
  * `conditionalAgentSettings.ts`), so a save that names any of them says which saved values it
  * started from (`expectedMemory`, BL-1294) and `PUT /api/agents/[id]` refuses it when they changed.
  */
+import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+
 export const AGENT_MEMORY_GROUP: readonly string[] = [
   'memory_enabled',
   'memory_linger_turns',
@@ -189,9 +191,12 @@ export function buildAgentSettingsSavePatch(baseline: Fields, next: Fields): Fie
 
   const ownKeyChanges = providerSettingsKeyChanges(baseBlock, nextBlock, isAgentRuntimeSettingKey)
 
-  const grouped = new Set(AGENT_SAVE_FIELD_GROUPS.flat())
+  const fieldGroups = normalizePrimaryAgentType(next) === 'api'
+    ? AGENT_SAVE_FIELD_GROUPS.filter((group) => group[0] !== 'show_reasoning')
+    : AGENT_SAVE_FIELD_GROUPS
+  const grouped = new Set(fieldGroups.flat())
   const groups: (readonly string[])[] = [
-    ...AGENT_SAVE_FIELD_GROUPS,
+    ...fieldGroups,
     ...Object.keys(next)
       .filter((key) => key !== PROVIDER_SETTINGS && !grouped.has(key))
       .map((key) => [key])

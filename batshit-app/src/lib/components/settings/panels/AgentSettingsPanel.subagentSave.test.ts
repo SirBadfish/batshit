@@ -5,6 +5,7 @@ import { redis } from '$lib/server/redis'
 import * as agentStore from '$lib/stores/agents.svelte'
 import { buildPickedPresetModelFields } from '$lib/utils/modelPresetPick'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
+import { loadAgentRoute } from '$lib/test-utils/agentPutRoute'
 
 /**
  * BL-844: a Subagent save sent its whole form. The Subagent record can change after Settings
@@ -18,17 +19,16 @@ import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
  * not name keeps its stored value, and `provider_specific_settings` is written key by key).
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   syncAgentClaudeProfiles: vi.fn(async () => {}),
   deleteAgentClaudeConfig: vi.fn(async () => {}),
-  agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
+  agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`]),
+  // A CLI Subagent's native save stages its managed Claude profile; never the real home here.
+  prepareManagedClaudeSubagentProfile: vi.fn(async () => {})
 }))
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({ runTrackedN8nCompatibilitySync: vi.fn() }))
 
 useRedisTestServer()
 
@@ -103,7 +103,7 @@ beforeAll(async () => {
 }, 60_000)
 
 /** Every Subagent PUT body the panel sent, in order. */
-let puts: Array<{ body: Record<string, any>; settled: boolean }> = []
+let puts: Array<{ body: Record<string, any>; settled: boolean; status?: number }> = []
 let agentReads = 0
 /** While set, the next Subagent PUT answers this status without touching the record. */
 let failNextSubagentPut: { status: number; error: string } | null = null
@@ -153,7 +153,9 @@ function installRoutes() {
         }
         const request = new Request(`http://localhost${path}`, { method, body: method === 'PUT' ? String(init.body) : undefined })
         const handler = method === 'PUT' ? subagentRoute.PUT : subagentRoute.GET
-        return (await handler({ params: { id: SUB }, request, locals: { user: { id: USER } } } as any)) as Response
+        const response = (await handler({ params: { id: SUB }, request, locals: { user: { id: USER } } } as any)) as Response
+        if (receipt) (receipt as typeof puts[number]).status = response.status
+        return response
       } finally {
         if (receipt) receipt.settled = true
       }
@@ -161,7 +163,7 @@ function installRoutes() {
     if (path === '/api/user/saved-models') return jsonResponse({ models: [PRESET_CHAT, PRESET_IMAGE] })
     if (path === '/api/models') return jsonResponse({ data: { connections: [] } })
     if (path === '/api/settings/api-keys') return jsonResponse({ keys: {} })
-    if (path === '/api/goons') return jsonResponse({ goons: [] })
+    if (path === '/api/goons') return jsonResponse({ ownerId: 'josh', goons: [] })
     if (path === '/api/icons/library') return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
     return jsonResponse({ error: `not routed in this test: ${method} ${path}` }, 404)
   })
@@ -263,7 +265,8 @@ async function waitForPuts(count: number) {
 describe('a Subagent save sends only what the user changed (BL-844)', () => {
   const originalFetch = global.fetch
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    agentRoute = await loadAgentRoute()
     ensureBrowserStubs()
     installRoutes()
     vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -275,6 +278,23 @@ describe('a Subagent save sends only what the user changed (BL-844)', () => {
     global.fetch = originalFetch
     agentStore.setAgents([])
   })
+
+  it('the real Subagent route keeps an ordinary API native DTO token-free and never stores a codex_settings or claude_settings block', async () => {
+    await seed()
+    const response = await subagentRoute.PUT({ params: { id: SUB }, locals: { user: { id: USER } },
+      request: new Request(`http://localhost/api/subagents/${SUB}`, { method: 'PUT', body: JSON.stringify({
+        codex_settings: { permissionMode: 'chat', model: 'custom-codex' }, claude_settings: { permissionMode: 'default', model: 'custom-claude' }
+      }) }) } as any)
+    expect(response.status).toBe(200)
+    const record = await redis.json.get(`subagent:${SUB}`) as Record<string, unknown>
+    expect(record).toMatchObject({ subagentType: 'api' })
+    // SA-139 R1: Codex CLI was removed; a body's `codex_settings` is dropped, never stored.
+    expect(record).not.toHaveProperty('codex_settings')
+    // SA-139 R5: the Claude Code CLI Subagent was removed too; a body's `claude_settings` is dropped.
+    expect(record).not.toHaveProperty('claude_settings')
+  })
+  // SA-139 R5: the CLI Subagent's native-only model save (and its model-selection publish) left
+  // with that type; a PUT on a leftover is refused before any write (the route's own tests).
 
   it('a rename sends only the name, and a change made to the Subagent elsewhere after Settings opened survives it', async () => {
     await seed()
@@ -339,7 +359,7 @@ describe('a Subagent save sends only what the user changed (BL-844)', () => {
 
     await toggleGlobalPrompt()
     await waitForPuts(3)
-    expect(puts[2].body).toEqual({ include_global_prompt: true })
+    expect(puts[2].body).toEqual({ include_global_prompt: true, expectedInstructions: { includeGlobalPrompt: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) } })
 
     const record = await storedSubagent()
     expect(record).toMatchObject({
@@ -348,6 +368,33 @@ describe('a Subagent save sends only what the user changed (BL-844)', () => {
       include_global_prompt: true,
       system_prompt: 'Answer only in haiku.'
     })
+  }, 120_000)
+
+  it('delegation limits: a 24-hour Call Timeout and Max Tool Steps each save only their own field', async () => {
+    await seed()
+    await openSubagent()
+
+    // Decision 4: up to 24 hours; the panel says the limit the way a person reads it.
+    await typeTimeout('86400')
+    await waitForPuts(1)
+    expect(puts[0].body).toEqual({ timeout_seconds: 86_400 })
+    expect(await screen.findByText('24 hours')).toBeTruthy()
+    // Blank is no limit, and says so.
+    expect((document.getElementById('subagent-timeout') as HTMLInputElement).placeholder).toBe('No limit')
+
+    // Decision 3: an optional per-Subagent tool-step limit.
+    const steps = document.getElementById('subagent-max-tool-steps') as HTMLInputElement
+    expect(steps.placeholder).toBe('No limit')
+    await fireEvent.input(steps, { target: { value: '25' } })
+    await waitForPuts(2)
+    expect(puts[1].body).toEqual({ max_tool_steps: 25 })
+
+    await fireEvent.input(steps, { target: { value: '' } })
+    await waitForPuts(3)
+    expect(puts[2].body).toEqual({ max_tool_steps: null })
+    const record = await storedSubagent()
+    expect(record.timeout_seconds).toBe(86_400)
+    expect(record).not.toHaveProperty('max_tool_steps')
   }, 120_000)
 
   it('a failed save leaves the baseline as it was: the next edit sends the failed change again, with its own', async () => {
@@ -404,8 +451,8 @@ describe('a Subagent save sends only what the user changed (BL-844)', () => {
   }, 120_000)
 
   it('a Subagent whose form differs from its record only where the save does not see it saves nothing on open', async () => {
-    // An API Subagent keeps no workflow URL: the form empties a stale one on open, which changes
-    // the form's signature but nothing the save would send.
+    // SA-139 R2: the form has no workflow URL any more. A stale one left on an API record is ignored,
+    // so opening the Subagent changes nothing the save would send.
     await seed({ webhook_url: 'https://n8n.example.com/webhook/stale', webhookUrl: 'https://n8n.example.com/webhook/stale' })
     const before = await storedSubagent()
     await openSubagent()
@@ -418,7 +465,8 @@ describe('a Subagent save sends only what the user changed (BL-844)', () => {
 describe('a Subagent save that lands keeps what was typed while it was in flight (BL-844, review fix)', () => {
   const originalFetch = global.fetch
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    agentRoute = await loadAgentRoute()
     ensureBrowserStubs()
     installRoutes()
     vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -532,7 +580,7 @@ describe('a Subagent save that lands keeps what was typed while it was in flight
     })
     await fireEvent.click(saveButton as HTMLElement)
     await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-    expect(puts[0].body).toEqual({ system_prompt: 'Answer in limericks.' })
+    expect(puts[0].body).toEqual({ system_prompt: 'Answer in limericks.', expectedInstructions: { customPrompt: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) } })
 
     // A name typed during the prompt's round trip: the form is not clean when the prompt lands.
     const nameInput = screen.getByDisplayValue(SUB_NAME) as HTMLInputElement
@@ -577,7 +625,7 @@ describe('a Subagent save that lands keeps what was typed while it was in flight
     await fireEvent.click(saveButton as HTMLElement)
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ system_prompt: 'Answer in limericks.' })
+    expect(puts[0].body).toEqual({ system_prompt: 'Answer in limericks.', expectedInstructions: { customPrompt: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) } })
     expect((await storedSubagent()).system_prompt).toBe('Answer in limericks.')
     // The form holds the saved prompt: the editor opens on it, and no second save follows.
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull(), { timeout: 5_000 })
@@ -585,5 +633,130 @@ describe('a Subagent save that lands keeps what was typed while it was in flight
     expect(await screen.findByDisplayValue('Answer in limericks.')).toBeTruthy()
     await pause(1500)
     expect(puts.length).toBe(1)
+  }, 120_000)
+
+  // SA-139 R5: the `cli` half left; a leftover CLI Subagent shows no Instructions tab.
+  it.each(['api'])('keeps a %s Subagent prompt draft on original-base conflict without replaying', async subagentType => {
+    await seed({ subagentType })
+    await openSubagent()
+    const instructionsTab = screen.getAllByRole('tab').find(element => /Instructions/.test(element.textContent ?? ''))!
+    await fireEvent.mouseDown(instructionsTab); await fireEvent.click(instructionsTab)
+    const promptRow = screen.getAllByText('Custom System Prompt').map(element => element.closest('.batshit-settings-form-row') as HTMLElement | null).find(row => row?.closest('details[name="subagent-instructions-cards"]'))!
+    await fireEvent.click(within(promptRow).getByRole('button', { name: /Edit/ }))
+    const editor = await screen.findByDisplayValue('Answer only in haiku.') as HTMLTextAreaElement
+    await fireEvent.input(editor, { target: { value: '  Keep my draft.  ' } })
+    await changeElsewhere({ system_prompt: 'Remote instructions.' })
+    await fireEvent.click(within(editor.closest('[role="dialog"]') as HTMLElement).getByRole('button', { name: /Save Changes/ }))
+    await waitForPuts(1)
+    expect(puts[0].body).toEqual({ system_prompt: 'Keep my draft.', expectedInstructions: { customPrompt: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) } })
+    await waitFor(() => expect(screen.getByTestId('subagent-instructions-notice').textContent).toContain('not saved'), { timeout: 8_000 })
+    expect(editor.value).toBe('  Keep my draft.  ')
+    expect((await storedSubagent()).system_prompt).toBe('Remote instructions.')
+    await pause(1000)
+    expect(puts).toHaveLength(1)
+  }, 120_000)
+
+  it('keeps an actually saved Subagent prompt unconfirmed after the route loses its postwrite read and returns404 (BL-1668)', async () => {
+    await seed()
+    await openSubagent()
+    const instructionsTab = screen.getAllByRole('tab').find(element => /Instructions/.test(element.textContent ?? ''))!
+    await fireEvent.mouseDown(instructionsTab); await fireEvent.click(instructionsTab)
+    const promptRow = screen.getAllByText('Custom System Prompt').map(element => element.closest('.batshit-settings-form-row') as HTMLElement | null).find(row => row?.closest('details[name="subagent-instructions-cards"]'))!
+    await fireEvent.click(within(promptRow).getByRole('button', { name: /Edit/ }))
+    const editor = await screen.findByDisplayValue('Answer only in haiku.') as HTMLTextAreaElement
+    await fireEvent.input(editor, { target: { value: '  Keep the issued draft.  ' } })
+    const actualUpdate = vi.isMockFunction(redis.updateSubagent) ? vi.mocked(redis.updateSubagent).getMockImplementation()! : redis.updateSubagent.bind(redis)
+    const actualGet = vi.isMockFunction(redis.json.get) ? vi.mocked(redis.json.get).getMockImplementation()! : redis.json.get.bind(redis.json)
+    const updateSpy = vi.spyOn(redis, 'updateSubagent')
+    const getSpy = vi.spyOn(redis.json, 'get')
+    let missPostwriteRead = false
+    let committedPrompt: unknown
+    await updateSpy.withImplementation(async (...args) => {
+      const saved = await actualUpdate(...args)
+      if (args[0] === SUB && Object.hasOwn(args[1], 'system_prompt')) {
+        committedPrompt = ((await actualGet(`subagent:${SUB}`)) as Record<string, unknown>).system_prompt
+        expect(committedPrompt).toBe('Keep the issued draft.')
+        missPostwriteRead = true
+      }
+      return saved
+    }, async () => {
+      await getSpy.withImplementation(async (...args) => {
+        if (missPostwriteRead && args[0] === `subagent:${SUB}`) { missPostwriteRead = false; return null }
+        return actualGet(...args)
+      }, async () => {
+        const save = within(editor.closest('[role="dialog"]') as HTMLElement).getByRole('button', { name: /Save Changes/ })
+        await fireEvent.click(save)
+        await waitForPuts(1)
+        expect(committedPrompt).toBe('Keep the issued draft.')
+        expect(puts[0].status).toBe(404)
+        expect(screen.getByTestId('subagent-instructions-notice').textContent).toContain('unconfirmed')
+        expect(editor.value).toBe('  Keep the issued draft.  ')
+        expect((await actualGet(`subagent:${SUB}`) as Record<string, unknown>).system_prompt).toBe('Keep the issued draft.')
+        await fireEvent.click(save)
+        await pause(1000)
+        expect(puts).toHaveLength(1)
+        expect(screen.getByTestId('subagent-instructions-notice').textContent).toContain('unconfirmed')
+      })
+    })
+  }, 120_000)
+
+  it('drains a Subagent instructions readback after a held GET while a later invalid core draft blocks the at-rest fallback (BL-1670)', async () => {
+    await seed()
+    await openSubagent()
+    const openEditor = async (text: string) => {
+      const tab = screen.getAllByRole('tab').find(element => /Instructions/.test(element.textContent ?? ''))!
+      await fireEvent.mouseDown(tab); await fireEvent.click(tab)
+      const row = screen.getAllByText('Custom System Prompt').map(element => element.closest('.batshit-settings-form-row') as HTMLElement | null).find(row => row?.closest('details[name="subagent-instructions-cards"]'))!
+      await fireEvent.click(within(row).getByRole('button', { name: /Edit/ }))
+      const editor = await screen.findByDisplayValue(text) as HTMLTextAreaElement
+      return { editor, save: within(editor.closest('[role="dialog"]') as HTMLElement).getByRole('button', { name: /Save Changes/ }) }
+    }
+    let releasePut = () => {}
+    let releaseRead = () => {}
+    holdNextSubagentPut = new Promise<void>(resolve => { releasePut = resolve })
+    const readGate = new Promise<void>(resolve => { releaseRead = resolve })
+    const originalGet = subagentRoute.GET
+    let readCaptured = false
+    let capturedPrompt: unknown
+    const getSpy = vi.spyOn(subagentRoute, 'GET').mockImplementationOnce(async event => {
+      const response = await originalGet(event)
+      capturedPrompt = (await response.clone().json()).subagent.system_prompt
+      readCaptured = true
+      await readGate
+      return response
+    })
+    try {
+      const { editor, save } = await openEditor('Answer only in haiku.')
+      await fireEvent.input(editor, { target: { value: 'Answer in limericks.' } })
+      await fireEvent.click(save)
+      await waitFor(() => expect(puts).toHaveLength(1), { timeout: 8_000 })
+      // An edit queued after the admitted save must survive its older landing.
+      await fireEvent.input(document.getElementById('subagent-display')!, { target: { value: '' } })
+      const notice = await screen.findByTestId('subagent-settings-read-wait')
+      await fireEvent.click(within(notice).getByRole('button', { name: /Retry/, hidden: true }))
+      await waitFor(() => expect(readCaptured).toBe(true), { timeout: 8_000 })
+      expect(capturedPrompt).toBe('Answer only in haiku.')
+      releasePut()
+      await waitForPuts(1)
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull(), { timeout: 5_000 })
+      releaseRead()
+      await waitFor(() => expect(screen.queryByText('Loading subagent…')).toBeNull(), { timeout: 8_000 })
+      const reopened = await openEditor('Answer in limericks.')
+      expect((document.getElementById('subagent-display') as HTMLInputElement).value).toBe('')
+      expect(puts).toHaveLength(1)
+      // Subagent manual saves validate its whole core form. Deliberately return the
+      // unrelated name to its original value; that correction itself writes nothing.
+      await fireEvent.click(within(reopened.editor.closest('[role="dialog"]') as HTMLElement).getByRole('button', { name: /Cancel/ }))
+      await fireEvent.input(document.getElementById('subagent-display')!, { target: { value: SUB_NAME } })
+      const next = await openEditor('Answer in limericks.')
+      await fireEvent.input(next.editor, { target: { value: 'Answer in couplets.' } })
+      await fireEvent.click(next.save)
+      await waitForPuts(2)
+      expect(puts[1].body).toEqual({ system_prompt: 'Answer in couplets.', expectedInstructions: { customPrompt: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) } })
+      expect(puts[1].body.expectedInstructions.customPrompt).not.toBe(puts[0].body.expectedInstructions.customPrompt)
+      expect(await storedSubagent()).toMatchObject({ displayName: SUB_NAME, system_prompt: 'Answer in couplets.' })
+    } finally {
+      releasePut(); releaseRead(); getSpy.mockRestore()
+    }
   }, 120_000)
 })

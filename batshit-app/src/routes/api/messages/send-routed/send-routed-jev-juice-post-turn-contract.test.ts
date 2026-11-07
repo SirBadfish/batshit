@@ -18,7 +18,7 @@ describe('send-routed Judge Juice after-reply check contracts', () => {
   const checkTurn = source.indexOf('const jevJuicePostTurnCheck = jevJuiceGroupSelection', zipTurn)
   const seam = source.indexOf('const jevJuiceHintProvider = jevJuiceGroupSelection', checkTurn)
   const compile = source.indexOf('await databaseService.buildFormattedChatInput(', seam)
-  const compileEnd = source.indexOf("throw new Error('Failed to build formatted chat input for API or CLI agent')", compile)
+  const compileEnd = source.indexOf("throw new Error('Failed to build formatted chat input for the agent')", compile)
 
   it('builds one after-reply turn per send from this send\'s own history, and never for a group speaker', () => {
     expect(streamStart).toBeGreaterThan(-1)
@@ -47,8 +47,7 @@ describe('send-routed Judge Juice after-reply check contracts', () => {
   })
 
   it('marks the notes as told only at the accepted-send boundary', () => {
-    // BL-527: after the clip/countdown/memory block, not inside it, so a managed CLI
-    // control-approval resume (no clip spend) still marks what its compile told.
+    // BL-527: the told mark stays after the clip/countdown/memory block.
     const consumeGate = source.indexOf('if (consumeSessionClips && !isApprovalResumeWithoutUserTurn) {\n', compileEnd)
     const zipGate = source.indexOf('if (jevJuiceSmartZip && messageForCompilation && !groupContext) {', consumeGate)
     const checkGate = source.indexOf('if (jevJuicePostTurnCheck && messageForCompilation && !groupContext) {', zipGate)
@@ -74,11 +73,11 @@ describe('send-routed Judge Juice after-reply check contracts', () => {
       snapshot
     )
     const gate = source.indexOf(
-      '      !silentResponse &&\n      !replyAwaitsApproval &&\n      !replyOutputLimitFailure &&\n      (afterReplySmartZip || afterReplyCheck)\n',
+      '      !silentResponse &&\n      !replyAwaitsApproval &&\n      !replyOutputLimitFailure &&\n      !(mcpApiRun && p5ApiRunMustPause(mcpApiRun)) &&\n      (afterReplySmartZip || afterReplyCheck || resolveAgentJevSkillSessionsEnabled(agent))\n',
       awaits
     )
     const step = source.indexOf('? afterReplyCheck.runPostTurn({', gate)
-    const awaited = source.indexOf('await Promise.all([smartZipStep, postTurnCheckStep])', step)
+    const awaited = source.indexOf('await Promise.all([smartZipStep, postTurnCheckStep, skillSessionStep])', step)
     const responseBuilt = source.indexOf('const response = json({', step)
 
     expect(complete).toBeGreaterThan(finalize)
@@ -93,8 +92,11 @@ describe('send-routed Judge Juice after-reply check contracts', () => {
     // The run's own answer says the same thing the gate decided.
     expect(source.indexOf('awaitsApproval: replyAwaitsApproval,', responseBuilt)).toBeGreaterThan(responseBuilt)
 
-    // The send's own check, else (BL-527) the check given to a run that finishes an earlier run's reply.
-    expect(source).toContain('const afterReplyCheck = jevJuicePostTurnCheck ?? jevJuiceContinuedReply?.postTurnCheck')
+    // The send's own check, else (BL-527) the check given to a run that finishes an earlier run's
+    // reply.
+    expect(source).toContain(
+      'const afterReplyCheck = jevJuicePostTurnCheck ?? jevJuiceContinuedReply?.postTurnCheck\n'
+    )
     const body = source.slice(step, awaited)
     expect(body).toContain('reply: finishedReply,')
     expect(body).toContain('newZipIds,')
@@ -105,27 +107,44 @@ describe('send-routed Judge Juice after-reply check contracts', () => {
     // Appending rows is a read-modify-write: this lane appends after smart zip's step settles.
     expect(body).toContain('appendRowsAfter: smartZipStep,')
     // ONE site: never on the error, abort, or interrupted paths.
-    expect(source.split('.runPostTurn(').length - 1).toBe(2)
+    expect(source.split('.runPostTurn(').length - 1).toBe(3)
+    expect(source.split('skillSessionTurn.runPostTurn(').length - 1).toBe(1)
     expect(source.split('afterReplyCheck.runPostTurn(').length - 1).toBe(1)
   })
 
   it('gives a run that finishes an earlier run\'s reply the after-reply steps alone, from the request that reply answers (BL-527)', () => {
-    const continued = source.indexOf('const jevJuiceContinuedReply =', checkTurn)
+    const continued = source.indexOf('let jevJuiceContinuedReply =', checkTurn)
     expect(continued).toBeGreaterThan(checkTurn)
     expect(continued).toBeLessThan(seam)
     const body = source.slice(continued, seam)
-    expect(body).toContain('jevJuiceGroupSelection || !(isApprovalResumeWithoutUserTurn || isContextContinuationRun)')
+    expect(body).toContain(
+      'jevJuiceGroupSelection ||\n    !(isApprovalResumeWithoutUserTurn || isContextContinuationRun)'
+    )
     expect(body).toContain('? approvalResumeReplyTurn(pausedApprovalTurn, approvalResumePrior)')
     expect(body).toContain(': findContextContinuationTurn(previousMessages, contextContinuationRaw?.previousMessageId),')
     // It reaches the compiler through nothing (no provider before the reply) and the accepted-send
     // boundary through nothing (no told mark): only the after-reply site reads it.
-    expect(source.slice(seam, compileEnd)).not.toContain('jevJuiceContinuedReply')
+    expect(source.slice(compile, compileEnd)).not.toContain('jevJuiceContinuedReply')
+    // A managed API continuation adopts only actual saved canonical parts. This
+    // creates after-reply owners; it never passes them into compiler options.
+    const part = source.indexOf('const mcpApiPart =', seam)
+    const lineage = source.indexOf('const lineage = await captureP5ApiCanonicalLineage(mcpOriginalPreparation, mcpApiPart)', part)
+    const canonical = source.indexOf('if (lineage) jevJuiceContinuedReply = buildContinuedReplySteps({', lineage)
+    expect(part).toBeGreaterThan(seam)
+    expect(lineage).toBeGreaterThan(part)
+    expect(canonical).toBeGreaterThan(lineage)
+    expect(canonical).toBeLessThan(compile)
+    expect(source.slice(lineage, compile)).toContain('continued: await originalApiContinuationReplyTurn(lineage)')
     const uses = source.split('\n').filter((line) => line.includes('jevJuiceContinuedReply') && !line.trim().startsWith('//'))
     expect(uses.map((line) => line.trim())).toEqual([
-      'const jevJuiceContinuedReply =',
+      'let jevJuiceContinuedReply =',
+      'if (lineage) jevJuiceContinuedReply = buildContinuedReplySteps({ userId, sessionId, agent, globalZipSettings,',
       'const afterReplySmartZip = jevJuiceSmartZip ?? jevJuiceContinuedReply?.smartZip',
       'const afterReplyCheck = jevJuicePostTurnCheck ?? jevJuiceContinuedReply?.postTurnCheck',
-      'const earlierParts = jevJuiceContinuedReply?.earlierParts ?? []'
+      'const earlierParts = jevJuiceContinuedReply?.earlierParts ?? []',
+      'lineageComplete: skillSavedReplyComplete && (!(isApprovalResumeWithoutUserTurn || isContextContinuationRun) || !!jevJuiceContinuedReply?.skillSessionContext),',
+      "request: jevJuiceContinuedReply?.skillSessionContext?.request ?? (typeof messageForCompilation === 'string' ? messageForCompilation : ''),",
+      "? 'wake' : jevJuiceContinuedReply?.skillSessionContext ? 'trusted_resume' : 'user',"
     ])
   })
 

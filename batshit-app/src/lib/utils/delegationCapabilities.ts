@@ -8,9 +8,10 @@
  * agents to call something that was not there — the opposite of Batshit's fail-loudly rule.
  * So the plumbing landed gated, and each packet flipped exactly one constant here.
  *
- * P4 (2026-09-04) flipped it: `native_spawn_workers` (API) and `spawn_workers` (managed
- * CLI bridge) exist, the runner is `$lib/server/services/workerRunner.ts`, and the caps
- * below are enforced there through `workerTurnBudget.ts`.
+ * P4 (2026-09-04) flipped it: `native_spawn_workers` (API) exists, the runner is
+ * `$lib/server/services/workerRunner.ts`, and the caps below are enforced there through
+ * `workerTurnBudget.ts`. (The managed CLI bridge's `spawn_workers` went with the Claude Code
+ * CLI Primary in SA-139 R4.)
  *
  * No `$lib/server` imports: Agent Settings loads this in the browser.
  */
@@ -18,10 +19,20 @@
 /** DL-111-09..12. Flipped by SA-111 P4 when the worker tools and runner shipped. */
 export const WORKERS_FEATURE_ENABLED = true
 
-/** DL-111-09: three workers per call, three concurrent, nine runs per parent turn. */
-export const WORKERS_MAX_PER_CALL = 3
-export const WORKERS_MAX_CONCURRENT = 3
-export const WORKERS_MAX_RUNS_PER_TURN = 9
+/**
+ * Delegation limits (Josh, 2026-10-24, decision 6): six Workers at a time, Codex's default
+ * (`agents.max_concurrent_threads_per_session`), and up to six in one call. There is no
+ * per-turn cap any more (DL-111-09's nine per parent turn is gone).
+ */
+export const WORKERS_MAX_PER_CALL = 6
+export const WORKERS_MAX_CONCURRENT = 6
+
+/**
+ * The CLI profile slot folders one Primary Agent's Workers can use at once
+ * (`subagent_cli-worker_<agent>_<1..n>`, BL-285). One per Worker that can run at a time, so a
+ * Primary Agent's delete knows every folder its Workers may have left.
+ */
+export const WORKER_PROFILE_SLOTS = WORKERS_MAX_CONCURRENT
 
 /** DL-111-10: a worker's brief and its optional role label are bounded, not unbounded text. */
 export const WORKER_TASK_MAX_CHARS = 20_000

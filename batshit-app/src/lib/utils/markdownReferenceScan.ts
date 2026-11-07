@@ -21,15 +21,10 @@ function delimiterFinder(text: string, delimiter: string) {
   }
 }
 
-function scanReferences(
-  text: string,
-  selectedKind: MarkdownReference['kind'] | undefined,
-  excludeIdBrace: boolean
-): MarkdownReference[] {
+function scanReferences(text: string): MarkdownReference[] {
   const references: MarkdownReference[] = []
   const nextColon = delimiterFinder(text, ':')
   const nextBrace = delimiterFinder(text, '}')
-  const nextPair = delimiterFinder(text, '}}')
   let from = 0
   while (from < text.length) {
     const start = text.indexOf('{{batshit-', from)
@@ -38,10 +33,10 @@ function scanReferences(
     const kind = text.startsWith('{{batshit-zip:', start)
       ? 'batshit-zip'
       : text.startsWith('{{batshit-clip:', start) ? 'batshit-clip' : undefined
-    if (!kind || (selectedKind && kind !== selectedKind)) continue
+    if (!kind) continue
     const idStart = start + kind.length + 3
     const colon = nextColon(idStart)
-    const brace = excludeIdBrace ? nextBrace(idStart) : nextPair(idStart + 1)
+    const brace = nextBrace(idStart)
     let idEnd: number
     let end: number
     let description: string | undefined
@@ -64,18 +59,12 @@ function scanReferences(
   return references
 }
 
-/** Transcript ids exclude ':' and '}', unlike the message formatter grammar. */
+/**
+ * The transcript export's grammar: ids exclude ':' and '}'. The chat view's formatter reads the
+ * trust reader's shapes (`scanZipReferences`, `scanClipReferences`) since BL-609.
+ */
 export function scanTranscriptReferences(text: string) {
-  return scanReferences(text, undefined, true)
-}
-
-/** Preserve the message formatter's historical ':'-only id exclusion. */
-export function scanMessageZipReferences(text: string) {
-  return scanReferences(text, 'batshit-zip', false)
-}
-
-export function scanMessageClipReferences(text: string) {
-  return scanReferences(text, 'batshit-clip', false)
+  return scanReferences(text)
 }
 
 export function scanTranscriptLegacyClipBlocks(text: string) {

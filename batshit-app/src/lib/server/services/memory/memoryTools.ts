@@ -1,3 +1,8 @@
+import { readMemoryObservation } from './memoryOwnership'
+import { captureSettingsLifecycle, type SettingsLifecycleSnapshot } from '../appActions/settings/lifecycle'
+import { memoryMutationUnknown, readMemoryMutationSnapshot } from './memoryMutation'
+import { effectiveMemoryRecord, memoryIsDeleted, memoryIsEligible } from './memoryState'
+import { createRecallMediaPermit } from './memoryRecallDelivery'
 /**
  * SA-104 P3 — the memory tool operations layer.
  *
@@ -57,14 +62,13 @@ import {
   type MemorySearchFilters,
   type SegmentSearchFilters
 } from './memoryIndex'
-import { MEMORY_SEGMENT_KEY_PREFIX } from './memoryKeys'
+import { MEMORY_SEGMENT_KEY_PREFIX, memoryKey } from './memoryKeys'
 import { queuePendingMemoryRecalls } from './memoryLinger'
 import { blendMemoryRanking, foldAwarenessState, getMemoryFold } from './memoryRecall'
 import {
   closeEpisode,
   getOpenEpisode,
   updateEpisodeBounds,
-  updateEpisodeWhiteboard,
   type EpisodeRecord
 } from './memoryEpisodes'
 import { isFixedSession } from '$lib/utils/fixedSession'
@@ -148,6 +152,7 @@ export interface MemorySummary {
   saved_at: string
   expires_at?: string | null
   superseded: boolean
+  expired: boolean
   superseded_by?: string | null
   trigger_terms?: string[]
   /** Per-memory linger override (turns or 'episode'), when set. */
@@ -168,6 +173,11 @@ export interface MemorySummary {
 const GIST_PREVIEW_CHARS = 140
 
 export function toMemorySummary(record: MemoryRecord): MemorySummary {
+  return toMemorySummaryAt(record, Date.now())
+}
+
+function toMemorySummaryAt(record: MemoryRecord, nowTs: number): MemorySummary {
+  record = effectiveMemoryRecord(record, nowTs)
   const gist =
     record.gist?.trim() ||
     (record.content.length > GIST_PREVIEW_CHARS
@@ -182,6 +192,7 @@ export function toMemorySummary(record: MemoryRecord): MemorySummary {
     saved_at: record.saved_at,
     ...(record.expires_at ? { expires_at: record.expires_at } : {}),
     superseded: record.is_superseded === 'y',
+    expired: memoryIsExpired(record, nowTs),
     ...(record.superseded_by ? { superseded_by: record.superseded_by } : {}),
     ...(record.trigger_terms?.length ? { trigger_terms: record.trigger_terms } : {}),
     ...(record.linger_override !== undefined ? { linger_override: record.linger_override } : {}),
@@ -217,7 +228,7 @@ async function findNearDuplicates(
   const records = await fetchMemoriesByKeys(nearKeys.map((entry) => entry.key))
   const distanceByKey = new Map(nearKeys.map((entry) => [entry.key, entry.distance]))
   return records
-    .filter((candidate) => candidate.id !== record.id)
+    .filter((candidate) => candidate.id !== record.id && memoryIsEligible(candidate))
     .map((candidate) => ({
       id: candidate.id,
       gist: toMemorySummary(candidate).gist,
@@ -253,6 +264,7 @@ export async function assertStandingMediaCapacity(options: {
   const existingCount = records
     .filter(
       (record) =>
+        !memoryIsDeleted(record) &&
         record.id !== options.excludeMemoryId &&
         record.lane === 'awareness' &&
         record.media_mode === 'always' &&
@@ -273,6 +285,7 @@ async function copyClipInputs(options: {
   agentId: string
   memoryId: string
   clipIds: string[]
+  lifecycle?: SettingsLifecycleSnapshot
 }): Promise<MemoryMediaRecord[]> {
   const copied: MemoryMediaRecord[] = []
   try {
@@ -282,7 +295,8 @@ async function copyClipInputs(options: {
           userId: options.userId,
           agentId: options.agentId,
           memoryId: options.memoryId,
-          clipId
+          clipId,
+          lifecycle: options.lifecycle
         })
       )
     }
@@ -309,6 +323,7 @@ export async function saveMemoryOp(
   context: MemorySaveContext,
   rawPayload: unknown
 ): Promise<MemorySaveResult> {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
   await requireMemoryEnabledAgent(context.userId, context.agentId)
 
   const validation = validateMemorySavePayload(rawPayload)
@@ -355,20 +370,10 @@ export async function saveMemoryOp(
         userId: context.userId,
         agentId: context.agentId,
         memoryId,
-        clipIds: payload.clip_ids
+        clipIds: payload.clip_ids,
+        lifecycle
       })
     : []
-  try {
-    await assertStandingMediaCapacity({
-      agentId: context.agentId,
-      mode: mediaMode,
-      mediaCount: media.length
-    })
-  } catch (error) {
-    for (const item of media) await deleteMemoryMedia(item).catch(() => {})
-    throw error
-  }
-
   let record: MemoryRecord
   try {
     record = await createMemory(
@@ -387,6 +392,7 @@ export async function saveMemoryOp(
         links: payload.links,
         media,
         media_mode: mediaMode,
+        supersedes: payload.supersedes,
         provenance: [
           {
             session_id: sessionId,
@@ -395,16 +401,15 @@ export async function saveMemoryOp(
           }
         ]
       },
-      { embedder }
+      { embedder, lifecycle }
     )
   } catch (error) {
-    for (const item of media) await deleteMemoryMedia(item).catch(() => {})
+    if (!memoryMutationUnknown(error)) for (const item of media) await deleteMemoryMedia(item).catch(() => {})
     throw error
   }
 
   let superseded: string[] | undefined
   if (payload.supersedes?.length) {
-    await supersedeMemory(context.agentId, record.id, payload.supersedes)
     superseded = payload.supersedes
   }
 
@@ -471,6 +476,7 @@ function parseLaneFilter(value: unknown): MemoryLane | undefined {
 export interface MemorySearchInput {
   query: string
   lane?: string
+  include_expired?: boolean
   include_superseded?: boolean
   event_from?: string
   event_to?: string
@@ -542,6 +548,7 @@ export async function searchMemoriesOp(
   const limit = Math.min(Math.max(limitRaw, 1), SEARCH_MAX_LIMIT)
 
   const filters: MemorySearchFilters = {}
+  if (input.include_expired === true) filters.includeExpired = true
   const lane = parseLaneFilter(input.lane)
   if (lane) filters.lane = lane
   if (input.include_superseded === false) filters.superseded = 'n'
@@ -566,7 +573,7 @@ export async function searchMemoriesOp(
     filters
   })
 
-  const records = await fetchMemoriesByKeys(hits.map((hit) => hit.key))
+  const records = (await fetchMemoriesByKeys(hits.map((hit) => hit.key))).filter(record => memoryIsEligible(record, input.include_expired === true))
   const hitOrder = new Map<string, number>()
   hits.forEach((hit, index) => {
     const memoryId = hit.key.split(':').pop() as string
@@ -613,7 +620,7 @@ export async function searchMemoriesOp(
       )
       const poolOrder = new Map<string, number>()
       poolKeys.forEach((key, index) => poolOrder.set(key.split(':').pop() as string, index))
-      const pool = (await fetchMemoriesByKeys(poolKeys)).sort(
+      const pool = (await fetchMemoriesByKeys(poolKeys)).filter(record => memoryIsEligible(record, input.include_expired === true)).sort(
         (a, b) => (poolOrder.get(a.id) ?? 0) - (poolOrder.get(b.id) ?? 0)
       )
 
@@ -671,7 +678,7 @@ export async function searchMemoriesOp(
       if (linkedSummaries.length >= LINK_EXPANSION_MAX) break
       if (includedIds.has(linkedId)) continue
       const linked = await getMemory(context.agentId, linkedId)
-      if (!linked) continue
+      if (!linked || !memoryIsEligible(linked, input.include_expired === true)) continue
       includedIds.add(linkedId)
       linkedSummaries.push({ ...toMemorySummary(linked), linked_from: record.id })
     }
@@ -715,10 +722,19 @@ export async function searchMemoriesOp(
   )
   const segments = segmentRecords.map(toMemorySegmentSummary)
 
+  // Reranking and segment search await after the initial hit load. Re-read the
+  // bounded result set so an expired/deleted id cannot leak through that gap.
+  const fresh = new Map((await fetchMemoriesByKeys(results.map(row => memoryKey(context.agentId, row.id)))).map(record => [record.id, record]))
+  const safeResults = results.flatMap(summary => {
+    const record = fresh.get(summary.id)
+    if (!record || !memoryIsEligible(record, input.include_expired === true)) return []
+    const old = ranked.find(entry => entry.id === record.id)
+    return [{ ...toMemorySummary(record), ...(summary.linked_from ? { linked_from: summary.linked_from } : {}), ...(summary.jev_relevance !== undefined && old?.content === record.content ? { jev_relevance: summary.jev_relevance } : {}) }]
+  })
   return {
-    results,
+    results: safeResults,
     ...(segments.length > 0 ? { segments } : {}),
-    totalReturned: results.length + segments.length,
+    totalReturned: safeResults.length + segments.length,
     note:
       'These are summary references, not full memories. To bring chosen memories into your context, call ' +
       'sys.memory.recall with their ids. Entries marked superseded point to the chosen current memory — timestamps ' +
@@ -730,6 +746,7 @@ export async function searchMemoriesOp(
 
 export interface MemoryListInput {
   lane?: string
+  include_expired?: boolean
   include_superseded?: boolean
   limit?: number
 }
@@ -744,7 +761,7 @@ export async function listMemoriesOp(
   const limitRaw = typeof input.limit === 'number' ? Math.floor(input.limit) : LIST_DEFAULT_LIMIT
   const limit = Math.min(Math.max(limitRaw, 1), LIST_MAX_LIMIT)
 
-  let records = await listMemories(context.agentId)
+  let records = (await listMemories(context.agentId)).filter(record => memoryIsEligible(record, input.include_expired === true)).map(record => effectiveMemoryRecord(record))
   if (lane) records = records.filter((record) => record.lane === lane)
   if (input.include_superseded === false) {
     records = records.filter((record) => record.is_superseded !== 'y')
@@ -779,8 +796,10 @@ export async function updateMemoryOp(
   context: MemoryToolContext,
   input: MemoryUpdateInput
 ): Promise<{ updated: MemorySummary }> {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
   await requireMemoryEnabledAgent(context.userId, context.agentId)
-  const existing = await getMemory(context.agentId, input.memoryId)
+  const snapshot = await readMemoryMutationSnapshot(context.agentId, { lifecycle, targetIds: [input.memoryId] })
+  const existing = snapshot.records.find(record => record.id === input.memoryId)
   if (!existing) throw new MemoryToolError(`Memory "${input.memoryId}" was not found for this agent.`)
   if (
     input.media_mode !== undefined &&
@@ -807,7 +826,8 @@ export async function updateMemoryOp(
           userId: context.userId,
           agentId: context.agentId,
           memoryId: input.memoryId,
-          clipIds: input.clip_ids
+          clipIds: input.clip_ids,
+          lifecycle
         })
       : null
     updates.media = replacementMedia
@@ -817,31 +837,14 @@ export async function updateMemoryOp(
     for (const item of replacementMedia ?? []) await deleteMemoryMedia(item).catch(() => {})
     throw new MemoryToolError('Memory update needs at least one field to change.')
   }
-  const nextMode = input.media_mode === null ? 'on_recall' : input.media_mode ?? existing.media_mode ?? 'on_recall'
-  const nextMedia = replacementMedia === undefined ? existing.media ?? [] : replacementMedia ?? []
-  if (nextMode === 'always' && existing.lane !== 'awareness') {
-    for (const item of replacementMedia ?? []) await deleteMemoryMedia(item).catch(() => {})
-    throw new MemoryToolError('Always-on media is only valid for an awareness memory.')
-  }
-  try {
-    await assertStandingMediaCapacity({
-      agentId: context.agentId,
-      mode: nextMode,
-      mediaCount: nextMedia.length,
-      excludeMemoryId: existing.id
-    })
-  } catch (error) {
-    for (const item of replacementMedia ?? []) await deleteMemoryMedia(item).catch(() => {})
-    throw error
-  }
   const embedder = await createMemoryEmbedderAsync((await getMemoryConfig()).embedding, {
     userId: context.userId
   })
   let record: MemoryRecord
   try {
-    record = await updateMemory(context.agentId, input.memoryId, updates, { embedder })
+    record = await updateMemory(context.agentId, input.memoryId, updates, { embedder, lifecycle, snapshot })
   } catch (error) {
-    for (const item of replacementMedia ?? []) await deleteMemoryMedia(item).catch(() => {})
+    if (!memoryMutationUnknown(error)) for (const item of replacementMedia ?? []) await deleteMemoryMedia(item).catch(() => {})
     throw error
   }
   if (replacementMedia !== undefined) {
@@ -855,6 +858,7 @@ export async function moveMemoryLaneOp(
   context: MemoryToolContext,
   input: { memoryId: string; lane: string }
 ): Promise<{ moved: MemorySummary }> {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
   await requireMemoryEnabledAgent(context.userId, context.agentId)
   const lane = parseLaneFilter(input.lane)
   if (!lane) {
@@ -874,7 +878,7 @@ export async function moveMemoryLaneOp(
       'Turn off always-on media before moving this memory out of the awareness lane.'
     )
   }
-  const record = await updateMemory(context.agentId, input.memoryId, { lane })
+  const record = await updateMemory(context.agentId, input.memoryId, { lane }, { deliberateLaneMove: true, lifecycle })
   return { moved: toMemorySummary(record) }
 }
 
@@ -882,11 +886,12 @@ export async function supersedeMemoryOp(
   context: MemoryToolContext,
   input: { memoryId: string; supersedes: string[] }
 ): Promise<{ superseder: MemorySummary; superseded: string[] }> {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
   await requireMemoryEnabledAgent(context.userId, context.agentId)
   if (!Array.isArray(input.supersedes) || input.supersedes.length === 0) {
     throw new MemoryToolError('"supersedes" must list at least one memory id to supersede.')
   }
-  const record = await supersedeMemory(context.agentId, input.memoryId, input.supersedes)
+  const record = await supersedeMemory(context.agentId, input.memoryId, input.supersedes, { lifecycle })
   return { superseder: toMemorySummary(record), superseded: input.supersedes }
 }
 
@@ -894,25 +899,27 @@ export async function unsupersedeMemoryOp(
   context: MemoryToolContext,
   input: { memoryId: string }
 ): Promise<{ restored: MemorySummary }> {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
   await requireMemoryEnabledAgent(context.userId, context.agentId)
-  const record = await unsupersedeMemory(context.agentId, input.memoryId)
+  const record = await unsupersedeMemory(context.agentId, input.memoryId, { lifecycle })
   return { restored: toMemorySummary(record) }
 }
 
 export async function deleteMemoryOp(
   context: MemoryToolContext,
   input: { memoryId: string }
-): Promise<{ deleted: boolean; memoryId: string }> {
+): Promise<{ deleted: boolean; memoryId: string; note: string }> {
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`])
   await requireMemoryEnabledAgent(context.userId, context.agentId)
   const existing = await getMemory(context.agentId, input.memoryId)
   if (!existing) {
     throw new MemoryToolError(`Memory "${input.memoryId}" was not found for this agent.`)
   }
-  const deleted = await deleteMemory(context.agentId, input.memoryId)
+  const deleted = await deleteMemory(context.agentId, input.memoryId, { lifecycle })
   if (deleted) {
     await refoldAwarenessAfterDelete(context.agentId, input.memoryId, existing.lane)
   }
-  return { deleted, memoryId: input.memoryId }
+  return { deleted, memoryId: input.memoryId, note: 'Moved to Deleted Memories. The user can restore it or permanently empty that section in Settings → Memory.' }
 }
 
 /**
@@ -944,6 +951,8 @@ export async function refoldAwarenessAfterDelete(
 }
 
 export interface MemoryRecallResult {
+  /** Opaque in-process delivery admission, never a restored grant or a model flag. */
+  recall_media_token?: string
   /**
    * 2026-08-29: recall now returns FULL CONTENT in-turn (Josh's call — the agent
    * reads what it recalls immediately). Memory tool results leave no compiled-
@@ -982,94 +991,61 @@ export interface MemoryRecallResult {
  */
 export async function recallMemoriesOp(
   context: MemoryToolContext,
-  input: { memoryIds: string[] }
+  input: { memoryIds: string[]; include_expired?: boolean }
 ): Promise<MemoryRecallResult> {
-  await requireMemoryEnabledAgent(context.userId, context.agentId)
-
-  const memoryIds = Array.isArray(input.memoryIds)
-    ? Array.from(
-        new Set(
-          input.memoryIds
-            .map((id) => (typeof id === 'string' ? id.trim() : ''))
-            .filter((id) => id.length > 0)
-        )
-      )
-    : []
-  if (memoryIds.length === 0) {
-    throw new MemoryToolError('"memoryIds" must list at least one memory id to recall.')
-  }
-  if (memoryIds.length > RECALL_MAX_IDS) {
-    throw new MemoryToolError(`Recall at most ${RECALL_MAX_IDS} memories per call.`)
-  }
-
   const sessionId = typeof context.sessionId === 'string' ? context.sessionId.trim() : ''
-  if (!sessionId) {
-    throw new MemoryToolError('Memory recall needs a chat session context.')
-  }
-
-  const recalled: MemoryRecallResult['recalled'] = []
-  const recalledSegments: Array<MemorySegmentSummary & { summary: string }> = []
+  if (!sessionId) throw new MemoryToolError('Memory recall needs a chat session context.')
+  const lifecycle = captureSettingsLifecycle([`agent:${context.agentId}`, `session:${sessionId}`])
+  await requireMemoryEnabledAgent(context.userId, context.agentId)
+  const ids = Array.isArray(input.memoryIds) ? [...new Set(input.memoryIds.map(id => typeof id === 'string' ? id.trim() : '').filter(Boolean))] : []
+  if (!ids.length) throw new MemoryToolError('"memoryIds" must list at least one memory id to recall.')
+  if (ids.length > RECALL_MAX_IDS) throw new MemoryToolError(`Recall at most ${RECALL_MAX_IDS} memories per call.`)
+  const memoryIds = ids.filter(id => !id.startsWith('memseg_')), segmentIds = ids.filter(id => id.startsWith('memseg_'))
+  const owner = { userId: context.userId, agentId: context.agentId, sessionId, lifecycle, memoryIds, segmentIds, requireEnabled: true }
+  const original = await readMemoryObservation(owner)
   const entries: Array<{ id: string; kind: 'memory' | 'segment' }> = []
-  for (const memoryId of memoryIds) {
-    if (memoryId.startsWith('memseg_')) {
-      const segment = await getMemorySegment(context.agentId, memoryId)
-      if (!segment) {
-        throw new MemoryToolError(
-          `Segment "${memoryId}" was not found for this agent; nothing was queued.`,
-          'Use sys.memory.search to find valid ids, then recall again.'
-        )
-      }
-      recalledSegments.push({ ...toMemorySegmentSummary(segment), summary: segment.summary })
-      entries.push({ id: memoryId, kind: 'segment' })
-      continue
+  for (const id of ids) {
+    if (id.startsWith('memseg_')) {
+      if (!original.segments.has(id)) throw new MemoryToolError(`Segment "${id}" was not found for this agent; nothing was queued.`)
+      entries.push({ id, kind: 'segment' })
+    } else {
+      const record = original.records.get(id)
+      if (!record || !memoryIsEligible(record, input.include_expired === true, original.nowTs)) throw new MemoryToolError(`Memory "${id}" is unavailable, deleted or expired; nothing was queued.`, 'Use sys.memory.search to find valid ids.')
+      if (!memoryIsExpired(record, original.nowTs)) entries.push({ id, kind: 'memory' })
     }
-    const record = await getMemory(context.agentId, memoryId)
-    if (!record) {
-      throw new MemoryToolError(
-        `Memory "${memoryId}" was not found for this agent; nothing was queued.`,
-        'Use sys.memory.search to find valid ids, then recall again.'
-      )
-    }
-    recalled.push({
-      ...toMemorySummary(record),
-      content: record.content,
-      // SA-105 P2 (DL-105-04): a BYTE-FREE media plan. Bytes are loaded later,
-      // at delivery time, from the media id — never here, because this object
-      // rides into intermediate steps, the Execution Viewer and the persisted
-      // step payload, which is exactly the pile-up the story exists to prevent.
-      //
-      // Delivery is deliberately NOT decided here. This op has no provider
-      // knowledge (its context is userId/agentId/sessionId), and the honest
-      // answer depends on the run's lane. `applyRecallMediaDelivery` in
-      // memoryRecallDelivery.ts fills in `delivery`, `reason` and the per-memory
-      // `media_note` where the lane IS known, so the model never reads a note
-      // that contradicts what it actually received.
-      ...(record.media?.length
-        ? {
-            media: record.media.map((entry) => ({
-              media_id: entry.id,
-              filename: entry.display_name,
-              mime_type: entry.mime_type,
-              bytes: entry.bytes
-            }))
-          }
-        : {})
-    })
-    entries.push({ id: memoryId, kind: 'memory' })
   }
-
   for (const entry of entries) {
-    if (entry.kind === 'segment') await touchMemorySegmentRecall(context.agentId, entry.id)
-    else await touchMemoryRecall(context.agentId, entry.id)
+    if (entry.kind === 'segment') await touchMemorySegmentRecall(context.agentId, entry.id, { lifecycle })
+    else await touchMemoryRecall(context.agentId, entry.id, { lifecycle })
   }
-  await queuePendingMemoryRecalls(sessionId, context.agentId, entries)
-
+  // An explicit-expired-only read is entirely read-only: no empty linger write.
+  if (entries.length) await queuePendingMemoryRecalls(sessionId, context.agentId, entries, {
+    lifecycle, userId: context.userId, agentOwner: original.agentOwner, sessionOwner: original.sessionOwner!
+  })
+  // Last await. Return fresh, currently eligible text/media only, never the rows
+  // captured before another touch/queue operation yielded.
+  const final = await readMemoryObservation({ ...owner, expectedAgent: original.agentOwner, expectedSession: original.sessionOwner! })
+  const recalled: MemoryRecallResult['recalled'] = memoryIds.flatMap(id => {
+    const record = final.records.get(id)
+    if (!record || !memoryIsEligible(record, input.include_expired === true, final.nowTs)) return []
+    return [{ ...toMemorySummaryAt(record, final.nowTs), content: record.content,
+      ...(record.media?.length ? { media: record.media.map(media => ({ media_id: media.id, filename: media.display_name, mime_type: media.mime_type, bytes: media.bytes })) } : {}) }]
+  })
+  const recalledSegments = segmentIds.flatMap(id => {
+    const record = final.segments.get(id)
+    return record ? [{ ...toMemorySegmentSummary(record), summary: record.summary }] : []
+  })
+  const skipped = recalled.length + recalledSegments.length < ids.length
   return {
     recalled,
-    ...(recalledSegments.length > 0 ? { recalledSegments } : {}),
-    note:
-      'Full content above — read it now; this tool result never enters chat history. The same memories also ' +
-      'arrive in your Memory context from the next message and linger there, so you keep them for the follow-up turns.'
+    ...(recalled.some(record => record.media?.length) ? { recall_media_token: createRecallMediaPermit({
+      userId: context.userId, agentId: context.agentId, sessionId, lifecycle, agentOwner: final.agentOwner, sessionOwner: final.sessionOwner!, includeExpired: input.include_expired === true, records: recalled
+    }) } : {}),
+    ...(recalledSegments.length ? { recalledSegments } : {}),
+    note: 'Full content above is available for this call and never enters chat history. ' +
+      (recalled.some(record => record.expired) ? 'Expired results are historical references and are excluded from automatic context. ' : '') +
+      (entries.length ? 'Queued records can surface from the next message while they remain eligible. ' : 'No records were queued for later messages. ') +
+      (skipped ? 'Some requested records became unavailable during recall and were not returned.' : '')
   }
 }
 
@@ -1130,41 +1106,6 @@ export async function closeEpisodeOp(
     closed: episodeSummary(closed),
     note:
       'Episode closed. A new episode opens on the next message; graduation of closed episodes happens during naps and dreaming.'
-  }
-}
-
-/** Whiteboards compile into the current-message DCM every turn — keep them compact. */
-export const WHITEBOARD_MAX_CHARS = 6_000
-
-/**
- * SA-104 P6 — update (or clear) the open episode's whiteboard: the agent-maintained
- * working-facts block that rides the current-message DCM until the episode closes (DL-104-07).
- * Content replaces the whole whiteboard (the agent rewrites it deliberately); null or
- * empty clears it. Closing an episode keeps the final content on the record
- * (dissolved = kept, no longer compiled — DL-104-02).
- */
-export async function updateWhiteboardOp(
-  context: MemoryToolContext,
-  input: { content?: string | null }
-): Promise<{ episode: Record<string, any>; whiteboard: string | null; note: string }> {
-  await requireMemoryEnabledAgent(context.userId, context.agentId)
-  const { sessionId, openEpisode } = await requireFixedSessionForEpisodes(context)
-
-  const rawContent = typeof input.content === 'string' ? input.content.trim() : ''
-  if (rawContent.length > WHITEBOARD_MAX_CHARS) {
-    throw new MemoryToolError(
-      `The whiteboard is capped at ${WHITEBOARD_MAX_CHARS} characters (it arrives with every current message). Keep only load-bearing working facts; move durable knowledge into memories instead.`
-    )
-  }
-
-  const content = rawContent.length > 0 ? rawContent : null
-  const updated = await updateEpisodeWhiteboard(sessionId, openEpisode.id, content, 'agent')
-  return {
-    episode: episodeSummary(updated),
-    whiteboard: updated.whiteboard?.content ?? null,
-    note: content
-      ? 'Whiteboard updated. It arrives with every current message (Episode whiteboard section) until this episode closes. Naps never change a board you wrote.'
-      : 'Whiteboard cleared. A nap may fill an empty board; once you write it again, naps leave it alone.'
   }
 }
 

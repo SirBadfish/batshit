@@ -20,7 +20,7 @@ const context = (actingAgentId = 'sadie', userId = 'josh'): SettingsOwnerContext
 })
 const developer: SettingsOwnerContext = { actor: { kind: 'developer', userId: 'josh' }, signal: new AbortController().signal, check() {} }
 const raw = (value: unknown) => value === undefined ? '[]' : JSON.stringify([value])
-const initial = () => [raw('sadie'), raw('josh'), raw('api'), raw('Sadie'), raw(false), raw({ on_my_mind: 2000, triggers: 1200, recalled: 2400, untouchedSibling: 'keep' }), raw(undefined), raw(2), raw(undefined), raw(2), raw(undefined), raw(undefined)]
+const initial = () => [raw('sadie'), raw('josh'), raw('api'), raw('Sadie'), raw(false), raw({ on_my_mind: 2000, triggers: 1200, recalled: 2400, untouchedSibling: 'keep' }), raw(undefined), raw(2), raw(undefined), raw(2), raw(undefined), raw(undefined), raw(undefined), raw(undefined), raw(undefined), raw(undefined), ...Array(5).fill('[]')]
 function readyClient(evalOperation: SettingsRedisClient['eval']): SettingsRedisClient & { events: EventEmitter } {
   const events = new EventEmitter()
   return { events, isOpen: true, isReady: true, eval: evalOperation,
@@ -103,7 +103,7 @@ describe('conditional owner save and truthful outcomes', () => {
       const pending = new Promise<void>(resolve => { resume = resolve })
       const reached = new Promise<void>(resolve => { deferred = resolve })
       const client = readyClient(async script => {
-        if (script === READ_SETTINGS_SNAPSHOT_SCRIPT) return ['OK', ...initial()]
+        if (script === READ_SETTINGS_SNAPSHOT_SCRIPT) return ['OK', ...initial(), '', '']
         mutations += 1; return 'OK'
       })
       const store = createConditionalSettingsStore(async operation => {
@@ -124,7 +124,7 @@ describe('conditional owner save and truthful outcomes', () => {
   it('reports a failed client acquisition as definite no-write without retry', async () => {
     let calls = 0; let mutations = 0
     const client = readyClient(async script => {
-      if (script === READ_SETTINGS_SNAPSHOT_SCRIPT) return ['OK', ...initial()]
+      if (script === READ_SETTINGS_SNAPSHOT_SCRIPT) return ['OK', ...initial(), '', '']
       mutations += 1; return 'OK'
     })
     const owner = createOwnAgentSettingsExecutors(createConditionalSettingsStore(async operation => {
@@ -139,7 +139,7 @@ describe('conditional owner save and truthful outcomes', () => {
   it('never submits a command to a disconnected client that can queue until reconnect', async () => {
     const queue = new RedisCommandsQueue(2, undefined, () => {})
     let issues = 0
-    const client = readyClient(async script => script === READ_SETTINGS_SNAPSHOT_SCRIPT ? ['OK', ...initial()] : 'OK')
+    const client = readyClient(async script => script === READ_SETTINGS_SNAPSHOT_SCRIPT ? ['OK', ...initial(), '', ''] : 'OK')
     Object.defineProperty(client, 'isReady', { value: false, configurable: true })
     client.withAbortSignal = signal => ({ async eval() { issues += 1; return queue.addCommand(['EVAL', 'probe', '0'], { abortSignal: signal }) } })
     const owner = createOwnAgentSettingsExecutors(createConditionalSettingsStore(async operation => operation(client)))
@@ -155,7 +155,7 @@ describe('conditional owner save and truthful outcomes', () => {
     const queue = new RedisCommandsQueue(2, undefined, () => {})
     const events = new EventEmitter(); let sharedErrors = 0; events.on('error', () => { sharedErrors += 1 })
     let issued!: () => void; const reached = new Promise<void>(resolve => { issued = resolve })
-    const client = readyClient(async () => ['OK', ...initial()])
+    const client = readyClient(async () => ['OK', ...initial(), '', ''])
     client.on = events.on.bind(events); client.removeListener = events.removeListener.bind(events)
     client.withAbortSignal = signal => ({ async eval(script, options) {
       const pending = queue.addCommand(['EVAL', script, '1', ...options.keys, ...options.arguments], { abortSignal: signal })
@@ -174,7 +174,7 @@ describe('conditional owner save and truthful outcomes', () => {
     const queue = new RedisCommandsQueue(2, undefined, () => {})
     const events = new EventEmitter(); let issued!: () => void; let bytes = 0
     const reached = new Promise<void>(resolve => { issued = resolve })
-    const client = readyClient(async () => ['OK', ...initial()])
+    const client = readyClient(async () => ['OK', ...initial(), '', ''])
     client.on = events.on.bind(events); client.removeListener = events.removeListener.bind(events)
     client.withAbortSignal = signal => ({ async eval(script, options) {
       const pending = queue.addCommand(['EVAL', script, '1', ...options.keys, ...options.arguments], { abortSignal: signal })
@@ -193,7 +193,7 @@ describe('conditional owner save and truthful outcomes', () => {
     const queue = new RedisCommandsQueue(2, undefined, () => {})
     const stopped = new AbortController(); let issued!: () => void
     const reached = new Promise<void>(resolve => { issued = resolve })
-    const client = readyClient(async () => ['OK', ...initial()])
+    const client = readyClient(async () => ['OK', ...initial(), '', ''])
     client.withAbortSignal = signal => ({ async eval(script, options) {
       const pending = queue.addCommand(['EVAL', script, '1', ...options.keys, ...options.arguments], { abortSignal: signal })
       issued(); return pending
@@ -209,7 +209,7 @@ describe('conditional owner save and truthful outcomes', () => {
   })
   it('cancels an unsent command at the server-owned deadline and refuses a missing cancellation signal', async () => {
     const queue = new RedisCommandsQueue(2, undefined, () => {})
-    const client = readyClient(async () => ['OK', ...initial()])
+    const client = readyClient(async () => ['OK', ...initial(), '', ''])
     client.withAbortSignal = signal => ({ async eval(script, options) {
       return queue.addCommand(['EVAL', script, '1', ...options.keys, ...options.arguments], { abortSignal: signal })
     } })
@@ -300,7 +300,7 @@ describe('conditional owner save and truthful outcomes', () => {
     const calls: Array<{ script: string; keys: string[]; arguments: string[] }> = []
     const client = readyClient(async (script, options) => {
       calls.push({ script, ...options })
-      return script === READ_SETTINGS_SNAPSHOT_SCRIPT ? ['OK', ...initial()] : 'OK'
+      return script === READ_SETTINGS_SNAPSHOT_SCRIPT ? ['OK', ...initial(), '', ''] : 'OK'
     })
     const store = createConditionalSettingsStore(async operation => operation(client))
     const before = await store.read('sadie')
@@ -325,7 +325,7 @@ describe('18-tab masked inspection', () => {
     for (const malformed of [[], false, 123, 'bad saved block']) {
       for (const [tab, block, ids] of [
         ['clips', 'ui_settings', ['compressImages', 'compressionQuality', 'maxImageSize', 'forceJpeg']],
-        ['tools', 'global_zip_settings', ['zipViewMode', 'toolNotes']],
+        ['tools', 'global_zip_settings', ['zipViewMode', 'toolNotes', 'liveFileReads']],
         ['voice', 'voice_settings', ['lipSyncMode']],
         ['3d-goons', 'goons_settings', ['dockOpen']]
       ] as const) {
@@ -339,7 +339,7 @@ describe('18-tab masked inspection', () => {
     for (const absent of [undefined, null, {}]) {
       for (const [tab, block, ids] of [
         ['clips', 'ui_settings', ['compressImages', 'compressionQuality', 'maxImageSize', 'forceJpeg']],
-        ['tools', 'global_zip_settings', ['zipViewMode', 'toolNotes']],
+        ['tools', 'global_zip_settings', ['zipViewMode', 'toolNotes', 'liveFileReads']],
         ['voice', 'voice_settings', ['lipSyncMode']],
         ['3d-goons', 'goons_settings', ['dockOpen']]
       ] as const) {
@@ -370,12 +370,17 @@ describe('18-tab masked inspection', () => {
       userSettings: { displayName: 'Josh', user_id: 'josh', email: secret, global_custom_system_prompt: secret, admin_settings: { token: secret },
         ui_settings: { compress_images: false, compression_quality: 40, max_image_size: '1024', force_jpeg: true, token: secret, upload_settings: { tunnel_url: secret } },
         voice_settings: { goonLipSync: { mode: 'viseme' }, byoProviders: [{ apiKey: secret }], inputDeviceId: secret },
-        goons_settings: { dockOpen: true, desktop: { shortcut: secret } }, global_zip_settings: { zip_ai_view_mode: 'inline', zip_tool_notes_enabled: true, credentials: secret } } }
+        goons_settings: { dockOpen: true, desktop: { shortcut: secret } }, global_zip_settings: { zip_ai_view_mode: 'inline', zip_tool_notes_enabled: true, live_file_reads: true, credentials: secret } } }
     for (const tab of SETTINGS_TABS) {
       const result = projectSettingsInspection(tab, sources, 'developer')
       assert.equal(result.tab, tab); assert(!JSON.stringify(result).includes(secret))
       for (const field of result.fields) if (field.state !== 'value') assert(!Object.hasOwn(field, 'value'))
     }
+    // SA-137 P4a: Live File Reads is a read-only saved boolean, listed beside Tool Notes; an agent cannot write it here.
+    const tools = projectSettingsInspection('tools', sources, 'developer').fields
+    assert.equal(tools.find(field => field.id === 'liveFileReads')?.state, 'value')
+    assert.equal(tools.find(field => field.id === 'liveFileReads')?.value, true)
+    assert.equal(SETTINGS_FIELDS.tools.find(field => field.id === 'liveFileReads')?.access, 'read_only')
     assert.equal(projectSettingsInspection('theme', sources, 'developer').availability, 'not_implemented')
     assert.equal(projectSettingsInspection('api-keys', sources, 'developer').availability, 'human_only')
     assert.equal(projectSettingsInspection('user', sources, 'agent').fields[0].state, 'masked')

@@ -11,7 +11,17 @@
  * Browser-safe: no server imports (Agent Settings reads it too).
  */
 
+import { resolveAgentFabricUtilitiesEnabled } from '$lib/utils/brokerAvailability'
+
 export const AGENT_JEV_SKILL_TOOL_HINTS_FIELD = 'jev_juice_skill_tool_hints' as const
+export type JevSkillSessionMode = 'off' | 'suggest' | 'manage'
+/** The same saved field accepts the prior boolean shape without upgrading its consent. */
+export type StoredJevSkillSessionMode = JevSkillSessionMode | boolean | null
+export const JEV_SKILL_SESSION_MODE_LABELS: Record<JevSkillSessionMode, string> = {
+  off: 'Off',
+  suggest: 'Suggest',
+  manage: 'Help manage skill sessions'
+}
 /** SA-120 P2: the per-agent switch for the `sys.judge.ask` tool. */
 export const AGENT_JEV_JUDGE_TOOL_FIELD = 'jev_juice_judge_tool' as const
 /** SA-120 P4a: the per-agent switch for the Jev relevance term in `sys.memory.search` (LS-052). */
@@ -25,7 +35,7 @@ export const AGENT_JEV_STYLE_COACH_FIELD = 'jev_juice_style_coach' as const
 
 /** Every per-agent Judge Juice switch, with the wording the write-side error uses. */
 export const AGENT_JEV_JUICE_FIELDS = Object.freeze({
-  [AGENT_JEV_SKILL_TOOL_HINTS_FIELD]: 'Judge Juice: Suggest Skills and Tools',
+  [AGENT_JEV_SKILL_TOOL_HINTS_FIELD]: 'Judge Juice: Skills and Tools',
   [AGENT_JEV_JUDGE_TOOL_FIELD]: 'Judge Juice: Judgment Tool',
   [AGENT_JEV_MEMORY_RERANK_FIELD]: 'Judge Juice: Rerank Memory Search',
   [AGENT_JEV_MEMORY_RECALL_FIELD]: 'Judge Juice: Recall by Meaning',
@@ -38,14 +48,39 @@ function readSwitch(agent: unknown, field: string): boolean {
   return (agent as Record<string, unknown>)[field] === true
 }
 
-/** THE rule for "may this agent's sends ask Jev for skill and tool hints?" */
-export function resolveAgentJevSkillToolHintsEnabled(agent: unknown): boolean {
-  return readSwitch(agent, AGENT_JEV_SKILL_TOOL_HINTS_FIELD)
+/** Legacy true is Suggest only. Opening still requires an actual trusted skill read. */
+export function resolveAgentJevSkillSessionMode(agent: unknown): JevSkillSessionMode {
+  if (!agent || typeof agent !== 'object') return 'off'
+  const value = (agent as Record<string, unknown>)[AGENT_JEV_SKILL_TOOL_HINTS_FIELD]
+  if (value === 'manage') return 'manage'
+  return value === true || value === 'suggest' ? 'suggest' : 'off'
 }
 
-/** THE rule for "does this agent hold the `sys.judge.ask` tool?" (PRIMARY actors only; callers pass explicit false for delegated runs). */
-export function resolveAgentJevJudgeToolEnabled(agent: unknown): boolean {
+/** THE rule for "may this agent's sends ask the judge for skill and tool hints?" */
+export function resolveAgentJevSkillToolHintsEnabled(agent: unknown): boolean {
+  return resolveAgentJevSkillSessionMode(agent) !== 'off'
+}
+
+/** Only an explicit Manage choice allows inferred lifecycle closure. */
+export function resolveAgentJevSkillSessionsEnabled(agent: unknown): boolean {
+  return resolveAgentJevSkillSessionMode(agent) === 'manage'
+}
+
+/**
+ * The saved "Judge Juice: Judgment Tool" switch exactly as Settings shows it. Not the rule:
+ * only the Settings form, which must not erase a saved choice, reads this.
+ */
+export function readAgentJevJudgeToolSwitch(agent: unknown): boolean {
   return readSwitch(agent, AGENT_JEV_JUDGE_TOOL_FIELD)
+}
+
+/**
+ * THE rule for "does this agent hold the `sys.judge.ask` tool?" (PRIMARY actors only; callers
+ * pass explicit false for delegated runs). The tool is a Fabric control, so it is also off while
+ * the agent's Fabric & Utilities switch is off (Josh, 2026-10-24); the saved choice is kept.
+ */
+export function resolveAgentJevJudgeToolEnabled(agent: unknown): boolean {
+  return readAgentJevJudgeToolSwitch(agent) && resolveAgentFabricUtilitiesEnabled(agent)
 }
 
 /**
@@ -135,6 +170,10 @@ export function validateJevJuiceAgentFields(input: Record<string, unknown>): str
   for (const [field, label] of Object.entries(AGENT_JEV_JUICE_FIELDS)) {
     if (!Object.prototype.hasOwnProperty.call(input, field)) continue
     const value = input[field]
+    if (field === AGENT_JEV_SKILL_TOOL_HINTS_FIELD) {
+      if (value === null || typeof value === 'boolean' || value === 'off' || value === 'suggest' || value === 'manage') continue
+      return `"${label}" must be off, suggest, or manage (legacy true or false is also accepted).`
+    }
     if (value === null || typeof value === 'boolean') continue
     return `"${label}" must be true or false.`
   }

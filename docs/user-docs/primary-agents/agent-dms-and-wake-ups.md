@@ -26,6 +26,8 @@ Turn **Agent DMs** on for at least two agents, or nobody has anyone to write to.
 
 There is also one instance-wide switch in **Admin → Instance-wide defaults → Agent Wake-ups → Allow Wake-ups**. Turn it off and nothing can start a chat on its own; every wake-up waits in the inbox instead, with the reason recorded.
 
+Agent DMs also need the agent’s **Fabric & Utilities** switch in its Tools settings. While that is off, Agent DMs is unavailable: no inbox, DM tools, schedules or webhooks can write to it. Your Agent DMs choice is kept and works again when Fabric & Utilities is back on.
+
 ### Working style: Parallel or One at a time
 
 - **Parallel** (default): a wake-up opens its own new chat. The agent can be woken while it is already busy somewhere else. One woken turn per agent at a time.
@@ -98,7 +100,6 @@ Nothing is cancelled while a card waits. The turn ends normally, the item stays 
 
 A woken chat can stop on something only you can clear: an approval card like the one above, or a Bash or tool approval waiting for a click. Batshit says so instead of leaving it to look like work in progress.
 
-A **Claude Code agent's** approval card says so the moment it appears, while the agent is still waiting for your click, not only after its turn ends. Open the chat within the card's ten minutes and the card is there to answer. When the card is answered or runs out, its own **Needs you** goes away again; another holdup's stays.
 
 - The header envelope turns **orange**, and its tooltip says how many items need you.
 - The drawer row gets a **Needs you** badge; hover it for the reason.
@@ -274,7 +275,7 @@ Rows in the Admin card show each hook's name, agent, delivery default, when it w
 
 **About exposure.** The webhook route lives wherever Batshit lives. On your own machine only your machine can reach it. If you run a tunnel — a Cloudflare tunnel for clip uploads, for instance — that tunnel publishes the whole origin, and this route is reachable from the internet along with everything else. That is your existing tunnel choice, not something this feature turns on. The token is 32 random bytes, every bad token gets the same answer so a hook id gives nothing away, and each hook is limited to 30 calls an hour.
 
-**When to use n8n instead of a schedule.** Use Batshit's own [Schedules](#schedules--the-built-in-clock) whenever the trigger is just *time*. Reach for n8n and a webhook when the trigger lives **outside** Batshit — a Slack message, a new video, an email, a finished build — or when the flow has outside steps before it reaches Batshit. There is still an official n8n template for the time-based case, in [the n8n templates folder](../resources/n8n-workflow-templates.md), for people who already run their automations there.
+**When to use n8n instead of a schedule.** Use Batshit's own [Schedules](#schedules--the-built-in-clock) whenever the trigger is just *time*. Reach for n8n and a webhook when the trigger lives **outside** Batshit — a Slack message, a new video, an email, a finished build — or when the flow has outside steps before it reaches Batshit. There is still an official n8n template for the time-based case, described in [Templates](../reference/templates.md#wake-an-agent-on-a-schedule-with-n8n), for people who already run their automations there.
 
 ### Text from outside is only as trustworthy as whatever sent it
 

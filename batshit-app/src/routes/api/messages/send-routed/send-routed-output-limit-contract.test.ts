@@ -37,11 +37,12 @@ describe('send-routed: a reply that stopped at the output limit', () => {
     expect(limitThrow).toBeGreaterThan(limit)
     expect(empty).toBeGreaterThan(limitThrow)
     expect(handlerSource.slice(limit, limitThrow)).toContain('wroteReply: false')
+    expect(handlerSource.slice(limit, limitThrow)).toContain('claudePlan: Boolean(streamResult?.__claudePlanModel)')
   })
 
   it('a reply that wrote something is finalized as an output-limit failure, joined into its own end metadata', () => {
     const successElse = handlerSource.indexOf(
-      "      if (isOutputLimitFinish(streamFinishReason)) {\n        replyOutputLimitFailure = outputLimitFailureMetadata(\n          describeOutputLimitStop({ outputTokens: lastStepOutputTokens, wroteReply: true }),\n        )\n      }\n      await finalizeAssistantMessage('postStream')\n      await streamAdapter.emitComplete()\n"
+      "      if (isOutputLimitFinish(streamFinishReason)) {\n        replyOutputLimitFailure = outputLimitFailureMetadata(\n          describeOutputLimitStop({ outputTokens: lastStepOutputTokens, wroteReply: true, claudePlan: Boolean(streamResult?.__claudePlanModel) }),\n        )\n      }\n      await finalizeAssistantMessage('postStream')\n      await streamAdapter.emitComplete()\n"
     )
     expect(successElse).toBeGreaterThan(-1)
 
@@ -54,7 +55,7 @@ describe('send-routed: a reply that stopped at the output limit', () => {
     )
     const base = handlerSource.indexOf('      const endMetadataBase =', finalize)
     const emitEnd = handlerSource.indexOf('      await streamAdapter.emitEnd({', finalize)
-    const save = handlerSource.indexOf('      await redis.saveMessage(finalMessage)', finalize)
+    const save = handlerSource.indexOf('      await persistCanonicalReply(finalMessage, mcpOriginalPreparation, mcpApiPart)', finalize)
     expect(finalize).toBeGreaterThan(-1)
     expect(join).toBeGreaterThan(base)
     expect(save).toBeGreaterThan(join)
@@ -77,7 +78,7 @@ describe('send-routed: a reply that stopped at the output limit', () => {
     expect(spread).toBeGreaterThan(writers)
     expect(contextKind).toBeGreaterThan(spread)
     expect(handlerSource).toContain(
-      "    if (errorCode === 'PROVIDER_EMPTY_RESPONSE' || errorCode === OUTPUT_LIMIT_ERROR_CODE) {"
+      "    if (incompleteToolCallFailure || errorCode === 'PROVIDER_EMPTY_RESPONSE' || errorCode === OUTPUT_LIMIT_ERROR_CODE || errorCode === GATEWAY_STREAM_FORMAT_ERROR_CODE) {"
     )
   })
 })

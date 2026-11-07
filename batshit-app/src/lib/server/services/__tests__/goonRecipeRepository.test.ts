@@ -30,6 +30,10 @@ import {
   RecipeRepositoryError,
   compareAndSwapRecipeJobState,
   compareAndSwapRecipeState,
+  createRecipeBootstrapManagedSnapshot,
+  initializeRecipeState,
+  getOwnedGoonForRecipeBootstrap,
+  getGoonRecipeJob,
   discardRecipeAnalysisRecords,
   getGoonRecipeDocument,
   getOwnedRecipeGoon,
@@ -423,6 +427,86 @@ describe('Goon Recipe repository', () => {
     await expect(getGoonRecipeDocument(USER_ID, GOON_ID, document.sha256)).resolves.toEqual(
       document
     )
+
+    const wrongDigest = document.sha256 === sha('f') ? sha('e') : sha('f')
+    const misplacedKey = `goon_recipe_document:${USER_ID}:${GOON_ID}:${wrongDigest}`
+    await redis.json.set(misplacedKey, '$', document)
+    const misplacedBefore = await redis.execute((client) => client.sendCommand(['JSON.GET', misplacedKey]))
+    await expect(getGoonRecipeDocument(USER_ID, GOON_ID, wrongDigest))
+      .rejects.toMatchObject({ code: 'CORRUPT_RECORD', status: 500 })
+    expect(await redis.execute((client) => client.sendCommand(['JSON.GET', misplacedKey]))).toBe(misplacedBefore)
+  })
+
+  it.runIf(REAL_REDIS_LANE)('refuses Goon and job records stored under another identity without changing them', async () => {
+    const goonKey = `goon:${GOON_ID}`
+    const misplacedGoon = { ...goon(), id: 'another-goon' }
+    await redis.json.set(goonKey, '$', misplacedGoon)
+    const goonBefore = await redis.execute((client) => client.sendCommand(['JSON.GET', goonKey]))
+    await expect(getOwnedRecipeGoon(USER_ID, GOON_ID)).rejects.toMatchObject({ code: 'CORRUPT_RECORD', status: 500 })
+    await expect(getOwnedGoonForRecipeBootstrap(USER_ID, GOON_ID)).rejects.toMatchObject({ code: 'CORRUPT_RECORD', status: 500 })
+    expect(await redis.execute((client) => client.sendCommand(['JSON.GET', goonKey]))).toBe(goonBefore)
+
+    await redis.json.set(goonKey, '$', { ...misplacedGoon, user_id: 'another-user' })
+    await expect(getOwnedRecipeGoon(USER_ID, GOON_ID)).rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 })
+    await expect(getOwnedGoonForRecipeBootstrap(USER_ID, GOON_ID)).rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 })
+    const legacy = goon(); delete legacy.recipe
+    await redis.json.set(goonKey, '$', legacy)
+    await expect(getOwnedGoonForRecipeBootstrap(USER_ID, GOON_ID)).resolves.toEqual(legacy)
+
+    const job = bakingJob()
+    const misplacedKey = `goon_recipe_job:${USER_ID}:${GOON_ID}:another-job`
+    await redis.json.set(misplacedKey, '$', job)
+    const jobBefore = await redis.execute((client) => client.sendCommand(['JSON.GET', misplacedKey]))
+    await expect(getGoonRecipeJob(USER_ID, GOON_ID, 'another-job')).rejects.toMatchObject({ code: 'CORRUPT_RECORD', status: 500 })
+    expect(await redis.execute((client) => client.sendCommand(['JSON.GET', misplacedKey]))).toBe(jobBefore)
+    await redis.json.set(`goon_recipe_job:${USER_ID}:${GOON_ID}:${job.jobId}`, '$', job)
+    await expect(getGoonRecipeJob(USER_ID, GOON_ID, job.jobId)).resolves.toEqual(job)
+  })
+
+  it.runIf(REAL_REDIS_LANE)('binds bootstrap to its captured public kind/profile/Closet before publication', async () => {
+    const original = goon(); delete original.recipe
+    original.kind = 'custom'; original.sourceProfile = 'expert-custom-glb'; original.closet = { items: {} }
+    await redis.json.set(`goon:${GOON_ID}`, '$', original)
+    const expectedManagedState = createRecipeBootstrapManagedSnapshot(original)
+    await redis.json.set(`goon:${GOON_ID}`, '$.closet', { items: {}, newer: true })
+    const before = await redis.execute(client => client.sendCommand(['JSON.GET', `goon:${GOON_ID}`]))
+    await expect(initializeRecipeState({ userId: USER_ID, goonId: GOON_ID, expectedManagedState,
+      nextGoon: { ...original, recipe: recipeOwner() } as GoonRecord, records: [] }))
+      .rejects.toMatchObject({ code: 'WRITE_CONFLICT', status: 409 })
+    expect(await redis.execute(client => client.sendCommand(['JSON.GET', `goon:${GOON_ID}`]))).toBe(before)
+  })
+
+  it.runIf(REAL_REDIS_LANE)('refuses unsupported stored or proposed Goon fields before bootstrap or CAS writes', async () => {
+    for (const held of [
+      { anatomyPresence: null }, { clothingState: null }, { clothingCloset: null }, { sphericalEyelid: null },
+      { closet: { clothingPresets: {} } }, { recipe: { ...recipeOwner(), requiredMotionPreparation: {} } }
+    ]) {
+      const stored = { ...goon(), ...held } as GoonRecord
+      await redis.json.set(`goon:${GOON_ID}`, '$', stored)
+      const before = await redis.execute(client => client.sendCommand(['JSON.GET', `goon:${GOON_ID}`]))
+      await expect(getOwnedRecipeGoon(USER_ID, GOON_ID)).rejects.toMatchObject({ code: 'UNSUPPORTED_FIELDS', status: 400 })
+      const recordKey = `goon_recipe_document:${USER_ID}:${GOON_ID}:not-written`
+      await expect(compareAndSwapRecipeState({ userId: USER_ID, goonId: GOON_ID, expectedWriteVersion: 1,
+        nextGoon: goon('Proposed safe fields', 2), records: [{ key: recordKey, value: { marker: 'must-not-write' } }] }))
+        .rejects.toMatchObject({ code: 'UNSUPPORTED_FIELDS', status: 400 })
+      expect(await redis.execute(client => client.sendCommand(['JSON.GET', `goon:${GOON_ID}`]))).toBe(before)
+      expect(await redis.json.get(recordKey)).toBeNull()
+      await expect(compareAndSwapRecipeState({ userId: USER_ID, goonId: GOON_ID, expectedWriteVersion: 1,
+        nextGoon: { ...goon('Unsupported proposal', 2), ...held } as GoonRecord }))
+        .rejects.toMatchObject({ code: 'UNSUPPORTED_FIELDS', status: 400 })
+      if (!Object.hasOwn(held, 'recipe')) {
+        const legacy = { ...goon(), ...held }; delete legacy.recipe
+        await redis.json.set(`goon:${GOON_ID}`, '$', legacy)
+        const legacyBefore = await redis.execute(client => client.sendCommand(['JSON.GET', `goon:${GOON_ID}`]))
+        await expect(getOwnedGoonForRecipeBootstrap(USER_ID, GOON_ID)).rejects.toMatchObject({ code: 'UNSUPPORTED_FIELDS', status: 400 })
+        await expect(initializeRecipeState({ userId: USER_ID, goonId: GOON_ID,
+          expectedManagedState: createRecipeBootstrapManagedSnapshot(legacy), nextGoon: goon(),
+          records: [{ key: recordKey, value: { marker: 'must-not-write' } }] }))
+          .rejects.toMatchObject({ code: 'UNSUPPORTED_FIELDS', status: 400 })
+        expect(await redis.execute(client => client.sendCommand(['JSON.GET', `goon:${GOON_ID}`]))).toBe(legacyBefore)
+        expect(await redis.json.get(recordKey)).toBeNull()
+      }
+    }
   })
 
   it.runIf(REAL_REDIS_LANE)('allows exactly one of two concurrent CAS writers', async () => {
@@ -670,6 +754,13 @@ describe('Goon Recipe repository', () => {
     await putRecipeRevisionEnvelope(USER_ID, GOON_ID, envelope)
     await expect(getRecipeRevisionEnvelope(USER_ID, GOON_ID, revision.revisionId)).resolves.toEqual(envelope)
     await expect(putRecipeRevisionEnvelope(USER_ID, GOON_ID, envelope)).resolves.toMatchObject({ envelope })
+    const wrongRevisionId = 'misplaced-revision'
+    const misplacedKey = `goon_recipe_revision:${USER_ID}:${GOON_ID}:${wrongRevisionId}`
+    await redis.json.set(misplacedKey, '$', envelope)
+    const misplacedBefore = await redis.execute((client) => client.sendCommand(['JSON.GET', misplacedKey]))
+    await expect(getRecipeRevisionEnvelope(USER_ID, GOON_ID, wrongRevisionId))
+      .rejects.toMatchObject({ code: 'CORRUPT_RECORD', status: 500 })
+    expect(await redis.execute((client) => client.sendCommand(['JSON.GET', misplacedKey]))).toBe(misplacedBefore)
   })
 
   it.runIf(REAL_REDIS_LANE)('preserves migration-plan proof hashes through RedisJSON', async () => {

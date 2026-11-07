@@ -18,7 +18,8 @@ import {
   registerSteerRun,
   takeMissedDmSteers
 } from '$lib/server/services/steerInboxRegistry'
-import { MAX_OPEN_DMS_PER_INBOX, STEER_MISSED_REASON } from '$lib/utils/dmControl'
+import { MAX_OPEN_DMS_PER_INBOX, STEER_MISSED_REASON, steerDmTooLongReason } from '$lib/utils/dmControl'
+import { formatSteerForModel } from '$lib/utils/steerControl'
 import {
   __resetDmLocksForTests,
   createDm,
@@ -33,6 +34,7 @@ import {
   buildWokenDmContent,
   claimDmOp,
   deliverScheduledDm,
+  deliverWebhookDm,
   closeDmOp,
   listDmAgentsOp,
   listDmsOp,
@@ -67,6 +69,12 @@ function stubFetch() {
       return new Response(JSON.stringify({ success: true }), { status: 200 })
     })
   )
+}
+
+// SA-139 R5: the lower writer refuses to save a retired type, so a test that turns a live agent
+// into a stored leftover writes the field directly, the way an old record already holds it.
+async function storeRetiredAgentType(id: string, agentType: 'cli' | 'n8n') {
+  await redis.json.set(`agent:${id}`, '$.agentType', agentType)
 }
 
 async function seedAgent(id: string, overrides: Record<string, any> = {}) {
@@ -147,7 +155,8 @@ describe('the enablement gate (DL-113-03)', () => {
   })
 
   it('refuses an agent owned by somebody else', async () => {
-    await redis.updateAgent(FAYE, { user_id: 'someone-else' } as any)
+    // BL-1702 (abba40536): an ordinary save never writes `user_id`, so the owner is moved directly.
+    await redis.json.set(`agent:${FAYE}`, '$.user_id', 'someone-else' as never)
     await expect(requireDmEnabledAgent(USER, FAYE)).rejects.toThrow(/does not belong/i)
   })
 
@@ -194,7 +203,27 @@ describe('sending (DL-113-03)', () => {
         body: 'y',
         deliver: 'wait'
       })
-    ).rejects.toThrow(/not an API or CLI primary/i)
+    ).rejects.toThrow(/cannot receive DMs \(to\)\. The n8n Primary Agent type was removed from Batshit\./)
+  })
+
+  // SA-139 R4 (D14): a stored CLI Primary is a retired type, so a DM to it is refused before
+  // anything is written to its inbox.
+  it('refuses a CLI Primary recipient before its inbox is written', async () => {
+    await seedAgent('agent-clio', {
+      agentType: 'cli',
+      primary_model_provider: 'anthropic-claude-cli',
+      primary_model_name: 'claude-cli'
+    })
+    await expect(
+      sendDmOp(baseContext(), {
+        to: 'agent-clio',
+        kind: 'info',
+        subject: 'x',
+        body: 'y',
+        deliver: 'wait'
+      })
+    ).rejects.toThrow('Clio cannot receive DMs (to). The Claude Code CLI lane was removed from Batshit.')
+    expect(await listInbox('agent-clio', { includeClosed: true })).toHaveLength(0)
   })
 
   it('refuses a recipient with Agent DMs off', async () => {
@@ -1203,15 +1232,47 @@ describe('scheduled wake-ups (SA-115, DL-115-05)', () => {
     await redis.updateAgent(COOPER, { dms_enabled: false } as any)
     await expect(deliverScheduledDm(schedule, { trigger: 'tick' })).rejects.toThrow(/Agent DMs/i)
 
-    await redis.updateAgent(COOPER, { dms_enabled: true, agentType: 'n8n' } as any)
+    await redis.updateAgent(COOPER, { dms_enabled: true } as any)
+    await storeRetiredAgentType(COOPER, 'n8n')
     await expect(deliverScheduledDm(schedule, { trigger: 'tick' })).rejects.toThrow(
-      /API or CLI primary/i
+      'Cooper cannot receive DMs, so a schedule cannot write to it. The n8n Primary Agent type was removed from Batshit.'
     )
 
     await redis.del(`agent:${COOPER}`)
     await expect(deliverScheduledDm(schedule, { trigger: 'tick' })).rejects.toThrow(
       /no longer exists/i
     )
+  })
+
+  // SA-139 R4 (D14): a schedule made while its agent was live, whose agent is now a stored CLI
+  // Primary, is refused before anything is written to that agent's inbox.
+  it('refuses a CLI Primary recipient before its inbox is written', async () => {
+    const schedule = await seedSchedule({ deliver: 'wait' })
+    await storeRetiredAgentType(COOPER, 'cli')
+
+    await expect(deliverScheduledDm(schedule, { trigger: 'tick' })).rejects.toThrow(
+      'Cooper cannot receive DMs, so a schedule cannot write to it. The Claude Code CLI lane was removed from Batshit.'
+    )
+    expect(await listInbox(COOPER, { includeClosed: true })).toHaveLength(0)
+  })
+})
+
+describe('SA-139 R4: a webhook DM to a retired CLI Primary', () => {
+  it('is refused before its inbox is written', async () => {
+    await storeRetiredAgentType(COOPER, 'cli')
+    const hook = {
+      id: 'whk_cli', userId: USER, agentId: COOPER, name: 'Nightly build',
+      tokenHash: 'a'.repeat(64), tokenPrefix: 'whk_', tokenSuffix: 'abcd', deliverDefault: 'wait',
+      enabled: true, createdAt: '2026-10-27T00:00:00.000Z', updatedAt: '2026-10-27T00:00:00.000Z',
+      lastUsedAt: null, useCount: 0
+    }
+
+    await expect(
+      deliverWebhookDm({ hook: hook as any, input: { message: 'Build 412 finished.' } })
+    ).rejects.toThrow(
+      'Cooper cannot receive DMs, so a webhook cannot write to it. The Claude Code CLI lane was removed from Batshit.'
+    )
+    expect(await listInbox(COOPER, { includeClosed: true })).toHaveLength(0)
   })
 })
 
@@ -1412,7 +1473,7 @@ describe('steering a busy agent (DL-114-13)', () => {
   const COOPER_ASSISTANT = 'msg_assistant_cooper'
 
   async function startCooperReply(
-    options: { steerable?: boolean; reason?: string | null; messageId?: string } = {}
+    options: { steerable?: boolean; reason?: string | null; messageId?: string; dmSteerLimit?: number } = {}
   ) {
     const messageId = options.messageId ?? COOPER_ASSISTANT
     await redis.createSession({
@@ -1427,7 +1488,8 @@ describe('steering a busy agent (DL-114-13)', () => {
       messageId,
       steerable: options.steerable ?? true,
       reason: options.reason ?? null,
-      lane: (options.steerable ?? true) ? 'api' : null
+      lane: (options.steerable ?? true) ? 'api' : null,
+      ...(options.dmSteerLimit !== undefined ? { dmSteerLimit: options.dmSteerLimit } : {})
     })
     return messageId
   }
@@ -1477,6 +1539,37 @@ describe('steering a busy agent (DL-114-13)', () => {
       actual: 'steer',
       sessionId: COOPER_SESSION
     })
+  })
+
+  it('SA-139 BL-2358: a DM longer than the reply can take whole stays an ordinary DM, and the sender is told why', async () => {
+    // Three DMs of one length (an exact repeat is refused as a duplicate); a DM id's length is fixed.
+    const long = (letter: string) => ({ to: COOPER, kind: 'info' as const, subject: 'Long notes', body: letter.repeat(12_000), deliver: 'steer' as const })
+    const replies: string[] = []
+    try {
+      // No limit (every connection but the Claude plan): the long DM lands, as before.
+      replies.push(await startCooperReply({ messageId: 'msg_assistant_free' }))
+      expect((await sendOne(baseContext(), long('x'))).delivered_as).toBe('steer')
+      const wrapped = formatSteerForModel(listPendingSteers(COOPER_SESSION)[0]).length
+      expect(wrapped).toBeGreaterThan(12_000)
+      stopCooperReply(replies.pop())
+      __resetSteerInboxRegistryForTests()
+
+      // Exactly at the limit (the wrapped text, as the model connection counts it): it lands.
+      replies.push(await startCooperReply({ messageId: 'msg_assistant_at_limit', dmSteerLimit: wrapped }))
+      expect((await sendOne(baseContext(), long('y'))).delivered_as).toBe('steer')
+      stopCooperReply(replies.pop())
+      __resetSteerInboxRegistryForTests()
+
+      // One character over: not steered in, nothing waits for the reply, the record says wait.
+      replies.push(await startCooperReply({ messageId: 'msg_assistant_over', dmSteerLimit: wrapped - 1 }))
+      const refused = await sendOne(baseContext(), long('z'))
+      expect(refused.delivered_as).toBe('wait')
+      expect(refused.reason).toBe(steerDmTooLongReason(wrapped, wrapped - 1))
+      expect(listPendingSteers(COOPER_SESSION)).toHaveLength(0)
+      expect((await getDm(refused.dm_id))?.delivery).toMatchObject({ requested: 'steer', actual: 'wait', reason: refused.reason })
+    } finally {
+      for (const messageId of replies) stopCooperReply(messageId)
+    }
   })
 
   it('degrades to wait when the recipient is idle, and records why', async () => {

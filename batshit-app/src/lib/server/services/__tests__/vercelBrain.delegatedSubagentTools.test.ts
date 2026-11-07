@@ -26,12 +26,15 @@ vi.mock('../nativeTools', async (importOriginal) => {
   }
 })
 
+const runnerMocks = vi.hoisted(() => ({ executeManagedSubagent: vi.fn() }))
+
 vi.mock('../subagentRunner', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../subagentRunner')>()),
   compileManagedSubagentSystemPrompt: vi.fn(async (subagent: any) => ({
     systemPrompt: '',
     description: `Delegate to ${subagent.displayName}`
-  }))
+  })),
+  executeManagedSubagent: (...args: any[]) => runnerMocks.executeManagedSubagent(...args)
 }))
 
 const { VercelAIBrain } = await import('../vercelBrain')
@@ -44,8 +47,6 @@ const SIBLING = { id: 'zbctx_sibling', user_id: USER, displayName: 'zbctx Siblin
 async function subagentToolNames(agentContext: { assignedSubagents?: any[] } | undefined) {
   const brain = new VercelAIBrain() as any
   const { tools, maps } = await brain.buildToolsForMode3(
-    undefined,
-    undefined,
     'zbctx_session',
     USER,
     [],
@@ -90,5 +91,37 @@ describe('Subagent tools in a delegated run', () => {
     const { subagentTools } = await subagentToolNames(undefined)
 
     expect(subagentTools).toEqual([SIBLING.id, SUBAGENT.id].sort())
+  })
+})
+
+describe('the Subagent tool result on the API Primary lane (delegation limits, 2026-10-24)', () => {
+  async function callSubagentTool(status: string) {
+    runnerMocks.executeManagedSubagent.mockResolvedValueOnce({
+      output: status === 'partial' ? '[Partial result: …]\n\nHalf done.' : 'Done.',
+      intermediateSteps: [],
+      subagentType: 'api',
+      usage: null,
+      modelId: 'm',
+      provider: 'p',
+      durationMs: 1,
+      status,
+      thread: 'fresh'
+    })
+    const brain = new VercelAIBrain() as any
+    const { tools } = await brain.buildToolsForMode3(
+      'zbctx_session', USER, [], undefined, PARENT,
+      { assignedSubagents: [SIBLING] }, null, null, 'off', { scopeAgentId: null }
+    )
+    return tools[SIBLING.id].execute({ chatInput: 'Go.' }, { toolCallId: 'c1', messages: [] })
+  }
+
+  it('a run its step limit stopped is not a failed call: success, with status partial', async () => {
+    await expect(callSubagentTool('partial')).resolves.toMatchObject({ kind: 'subagent', success: true, status: 'partial' })
+  })
+
+  it('a failed or timed-out run still reads as unsuccessful', async () => {
+    await expect(callSubagentTool('timed_out')).resolves.toMatchObject({ success: false, status: 'timed_out' })
+    await expect(callSubagentTool('failed')).resolves.toMatchObject({ success: false, status: 'failed' })
+    await expect(callSubagentTool('completed')).resolves.toMatchObject({ success: true, status: 'completed' })
   })
 })

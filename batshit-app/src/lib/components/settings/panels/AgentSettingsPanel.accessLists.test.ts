@@ -5,6 +5,10 @@ import { redis } from '$lib/server/redis'
 import * as agentStore from '$lib/stores/agents.svelte'
 import { buildPickedPresetModelFields } from '$lib/utils/modelPresetPick'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
+import { defaultAppActionsPolicy } from '$lib/appActions/settings/managementContract'
+import { createHash } from 'node:crypto'
+import { captureSettingsLifecycle } from '$lib/server/services/appActions/settings/lifecycle'
+import { loadAgentRoute } from '$lib/test-utils/agentPutRoute'
 
 /**
  * The Agent Settings half of BL-544 and BL-482.
@@ -28,26 +32,40 @@ import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
  * proven on real Redis in `agentAccessRoutes.test.ts`).
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   syncAgentClaudeProfiles: vi.fn(async () => {}),
   deleteAgentClaudeConfig: vi.fn(async () => {}),
   agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
 }))
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({ runTrackedN8nCompatibilitySync: vi.fn() }))
+// The existing engine-delete owner consumes one corresponding current voice/base read.
+// This default-lane read twin does not execute engine setup, status or runtime cleanup.
+vi.mock('$lib/server/configuredTtsGuard', async importOriginal => {
+  const actual = await importOriginal<typeof import('$lib/server/configuredTtsGuard')>()
+  return { ...actual, readVoiceEngineClearRecord: async (_client: unknown, userId: string, id: string) => {
+    const lifecycle = captureSettingsLifecycle([`agent:${id}`])
+    const record = await redis.json.get(`agent:${id}`) as Record<string, unknown>
+    const { agentTypeSnapshotOf } = await import('$lib/test-utils/agentUpdateScriptTwin')
+    if (record.user_id !== userId) throw new actual.ConfiguredTtsConflictError()
+    const target = actual.configuredTtsSnapshotFromDetail(id, record, actual.CONFIGURED_TTS_READ_PATHS.map(path => agentTypeSnapshotOf(record, [path])), lifecycle)
+    return { voiceProfile: record.voice_profile, basis: { target, fingerprint: createHash('sha1').update(agentTypeSnapshotOf(record, ['$.voice_profile'])).digest('hex') } }
+  } }
+})
+// The Access boundary does not execute voice analysis. Match the owning Tool Grid UI lane's
+// existing WASM stub so a worktree's shared dependency asset is not imported by Vite.
+vi.mock('$lib/services/rhubarbWasmLipSync', () => ({ analyzeGoonLipSyncWithRhubarbWasm: vi.fn(async () => { throw new Error('Lip sync is outside this Access persistence fixture') }) }))
 
 useRedisTestServer()
 
 const USER = 'ssacc_panel_user'
-const AGENT = 'ssacc_panel_agent'
+let AGENT = 'ssacc_panel_agent'
 const OTHER_AGENTS = ['ssacc_nova', 'ssacc_orla']
 const SUB = 'ssacc_panel_sub'
 const SKILL = 'ssacc-panel-skill'
 const ARTIFACT = 'artifact_ssacc_panel'
+const POLICY_SUBJECT_REVISION = `sha256:${'a'.repeat(64)}`
 
 const PRESET = {
   id: 'ssacc_panel_preset',
@@ -152,20 +170,32 @@ let agentRoute: typeof import('../../../../routes/api/agents/[id]/+server')
 let subagentRoute: typeof import('../../../../routes/api/subagents/[id]/+server')
 
 beforeAll(async () => {
-  agentRoute = await import('../../../../routes/api/agents/[id]/+server')
+  agentRoute = await loadAgentRoute()
   subagentRoute = await import('../../../../routes/api/subagents/[id]/+server')
 }, 60_000)
 
 type Sent = { method: string; path: string; body: Record<string, any> }
 let sent: Sent[] = []
 let agentReads = 0
+let policyReads = 0
+let commandListReads = 0
+let artifactListReads = 0
+let commandListReplies: Array<() => Response | Promise<Response>> = []
+let artifactListReplies: Array<() => Response | Promise<Response>> = []
 /** The stored skill and artifact records the fake routes answer from. */
 let skills: Map<string, Record<string, any>>
 let artifacts: Map<string, Record<string, any>>
 
 function installRoutes() {
+  const routeReady = loadAgentRoute()
   sent = []
   agentReads = 0
+  policyReads = 0
+  commandListReads = 0
+  artifactListReads = 0
+  commandListReplies = []
+  artifactListReplies = []
+  let policy = { success: true, agentId: AGENT, generation: 0, subjectRevision: POLICY_SUBJECT_REVISION, policy: defaultAppActionsPolicy(), subjects: [] }
   skills = new Map()
   artifacts = new Map()
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
@@ -182,7 +212,14 @@ function installRoutes() {
     if (path === `/api/agents/${AGENT}/subagents`) {
       return jsonResponse({ subagents: [] })
     }
+    if (path === `/api/agents/${AGENT}/app-actions-policy`) {
+      if (method === 'GET') { policyReads += 1; return jsonResponse(policy) }
+      if (body.expectedGeneration !== policy.generation || body.expectedSubjectRevision !== policy.subjectRevision) return jsonResponse({ error: 'Policy changed.' }, 409)
+      policy = { ...policy, generation: policy.generation + 1, policy: body.policy }
+      return jsonResponse(policy)
+    }
     if (path === `/api/agents/${AGENT}`) {
+      await routeReady
       const request = new Request(`http://localhost${path}`, { method, body: method === 'PUT' ? String(init.body) : undefined })
       if (method !== 'PUT') agentReads += 1
       const handler = method === 'PUT' ? agentRoute.PUT : agentRoute.GET
@@ -202,6 +239,9 @@ function installRoutes() {
     // the one-agent route (one id against the list as stored; a record with no list is on for
     // every agent, so turning one off writes the user's other agents).
     if (path === '/api/slash-commands' && method === 'GET') {
+      commandListReads += 1
+      const reply = commandListReplies.shift()
+      if (reply) return reply()
       return jsonResponse({ slashCommands: [...skills.values()].map((record) => structuredClone(record)) })
     }
     const skillAccess = path.match(/^\/api\/slash-commands\/([^/]+)\/agent-access$/)
@@ -237,6 +277,9 @@ function installRoutes() {
     // Artifacts: the list, the whole-record PUT (merges the body), and the one-agent route (one
     // id against the stored list; Agent Use and the scope stay).
     if (path === '/api/artifacts' && method === 'GET') {
+      artifactListReads += 1
+      const reply = artifactListReplies.shift()
+      if (reply) return reply()
       return jsonResponse([...artifacts.values()].map((record) => structuredClone(record)))
     }
     const artifactAccess = path.match(/^\/api\/artifacts\/([^/]+)\/agent-access$/)
@@ -261,7 +304,7 @@ function installRoutes() {
     if (path === '/api/user/saved-models') return jsonResponse({ models: [PRESET] })
     if (path === '/api/models') return jsonResponse({ data: { connections: [] } })
     if (path === '/api/settings/api-keys') return jsonResponse({ keys: {} })
-    if (path === '/api/goons') return jsonResponse({ goons: [] })
+    if (path === '/api/goons') return jsonResponse({ ownerId: 'josh', goons: [] })
     if (path === '/api/icons/library') return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
     return jsonResponse({ error: `not routed in this test: ${method} ${path}` }, 404)
   })
@@ -310,10 +353,43 @@ function sentTo(pattern: RegExp) {
   return sent.filter((entry) => pattern.test(entry.path))
 }
 
+function heldResponse() {
+  let release!: (response: Response) => void
+  const response = new Promise<Response>((resolve) => { release = resolve })
+  return { reply: () => response, release }
+}
+
+function accessCard(title: string) {
+  const card = Array.from(document.querySelectorAll('details')).find(node =>
+    node.getAttribute('name')?.endsWith('-access-cards') &&
+    node.querySelector('.batshit-settings-accordion-card-title')?.textContent === title
+  ) as HTMLDetailsElement
+  expect(card).toBeTruthy()
+  card.open = true
+  return within(card)
+}
+
+async function seedSubagent() {
+  await redis.json.set(`subagent:${SUB}`, '$', {
+    id: SUB, user_id: USER, displayName: 'Ssacc Panel Sub', slug: SUB,
+    subagentType: 'api', specialty: 'general',
+    created_at: '2026-09-28T00:00:00.000Z', updated_at: '2026-09-28T00:00:00.000Z'
+  } as any)
+  await redis.sAdd(`user:${USER}:subagents`, SUB)
+}
+
+async function pickSubagent() {
+  await fireEvent.keyDown(screen.getByRole('button', { name: 'Select Agents & Subagents' }), { key: 'ArrowDown' })
+  const item = await screen.findByText('Ssacc Panel Sub', { selector: '.batshit-settings-action-row-title' })
+  await fireEvent.click(item.closest('button') as HTMLElement)
+  await screen.findByDisplayValue('Ssacc Panel Sub', {}, { timeout: 15_000 })
+}
+
 describe('Agents > Access turns one agent on or off (BL-544, the panel half)', () => {
   const originalFetch = global.fetch
 
   beforeEach(() => {
+    AGENT = 'ssacc_panel_agent'
     ensureBrowserStubs()
     installRoutes()
     vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -324,7 +400,203 @@ describe('Agents > Access turns one agent on or off (BL-544, the panel half)', (
     vi.restoreAllMocks()
     global.fetch = originalFetch
     agentStore.setAgents([])
+    AGENT = 'ssacc_panel_agent'
   })
+
+  it('a command update during the first combined load queues one full read and rejects both stale lists (BL-1892)', async () => {
+    await redis.createAgent(probeAgent() as any)
+    skills.set(SKILL, skillRecord({ enabled_agent_ids: [AGENT] }))
+    artifacts.set(ARTIFACT, artifactRecord({ agent_allowlist: [AGENT] }))
+    const held = heldResponse()
+    commandListReplies.push(held.reply)
+    artifactListReplies.push(() => jsonResponse([artifactRecord({ name: 'Stale artifact' })]))
+    await openAgentPanel()
+    await openAccessTab()
+    await waitFor(() => expect(artifactListReads).toBe(1))
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    expect(commandListReads).toBe(1)
+    held.release(jsonResponse({ slashCommands: [skillRecord({ displayName: 'Stale skill' })] }))
+
+    expect((await accessSwitch('Ssacc Panel Skill')).getAttribute('aria-checked')).toBe('true')
+    expect((await accessSwitch('Ssacc Panel Artifact')).getAttribute('aria-checked')).toBe('true')
+    expect(commandListReads).toBe(2)
+    expect(artifactListReads).toBe(2)
+    expect(screen.queryByText('Stale skill')).toBeNull()
+    expect(screen.queryByText('Stale artifact')).toBeNull()
+    expect(sent).toEqual([])
+  }, 60_000)
+
+  it('after a full load a queued command refresh remains narrow and keeps the confirmed artifacts', async () => {
+    await redis.createAgent(probeAgent() as any)
+    skills.set(SKILL, skillRecord())
+    artifacts.set(ARTIFACT, artifactRecord())
+    await openAgentPanel()
+    await openAccessTab()
+    await accessSwitch('Ssacc Panel Artifact')
+    const held = heldResponse()
+    commandListReplies.push(held.reply)
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    await waitFor(() => expect(commandListReads).toBe(2))
+    skills.set(SKILL, skillRecord({ enabled_agent_ids: [AGENT] }))
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    held.release(jsonResponse({ slashCommands: [skillRecord({ displayName: 'Stale refresh' })] }))
+    await waitFor(async () => expect((await accessSwitch('Ssacc Panel Skill')).getAttribute('aria-checked')).toBe('true'))
+    expect(commandListReads).toBe(3)
+    expect(artifactListReads).toBe(1)
+    expect(await accessSwitch('Ssacc Panel Artifact')).toBeTruthy()
+    expect(screen.queryByText('Stale refresh')).toBeNull()
+    expect(sent).toEqual([])
+  }, 60_000)
+
+  it.each(['agent', 'subagent'] as const)('%s Access offers deliberate Retry for command and artifact failures, with no automatic retry (BL-1893)', async (kind) => {
+    await seedSubagent()
+    await redis.createAgent(probeAgent() as any)
+    skills.set(SKILL, skillRecord())
+    artifacts.set(ARTIFACT, artifactRecord())
+    commandListReplies.push(() => jsonResponse({ error: 'Commands unavailable' }, 503))
+    await openAgentPanel()
+    if (kind === 'subagent') await pickSubagent()
+    await openAccessTab()
+    const skillsCard = accessCard('Skills & Prompts')
+    const artifactsCard = accessCard('Artifacts')
+    await skillsCard.findByText('Commands unavailable')
+    await artifactsCard.findByText('Commands unavailable')
+    await pause(150)
+    expect(commandListReads).toBe(1)
+    expect(artifactListReads).toBe(1)
+
+    artifactListReplies.push(() => jsonResponse({ error: 'Artifacts unavailable' }, 503))
+    await fireEvent.click(skillsCard.getByRole('button', { name: 'Retry' }))
+    await artifactsCard.findByText('Artifacts unavailable')
+    await pause(150)
+    expect(commandListReads).toBe(2)
+    expect(artifactListReads).toBe(2)
+    expect(artifactsCard.queryByText('No agent-usable artifacts found yet.')).toBeNull()
+    expect(sent).toEqual([])
+
+    await fireEvent.click(artifactsCard.getByRole('button', { name: 'Retry' }))
+    await accessSwitch('Ssacc Panel Skill')
+    await accessSwitch('Ssacc Panel Artifact')
+    expect(commandListReads).toBe(3)
+    expect(artifactListReads).toBe(3)
+    expect(skillsCard.queryByRole('button', { name: 'Retry' })).toBeNull()
+    expect(artifactsCard.queryByText('Artifacts unavailable')).toBeNull()
+    expect(sent).toEqual([])
+  }, 60_000)
+
+  it.each([false, true])('a command event cannot narrow a full Retry (previously loaded: %s)', async (previouslyLoaded) => {
+    await redis.createAgent(probeAgent() as any)
+    skills.set(SKILL, skillRecord())
+    artifacts.set(ARTIFACT, artifactRecord())
+    if (!previouslyLoaded) artifactListReplies.push(() => jsonResponse({ artifacts: [] }))
+    await openAgentPanel()
+    await openAccessTab()
+    const card = accessCard('Artifacts')
+    if (previouslyLoaded) {
+      await accessSwitch('Ssacc Panel Artifact')
+      commandListReplies.push(() => jsonResponse({ error: 'Commands unavailable' }, 503))
+      window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+      await card.findByText('Commands unavailable')
+    } else {
+      await card.findByText('The saved artifact list is unreadable.')
+    }
+    const held = heldResponse()
+    artifactListReplies.push(held.reply)
+    await fireEvent.click(card.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(artifactListReads).toBe(2))
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    held.release(jsonResponse([artifactRecord({ name: 'Stale retry artifact' })]))
+    await waitFor(() => expect(artifactListReads).toBe(3))
+    await accessSwitch('Ssacc Panel Artifact')
+    expect(artifactListReads).toBe(3)
+    expect(screen.queryByText('Stale retry artifact')).toBeNull()
+    expect(sent).toEqual([])
+  }, 60_000)
+
+  it('a failed full Retry retains its Artifact read obligation across a later command event', async () => {
+    await redis.createAgent(probeAgent() as any)
+    skills.set(SKILL, skillRecord())
+    artifacts.set(ARTIFACT, artifactRecord())
+    await openAgentPanel()
+    await openAccessTab()
+    await accessSwitch('Ssacc Panel Artifact')
+    const card = accessCard('Artifacts')
+    commandListReplies.push(() => jsonResponse({ error: 'Commands unavailable' }, 503))
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    await card.findByText('Commands unavailable')
+    artifactListReplies.push(() => jsonResponse({ error: 'Artifacts unavailable' }, 503))
+    await fireEvent.click(card.getByRole('button', { name: 'Retry' }))
+    await card.findByText('Artifacts unavailable')
+    expect(artifactListReads).toBe(2)
+
+    artifacts.set(ARTIFACT, artifactRecord({ name: 'Current artifact after recovery' }))
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    await accessSwitch('Current artifact after recovery')
+    expect(artifactListReads).toBe(3)
+    expect(screen.queryByText('Ssacc Panel Artifact', { selector: '.batshit-settings-parent-label' })).toBeNull()
+    expect(card.queryByText('Artifacts unavailable')).toBeNull()
+    expect(sent).toEqual([])
+  }, 60_000)
+
+  it('a shared list landing after an agent switch uses the current exact Subagent only for the next toggle', async () => {
+    await seedSubagent()
+    await redis.createAgent(probeAgent() as any)
+    skills.set(SKILL, skillRecord({ enabled_agent_ids: [AGENT] }))
+    artifacts.set(ARTIFACT, artifactRecord({ agent_allowlist: [AGENT] }))
+    const held = heldResponse()
+    artifactListReplies.push(held.reply)
+    await openAgentPanel()
+    await openAccessTab()
+    await waitFor(() => expect(artifactListReads).toBe(1))
+    await pickSubagent()
+    await openAccessTab()
+    held.release(jsonResponse([artifactRecord({ agent_allowlist: [AGENT] })]))
+    const toggle = await accessSwitch('Ssacc Panel Artifact')
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    expect(sent).toEqual([])
+    await fireEvent.click(toggle)
+    await waitFor(() => expect(sentTo(/^\/api\/artifacts\//)).toHaveLength(1))
+    expect(sentTo(/^\/api\/artifacts\//)[0].body).toEqual({ agentId: SUB, enabled: true })
+    expect(artifacts.get(ARTIFACT)?.agent_allowlist).toEqual([AGENT, SUB])
+  }, 60_000)
+
+  it('unmount drops a queued refresh and a late load cannot revive it', async () => {
+    await redis.createAgent(probeAgent() as any)
+    const held = heldResponse()
+    artifactListReplies.push(held.reply)
+    const view = await openAgentPanel()
+    await openAccessTab()
+    await waitFor(() => expect(artifactListReads).toBe(1))
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    view.unmount()
+    held.release(jsonResponse([artifactRecord()]))
+    await pause(150)
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    expect(commandListReads).toBe(1)
+    expect(artifactListReads).toBe(1)
+    expect(sent).toEqual([])
+  }, 60_000)
+
+  it('mounts App Actions for the selected Primary only in Access and saves through its separate CAS owner', async () => {
+    await redis.createAgent(probeAgent() as any)
+    await openAgentPanel()
+    expect(policyReads).toBe(0)
+    await openAccessTab()
+    await waitFor(() => expect(policyReads).toBe(1))
+    const card = Array.from(document.querySelectorAll('details')).find(node => node.querySelector('.batshit-settings-accordion-card-title')?.textContent === 'App Actions') as HTMLDetailsElement
+    expect(card).toBeTruthy(); card.open = true
+    const access = within(card)
+    await fireEvent.click(access.getByRole('switch', { name: 'Enable App Actions' }))
+    expect(sentTo(/app-actions-policy/)).toEqual([])
+    await fireEvent.click(access.getByRole('button', { name: 'Save App Actions Access' }))
+    await waitFor(() => expect(sentTo(/app-actions-policy/)).toHaveLength(1))
+    expect(sentTo(/app-actions-policy/)[0]).toEqual({ method: 'PUT', path: `/api/agents/${AGENT}/app-actions-policy`, body: {
+      expectedGeneration: 0, expectedSubjectRevision: POLICY_SUBJECT_REVISION, policy: { ...defaultAppActionsPolicy(), enabled: true }
+    } })
+    expect(sentTo(new RegExp(`^/api/agents/${AGENT}$`))).toEqual([])
+  }, 60_000)
 
   it('a skill toggle keeps an agent another panel turned on after Access loaded, and never switches Enable For All Agents', async () => {
     await redis.createAgent(probeAgent() as any)
@@ -348,6 +620,116 @@ describe('Agents > Access turns one agent on or off (BL-544, the panel half)', (
     expect(skills.get(SKILL)?.enabled_agent_ids).toEqual(['ssacc_nova', 'ssacc_orla', AGENT])
     expect(skills.get(SKILL)?.enabled_for_all_agents).toBe(false)
     await waitFor(() => expect((toggle as HTMLElement).getAttribute('aria-checked')).toBe('true'))
+  }, 60_000)
+
+  it('loaded skill and Artifact access distinguish A-B from a_b and toggle only the selected exact ID', async () => {
+    AGENT = 'A-B'
+    installRoutes()
+    await redis.createAgent(probeAgent() as any)
+    await redis.createAgent(probeAgent({ id: 'a_b', displayName: 'Bystander' }) as any)
+    skills.set(SKILL, skillRecord({ enabled_agent_ids: ['A-B', 'a_b'] }))
+    artifacts.set(ARTIFACT, artifactRecord({ agent_allowlist: ['A-B'] }))
+    skills.set('invalid_skill', skillRecord({ id: 'invalid_skill', displayName: 'Invalid Saved Skill', enabled_agent_ids: [' A-B '] }))
+    artifacts.set('invalid_artifact', artifactRecord({ id: 'invalid_artifact', name: 'Invalid Saved Artifact', agent_allowlist: [' A-B '] }))
+    await openAgentPanel(); await openAccessTab()
+    const skill = await accessSwitch('Ssacc Panel Skill')
+    const artifact = await accessSwitch('Ssacc Panel Artifact')
+    expect(skill.getAttribute('aria-checked')).toBe('true')
+    expect(artifact.getAttribute('aria-checked')).toBe('true')
+    expect((await accessSwitch('Invalid Saved Skill')).getAttribute('aria-checked')).toBe('false')
+    expect((await accessSwitch('Invalid Saved Artifact')).getAttribute('aria-checked')).toBe('false')
+    await fireEvent.click(skill)
+    await waitFor(() => expect(sentTo(/^\/api\/slash-commands\//)).toHaveLength(1))
+    expect(sentTo(/^\/api\/slash-commands\//)[0].body).toEqual({ agentId: 'A-B', enabled: false })
+    expect(skills.get(SKILL)?.enabled_agent_ids).toEqual(['a_b'])
+    expect(artifacts.get(ARTIFACT)?.agent_allowlist).toEqual(['A-B'])
+  }, 60_000)
+
+  it('keeps exact legacy loaded references selectable for literal removal without matching a different ID', async () => {
+    AGENT = 'odd.id'
+    installRoutes()
+    // Existing legacy data, not a request to create a new noncanonical identity.
+    await redis.json.set(`agent:${AGENT}`, '$', probeAgent() as never)
+    await redis.sAdd(`user:${USER}:agents`, AGENT)
+    skills.set(SKILL, skillRecord({ enabled_agent_ids: ['odd.id', 'odd_id'] }))
+    artifacts.set(ARTIFACT, artifactRecord({ agent_allowlist: ['odd.id'] }))
+    await openAgentPanel(); await openAccessTab()
+    const skill = await accessSwitch('Ssacc Panel Skill')
+    expect(skill.getAttribute('aria-checked')).toBe('true')
+    expect((await accessSwitch('Ssacc Panel Artifact')).getAttribute('aria-checked')).toBe('true')
+    await fireEvent.click(skill)
+    await waitFor(() => expect(sentTo(/^\/api\/slash-commands\//)).toHaveLength(1))
+    expect(sentTo(/^\/api\/slash-commands\//)[0].body).toEqual({ agentId: 'odd.id', enabled: false })
+    expect(skills.get(SKILL)?.enabled_agent_ids).toEqual(['odd_id'])
+  }, 60_000)
+
+  it('keeps restrictive Artifact legacy intent without showing malformed refs as All Agents', async () => {
+    await redis.createAgent(probeAgent() as any)
+    const malformed = artifactRecord({ id: 'malformed_legacy', name: 'Malformed Legacy Artifact', agent_allowlist: [' ' + AGENT + ' '] })
+    Reflect.deleteProperty(malformed, 'agent_access_scope'); Reflect.deleteProperty(malformed, 'agent_use_enabled')
+    const inherited = artifactRecord({ id: 'metadata_legacy', name: 'Metadata Legacy Artifact', metadata: { assignedAgentIds: [AGENT] } })
+    Reflect.deleteProperty(inherited, 'agent_allowlist'); Reflect.deleteProperty(inherited, 'agent_access_scope'); Reflect.deleteProperty(inherited, 'agent_use_enabled')
+    artifacts.set(malformed.id, malformed); artifacts.set(inherited.id, inherited)
+    await openAgentPanel(); await openAccessTab()
+    expect((await accessSwitch('Malformed Legacy Artifact')).getAttribute('aria-checked')).toBe('false')
+    expect((await accessSwitch('Metadata Legacy Artifact')).getAttribute('aria-checked')).toBe('true')
+    expect(sent).toEqual([])
+  }, 60_000)
+
+  it('refreshes mounted access after a value-free external event without a hydration write', async () => {
+    await redis.createAgent(probeAgent() as any)
+    skills.set(SKILL, skillRecord({ enabled_agent_ids: [] }))
+    await openAgentPanel(); await openAccessTab()
+    expect((await accessSwitch('Ssacc Panel Skill')).getAttribute('aria-checked')).toBe('false')
+    skills.set(SKILL, { ...skills.get(SKILL)!, enabled_agent_ids: [AGENT] })
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated', { detail: { source: 'unknown' } }))
+    await waitFor(async () => expect((await accessSwitch('Ssacc Panel Skill')).getAttribute('aria-checked')).toBe('true'))
+    expect(sent).toEqual([])
+  }, 60_000)
+
+  it('drops an older in-flight access read and loads the latest event without writing', async () => {
+    await redis.createAgent(probeAgent() as any)
+    skills.set(SKILL, skillRecord({ enabled_agent_ids: [] }))
+    await openAgentPanel(); await openAccessTab()
+    await accessSwitch('Ssacc Panel Skill')
+    const baseFetch = global.fetch
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    let reads = 0
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/slash-commands' && (!init?.method || init.method === 'GET')) {
+        reads += 1
+        const response = await baseFetch(input, init)
+        if (reads === 1) await held
+        return response
+      }
+      return baseFetch(input, init)
+    })
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    await waitFor(() => expect(reads).toBe(1))
+    skills.set(SKILL, { ...skills.get(SKILL)!, enabled_agent_ids: [AGENT] })
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    release()
+    await waitFor(async () => expect((await accessSwitch('Ssacc Panel Skill')).getAttribute('aria-checked')).toBe('true'))
+    expect(reads).toBe(2)
+    expect(sent).toEqual([])
+  }, 60_000)
+
+  it('shows failed refresh honestly and recovers without treating it as an empty saved list', async () => {
+    await redis.createAgent(probeAgent() as any)
+    skills.set(SKILL, skillRecord({ enabled_agent_ids: [AGENT] }))
+    await openAgentPanel(); await openAccessTab()
+    expect((await accessSwitch('Ssacc Panel Skill')).getAttribute('aria-checked')).toBe('true')
+    const baseFetch = global.fetch
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => String(input) === '/api/slash-commands'
+      ? jsonResponse({ error: 'Saved access read unavailable' }, 503) : baseFetch(input, init))
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    expect((await screen.findAllByText('Saved access read unavailable')).length).toBeGreaterThan(0)
+    expect(screen.queryByText('No skills or prompts found yet.')).toBeNull()
+    global.fetch = baseFetch
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated'))
+    await waitFor(async () => expect((await accessSwitch('Ssacc Panel Skill')).getAttribute('aria-checked')).toBe('true'))
+    expect(sent).toEqual([])
   }, 60_000)
 
   it('an artifact toggle keeps an agent added elsewhere, and sends no scope', async () => {
@@ -395,13 +777,14 @@ describe('Agents > Access turns one agent on or off (BL-544, the panel half)', (
   it('the basic save does not send back a voice profile a voice engine delete cleared after Settings opened', async () => {
     await redis.createAgent(
       probeAgent({
-        voice_profile: { tts: { providerId: 'ssacc_engine', modelId: 'ssacc-model', voiceId: 'ssacc-voice' } }
+        voice_profile: { tts: { providerId: 'byo:ssacc_engine', modelId: 'ssacc-model', voiceId: 'ssacc-voice' } }
       }) as any
     )
     await openAgentPanel()
 
     // Settings > Voice deletes the engine: the server clears the agent's voice (voiceEngineRegistry).
-    await redis.updateAgent(AGENT, { voice_profile: null } as any)
+    const { clearDeletedVoiceEngineAgentProfiles } = await import('$lib/server/services/voiceEngineRegistry')
+    expect(await clearDeletedVoiceEngineAgentProfiles(USER, ['byo:ssacc_engine'])).toEqual([AGENT])
     expect((await redis.json.get(`agent:${AGENT}`) as any).voice_profile).toBeUndefined()
 
     const input = document.getElementById('agent-display') as HTMLInputElement

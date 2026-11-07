@@ -3,22 +3,6 @@ import { describe, expect, it } from 'vitest'
 import { isContextExhaustionError } from '../services/contextExhaustion'
 
 describe('isContextExhaustionError', () => {
-  it('matches the Codex CLI context-window failure verbatim', () => {
-    expect(
-      isContextExhaustionError(
-        "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
-      ),
-    ).toBe(true)
-  })
-
-  it('matches the Codex CLI failure with a typographic apostrophe', () => {
-    expect(
-      isContextExhaustionError(
-        'Codex ran out of room in the model’s context window. Start a new thread or clear earlier history before retrying.',
-      ),
-    ).toBe(true)
-  })
-
   it('matches OpenAI context_length_exceeded codes and messages', () => {
     expect(isContextExhaustionError('context_length_exceeded')).toBe(true)
     expect(

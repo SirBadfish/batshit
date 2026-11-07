@@ -557,6 +557,37 @@ describe.runIf(REAL_REDIS_LANE)('POST /api/artifacts/complete', () => {
     )
   })
 
+  it('SA-139: refuses an object run on a Claude plan preset of any spelling before any paid client', async () => {
+    const { POST } = await import('../../../routes/api/artifacts/complete/+server')
+    for (const connection of [{ type: 'direct', id: 'claude-plan:local' }, { type: 'direct', id: 'direct:claude-plan', service: 'claude-plan' }]) {
+      await redis.del('ratelimit:artifact:user_1:art_1')
+      await redis.json.set('model:preset_artifact_plan', '$', { id: 'preset_artifact_plan', modelId: 'claude-opus-5-5', modelName: 'Plan Opus',
+        provider: 'anthropic', purpose: 'chat', connection, settings: {}, pricing: {} })
+      await seedArtifactRecord({ model_config: { mode: 'basic', primary: { source: 'preset', presetId: 'preset_artifact_plan', modelId: null } } })
+      providerMocks.getModel.mockClear(); aiMocks.streamText.mockClear()
+      const response = await POST(buildEvent({ artifactId: 'art_1', prompt: 'Build a plan', mode: 'object',
+        schema: { type: 'object', properties: { calls: { type: 'array' } }, required: ['calls'] }, schemaName: 'PlanSchema' }))
+      const buffer = await readResponseBody(response)
+      expect(buffer).toContain('Artifacts cannot use the Claude plan connection')
+      expect(providerMocks.getModel).not.toHaveBeenCalled()
+      expect(aiMocks.streamText).not.toHaveBeenCalled()
+    }
+  })
+
+  it('SA-139 P4 (D11): refuses a chat or agent run on a Claude plan preset with the artifacts sentence, before the reply loop', async () => {
+    const { POST } = await import('../../../routes/api/artifacts/complete/+server')
+    await redis.del('ratelimit:artifact:user_1:art_1')
+    await redis.json.set('model:preset_artifact_plan', '$', { id: 'preset_artifact_plan', modelId: 'claude-opus-5-5', modelName: 'Plan Opus',
+      provider: 'anthropic', purpose: 'chat', connection: { type: 'direct', id: 'claude-plan:local', service: 'claude-plan' }, settings: {}, pricing: {} })
+    await seedArtifactRecord({ model_config: { mode: 'basic', primary: { source: 'preset', presetId: 'preset_artifact_plan', modelId: null } } })
+    aiMocks.streamNativeMode.mockClear(); providerMocks.getModel.mockClear()
+    const response = await POST(buildEvent({ artifactId: 'art_1', prompt: 'stream please', sessionId: 'sess_plan' }))
+    const buffer = await readResponseBody(response)
+    expect(buffer).toContain('Artifacts cannot use the Claude plan connection. Choose a separate API-compatible preset for artifacts.')
+    expect(aiMocks.streamNativeMode).not.toHaveBeenCalled()
+    expect(providerMocks.getModel).not.toHaveBeenCalled()
+  })
+
   it('hydrates manual visual models from the catalog and uses the saved OpenAI key for GPT Image 2', async () => {
     const { POST } = await import('../../../routes/api/artifacts/complete/+server')
 

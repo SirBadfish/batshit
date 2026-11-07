@@ -164,7 +164,8 @@
     targetEngine.resetMaterialOverrides()
     await applyMountedLiveGoonClosetAssignments(targetEngine, {
       goon,
-      goonsSettings: normalizeGoonsSettings(userSettings.goons_settings)
+      goonsSettings: normalizeGoonsSettings(userSettings.goons_settings),
+      isCurrent: () => generation === loadGeneration && engine === targetEngine
     })
     if (generation !== loadGeneration || engine !== targetEngine) return
     if (snapshot?.goon?.goonId === goon.id) {

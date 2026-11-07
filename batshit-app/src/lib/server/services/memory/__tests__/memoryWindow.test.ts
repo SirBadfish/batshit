@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   memorySearchLaneActive,
   useMemorySearchTestServer
@@ -93,15 +93,14 @@ import {
   episodeKey,
   getEpisode,
   sessionEpisodesKey,
+  updateEpisodeWhiteboard,
   type EpisodeRecord
 } from '../memoryEpisodes'
 import {
   closeEpisodeOp,
   deleteMemoryOp,
-  updateWhiteboardOp,
   searchMemoriesOp,
-  recallMemoriesOp,
-  MemoryToolError
+  recallMemoriesOp
 } from '../memoryTools'
 import {
   commitMemoryTurnState,
@@ -110,8 +109,8 @@ import {
   getMemoryFold
 } from '../memoryRecall'
 import { getMemoryLingerState } from '../memoryLinger'
-import { reportForCliSnapshot } from '$lib/utils/cliContextWindow'
 import { countMessageTokens } from '$lib/utils/tokenCounter'
+import { normalizeId } from '$lib/utils/idNormalizer'
 import {
   applyFixedSessionGraduationToMessages,
   getFixedSessionGraduationState,
@@ -128,19 +127,12 @@ const REGULAR_SESSION = 'sess_window_regular'
 const PRESET_ID = 'preset_window_test'
 
 const NOW = new Date('2026-06-10T12:00:00.000Z')
-const CLAUDE_CAP_ENV_KEYS = [
-  'CLAUDE_CODE_DISABLE_1M_CONTEXT',
-  'ANTHROPIC_BASE_URL',
-  'CLAUDE_CODE_USE_BEDROCK',
-  'CLAUDE_CODE_USE_VERTEX',
-  'CLAUDE_CODE_USE_FOUNDRY'
-] as const
-
 function agentRecord(overrides: Record<string, any> = {}) {
   return {
     id: AGENT,
     user_id: USER,
     name: 'Window Agent',
+    agentType: 'cli', // Existing episode-board cases exercise the retained CLI contract.
     memory_enabled: true,
     primary_model_preset_id: PRESET_ID,
     memory_window: {
@@ -154,42 +146,10 @@ function agentRecord(overrides: Record<string, any> = {}) {
   }
 }
 
-function namedClaudeCliAgent(memoryWindow: Record<string, unknown> = {
-  floor_mode: 'auto',
-  ceiling_headroom_mode: 'auto',
-  nap_threshold_percent: 80
-}, overrides: Record<string, unknown> = {}) {
-  return agentRecord({
-    primary_model_preset_id: null,
-    primary_model_provider: 'claude-cli',
-    primary_model_name: 'claude/claude-cli',
-    primary_model_connection: { id: 'claude-cli', type: 'direct', service: 'claude-cli' },
-    claude_settings: { permissionMode: 'default', model: 'sonnet' },
-    memory_window: memoryWindow,
-    ...overrides
-  })
-}
-
-async function seedCliContextReport(sessionId: string, agent: Record<string, any>, contextWindow: number) {
-  const report = reportForCliSnapshot({
-    runtime: 'claude',
-    model: 'sonnet',
-    actualModel: 'claude-sonnet-5',
-    contextWindow,
-    evidence: 'runtime',
-    disableClaude1M: false,
-    reportedAt: NOW.getTime()
-  }, agent, null, null, agent.primary_model_name)
-  await redis.json.set(`session:${sessionId}:execution_log`, '$', [{
-    id: `reply-${sessionId}`,
-    sessionId,
-    userId: USER,
-    agentId: agent.id,
-    agentName: 'Claude context report fixture',
-    agentType: 'cli',
-    createdAt: NOW.toISOString(),
-    runtime: { runtimeId: 'claude', metadata: { cliContextWindow: report } }
-  }] as never)
+async function seedApiWindowPreset(id: string, contextWindow: number) {
+  await redis.json.set(`model:${id}`, '$', {
+    id, modelId: 'test-model', modelName: 'Test Model', provider: 'openai', contextWindow
+  } as never)
 }
 
 async function seedAgent(overrides: Record<string, any> = {}) {
@@ -263,7 +223,6 @@ const bigText = (label: string) => `${label} ${'x'.repeat(6_000)}`
 
 describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
   beforeEach(async () => {
-    for (const key of CLAUDE_CAP_ENV_KEYS) vi.stubEnv(key, '')
     embedderFactory.calls = []
     embedderFactory.requireUser = false
     embedderFactory.setupError = null
@@ -288,10 +247,6 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       provider: 'openai',
       contextWindow: 200_000
     } as never)
-  })
-
-  afterEach(() => {
-    vi.unstubAllEnvs()
   })
 
   // -------------------------------------------------------------------------
@@ -363,6 +318,12 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
   // The nap (packet §1.4): relief order, pins, floor, loud failure
   // -------------------------------------------------------------------------
 
+  // Realistic zip ids (BL-1515): each is its own state id, `normalizeId(<raw id>)`, so no two share
+  // one. `zip_stale_1` and `zip_stale_2` both normalized to `zip_stale`.
+  const NAP_STALE_1 = 'cool_tool_1781000000000_stal1'
+  const NAP_STALE_2 = 'cool_tool_1781000000000_stal2'
+  const NAP_PINNED = 'cool_tool_1781000000000_pinnd'
+
   async function seedNapConversation() {
     // Old stretch (episode 1, closed): 4 small messages.
     await seedMessage(FIXED_SESSION, 'm1', 'user', 'Plan the lake trip', '2026-06-10T08:00:00.000Z')
@@ -373,10 +334,10 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     // completed assistant message (m12) belongs to ANOTHER agent so a
     // response_failed mark on m6 stays recovery-held (per-agent hold semantics).
     await seedMessage(FIXED_SESSION, 'm5', 'user', 'Now the garage project', '2026-06-10T09:00:00.000Z', {
-      zipIds: ['zip_stale_1']
+      zipIds: [NAP_STALE_1]
     })
     await seedMessage(FIXED_SESSION, 'm6', 'assistant', 'Measured the garage.', '2026-06-10T09:05:00.000Z', {
-      zipIds: ['zip_stale_2', 'zip_pinned']
+      zipIds: [NAP_STALE_2, NAP_PINNED]
     })
     await seedMessage(FIXED_SESSION, 'm7', 'user', 'What shelving fits?', '2026-06-10T09:10:00.000Z')
     await seedMessage(FIXED_SESSION, 'm8', 'assistant', 'Metal shelving, 40cm deep.', '2026-06-10T09:15:00.000Z')
@@ -411,6 +372,40 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     return { ep1, ep2 }
   }
 
+  it.each(['agent', 'nap', 'empty'] as const)('SA-133 API nap keeps %s boards untouched and delivers continuity through the live summary', async (kind) => {
+    await seedNapConversation()
+    const agent = agentRecord({ agentType: 'api', api_reasoning_retention: 'whiteboard' })
+    await seedAgent({ agentType: 'api', api_reasoning_retention: 'whiteboard' })
+    // The retired global block cannot disable this agent's board or alter its nap context.
+    await redis.json.set(`user:${USER}:settings`, '$', { global_api_reasoning_retention: { mode: 'neither', whiteboard_budget_tokens: 250, show_whiteboard: false } } as never)
+    const board = { schema_version: 1, user_id: USER, session_id: FIXED_SESSION, agent_id: AGENT,
+      content: kind === 'empty' ? null : 'Exact dependency: bolt M8; goal: finish shelves.', version: 3, updated_at: '2026-06-10T10:00:00.000Z' }
+    await redis.json.set(`whiteboard:${FIXED_SESSION}:${AGENT}`, '$', board as never)
+    await redis.json.set(episodeKey(FIXED_SESSION, 'ep2'), '$.whiteboard', kind === 'empty' ? null : { content: 'legacy board', updated_at: NOW.toISOString(), written_by: kind } as never)
+    const episodeBefore = await getEpisode(FIXED_SESSION, 'ep2')
+    let compactPrompt = ''
+    const summary = 'Goal: finish shelves. Use M8 bolts. Clearance is unverified; measure it next.'
+    const outcome = await runFixedSessionNap({ userId: USER, agent, sessionId: FIXED_SESSION,
+      trigger: 'manual', eventFetch: fetch, now: NOW,
+      generateSummary: async (prompt) => {
+        if (!prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')) return 'Lake trip planned.'
+        compactPrompt = prompt
+        return `SUMMARY:\n${summary}\nWHITEBOARD:\nMust never be saved.`
+      }, estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000]) })
+    expect(outcome.status, outcome.error).toBe('completed')
+    expect(compactPrompt).toContain('Return EXACTLY one section')
+    expect(compactPrompt).toContain('Do not omit necessary information merely because it is currently on that mutable board')
+    expect(compactPrompt).toContain(kind === 'empty' ? '(empty)' : 'Exact dependency: bolt M8')
+    expect(await redis.json.get(`whiteboard:${FIXED_SESSION}:${AGENT}`)).toEqual(board)
+    expect((await getEpisode(FIXED_SESSION, 'ep2'))?.whiteboard).toEqual(episodeBefore?.whiteboard)
+    const session = await redis.getSession(FIXED_SESSION)
+    const events = getFixedSessionGraduationState(session?.metadata).events
+    expect(events.some((event) => event.summary === summary)).toBe(true)
+    const live = applyFixedSessionGraduationToMessages(await redis.getSessionMessages(FIXED_SESSION), session)
+    expect(live.some((message) => message.content.includes(summary))).toBe(true)
+    expect(JSON.stringify(live)).not.toContain('Must never be saved.')
+  })
+
   it.each(['open', 'empty closed'] as const)(
     'BL-790: stale zips relieve a nap with an unavailable embedder and %s episode',
     async (episodeKind) => {
@@ -420,8 +415,8 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       if (episodeKind === 'empty closed') {
         await seedEpisode({ id: 'empty', state: 'closed', opened_at: '2026-05-01T00:00:00.000Z', closed_at: '2026-05-02T00:00:00.000Z' })
       }
-      await redis.sAdd(`unzipped:${FIXED_SESSION}`, 'zip_pinned')
-      await redis.json.set(`unzipped_item:${FIXED_SESSION}:zip_pinned`, '$', { source: 'user' } as never)
+      await redis.sAdd(`unzipped:${FIXED_SESSION}`, NAP_PINNED)
+      await redis.json.set(`unzipped_item:${FIXED_SESSION}:${NAP_PINNED}`, '$', { source: 'user' } as never)
       await redis.json.set(`message:${FIXED_SESSION}:m6`, '$.metadata.response_failed', true as never)
       const messagesBefore = await redis.getSessionMessages(FIXED_SESSION)
       embedderFactory.setupError = new Error('BL-790 embedding setup unavailable')
@@ -437,10 +432,10 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       expect(embedderFactory.calls).toEqual([])
       expect(generateSummary).not.toHaveBeenCalled()
       expect(outcome.record?.rezippedZipCount).toBe(1)
-      expect(await redis.sMembers(`rezipped:${FIXED_SESSION}`)).toEqual(['zip_stale_1'])
-      expect(await redis.json.get(`rezipped_item:${FIXED_SESSION}:zip_stale_1`)).toMatchObject({ source: 'agent', reason: 'nap', napId: outcome.record?.id })
-      expect(await redis.exists(`rezipped_item:${FIXED_SESSION}:zip_pinned`)).toBe(false)
-      expect(await redis.exists(`rezipped_item:${FIXED_SESSION}:zip_stale_2`)).toBe(false)
+      expect(await redis.sMembers(`rezipped:${FIXED_SESSION}`)).toEqual([NAP_STALE_1])
+      expect(await redis.json.get(`rezipped_item:${FIXED_SESSION}:${NAP_STALE_1}`)).toMatchObject({ source: 'agent', reason: 'nap', napId: outcome.record?.id })
+      expect(await redis.exists(`rezipped_item:${FIXED_SESSION}:${NAP_PINNED}`)).toBe(false)
+      expect(await redis.exists(`rezipped_item:${FIXED_SESSION}:${NAP_STALE_2}`)).toBe(false)
       expect(await redis.getSessionMessages(FIXED_SESSION)).toEqual(messagesBefore)
       expect(await listMemorySegments(AGENT)).toEqual([])
       const stored = await redis.getSession(FIXED_SESSION)
@@ -449,6 +444,45 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       expect((await getEpisode(FIXED_SESSION, 'ep2'))?.whiteboard?.content).toBe('Garage width: 6m')
     }
   )
+
+  it('BL-1515: step 2 rezips under the state id, made once, and passes over a zip the user zipped by hand, when the random part is all digits', async () => {
+    await seedNapConversation()
+    // No eligible closed summary, so the nap relieves the window with step 2 alone.
+    await redis.json.set(episodeKey(FIXED_SESSION, 'ep1'), '$.state', 'open' as never)
+    await redis.json.set(`message:${FIXED_SESSION}:m6`, '$.metadata.response_failed', true as never)
+    // State ids are `normalizeId(<raw id>)` (BL-476); a message names the raw id, and `normalizeId`
+    // cuts an all-digit tail, so it must never run on a state id again.
+    const STALE = 'cool_tool_1781000000000_48213'
+    const BY_HAND = 'cool_tool_1781000000001_50917'
+    const staleState = 'cool_tool_1781000000000'
+    const byHandState = 'cool_tool_1781000000001'
+    expect([normalizeId(STALE), normalizeId(BY_HAND)]).toEqual([staleState, byHandState])
+    await redis.json.set(`message:${FIXED_SESSION}:m5`, '$.metadata.zipIds', [STALE] as never)
+    await redis.json.set(`message:${FIXED_SESSION}:m6`, '$.metadata.zipIds', [] as never)
+    await redis.json.set(`message:${FIXED_SESSION}:m7`, '$.metadata.zipIds', [BY_HAND] as never)
+    // The user's "Zip now" on the second one.
+    await redis.sAdd(`rezipped:${FIXED_SESSION}`, byHandState)
+    const byHandMarker = { zipId: byHandState, sessionId: FIXED_SESSION, source: 'user', rezippedAt: 1781258400000 }
+    await redis.json.set(`rezipped_item:${FIXED_SESSION}:${byHandState}`, '$', byHandMarker as never)
+
+    const outcome = await runFixedSessionNap({
+      userId: USER, agent: agentRecord(), sessionId: FIXED_SESSION,
+      trigger: 'manual', eventFetch: fetch, now: NOW,
+      generateSummary: vi.fn(async () => 'must not be called'),
+      estimateTokens: estimateQueue([150_000, 150_000, 70_000])
+    })
+
+    expect(outcome.status, outcome.error).toBe('completed')
+    expect(outcome.record?.rezippedZipCount).toBe(1)
+    expect((await redis.sMembers(`rezipped:${FIXED_SESSION}`)).sort()).toEqual([staleState, byHandState].sort())
+    expect(await redis.json.get(`rezipped_item:${FIXED_SESSION}:${staleState}`)).toMatchObject({
+      zipId: staleState, source: 'agent', reason: 'nap', napId: outcome.record?.id
+    })
+    expect(await redis.json.get(`rezipped_item:${FIXED_SESSION}:${byHandState}`)).toEqual(byHandMarker)
+    // No record under a raw id: the compile and every route read only the state id.
+    expect(await redis.exists(`rezipped_item:${FIXED_SESSION}:${STALE}`)).toBe(false)
+    expect(await redis.exists(`rezipped_item:${FIXED_SESSION}:${BY_HAND}`)).toBe(false)
+  })
 
   it.each(['step 1', 'step 3'] as const)(
     'BL-790: unavailable embedding setup fails before the needed %s summary',
@@ -601,7 +635,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
   it('nap steps 2+3: stale zips rezip (pins + recovery holds skipped), open-episode narrative compacts with whiteboard refresh', async () => {
     await seedNapConversation()
     // Pin one zip via manual unzip; mark m6's run as failed (recovery hold).
-    await redis.sAdd(`unzipped:${FIXED_SESSION}`, 'zip_pinned')
+    await redis.sAdd(`unzipped:${FIXED_SESSION}`, NAP_PINNED)
     await redis.json.set(
       `message:${FIXED_SESSION}:m6`,
       '$.metadata.response_failed',
@@ -632,9 +666,9 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     // Step 2: m5's stale zip rezipped; the pinned zip and the recovery-held message's
     // zips were skipped.
     const rezipped = await redis.sMembers(`rezipped:${FIXED_SESSION}`)
-    expect(rezipped).toContain('zip_stale_1')
-    expect(rezipped).not.toContain('zip_pinned')
-    expect(rezipped).not.toContain('zip_stale_2')
+    expect(rezipped).toContain(NAP_STALE_1)
+    expect(rezipped).not.toContain(NAP_PINNED)
+    expect(rezipped).not.toContain(NAP_STALE_2)
     expect(record.rezippedZipCount).toBe(1)
 
     // Step 3: open-episode compaction covers the stale, unheld open-episode messages —
@@ -747,7 +781,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       expect(outcome.status).toBe('ended_early')
       expect(outcome.endedEarly).toBe('chat_deleted')
       expect(await redis.sMembers(`rezipped:${FIXED_SESSION}`)).toEqual([])
-      expect(await redis.exists(`rezipped_item:${FIXED_SESSION}:zip_stale_1`)).toBe(false)
+      expect(await redis.exists(`rezipped_item:${FIXED_SESSION}:${NAP_STALE_1}`)).toBe(false)
     } finally {
       spy.mockRestore()
       endSessionDelete(FIXED_SESSION)
@@ -756,11 +790,8 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
 
   it('nap step 3 never rewrites a board the agent wrote: summary-only call, board kept (2026-09-19)', async () => {
     await seedNapConversation()
-    // The agent writes the board through its control — that makes it the agent's.
-    await updateWhiteboardOp(
-      { userId: USER, agentId: AGENT, sessionId: FIXED_SESSION },
-      { content: 'Garage width: 6m. Josh wants metal shelving.' }
-    )
+    // Preserve a legacy agent-authored episode board across nap.
+    await updateEpisodeWhiteboard(FIXED_SESSION, 'ep2', 'Garage width: 6m. Josh wants metal shelving.', 'agent')
     expect((await getEpisode(FIXED_SESSION, 'ep2'))?.whiteboard?.written_by).toBe('agent')
 
     let step3Prompt = ''
@@ -850,11 +881,8 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       now: NOW,
       generateSummary: async (prompt) => {
         if (prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')) {
-          // The turn that arrived mid-nap: the agent writes its board through its control.
-          await updateWhiteboardOp(
-            { userId: USER, agentId: AGENT, sessionId: FIXED_SESSION },
-            { content: 'Agent board: buy the metal shelving.' }
-          )
+          // Simulate a concurrent write through the shared episode owner.
+          await updateEpisodeWhiteboard(FIXED_SESSION, 'ep2', 'Agent board: buy the metal shelving.', 'agent')
           return ['SUMMARY:', 'Garage project started; measurements done.', 'WHITEBOARD:', 'a nap board that must not land'].join('\n')
         }
         return 'Lake trip planned for July; cabin booked.'
@@ -1055,10 +1083,14 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     ).toHaveLength(0)
   })
 
-  it('uses the session runtime window for a named CLI nap; absent report keeps the verified choice', async () => {
-    const cliAgent = namedClaudeCliAgent()
-    const reportSession = 'sess_window_cli_report'
-    const choiceSession = 'sess_window_cli_choice'
+  it('uses the selected API preset window to decide the nap threshold', async () => {
+    const memoryWindow = { floor_mode: 'auto', ceiling_headroom_mode: 'auto', nap_threshold_percent: 80 }
+    const shortAgent = agentRecord({ agentType: 'api', memory_window: memoryWindow })
+    const longPreset = 'preset_window_one_million'
+    await seedApiWindowPreset(longPreset, 1_000_000)
+    const longAgent = agentRecord({ agentType: 'api', primary_model_preset_id: longPreset, memory_window: memoryWindow })
+    const reportSession = 'sess_window_api_short'
+    const choiceSession = 'sess_window_api_long'
     for (const sessionId of [reportSession, choiceSession]) {
       await redis.json.set(`session:${sessionId}`, '$', {
         id: sessionId,
@@ -1069,12 +1101,11 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       await seedMessage(sessionId, `source-${sessionId}`, 'user', 'This original source remains available.',
         '2026-06-09T08:00:00.000Z')
     }
-    await seedCliContextReport(reportSession, cliAgent, 200_000)
 
     let summaryCalls = 0
     const runtimeNap = await runFixedSessionNap({
       userId: USER,
-      agent: cliAgent,
+      agent: shortAgent,
       sessionId: reportSession,
       trigger: 'threshold',
       eventFetch: fetch,
@@ -1087,7 +1118,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     })
     const choiceNap = await runFixedSessionNap({
       userId: USER,
-      agent: cliAgent,
+      agent: longAgent,
       sessionId: choiceSession,
       trigger: 'threshold',
       eventFetch: fetch,
@@ -1113,11 +1144,10 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     }
   })
 
-  it('keeps an unknown CLI default honest and refuses a nap before a summary call', async () => {
-    const unknownAgent = namedClaudeCliAgent(undefined, {
-      claude_settings: { permissionMode: 'default' }
-    })
-    const sessionId = 'sess_window_cli_unknown'
+  it('keeps an unknown API context honest and refuses a nap before a summary call', async () => {
+    const unknownAgent = agentRecord({ agentType: 'api', primary_model_preset_id: null,
+      primary_model_provider: 'unknown-test-provider', primary_model_name: 'unknown-test-model' })
+    const sessionId = 'sess_window_api_unknown'
     await redis.json.set(`session:${sessionId}`, '$', {
       id: sessionId,
       user_id: USER,
@@ -1252,16 +1282,20 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     expect(again.status).toBe('nothing_new')
   })
 
-  it('uses a matching CLI runtime window for the regular graduation summary budget', async () => {
-    const cliAgent = namedClaudeCliAgent({
+  it('uses the selected API preset window for the regular graduation summary budget', async () => {
+    const memoryWindow = {
       floor_mode: 'custom',
       floor_tokens: 1_000,
       ceiling_headroom_mode: 'custom',
       ceiling_headroom_tokens: 50_000,
       nap_threshold_percent: 80
-    })
-    const reportSession = 'sess_window_regular_cli_report'
-    const choiceSession = 'sess_window_regular_cli_choice'
+    }
+    const longPreset = 'preset_window_one_million'
+    await seedApiWindowPreset(longPreset, 1_000_000)
+    const shortAgent = agentRecord({ agentType: 'api', memory_window: memoryWindow })
+    const longAgent = agentRecord({ agentType: 'api', primary_model_preset_id: longPreset, memory_window: memoryWindow })
+    const reportSession = 'sess_window_regular_api_short'
+    const choiceSession = 'sess_window_regular_api_long'
     for (const sessionId of [reportSession, choiceSession]) {
       await redis.json.set(`session:${sessionId}`, '$', {
         id: sessionId,
@@ -1275,7 +1309,6 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
           `2026-06-09T08:${String(index * 5).padStart(2, '0')}:00.000Z`)
       }
     }
-    await seedCliContextReport(reportSession, cliAgent, 200_000)
     const caps: Record<string, number> = {}
     for (const sessionId of [reportSession, choiceSession]) {
       const messages = await redis.getSessionMessages(sessionId)
@@ -1283,7 +1316,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       expect(sourceTokens).toBeGreaterThan(40_000)
       await graduateRegularSessionTail({
         userId: USER,
-        agent: cliAgent,
+        agent: sessionId === reportSession ? shortAgent : longAgent,
         sessionId,
         reason: 'close',
         now: NOW,
@@ -1742,75 +1775,14 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
   // Whiteboard lifecycle (packet §1.9)
   // -------------------------------------------------------------------------
 
-  it('whiteboard: tool-edited, compiled as DCM lines (SA-110), dissolved (kept) at close', async () => {
+  it('keeps a legacy episode board on close without compiling the retired CLI DCM', async () => {
     await seedEpisode({ id: 'epw', state: 'open', opened_at: '2026-06-10T08:00:00.000Z' })
-
-    const updated = await updateWhiteboardOp(
-      { userId: USER, agentId: AGENT, sessionId: FIXED_SESSION },
-      { content: 'Current goal: ship P6.' }
-    )
-    expect(updated.whiteboard).toBe('Current goal: ship P6.')
-
-    const compiled = await computeMemoryCompileContext({
-      userId: USER,
-      agentId: AGENT,
-      sessionId: FIXED_SESSION,
-      currentUserMessage: 'hello'
-    })
-    // SA-110 (DL-110-01): the board is DCM lines now — never a system-prompt block.
-    expect(compiled.whiteboardDcmLines[0]).toContain('Episode whiteboard (')
-    // 2026-09-19: the board names its author, and the agent is told naps leave its board alone.
-    expect(compiled.whiteboardDcmLines[0]).toContain('last written by you')
-    expect(compiled.whiteboardDcmLines.join('\n')).toContain('Current goal: ship P6.')
-    expect(compiled.whiteboardDcmLines.join('\n')).toContain('sys.memory.whiteboard')
-    expect(compiled.whiteboardDcmLines.join('\n')).toContain('Naps never change a board you wrote')
-    expect(compiled.memoryContext?.whiteboard?.present).toBe(true)
-    expect(compiled.memoryContext?.whiteboard?.placement).toBe('dcm')
-    expect(compiled.memoryContext?.whiteboard?.writtenBy).toBe('agent')
-    expect((await getEpisode(FIXED_SESSION, 'epw'))?.whiteboard?.written_by).toBe('agent')
-
-    // A nap-filled board says so where the agent reads it.
-    await redis.json.set(episodeKey(FIXED_SESSION, 'epw'), '$.whiteboard.written_by', 'nap' as never)
-    const napCompiled = await computeMemoryCompileContext({
-      userId: USER,
-      agentId: AGENT,
-      sessionId: FIXED_SESSION,
-      currentUserMessage: 'hello'
-    })
-    expect(napCompiled.whiteboardDcmLines[0]).toContain('filled in by a nap')
-    expect(napCompiled.memoryContext?.whiteboard?.writtenBy).toBe('nap')
-    await redis.json.set(episodeKey(FIXED_SESSION, 'epw'), '$.whiteboard.written_by', 'agent' as never)
-
-    // Regular sessions never compile a whiteboard.
-    const regularCompiled = await computeMemoryCompileContext({
-      userId: USER,
-      agentId: AGENT,
-      sessionId: REGULAR_SESSION,
-      currentUserMessage: 'hello'
-    })
-    expect(regularCompiled.whiteboardDcmLines).toEqual([])
-
-    // Close dissolves: content kept on the record, section no longer compiled.
+    await updateEpisodeWhiteboard(FIXED_SESSION, 'epw', 'Current goal: ship P6.', 'agent')
+    const compiled = await computeMemoryCompileContext({ userId: USER, agentId: AGENT, sessionId: FIXED_SESSION, currentUserMessage: 'hello' })
+    expect(compiled.whiteboardDcmLines).toEqual([])
     const { closeEpisode } = await import('../memoryEpisodes')
     await closeEpisode(FIXED_SESSION, 'epw', 'agent_mark')
-    expect((await getEpisode(FIXED_SESSION, 'epw'))?.whiteboard?.content).toBe(
-      'Current goal: ship P6.'
-    )
-    const afterClose = await computeMemoryCompileContext({
-      userId: USER,
-      agentId: AGENT,
-      sessionId: FIXED_SESSION,
-      currentUserMessage: 'hello'
-    })
-    expect(afterClose.whiteboardDcmLines).toEqual([])
-
-    // With no open episode left, the whiteboard control refuses loudly.
-    await expect(
-      updateWhiteboardOp(
-        { userId: USER, agentId: AGENT, sessionId: FIXED_SESSION },
-        { content: 'anything' }
-      )
-    ).rejects.toBeInstanceOf(MemoryToolError)
+    expect((await getEpisode(FIXED_SESSION, 'epw'))?.whiteboard?.content).toBe('Current goal: ship P6.')
   })
 
   // -------------------------------------------------------------------------
@@ -1925,11 +1897,14 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     expect(fold?.block).toContain('Fact C revised.')
   })
 
-  it('awareness fold: superseded/expired/moved entries get disregard notes while the SP stays frozen', async () => {
+  it('awareness fold: invalidated members refresh the read-only view before the accepted-send fold', async () => {
     await seedAwarenessRecord('mem_fold_d', 'Fact D.')
     await seedAwarenessRecord('mem_fold_e', 'Fact E.')
     await seedAwarenessRecord('mem_fold_f', 'Fact F.')
+    await seedAwarenessRecord('mem_fold_kept', 'Still eligible.')
+    await commitMemoryTurnState({ userId: USER, agentId: AGENT, sessionId: FIXED_SESSION, currentUserMessage: 'hello' })
     await foldAwarenessState({ agentId: AGENT, reason: 'nap' })
+    const priorFold = await getMemoryFold(AGENT)
 
     await redis.json.set(`memory:${AGENT}:mem_fold_d`, '$.is_superseded', 'y' as never)
     await redis.json.set(
@@ -1941,19 +1916,19 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     await redis.json.set(`memory:${AGENT}:mem_fold_f`, '$.lane', 'ltm' as never)
 
     const ctx = await compileFixed()
-    // The frozen view still shows all three; the pending notes carry the truth.
-    expect(ctx.onMyMindBlock).toContain('Fact D.')
-    expect(ctx.onMyMindBlock).toContain('Fact E.')
-    expect(ctx.onMyMindBlock).toContain('Fact F.')
-    const pending = ctx.awarenessPendingDcmLines.join('\n')
-    expect(pending).toContain('superseded [mem_fold_d]')
-    expect(pending).toContain('expired [mem_fold_e')
-    expect(pending).toContain('moved [mem_fold_f → ltm]')
-    expect(ctx.memoryContext?.awarenessFold?.pending).toMatchObject({
-      superseded: 1,
-      expired: 1,
-      moved: 1
-    })
+    expect(ctx.onMyMindBlock).toContain('Still eligible.')
+    expect(ctx.onMyMindBlock).not.toContain('Fact D.')
+    expect(ctx.onMyMindBlock).not.toContain('Fact E.')
+    expect(ctx.onMyMindBlock).not.toContain('Fact F.')
+    expect(ctx.awarenessPendingDcmLines).toEqual([])
+    expect(ctx.memoryContext?.awarenessFold?.source).toBe('live-bootstrap')
+    expect(await getMemoryFold(AGENT)).toEqual(priorFold)
+    expect((await compileFixed()).onMyMindBlock).toBe(ctx.onMyMindBlock)
+
+    await commitMemoryTurnState({ userId: USER, agentId: AGENT, sessionId: FIXED_SESSION, currentUserMessage: 'hello' })
+    const committedFold = await getMemoryFold(AGENT)
+    expect(committedFold?.reason).toBe('membership')
+    expect(committedFold?.block).toBe(ctx.onMyMindBlock)
   })
 
   it('awareness fold: deleting an awareness record re-folds immediately (DL-110-05)', async () => {

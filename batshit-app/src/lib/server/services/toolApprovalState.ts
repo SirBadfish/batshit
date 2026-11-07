@@ -12,17 +12,13 @@
  * That stream cannot wait forever, so the card gets three minutes and the sweep marks
  * anything older `expired`.
  *
- * A CLI-lane control approval is not inside anything. The managed agent's refusal already
- * came back, the turn already finished, and the card is answered by a *later* turn
- * (DL-116-08) — so its record deliberately lives 24 hours. P2 taught the CLIENT that rule
- * (`resolveApprovalExpiryMs` returns null for a non-`api` lane, and the card says "Waits for
- * you") but not the server, so the first send three minutes after a CLI pause would have
- * marked the entry AND retired its record while the card still said it was waiting.
+ * A historical CLI-lane control approval has no running agent behind it. It is not expired
+ * by the timed sweep: the explicit clear action settles it under the session-turn lock,
+ * without answering it or starting a replacement run.
  *
  * `control.lane` is written by the server where the entry is persisted and is never read
- * from a client, so skipping on it cannot be used to make a card immortal: an entry with no
- * `control` block at all — every Bash approval — keeps the three-minute clock exactly as
- * before.
+ * from a client. An entry with no `control` block — every live Bash approval — keeps the
+ * three-minute clock exactly as before.
  */
 
 import type { ToolApprovalEntry } from '$lib/types/tool-approvals'
@@ -61,7 +57,7 @@ export type ApprovalStateSnapshot = {
   }>
   updates: Array<{
     messageId: string
-    metadata: Record<string, any>
+    changes: Array<{ index: number; fields: Record<string, string | boolean> }>
   }>
 }
 
@@ -137,21 +133,24 @@ export function approvalEntryExpires(entry: Record<string, any> | null | undefin
  * could settle). That pause stays what P2 shipped: a tool-result hint the model relays; the
  * next attempt pauses at the policy and earns a card the SDK can answer.
  *
- * A `cli` or `service` card is answered by a resume TURN, which needs no SDK part at all.
+ * A tool-result pause on a service lane is surfaced as guidance; historical CLI entries are
+ * retained for display and explicit non-executing settlement.
  */
 export function toolResultApprovalRendersCard(request: ControlApprovalRequest): boolean {
   return request.lane !== 'api'
 }
 
 export function buildApprovalHistoryMessages(
-  requestMessages: unknown,
+  _requestMessages: unknown,
   persistedMessages: unknown,
 ): ApprovalHistoryMessage[] {
   const byId = new Map<string, ApprovalHistoryMessage>()
   const insertionOrder: string[] = []
   const idless: ApprovalHistoryMessage[] = []
 
-  const register = (raw: unknown, preferExisting = false) => {
+  // Request history supplies conversation context, never authority for saved approval cards.
+  // Even an absent/null stored summary is authoritative: a different tab may have settled it.
+  const register = (raw: unknown) => {
     if (!raw || typeof raw !== 'object') return
     const message = raw as Record<string, any>
     const messageId = typeof message.id === 'string' ? message.id : ''
@@ -181,14 +180,6 @@ export function buildApprovalHistoryMessages(
       return
     }
 
-    if (preferExisting) {
-      const existingApprovalCount = countApprovalEntries(existing.metadata)
-      const incomingApprovalCount = countApprovalEntries(normalized.metadata)
-      if (existingApprovalCount > 0 || incomingApprovalCount === 0) {
-        return
-      }
-    }
-
     byId.set(messageId, {
       ...existing,
       ...normalized,
@@ -199,12 +190,6 @@ export function buildApprovalHistoryMessages(
   if (Array.isArray(persistedMessages)) {
     for (const message of persistedMessages) {
       register(message)
-    }
-  }
-
-  if (Array.isArray(requestMessages)) {
-    for (const message of requestMessages) {
-      register(message, true)
     }
   }
 
@@ -223,14 +208,6 @@ export function buildApprovalHistoryMessages(
   })
 
   return combined
-}
-
-function countApprovalEntries(metadata: unknown): number {
-  if (!metadata || typeof metadata !== 'object') return 0
-  const summary = (metadata as Record<string, any>).toolApprovals
-  if (!summary || typeof summary !== 'object') return 0
-  const approvals = (summary as Record<string, any>).approvals
-  return Array.isArray(approvals) ? approvals.length : 0
 }
 
 export function analyzeApprovalState(
@@ -259,7 +236,8 @@ export function analyzeApprovalState(
     const messageCreatedAtMs = parseApprovalTimestampMs(
       message.created_at ?? message.timestamp,
     )
-    let nextApprovals: any[] | null = null
+    const changes: ApprovalStateSnapshot['updates'][number]['changes'] = []
+    const answered = readAnsweredApprovalIds(metadata)
 
     for (let idx = 0; idx < approvals.length; idx += 1) {
       const rawEntry = approvals[idx]
@@ -298,7 +276,7 @@ export function analyzeApprovalState(
           : undefined
       let changed = false
 
-      if (status === 'pending' && expiresAtMs !== null && nowMs >= expiresAtMs) {
+      if (!answered.has(approvalId) && status === 'pending' && expiresAtMs !== null && nowMs >= expiresAtMs) {
         status = 'expired'
         expiredAt = nowIso
         changed = true
@@ -330,11 +308,14 @@ export function analyzeApprovalState(
           }
         : entry
 
-      if (changed) {
-        if (!nextApprovals) {
-          nextApprovals = [...approvals]
+      if (changed && !answered.has(approvalId)) {
+        const fields: Record<string, string | boolean> = {}
+        for (const field of ['status', 'submitted', 'requestedAt', 'expiresAt', 'expiredAt'] as const) {
+          if (normalizedEntry[field] !== entry[field] && normalizedEntry[field] !== undefined) {
+            fields[field] = normalizedEntry[field]
+          }
         }
-        nextApprovals[idx] = normalizedEntry
+        if (Object.keys(fields).length > 0) changes.push({ index: idx, fields })
       }
 
       byId.set(approvalId, {
@@ -349,19 +330,13 @@ export function analyzeApprovalState(
     }
 
     if (
-      nextApprovals &&
+      changes.length > 0 &&
       typeof message.id === 'string' &&
       message.id.trim().length > 0
     ) {
       updates.push({
         messageId: message.id.trim(),
-        metadata: {
-          ...(metadata ?? {}),
-          toolApprovals: {
-            ...summary,
-            approvals: nextApprovals,
-          },
-        },
+        changes,
       })
     }
   }

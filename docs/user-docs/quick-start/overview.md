@@ -1,6 +1,6 @@
 # Quick start
 
-The fastest path from zero to your first message in Batshit: install, create an admin account, add one model source, make one `API` Primary Agent, and send. A walkthrough video is planned to sit at the top of the install experience; until then, this page is the shortest route in words.
+The fastest path from zero to your first message in Batshit: install, create an admin account, add one model source, make one Primary Agent, and send. A walkthrough video is planned to sit at the top of the install experience; until then, this page is the shortest route in words.
 
 This is the fast lane. The [Installation](../installation/choose-mac-app-or-docker.md) section is the thorough version with every option, tradeoff, and troubleshooting note. Use this page to get a working chat quickly, then go deeper where you need to.
 
@@ -25,18 +25,18 @@ Once Batshit is installed and running, this is the whole fast path:
 4. **Add one model source.** You need exactly one of these:
    - A provider API key (the simplest start) — use the wizard or open Settings → API Keys, add a key for a provider like OpenAI, Anthropic, or Google, then create a saved model preset in Settings → Models. Details: [API keys and models](../providers/api-keys-and-models.md).
    - A Local AI runtime — if you'd rather run a model on your own machine, configure it in Settings → Local AI and create a preset that uses it. Details: [Local AI](../local-ai/overview.md).
-5. **Create one `API` Primary Agent.** Use the wizard or open Settings → Agents, create a Primary Agent, set its type to `API`, give it a name, and pick the model preset you just saved.
+5. **Create one Primary Agent.** Use the wizard or open Settings → Agents, create a Primary Agent, give it a name, and pick the model preset you just saved.
 6. **Send a message.** Select the agent in chat and try: `Say hello and tell me one thing you can do in Batshit.` If the model answers, your core path works. (Don't ask it which model it is; models often misname themselves. The chat bar shows the preset Batshit actually used.)
 
 That's it. You now have a working Batshit chat.
 
-## Why `API` first
+## Why a saved model first
 
-Batshit has two Primary Agent types—`API` and `CLI`—and they're peer choices, not quality tiers. For a first message, `API` is the shortest route because Batshit talks straight to a model provider or Local AI runtime. It does not need a CLI installed and logged in; n8n can be added later as a tool and Workflow Subagent platform.
+A Primary Agent on a saved model is the shortest route to a first message: Batshit talks straight to a model provider, a Local AI runtime or your ChatGPT plan. It needs no CLI installed and logged in; n8n can be added later as a tool platform.
 
-You can add the other Primary type later when you want a managed Codex or Claude Code agent inside Batshit: `CLI`.
+To use your own Claude plan in the Mac app, set up the [Claude plan connection](../providers/claude-plan.md) and choose its saved model for an ordinary agent. Claude Code supplies the model; Batshit runs the tools.
 
-When you want n8n automation, [connect n8n](../primary-agents/connect-n8n.md) as a workflow-tool and Workflow Subagent platform. n8n is not a Primary Agent type.
+When you want n8n automation, [connect n8n](../primary-agents/connect-n8n.md) as a workflow-tool platform.
 
 The full picture lives in [Primary Agents](../primary-agents/overview.md).
 

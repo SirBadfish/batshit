@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
+import { instructionLeaves, readInstructionsSnapshot } from '$lib/server/instructionsGuard'
+import { readInstructionsSnapshotTwin } from '$lib/test-utils/agentUpdateScriptTwin'
+import { captureSettingsLifecycle } from '$lib/server/services/appActions/settings/lifecycle'
 
 /**
  * BL-482: clearing a Subagent's Custom System Prompt clears it. Settings sends the emptied prompt
@@ -12,10 +15,10 @@ import { redis } from '$lib/server/redis'
  * under plain `npm test` (the route only reads the record and writes it whole).
  */
 
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({ runTrackedN8nCompatibilitySync: vi.fn() }))
 
 useRedisTestServer()
 
+const REAL = process.env.VITEST_USE_REAL_REDIS === 'true'
 const USER = 'ssacc_sub_user'
 const SUB = 'ssacc_sub_prompt'
 const OLD_PROMPT = 'Answer only in haiku.'
@@ -39,6 +42,13 @@ async function seedSubagent() {
 
 async function callPut(updates: Record<string, unknown>) {
   const { PUT } = await import('./+server')
+  // 3698a4293: a save naming the prompt carries the instructions token of the copy Settings showed.
+  const leaves = instructionLeaves(updates)
+  if (leaves.length) {
+    const shown = REAL ? await redis.execute(client => readInstructionsSnapshot(client, SUB, 'subagent', undefined, leaves))
+      : readInstructionsSnapshotTwin(SUB, 'subagent', (await stored())!, captureSettingsLifecycle([`subagent:${SUB}`]), leaves)
+    updates = { ...updates, expectedInstructions: shown.revisions }
+  }
   const request = new Request(`http://localhost/api/subagents/${SUB}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },

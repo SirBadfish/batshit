@@ -28,12 +28,22 @@ vi.mock('$lib/server/services/cliSubagentProfileSync', () => ({
     profileId: 'batshit_agent_subagent_cli_run_probe', deleted: true, sharedWith: null, sharedWithKind: null
   }))
 }))
-vi.mock('$lib/server/services/codexProfileManager', () => ({ syncAgentCodexProfiles: vi.fn(async () => {}) }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   syncAgentClaudeProfiles: vi.fn(async () => {}),
   agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
 }))
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({ runTrackedN8nCompatibilitySync: vi.fn() }))
+// b34b0e201: the delete captures its slash-command write basis through EVAL first, and reaches
+// other fixed Lua owners after it. The default lane's fake has no generic EVAL, so there those
+// owners are held by the doubles shared with `subagent-delete-route.test.ts`; the real lane keeps
+// the actual owners.
+vi.mock('$lib/server/services/appActions/settings/authority', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).appActionsAuthorityDouble(await importOriginal(), 'default'))
+vi.mock('$lib/server/services/slashCommandRevision', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).slashCommandRevisionDouble(await importOriginal(), 'default'))
+vi.mock('$lib/server/services/subjectPopulation', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).subjectPopulationDouble(await importOriginal(), 'default'))
+vi.mock('$lib/server/services/artifactAgentAccessCleanup', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).artifactAgentAccessCleanupDouble(await importOriginal(), 'default'))
 // The route's 30 s bound, shortened per test; everything else is the real registry.
 const stopBound = vi.hoisted(() => ({ ms: 30_000 }))
 vi.mock('$lib/server/services/subagentRunRegistry', async (importOriginal) => {
@@ -124,7 +134,7 @@ describe('DELETE /api/subagents/[id] stops the Subagent’s own runs first (BL-2
     await seedSubagent(SUB)
     const run = await beginSubagentRun({ userId: USER, subagentId: SUB, label: SUB })
     const pin = pinHostCommandOwner({ userId: USER, kind: 'subagent', id: SUB })
-    const lease = await prepareHostCommand(pin, { kind: 'codex', program: '/bin/codex' })
+    const lease = await prepareHostCommand(pin, { kind: 'guardian', program: '/bin/claude' })
     run.signal.addEventListener('abort', () => {
       events.push('preparing run stopped')
       lease.abortBeforeSpawn()

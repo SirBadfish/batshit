@@ -10,7 +10,7 @@
   /**
    * SA-104 P7 — the visible dreaming log + manual "Dream now" trigger (DL-104-02 /
    * DL-104-15; p7 packet doc §1.9). Dreaming is between-conversation maintenance:
-   * consolidation, supersession repair, expiry demotion, overnight episode
+   * consolidation, supersession repair, plain expiry, overnight episode
    * graduation. Every run's actions carry a WHY — this card is the inspectability
    * surface. The log stays readable for a memory-disabled agent; only dreaming NOW
    * requires enablement.
@@ -127,7 +127,7 @@
     if (counts.consolidationMerges) parts.push(`${counts.consolidationMerges} merge(s)`)
     if (counts.consolidationReviews) parts.push(`${counts.consolidationReviews} kept separate`)
     if (counts.supersessionRepairs) parts.push(`${counts.supersessionRepairs} repair(s)`)
-    if (counts.expiriesDemoted) parts.push(`${counts.expiriesDemoted} expiry demotion(s)`)
+    if (counts.expiriesDemoted) parts.push(`${counts.expiriesDemoted} expired memories processed`)
     if (counts.eraConsolidations) parts.push(`${counts.eraConsolidations} era merge(s)`)
     if (counts.reembedded) parts.push(`${counts.reembedded} re-embedded`)
     if (counts.failures) parts.push(`${counts.failures} failed`)
@@ -157,7 +157,7 @@
       <p>
         Between conversations the agent's memory dreams: near-duplicate memories merge
         (with full history kept), supersession chains get repaired, expired entries
-        demote instead of vanishing, and finished episodes graduate overnight. It runs
+        stay hidden from ordinary recall and remain available with Show expired, and finished episodes graduate overnight. It runs
         on its own after the agent has been idle past its idle gap; Dream Now runs a
         pass immediately. Every action is logged here with its reason — nothing is
         reorganized invisibly.

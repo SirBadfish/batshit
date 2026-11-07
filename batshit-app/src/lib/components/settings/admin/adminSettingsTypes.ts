@@ -1,7 +1,13 @@
-export const DEFAULT_DCM_SCHEMA_HINT_REQUIRED_LIMIT = 6
-export const DEFAULT_DCM_SCHEMA_HINT_OPTIONAL_LIMIT = 6
-export const DEFAULT_DCM_SCHEMA_HINT_MAX_CHARS = 240
-export const DEFAULT_DCM_TOOL_NAME_THRESHOLD = 6
+export {
+  DEFAULT_DCM_SCHEMA_HINT_REQUIRED_LIMIT,
+  DEFAULT_DCM_SCHEMA_HINT_OPTIONAL_LIMIT,
+  DEFAULT_DCM_SCHEMA_HINT_MAX_CHARS,
+  DEFAULT_DCM_TOOL_NAME_THRESHOLD,
+  DEFAULT_DCM_TOTAL_HINT_TOKENS,
+  MIN_DCM_TOTAL_HINT_TOKENS,
+  MAX_DCM_TOTAL_HINT_TOKENS,
+  normalizeTotalHintTokens
+} from '$lib/utils/dynamicSchemaHintSettings'
 export const DEFAULT_GOON_LIP_SYNC_LAB_ENABLED = false
 /** SA-113 P1 (DL-113-01): the wake-up master switch defaults ON. */
 export const DEFAULT_AGENT_WAKEUPS_ENABLED = true
@@ -43,6 +49,7 @@ export type AdminSettingsState = {
   dcmSchemaHintRequiredLimit: number
   dcmSchemaHintOptionalLimit: number
   dcmSchemaHintMaxChars: number
+  dcmSchemaHintTotalTokens: number
   dcmToolNameThreshold: number
   goonLipSyncLabEnabled: boolean
   agentWakeupsEnabled: boolean
@@ -214,12 +221,19 @@ export type CoreSystemPromptSummary = {
   matchesDefault: boolean
   customized: boolean
   newDefaultAvailable: boolean
+  setupCompatibilityNotice?: string
   lastUpdated: string | null
+  /** Part of this prompt is built into Batshit (a placeholder the compile fills); Admin shows it read-only. */
+  hasBuiltInText?: boolean
+  /** A section built entirely into Batshit, with no stored record: view only, no edit or reset. */
+  readOnly?: boolean
 }
 
 export type CoreSystemPromptDetail = CoreSystemPromptSummary & {
   value: string
   defaultValue: string
+  /** The text the compile fills this prompt's placeholders with, shown read-only. */
+  builtInText?: string
 }
 
 export function formatBackupDate(value: string) {

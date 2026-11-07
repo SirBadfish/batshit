@@ -1,3 +1,4 @@
+import { withoutServerReplayFields } from '$lib/utils/serverReplayFields'
 import { saveClipRecord } from '$lib/server/services/clipPersistence.server'
 import { json, error, type RequestHandler } from '@sveltejs/kit'
 import { apiError, apiFailure } from '$lib/server/services/apiResponses'
@@ -5,7 +6,6 @@ import { redis } from '$lib/server/redis'
 import { v4 as uuidv4 } from 'uuid'
 import { publishSessionEvent } from '$lib/server/ssePublisher'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
-import { refuseDelegatedRunOutsideList } from '$lib/server/services/actingAgentIdentity'
 import { internalServiceHeaders } from '$lib/server/services/internalRequestAuth'
 import {
   getInternalBatshitServerAuthHeaders,
@@ -541,7 +541,8 @@ async function loadSessionMessagesForRouting(
   // SA-113 P3 (F-P2-1): the RECENT `limit`. `getMessages` is head-first, so an auto
   // follow-up in a chat longer than 300 messages routed on that chat's opening exchange.
   const loaded = await redis.getRecentMessages(sessionId, limit)
-  return Array.isArray(loaded) ? loaded as Array<Record<string, any>> : []
+  // SA-137: a paused reply's server-only replay fields never ride a history post.
+  return Array.isArray(loaded) ? (loaded as Array<Record<string, any>>).map(withoutServerReplayFields) : []
 }
 
 function formatShareMessage(options: {
@@ -621,19 +622,12 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
   if (!auth) {
     return apiError('Unauthorized', 401)
   }
-  // BL-81 follow-up: no Subagent or Worker run shares to chat on its own credential. Its
-  // allowed artifact tools (`use.artifact.*` on `/api/controls/use`) share through their
-  // handler, which calls this route with the instance token.
-  const delegatedRefusal = refuseDelegatedRunOutsideList(auth, null)
-  if (delegatedRefusal) {
-    return apiFailure(delegatedRefusal.message, 403, { code: delegatedRefusal.code })
-  }
   // BL-472: iframe code can call shareToChat without a click. Its own initiator field
   // proves neither human intent nor an agent turn. Only the session lane names a human;
   // the instance-token handler may retain its agent hint to avoid recursive follow-ups.
   const initiator: ShareInitiator = auth.auth === 'session'
     ? 'user'
-    : auth.auth === 'agent' || (auth.auth === 'service' && data.initiator === 'agent')
+    : auth.auth === 'service' && data.initiator === 'agent'
       ? 'agent'
       : 'artifact'
   const forwardedServiceToken =

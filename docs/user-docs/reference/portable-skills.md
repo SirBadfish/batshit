@@ -1,10 +1,12 @@
-# Portable Skill downloads
+# Batshit plugin download and older archives
 
-This page lists the Portable Skill bundles published by the docs site under `/portable-skills/`.
+For the current release, download the complete eight-skill **Batshit** plugin from **Settings → Plugins & shit → Plugins → Batshit → Download Plugin**. See [outside-agent setup](../skills/portable-skills.md).
 
-Portable Skill bundles are public and secret-free. Your private token belongs in Settings -> Skills & Prompts -> Portable Skills and, if you choose, a local file under `~/.batshit/portable-skills/`.
+The separate downloads below are **older-version archives**. Their instructions and bundled help belong to older releases and may describe agent types that were removed. Use them only when maintaining the matching older installation.
 
-## Current bundles
+Portable Skill bundles are public and secret-free. Your private token belongs in Settings → Plugins & shit → Portable Skills and, if you choose, a local file under `~/.batshit/portable-skills/`.
+
+## Older-version per-skill archives
 
 | Portable Skill | Token scope | Zip | Browsable entrypoint |
 | --- | --- | --- | --- |
@@ -18,34 +20,6 @@ Portable Skill bundles are public and secret-free. Your private token belongs in
 ## Install guide
 
 Start with [Portable Skills](../skills/portable-skills.md) for token setup, private env-file guidance, and install paths for Claude Code, Codex, and generic outside agents.
-
-## Copy-ready install prompts
-
-Paste one of these into the outside agent that should install the skill:
-
-```txt
-Install the Batshit Portable Batshit Guide skill from https://docs.batshit.ai/portable-skills/batshit-guide.zip. No token or env file is needed; it is informational only.
-```
-
-```txt
-Install the Batshit Portable Voice Engine Installer skill from https://docs.batshit.ai/portable-skills/voice-engine-installer.zip. Use credentials from ~/.batshit/portable-skills/portable-skills.env.
-```
-
-```txt
-Install the Batshit Portable Artifact Creator skill from https://docs.batshit.ai/portable-skills/artifact-creator.zip. Use credentials from ~/.batshit/portable-skills/portable-skills.env.
-```
-
-```txt
-Install the Batshit Portable CLI Tool Creator skill from https://docs.batshit.ai/portable-skills/cli-tool-creator.zip. Use credentials from ~/.batshit/portable-skills/portable-skills.env.
-```
-
-```txt
-Install the Batshit Portable Skill Creator skill from https://docs.batshit.ai/portable-skills/skill-creator.zip. Use credentials from ~/.batshit/portable-skills/portable-skills.env.
-```
-
-```txt
-Install the Batshit Portable Goon Scene Creator skill from https://docs.batshit.ai/portable-skills/goon-scene-creator.zip. Use credentials from ~/.batshit/portable-skills/portable-skills.env.
-```
 
 ## Per-skill guides
 

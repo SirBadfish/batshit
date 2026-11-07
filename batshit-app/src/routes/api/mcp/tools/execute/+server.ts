@@ -16,8 +16,6 @@ import { mcpGatewayDiscovery } from '$lib/server/services/mcpGatewayDiscovery'
 import { resolveDynamicMcpGatewayScope } from '$lib/server/services/mcpSelectionResolver'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
 import {
-  bindActingAgentId,
-  refuseDelegatedRunOutsideList,
   refusePortableSkillOutsideList
 } from '$lib/server/services/actingAgentIdentity'
 
@@ -76,13 +74,6 @@ export const POST: RequestHandler = async ({ locals, request }) => {
       logger.debug(`[MCP Tools Execute] Service auth for user ${userId}, tool: ${toolName}`)
     }
 
-    const delegatedRefusal = refuseDelegatedRunOutsideList(auth, 'sys.mcp.dynamic.use')
-    if (delegatedRefusal) {
-      return json(
-        { success: false, error: delegatedRefusal.message, code: delegatedRefusal.code, toolName },
-        { status: 403 }
-      )
-    }
     // BL-687: the same rule for a Portable Skill Token and the use control.
     const portableRefusal = refusePortableSkillOutsideList(auth, 'sys.mcp.dynamic.use')
     if (portableRefusal) {
@@ -97,18 +88,11 @@ export const POST: RequestHandler = async ({ locals, request }) => {
       : Array.isArray(body.gatewayFilter)
         ? body.gatewayFilter
         : undefined
-    // SA-117 DL-117-04: `agentId` here is a gateway SCOPE hint, not an act-as claim — but a
-    // hint the server minted still beats one the body typed, and a body id that differs from
-    // the bound one means a caller is confused about which agent it is.
-    const agentBinding = bindActingAgentId(auth, body.agentId)
-    if (!agentBinding.ok) {
-      return apiFailure(agentBinding.message, 400, { toolName }) as Response
-    }
+    const agentId = typeof body.agentId === 'string' ? body.agentId.trim() || null : null
 
     const scopeResolution = await resolveDynamicMcpGatewayScope({
       userId,
-      agentId: agentBinding.agentId ?? null,
-      ...(auth.auth === 'agent' ? { mcpGatewayScope: auth.mcpGatewayScope ?? [] } : {}),
+      agentId,
       selectedGateways
     })
 

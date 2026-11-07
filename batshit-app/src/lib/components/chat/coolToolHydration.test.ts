@@ -3,6 +3,13 @@ import { guardCutNotice } from '$lib/test-utils/guard-cut-notice'
 import { buildHydratedCoolToolStep } from './coolToolHydration'
 
 describe('coolToolHydration', () => {
+  it.each([['sys.judge.ask', 'Ask Judge Juice'], ['sys.mcp.dynamic.find', 'Dynamic Tool Search'], ['sys.mcp.dynamic.use', 'MCP Tool']])('reloads utility %s with its exact title and control renderer', (id, title) => {
+    const hydrated = buildHydratedCoolToolStep({ toolName: 'batshit_tool_use', operationKind: 'fabric_use', rendererFamily: 'generic_tool', toolArgs: { ref: `batshit:${id}`, input: {} }, toolResult: { success: true, family: 'batshit', target: id, result: {} } })
+    expect(hydrated.displayToolName).toBe(title)
+    expect(hydrated.operationKind).toBe('fabric_use')
+    expect(hydrated.rendererFamily).toBe('generic_tool')
+  })
+
   it.each([
     ['bash', 'bash', { command: 'printf large-output' }],
     ['read_file', 'read_file', { path: '/tmp/large.txt', command: 'cat /tmp/large.txt' }],

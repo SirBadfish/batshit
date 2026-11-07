@@ -1,19 +1,11 @@
 /**
  * The server's one Redis subscriber for `batshit:sse:*`: the chat and user channels that
- * processes outside a request publish on (`publishSessionEvent`, `publishUserEvent`, and the
- * Claude permission helper).
+ * processes outside a request publish on (`publishSessionEvent`, `publishUserEvent`).
  *
- * It lived inside `/api/sse/+server.ts` and started only when a browser opened its live hub,
- * so an event published while no browser had connected since the app started reached nobody,
- * the server included. BL-496 moved it here, for one reason: a managed Claude run with
- * approvals On Request must be able to wait for it BEFORE it launches
- * (`ensureSseExternalSubscriber`), because the permission helper publishes its card on this
- * channel and nothing else would hear it. A route module cannot be imported by a service, and
- * SvelteKit loads `/api/sse` only when a request reaches it.
- *
- * Every session event passes `noteClaudeApprovalEvent` first, so the server records a Claude
- * approval card whether or not a tab watches the chat or `/api/sse` has loaded. Then the
- * route's sinks, registered when the route loads, forward events to the tabs.
+ * `/api/sse` starts it when a browser opens its live hub (`ensureSseExternalSubscriber`), and
+ * the route's sinks, registered when the route loads, forward events to the tabs. BL-496 moved
+ * it out of the route so a managed Claude run could wait for it before launch; SA-139 R4 removed
+ * that run and the approval sink it fed, and this module stays the one subscriber.
  */
 
 import { createClient } from 'redis'
@@ -21,7 +13,6 @@ import { env } from '$env/dynamic/private'
 import { logger } from '$lib/utils/logger'
 import { resolveRedisConnectionUrl } from '$lib/server/redisConnection'
 import { parseSseChannel } from '$lib/server/ssePublisher'
-import { noteClaudeApprovalEvent } from '$lib/server/services/claudeApprovalEvents'
 import { registerRuntimeShutdownTask } from '$lib/server/services/runtimeShutdown'
 import { TURN_SHUTDOWN_WAIT_MS, waitForRunningTurns } from '$lib/server/services/turnOutcomeRegistry'
 
@@ -60,11 +51,6 @@ function handleMessage(message: string, channel: string) {
     return
   }
 
-  try {
-    noteClaudeApprovalEvent(parsed.sessionId, payload)
-  } catch (error) {
-    console.error('[SSE] Could not record a Claude approval event', error)
-  }
   sinks?.session(parsed.sessionId, payload)
 }
 
@@ -104,23 +90,6 @@ export function ensureSseExternalSubscriber(): Promise<boolean> {
   return ready
 }
 
-/**
- * BL-496: wait for the subscriber, at most `timeoutMs`. A Redis that cannot be reached keeps a
- * client connecting for as long as it retries; a run that must not start without the
- * subscriber gets a plain no instead of waiting with it. The start carries on in the background.
- */
-export async function waitForSseExternalSubscriber(timeoutMs: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timedOut = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => resolve(false), timeoutMs)
-  })
-  try {
-    return await Promise.race([ensureSseExternalSubscriber(), timedOut])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
-
 /** Shutdown: close the subscriber (after `/api/sse` has let its running turns finish). */
 export async function closeSseExternalSubscriber(): Promise<void> {
   const pending = ready
@@ -139,10 +108,9 @@ export async function closeSseExternalSubscriber(): Promise<void> {
   }
 }
 
-// The subscriber closes at shutdown even when `/api/sse` never loaded (a run started it). It
-// waits for running turns first, as the route's own task does, so a card raised during the
-// shutdown wait is still heard; the route's task closing it too is harmless (the close is
-// idempotent).
+// The subscriber closes at shutdown whoever started it. It waits for running turns first, as the
+// route's own task does, so an event published during the shutdown wait is still heard; the
+// route's task closing it too is harmless (the close is idempotent).
 registerRuntimeShutdownTask('sse-external-subscriber', async () => {
   await waitForRunningTurns(TURN_SHUTDOWN_WAIT_MS)
   await closeSseExternalSubscriber()

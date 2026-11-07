@@ -1,5 +1,5 @@
 <script lang="ts">
-import { onDestroy, onMount } from 'svelte'
+import { onDestroy, onMount, untrack } from 'svelte'
 import { toast } from '$lib/components/ui/sonner/settings-toast'
 import * as Card from '$lib/components/ui/card'
 import { Button } from '$lib/components/ui/button'
@@ -14,6 +14,7 @@ import SettingsAccordionCard from '$lib/components/settings/SettingsAccordionCar
 import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
 import SettingsTextEditor from '$lib/components/settings/SettingsTextEditor.svelte'
 import PortableSkillsSettingsPanel from './PortableSkillsSettingsPanel.svelte'
+import PluginSettingsPanel from './PluginSettingsPanel.svelte'
 import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
 import IconPicker from '$lib/components/icons/IconPicker.svelte'
 import IconRenderer from '$lib/components/icons/IconRenderer.svelte'
@@ -37,7 +38,7 @@ import {
   readUntrustedTextScreen,
   untrustedTextSkippedNote
 } from '$lib/utils/jevJuice'
-import { dispatchSlashCommandsUpdated } from '$lib/utils/liveSettingsEvents'
+import { dispatchSlashCommandsUpdated, LIVE_SETTINGS_EVENTS } from '$lib/utils/liveSettingsEvents'
 import {
   Sparkles,
   Plus,
@@ -51,13 +52,11 @@ import {
   FolderOpen
 } from '@lucide/svelte'
 import type {
-  AgentRow,
   SkillBundleFile,
   SkillBundleManifest,
   SkillSourceRow,
   SlashCommandRow
 } from '$lib/types/database'
-import type { SlashCommandDescriptor } from '$lib/types/slashCommands'
 
 interface Props {
   data?: {
@@ -69,7 +68,7 @@ interface Props {
 }
 
 type CommandType = 'prompt' | 'skill'
-type SkillsPromptsTab = 'skills' | 'skill-sources' | 'prompts' | 'portable-skills'
+type SkillsPromptsTab = 'plugins' | 'skills' | 'skill-sources' | 'prompts' | 'portable-skills'
 
 type SkillSource = 'custom' | 'system' | 'github' | 'git' | 'local' | 'url'
 type ImportSourceType = 'github' | 'url' | 'git' | 'local'
@@ -77,10 +76,6 @@ type SkillStandardsStatus = 'full' | 'degraded'
 
 type TrustLevel = 'trusted' | 'untrusted'
 
-interface CliCollisionEntry extends SlashCommandDescriptor {
-  agentId?: string
-  agentName?: string
-}
 
 interface FormState {
   id: string
@@ -122,11 +117,13 @@ let loading = $state(true)
 let bootstrapping = $state(false)
 let saving = $state(false)
 let deleting = $state(false)
-let activeSkillsPromptsTab = $state<SkillsPromptsTab>('skills')
+let activeSkillsPromptsTab = $state<SkillsPromptsTab>('plugins')
 let selectedCommandId = $state<string | null>(null)
+let commandReadGeneration = 0
+let commandPanelAlive = true
+let externalCommandChanged = $state(false)
 let isEditing = $state(false)
 let showEditor = $state(false)
-let loadingAgents = $state(false)
 let commandSaveState = $state<'idle' | 'saving' | 'saved'>('idle')
 let commandSaveError = $state<string | null>(null)
 let persistedCommandSignature = $state<string | null>(null)
@@ -154,7 +151,6 @@ let importWarnings = $state<string[]>([])
 // switch is on. Advisory only: it never blocks the import or the save.
 let importScreen = $state<UntrustedTextScreen | null>(null)
 const importScreenView = $derived(readUntrustedTextScreen(importScreen))
-let cliInvocationIndex = $state<Record<string, CliCollisionEntry[]>>({})
 let skillSources = $state<SkillSourceRow[]>([])
 let skillSourcesLoading = $state(false)
 let skillSourceSaving = $state(false)
@@ -206,7 +202,7 @@ const emptyForm = (): FormState => ({
 let form = $state<FormState>(emptyForm())
 
 const sortedCommands = $derived.by(() => {
-  return [...slashCommands].sort((a, b) => {
+  return slashCommands.filter(command => !command.plugin_id).sort((a, b) => {
     if ((a.is_system ? 1 : 0) !== (b.is_system ? 1 : 0)) {
       return (b.is_system ? 1 : 0) - (a.is_system ? 1 : 0)
     }
@@ -332,12 +328,6 @@ const normalizedInvocation = $derived.by(() =>
   normalizeInvocation(form.invocation_pattern || `/${form.name}`)
 )
 
-const invocationCliCollisions = $derived.by(() => {
-  const key = normalizedInvocation
-  if (!key) return []
-  return cliInvocationIndex[key] ?? []
-})
-
 const invocationBatshitCollisions = $derived.by(() => {
   const key = normalizedInvocation
   if (!key) return []
@@ -390,10 +380,14 @@ async function handleIconUpload(event: Event) {
 }
 
 onMount(async () => {
+  window.addEventListener(LIVE_SETTINGS_EVENTS.slashCommandsUpdated, handleSlashCommandsUpdated)
   await Promise.all([refreshPanelData(), loadIconLibrary()])
 })
 
 onDestroy(() => {
+  commandPanelAlive = false
+  commandReadGeneration += 1
+  window.removeEventListener(LIVE_SETTINGS_EVENTS.slashCommandsUpdated, handleSlashCommandsUpdated)
   clearCommandSaveResetTimeout()
 })
 
@@ -466,19 +460,6 @@ function normalizeAgentIds(input: string[]) {
         .filter((value) => value.length > 0)
     )
   )
-}
-
-function formatScopeLabel(scope: SlashCommandDescriptor['scope']) {
-  if (scope === 'project') return 'project'
-  if (scope === 'managed') return 'managed'
-  if (scope === 'global') return 'global'
-  return 'unknown'
-}
-
-function formatSourceLabel(source: SlashCommandDescriptor['source']) {
-  if (source === 'codex') return 'Codex'
-  if (source === 'claude') return 'Claude'
-  return 'Batshit'
 }
 
 function formatSkillSourceTrust(source: SkillSourceRow | null) {
@@ -726,6 +707,7 @@ function canAutosaveCurrentCommand(formState: FormState): boolean {
 }
 
 function selectCommand(command: SlashCommandRow) {
+  externalCommandChanged = false
   activeSkillsPromptsTab = command.type === 'skill' ? 'skills' : 'prompts'
   selectedCommandId = command.id
   isEditing = true
@@ -826,131 +808,46 @@ function hideEditor() {
   form = emptyForm()
 }
 
-async function loadSlashCommands() {
+function handleSlashCommandsUpdated() {
+  void loadSlashCommands({ preserveDraft: true })
+}
+async function loadSlashCommands(options: { preserveDraft?: boolean } = {}) {
+  const generation = ++commandReadGeneration
+  const selection = selectedCommandId
   try {
-    loading = true
+    if (!options.preserveDraft) loading = true
     const response = await fetch('/api/slash-commands')
     const payload = await response.json()
-    slashCommands = Array.isArray(payload.slashCommands) ? payload.slashCommands : []
+    if (!commandPanelAlive || generation !== commandReadGeneration) return
+    if (!response.ok || !Array.isArray(payload.slashCommands)) throw new Error('The saved Skills and Prompts list is unavailable.')
+    const signature = buildPersistedCommandSignature(form, { editing: isEditing,
+      selectedCommandType: selectedCommand?.type ?? form.type, systemCommand: selectedCommand ?? null })
+    const keepDraft = options.preserveDraft && (saving || commandSaveState === 'saving' || promptTemplateEditorOpen ||
+      showEditor && (!isEditing || persistedCommandSignature !== null && signature !== persistedCommandSignature))
+    const previous = selectedCommand
+    slashCommands = payload.slashCommands
 
-    if (selectedCommandId) {
+    if (selectedCommandId && selectedCommandId === selection) {
       const nextSelection = slashCommands.find((command) => command.id === selectedCommandId)
-      if (nextSelection) {
+      if (keepDraft) {
+        if (JSON.stringify(nextSelection) !== JSON.stringify(previous)) externalCommandChanged = true
+      } else if (nextSelection) {
         selectCommand(nextSelection)
       } else {
         hideEditor()
       }
     }
   } catch (error) {
+    if (!commandPanelAlive || generation !== commandReadGeneration) return
     console.error('Failed to load slash commands:', error)
     toast.error('Failed to load Skills and Prompts')
   } finally {
-    loading = false
-  }
-}
-
-async function loadAgentsAndCliInvocations() {
-  try {
-    loadingAgents = true
-    const agentsResponse = await fetch('/api/agents')
-    const agentsPayload = await agentsResponse.json()
-    const rawAgents = Array.isArray(agentsPayload?.agents) ? agentsPayload.agents : []
-    const agents = rawAgents
-      .map((agent: AgentRow) => ({
-        id: String(agent.id ?? '').trim(),
-        displayName: String(agent.displayName ?? agent.id ?? '').trim()
-      }))
-      .filter((agent: { id: string; displayName: string }) => agent.id.length > 0)
-      .sort((a: { displayName: string }, b: { displayName: string }) =>
-        a.displayName.localeCompare(b.displayName)
-      )
-
-    const requests: Array<{
-      provider: 'codex' | 'claude'
-      scope: 'managed' | 'global'
-      agentId?: string
-      agentName?: string
-    }> = [
-      { provider: 'codex', scope: 'global' },
-      { provider: 'claude', scope: 'global' }
-    ]
-
-    for (const agent of agents) {
-      requests.push({
-        provider: 'codex',
-        scope: 'managed',
-        agentId: agent.id,
-        agentName: agent.displayName
-      })
-      requests.push({
-        provider: 'claude',
-        scope: 'managed',
-        agentId: agent.id,
-        agentName: agent.displayName
-      })
-    }
-
-    const index: Record<string, CliCollisionEntry[]> = {}
-
-    await Promise.all(
-      requests.map(async (request) => {
-        try {
-          const params = new URLSearchParams()
-          params.set('provider', request.provider)
-          params.set('scope', request.scope)
-          if (request.agentId) params.set('agentId', request.agentId)
-          const response = await fetch(`/api/slash-commands/cli?${params.toString()}`)
-          const payload = await response.json()
-          const commands = Array.isArray(payload?.commands) ? payload.commands : []
-          for (const command of commands) {
-            const invocation = normalizeInvocation(String(command?.invocation ?? ''))
-            if (!invocation) continue
-            const entry: CliCollisionEntry = {
-              id: String(command.id ?? `${request.provider}:${invocation}`),
-              name: String(command.name ?? invocation.slice(1)),
-              invocation,
-              description: typeof command.description === 'string' ? command.description : undefined,
-              source: request.provider,
-              scope: request.scope,
-              plugin: typeof command.plugin === 'string' ? command.plugin : undefined,
-              argumentHint:
-                typeof command.argumentHint === 'string'
-                  ? command.argumentHint
-                  : typeof command.argument_hint === 'string'
-                    ? command.argument_hint
-                    : undefined,
-              agentId: request.agentId,
-              agentName: request.agentName
-            }
-
-            const existing = index[invocation] ?? []
-            if (!existing.some((candidate) =>
-              candidate.source === entry.source &&
-              candidate.scope === entry.scope &&
-              (candidate.agentId ?? '') === (entry.agentId ?? '') &&
-              candidate.id === entry.id
-            )) {
-              existing.push(entry)
-              index[invocation] = existing
-            }
-          }
-        } catch (error) {
-          console.warn('Failed to load CLI commands for collision index', request, error)
-        }
-      })
-    )
-
-    cliInvocationIndex = index
-  } catch (error) {
-    console.error('Failed to load agents/CLI collision index', error)
-    cliInvocationIndex = {}
-  } finally {
-    loadingAgents = false
+    if (commandPanelAlive && generation === commandReadGeneration) loading = false
   }
 }
 
 async function refreshPanelData() {
-  await Promise.all([loadSlashCommands(), loadAgentsAndCliInvocations(), loadSkillSources()])
+  await Promise.all([loadSlashCommands(), loadSkillSources()])
 }
 
 async function loadSkillSources() {
@@ -1387,18 +1284,20 @@ $effect(() => {
   if (!showEditor || !isEditing || !selectedCommandId) return
 
   promptTemplateEditSession
+  // A server snapshot is observation. Only draft/selection changes schedule writes.
+  const command = untrack(() => selectedCommand)
 
   const signature = buildPersistedCommandSignature(form, {
     editing: true,
-    selectedCommandType: selectedCommand?.type ?? form.type,
-    systemCommand: selectedCommand ?? null
+    selectedCommandType: command?.type ?? form.type,
+    systemCommand: command ?? null
   })
 
   if (!persistedCommandSignature || signature === persistedCommandSignature) {
     return
   }
 
-  if (!canAutosaveCurrentCommand(form)) {
+  if (!untrack(() => canAutosaveCurrentCommand(form))) {
     commandSaveState = 'idle'
     return
   }
@@ -1458,10 +1357,10 @@ async function deleteCommand(command: SlashCommandRow) {
   <div class="flex flex-wrap items-start justify-between gap-3">
     <div class="flex items-center gap-2">
       <BatshitIcon id="skills" class="h-5 w-5 text-muted-foreground" />
-      <h3 class="batshit-settings-section-title">Skills & Prompts</h3>
-      <SettingsInfoMenu ariaLabel="About Skills & Prompts" contentClass="w-80">
+      <h3 class="batshit-settings-section-title">Plugins &amp; shit</h3>
+      <SettingsInfoMenu ariaLabel="About Plugins & shit" contentClass="w-80">
         <p>
-          Create reusable Skills and Prompts for slash invocation in chat. Skill Sources manage
+          Plugins group related skills under one access switch. Create individual Skills and Prompts for slash invocation in chat. Skill Sources manage
           folders that scan into the normal Skills library.
         </p>
         <p class="mt-2">
@@ -1469,9 +1368,9 @@ async function deleteCommand(command: SlashCommandRow) {
         </p>
       </SettingsInfoMenu>
     </div>
-    {#if activeSkillsPromptsTab !== 'portable-skills'}
+    {#if activeSkillsPromptsTab !== 'portable-skills' && activeSkillsPromptsTab !== 'plugins'}
     <div class="flex flex-wrap items-center gap-2">
-      <Button variant="outline" size="sm" onclick={refreshPanelData} disabled={loading || loadingAgents}>
+      <Button variant="outline" size="sm" onclick={refreshPanelData} disabled={loading}>
         <RefreshCw  />
         Refresh
       </Button>
@@ -1487,6 +1386,10 @@ async function deleteCommand(command: SlashCommandRow) {
 
   <Tabs.Root bind:value={activeSkillsPromptsTab} class="w-full">
     <Tabs.List class="flex w-full flex-wrap gap-2">
+      <Tabs.Trigger value="plugins" class="min-w-[104px] flex-1 gap-2 sm:flex-none">
+        <BatshitIcon id="skills" class="h-3.5 w-3.5" />
+        <span>Plugins</span>
+      </Tabs.Trigger>
       <Tabs.Trigger value="skills" class="min-w-[104px] flex-1 gap-2 sm:flex-none">
         <BatshitIcon id="skills" class="h-3.5 w-3.5" />
         <span>Skills</span>
@@ -1506,7 +1409,9 @@ async function deleteCommand(command: SlashCommandRow) {
     </Tabs.List>
   </Tabs.Root>
 
-  {#if activeSkillsPromptsTab === 'skill-sources'}
+  {#if activeSkillsPromptsTab === 'plugins'}
+    <PluginSettingsPanel />
+  {:else if activeSkillsPromptsTab === 'skill-sources'}
     <div class="space-y-4">
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div class="flex items-center gap-1.5">
@@ -2094,6 +1999,9 @@ async function deleteCommand(command: SlashCommandRow) {
                   </Button>
                 {/if}
               {/snippet}
+          {#if externalCommandChanged}
+            <p class="batshit-settings-form-meta is-warning">Saved settings changed. Your draft is kept.</p>
+          {/if}
           {#if isEditingSystemCommand}
             <div class="batshit-settings-inline-alert is-info">
               Built-in Batshit skills keep their name, slash path, icon, and package content in the repo. You can adjust status, global agent access, and trust here.
@@ -2154,7 +2062,6 @@ async function deleteCommand(command: SlashCommandRow) {
                   <Label for="command-invocation" class="batshit-settings-form-label">Invocation</Label>
                   <SettingsInfoMenu ariaLabel="About Invocation">
                     <p>This is the slash alias Batshit suggests and expands in chat.</p>
-                    <p class="mt-2">Batshit resolves slash-item collisions before CLI-native variants.</p>
                   </SettingsInfoMenu>
                 </div>
               </div>
@@ -2165,22 +2072,12 @@ async function deleteCommand(command: SlashCommandRow) {
                   bind:value={form.invocation_pattern}
                   disabled={isEditingSystemCommand}
                 />
-                {#if invocationCliCollisions.length > 0 || invocationBatshitCollisions.length > 0}
+                {#if invocationBatshitCollisions.length > 0}
                   <div class="batshit-settings-inline-alert is-warning mt-2">
                     <p class="batshit-settings-form-label">Alias collision warning for <code>{normalizedInvocation}</code></p>
-                    {#if invocationBatshitCollisions.length > 0}
-                      <p class="mt-1">
-                        Existing Batshit slash item(s): {invocationBatshitCollisions.map((entry) => entry.displayName || entry.name).join(', ')}
-                      </p>
-                    {/if}
-                    {#if invocationCliCollisions.length > 0}
-                      <p class="mt-1">
-                        CLI slash item(s): {invocationCliCollisions.map((entry) =>
-                          `${formatSourceLabel(entry.source)}:${entry.name}${entry.scope ? ` (${formatScopeLabel(entry.scope)})` : ''}${entry.agentName ? ` @ ${entry.agentName}` : ''}`
-                        ).join(', ')}
-                      </p>
-                    {/if}
-                    <p class="mt-1">Typed collisions resolve to Batshit first. CLI variants require explicit dropdown selection.</p>
+                    <p class="mt-1">
+                      Existing Batshit slash item(s): {invocationBatshitCollisions.map((entry) => entry.displayName || entry.name).join(', ')}
+                    </p>
                   </div>
                 {/if}
               </div>

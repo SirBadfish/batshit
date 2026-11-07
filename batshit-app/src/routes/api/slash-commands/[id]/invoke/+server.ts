@@ -1,3 +1,6 @@
+import { commandEnabledForAgent } from '$lib/server/services/slashCommandCapabilities'
+import { isExactSavedAccessAgentId } from '$lib/utils/agentAccessIds'
+import { builtinPluginSkill, listAgentPlugins, projectPluginCommand } from '$lib/server/services/agentPlugins'
 import { json, type RequestHandler } from '@sveltejs/kit'
 
 import { redis } from '$lib/server/redis'
@@ -33,6 +36,10 @@ function resolveAgentId(input: unknown): string | null {
 }
 
 function validateAgentAccess(command: SlashCommandRow, agentId: string | null) {
+  if (command.plugin_id) {
+    if (!agentId) return { error: 'Agent context is required to invoke this plugin skill.', status: 400 }
+    return commandEnabledForAgent(command, agentId) ? null : { error: 'The plugin is not enabled for this agent.', status: 403 }
+  }
   if (command.enabled_for_all_agents === true) {
     if (!agentId) {
       return {
@@ -261,18 +268,22 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 
   try {
     const body = (await request.json().catch(() => ({}))) as InvocationBody
-    const commandKey = `slash_command:${locals.user.id}:${params.id}`
+    const requested = String(params.id ?? '').replace(/^\//, '')
+    const namespaced = requested.includes(':') ? (await listAgentPlugins(locals.user.id)).flatMap(plugin => plugin.skills).find(skill => skill.invocation === `/${requested}`) : undefined
+    const requestedCommandId = namespaced?.commandId ?? builtinPluginSkill(params.id)?.commandId ?? requested
+    const commandKey = `slash_command:${locals.user.id}:${requestedCommandId}`
     let command = (await redis.json.get(commandKey)) as SlashCommandRow | null
 
     if (!command) {
       return json({ error: 'Slash command not found' }, { status: 404 })
     }
 
+    command = await projectPluginCommand(locals.user.id, command)
     if (command.is_active === false) {
       return json({ error: 'This command is currently inactive.' }, { status: 400 })
     }
 
-    const agentId = resolveAgentId(body.agentId)
+    const agentId = command.plugin_id ? isExactSavedAccessAgentId(body.agentId) ? body.agentId : null : resolveAgentId(body.agentId)
     const agentAccessError = validateAgentAccess(command, agentId)
     if (agentAccessError) {
       return json({ error: agentAccessError.error }, { status: agentAccessError.status })
@@ -320,7 +331,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
       await bootstrapSystemSlashCommands(locals.user.id)
       const repairedCommand = (await redis.json.get(commandKey)) as SlashCommandRow | null
       if (repairedCommand) {
-        command = repairedCommand
+        command = await projectPluginCommand(locals.user.id, repairedCommand)
         skillId = command.skill_id
         if (skillId) {
           skill = await getSkill(locals.user.id, skillId)

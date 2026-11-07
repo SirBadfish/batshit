@@ -17,6 +17,7 @@ export const GET: RequestHandler = async ({ locals, url }) => {
       {
         query: url.searchParams.get('query') ?? '',
         lane: url.searchParams.get('lane') ?? undefined,
+        includeExpired: url.searchParams.get('includeExpired') === 'true',
         includeSuperseded: url.searchParams.get('includeSuperseded') !== 'false',
         limit: limitParam ? Number(limitParam) : undefined,
         savedFrom: url.searchParams.get('savedFrom') ?? undefined,

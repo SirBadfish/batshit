@@ -1,13 +1,10 @@
 /**
  * Runtime-scoped sections for admin-editable Batshit system prompts.
  *
- * Batshit compiles one prompt body for two primary-agent runtimes. Before SA-096 the
- * packaged prompts listed every runtime's tool names, call shapes, and examples at once,
- * so an API agent was taught call shapes for managed CLI and n8n, and every Bad/Good
- * example used a tool name that agent did not have.
- *
- * `runtimeFlavor` is already known at compile time, so prompts can mark sections that
- * belong to a single runtime and let the compiler drop the rest.
+ * Before SA-096 the packaged prompts listed every runtime's tool names, call shapes, and
+ * examples at once, so an API agent was taught call shapes for managed CLI and n8n, and every
+ * Bad/Good example used a tool name that agent did not have. Prompts mark sections that belong
+ * to a single runtime and the compiler drops the rest.
  *
  * Syntax (HTML comments so the raw prompt still reads as valid Markdown in the Admin editor):
  *
@@ -15,26 +12,21 @@
  *   ...content only API Primary Agents should see...
  *   <!-- /runtime -->
  *
- *   <!-- runtime:cli -->
- *   ...content only managed CLI agents should see...
- *   <!-- /runtime -->
- *
- * Scope names are the user-facing primary-agent types (`api`, `cli`), not the
- * internal runtime flavors, because that is the vocabulary the Admin prompt editor and the
- * product docs use.
+ * Scope names are the user-facing primary-agent types, because that is the vocabulary the
+ * Admin prompt editor and the product docs use. `api` is the one live scope. `cli` (the Claude
+ * Code CLI Primary lane, removed in SA-139 R4) and `n8n` (SA-106) are retired: saved custom
+ * prompts may still mark sections with them, so they parse, and their sections never compile.
  *
  * Parsing is strict on purpose. An unclosed block, a stray close marker, or an unknown scope
  * name throws instead of silently shipping the wrong content to a model. Per the Batshit
  * creed a bad admin edit should fail loudly rather than drift.
  */
 
-export type PromptRuntimeScope = 'api' | 'cli'
-type StoredPromptRuntimeScope = PromptRuntimeScope | 'n8n'
+export type PromptRuntimeScope = 'api'
+type StoredPromptRuntimeScope = PromptRuntimeScope | 'cli' | 'n8n'
 
-export type PromptRuntimeFlavor = 'codex' | 'claude' | 'vercel'
-
-const VALID_SCOPES: readonly PromptRuntimeScope[] = ['api', 'cli']
-const RETIRED_SCOPES = ['n8n'] as const
+const VALID_SCOPES: readonly PromptRuntimeScope[] = ['api']
+const RETIRED_SCOPES = ['cli', 'n8n'] as const
 const ACCEPTED_STORED_SCOPES: readonly StoredPromptRuntimeScope[] = [
   ...VALID_SCOPES,
   ...RETIRED_SCOPES
@@ -42,15 +34,6 @@ const ACCEPTED_STORED_SCOPES: readonly StoredPromptRuntimeScope[] = [
 
 const OPEN_MARKER = /^[ \t]*<!--[ \t]*runtime:([a-zA-Z0-9_,\s-]+?)[ \t]*-->[ \t]*$/
 const CLOSE_MARKER = /^[ \t]*<!--[ \t]*\/runtime[ \t]*-->[ \t]*$/
-
-/**
- * Maps an internal runtime flavor to the user-facing primary-agent type used in prompt scopes.
- * `vercel` is the API/direct Vercel AI SDK lane; `codex` and `claude` are both managed CLI.
- */
-export function runtimeFlavorToScope(runtimeFlavor: PromptRuntimeFlavor): PromptRuntimeScope {
-  if (runtimeFlavor === 'vercel') return 'api'
-  return 'cli'
-}
 
 function parseScopeList(raw: string, lineNumber: number): StoredPromptRuntimeScope[] {
   const parts = raw
@@ -151,16 +134,105 @@ export function applyPromptRuntimeScope(prompt: string, scope: PromptRuntimeScop
   return kept.join('\n')
 }
 
+const SESSION_OPEN_MARKER = /^[ \t]*<!--[ \t]*session:([a-zA-Z0-9_-]+)[ \t]*-->[ \t]*$/
+const SESSION_CLOSE_MARKER = /^[ \t]*<!--[ \t]*\/session[ \t]*-->[ \t]*$/
+const VALID_SESSION_KINDS = ['infinite'] as const
+
 /**
- * Model-facing broker tool names for a runtime. API agents get the `native_`-prefixed Vercel
- * AI SDK tools; managed CLI agents get the bridge names.
+ * Session-scoped sections (decision 11, 2026-10-24): text marked
+ *
+ *   <!-- session:infinite -->
+ *   ...content only an Infinite Session should see...
+ *   <!-- /session -->
+ *
+ * is kept (markers stripped) in an Infinite Session and dropped everywhere else. It is a
+ * separate marker kind from `runtime:`, so a runtime block may sit inside a session block;
+ * run this pass first, then `applyPromptRuntimeScope`. Parsing is strict for the same reason
+ * as the runtime pass: a bad Admin edit throws instead of shipping the wrong text.
+ */
+export function applyPromptSessionScope(
+  prompt: string,
+  session: { infiniteSession: boolean }
+): string {
+  if (!prompt) return prompt
+  if (!prompt.includes('<!--')) return prompt
+
+  const lines = prompt.split('\n')
+  const kept: string[] = []
+
+  let openLineNumber = 0
+  let keepingCurrentBlock = false
+  // The same one-blank-line seam rule as the runtime pass.
+  let justDroppedBlock = false
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    const lineNumber = index + 1
+
+    const openMatch = line.match(SESSION_OPEN_MARKER)
+    if (openMatch) {
+      if (openLineNumber) {
+        throw new Error(
+          `Prompt session scope marker on line ${lineNumber} opens while the block from ` +
+            `line ${openLineNumber} is still open. Nested session blocks are not supported.`
+        )
+      }
+      const kind = openMatch[1].toLowerCase()
+      if (!(VALID_SESSION_KINDS as readonly string[]).includes(kind)) {
+        throw new Error(
+          `Prompt session scope marker on line ${lineNumber} names an unknown session kind "${kind}". ` +
+            `Expected one of: ${VALID_SESSION_KINDS.join(', ')}.`
+        )
+      }
+      openLineNumber = lineNumber
+      keepingCurrentBlock = session.infiniteSession
+      continue
+    }
+
+    if (SESSION_CLOSE_MARKER.test(line)) {
+      if (!openLineNumber) {
+        throw new Error(
+          `Prompt session scope close marker on line ${lineNumber} has no matching open marker.`
+        )
+      }
+      justDroppedBlock = !keepingCurrentBlock
+      openLineNumber = 0
+      keepingCurrentBlock = false
+      continue
+    }
+
+    if (openLineNumber && !keepingCurrentBlock) continue
+
+    if (justDroppedBlock) {
+      justDroppedBlock = false
+      const isBlank = line.trim().length === 0
+      const lastKeptIsBlank = kept.length > 0 && kept[kept.length - 1].trim().length === 0
+      if (isBlank && lastKeptIsBlank) continue
+    }
+
+    kept.push(line)
+  }
+
+  if (openLineNumber) {
+    throw new Error(
+      `Prompt session scope block opened on line ${openLineNumber} is never closed. ` +
+        `Add a <!-- /session --> marker.`
+    )
+  }
+
+  return kept.join('\n')
+}
+
+/**
+ * Model-facing broker tool names for a runtime: API agents get the `native_`-prefixed Vercel AI
+ * SDK tools.
  */
 export function brokerToolNamesForScope(scope: PromptRuntimeScope): {
   search: string
   use: string
 } {
-  if (scope === 'api') {
-    return { search: 'native_batshit_tool_search', use: 'native_batshit_tool_use' }
+  switch (scope) {
+    case 'api':
+      return { search: 'native_batshit_tool_search', use: 'native_batshit_tool_use' }
   }
-  return { search: 'batshit_tool_search', use: 'batshit_tool_use' }
 }

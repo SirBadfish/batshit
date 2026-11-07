@@ -3,21 +3,22 @@
  *
  * Extracted verbatim from `/api/messages/compact` (which now imports it) so the
  * memory graduation writer and the nap can generate summaries through the exact same
- * model-resolution rules: API generation for API-compatible selections, the Codex CLI
- * hidden-text lane for current-model Codex agents, and loud refusals for Claude-CLI
- * and n8n current-model selections (choose an API-compatible preset instead). No
- * behavior change for the Compact feature — pure move.
+ * model-resolution rules: API generation for API-compatible selections, and loud refusals
+ * for a retired Primary Agent type (SA-139 R4) and for CLI or n8n-only model selections
+ * (choose an API-compatible preset instead).
  */
 
+import { captureAgentLocalReasoning } from './localModelReasoning'
 import { generateText, streamText } from 'ai'
 import { chatgptPlanAccountId } from '$lib/utils/chatgptPlanConnection'
 import { getChatgptPlanRuntime } from './chatgptPlanHost'
 import { PLAN_COMPACT, type PlanLease } from './chatgptPlanRuntime'
 import { ChatgptPlanError } from './chatgptPlanVault'
 import { isPlanSelection, assertPlanSettings, planProviderOptions } from './chatgptPlanInference'
+import { CLAUDE_PLAN_SERVICE, isClaudePlanSelection } from '$lib/utils/claudePlanConnection'
+import { admitClaudePlanSelection, ClaudePlanError } from './claudePlanAdmission'
 import { estimateTokens } from '$lib/utils/tokens'
 import { redis } from '$lib/server/redis'
-import { buildCodexRuntimeSettings } from '$lib/server/services/codexSettings'
 import { ProviderManager } from '$lib/server/services/providers'
 import type { AgentRow } from '$lib/types/database'
 import type { SavedModel, ModelConnectionInfo, ModelCapabilities } from '$lib/types/savedModels'
@@ -31,8 +32,8 @@ import { resolveModelIds } from '$lib/utils/modelIdResolver'
 import { resolveAgentModelFallbacks, resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
 import { loadRuntimeModelPreset } from '$lib/server/services/runtimeModelPreset'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
-import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
-import { resolveCurrentModelCompactRuntime } from '$lib/utils/contextCompaction'
+import { retiredPrimaryAgentRefusal } from '$lib/utils/primaryAgentType'
+import { namesRetiredCodexCliModel } from '$lib/utils/cliRuntimeIdentity'
 
 /**
  * SA-102 P1: Batshit's own bound on a summary/compact run's output length.
@@ -41,8 +42,7 @@ import { resolveCurrentModelCompactRuntime } from '$lib/utils/contextCompaction'
 const BATSHIT_SUMMARY_OUTPUT_TOKEN_BOUND = 6_000
 
 /**
- * BL-622 (rule C6): how long one summary call on the API lane may take, the Codex lane's own limit
- * (`generateHiddenText`). A Compact or a nap waits on this call; with no limit a model that never
+ * BL-622 (rule C6): how long one summary call on the API lane may take. A Compact or a nap waits on this call; with no limit a model that never
  * answered left the Compact's composer busy, with a Stop that stopped nothing, for as long as it
  * took.
  */
@@ -109,13 +109,15 @@ function isCliLikeSelection(params: {
     params.connection?.type ??
     ''
   ).toLowerCase()
+  // A model id that merely contains "codex" (an OpenAI API model) is not a CLI selection, and
+  // neither is a custom provider whose slug contains it: the retired Codex CLI is named by its
+  // exact ids only (SA-139 R3, Faye S12).
   return (
-    provider.includes('codex') ||
+    namesRetiredCodexCliModel({ primary_model_provider: params.provider, primary_model_connection: params.connection }) ||
     provider.includes('claude-cli') ||
-    modelId.includes('codex') ||
     modelId.includes('claude-cli') ||
-    connection.includes('codex') ||
-    connection.includes('claude')
+    // SA-139 (D1): only the Claude Code CLI lane; the Claude plan connection is an API connection.
+    connection.includes('claude-cli')
   )
 }
 
@@ -142,14 +144,8 @@ async function resolveSummaryModel(params: {
   userId: string
   agent: AgentRecord
   choice: SummaryModelChoice
+  abortSignal?: AbortSignal
 }) {
-  const agentType = normalizePrimaryAgentType(params.agent)
-  if (params.choice.modelMode === 'current' && agentType !== 'api') {
-    throw new Error(
-      'Current-model compacting for this Primary Agent is not available through the direct API compact path. Choose an API-compatible saved compact model preset.'
-    )
-  }
-
   const compactPreset =
     params.choice.modelMode === 'preset'
       ? await loadSavedModel(params.choice.modelPresetId)
@@ -171,8 +167,9 @@ async function resolveSummaryModel(params: {
       : null
   const preset = compactPreset ?? agentPreset
 
-  const selection = resolveRuntimeModelSelection({
+  const selectionArgs = {
     preset,
+    reasoningOverrides: params.choice.modelMode === 'current' ? params.agent.model_reasoning_overrides : null,
     presetId: compactPreset ? params.choice.modelPresetId : params.agent.primary_model_preset_id ?? null,
     provider: params.agent.primary_model_provider,
     modelId: params.agent.primary_model_name,
@@ -183,7 +180,10 @@ async function resolveSummaryModel(params: {
     // The compact preset's own settings; for the agent's model, the agent's bag, of which the
     // resolver keeps only the agent's own keys when a preset is named (BL-515).
     settings: (compactPreset?.settings ?? params.agent.provider_specific_settings ?? null) as Record<string, any> | null
-  })
+  }
+  const localReasoningSnapshot = params.choice.modelMode === 'current'
+    ? await captureAgentLocalReasoning(params.userId, selectionArgs, params.agent.model_reasoning_overrides, params.abortSignal) : undefined
+  const selection = resolveRuntimeModelSelection({ ...selectionArgs, localReasoning: localReasoningSnapshot?.contract })
 
   if (isCliLikeSelection({
     provider: selection.provider,
@@ -191,7 +191,7 @@ async function resolveSummaryModel(params: {
     connection: selection.connection
   })) {
     throw new Error(
-      'Compact cannot run through CLI model presets yet. Choose an API-compatible saved model preset for compacting.'
+      'Compact cannot run through CLI model presets, which Batshit no longer supports. Choose an API-compatible saved model preset for compacting.'
     )
   }
 
@@ -214,8 +214,11 @@ async function resolveSummaryModel(params: {
   }
 
   const runtimeSettings = buildRuntimeModelSettings({
+    localReasoning: localReasoningSnapshot?.contract,
+    localReasoningConnectionKey: localReasoningSnapshot?.connectionKey,
+    explicitReasoning: selection.explicitReasoning,
     provider: resolvedIds?.developerId ?? selection.provider,
-    modelId: resolvedIds?.modelId ?? selection.modelId,
+    modelId: localReasoningSnapshot ? effectiveModelId : resolvedIds?.modelId ?? selection.modelId,
     connection: selection.connection,
     contextWindow: selection.contextWindow,
     capabilities: selection.capabilities,
@@ -228,18 +231,27 @@ async function resolveSummaryModel(params: {
 
   const plan = isPlanSelection(selection.connection)
   if (plan) assertPlanSettings(selection.settings)
-  const model = plan ? null : (await ProviderManager.createForUser(params.userId)).getModel(effectiveModelId, {
+  // SA-139 P4 (D11): a Claude plan selection runs only through its own admission and run
+  // (`generateClaudePlanSummary`), never ProviderManager. Its sampling check gets the same raw
+  // fallbacks the summary would otherwise send, so none is dropped silently.
+  const claudePlan = isClaudePlanSelection(selection.connection)
+    ? { connection: selection.connection!, modelId: selection.modelId ?? effectiveModelId, settings: (selection.settings ?? null) as Record<string, unknown> | null,
+        sampling: params.choice.modelMode === 'preset' ? null : resolveAgentModelFallbacks({ preset: agentPreset, agent: params.agent }) ?? null }
+    : null
+  const model = plan || claudePlan ? null : (await ProviderManager.createForUser(params.userId)).getModel(effectiveModelId, {
     transport: selection.connection?.type,
     service: selection.connection?.service ?? null,
+    connectionId: selection.connection?.id ?? null,
     allowAutoFallback: false
   })
 
   return {
     plan,
+    claudePlan,
     connection: selection.connection,
     model,
     effectiveModelId,
-    provider:
+    provider: claudePlan ? CLAUDE_PLAN_SERVICE :
       resolvedIds?.developerId ??
       selection.provider ??
       selection.connection?.service ??
@@ -288,6 +300,74 @@ async function resolveSummaryModel(params: {
   }
 }
 
+/** The chat a Claude plan Compact belongs to: its run is that chat's, so the chat's delete or restore ends it. */
+export type ClaudePlanCompactOwner = { sessionId: string }
+
+/**
+ * SA-139 P4 (D11): plain Compact on the Claude plan. Central admission (consumer `compact`) comes
+ * first, so a refusal starts nothing; then one Claude Code run with no tools, in the Default Project
+ * Directory (Compact reads no project), ended once the summary is read. Claude Code takes no output
+ * limit or sampling, so none is sent; the summary budget is counted here, as on the ChatGPT plan.
+ * Other summary callers (memory graduation, naps) pass no Compact owner and are refused readably.
+ */
+async function generateClaudePlanSummary(params: {
+  userId: string
+  agent: AgentRecord
+  selection: { connection: ModelConnectionInfo; modelId: string; settings: Record<string, unknown> | null; sampling: Readonly<object> | null }
+  claudePlanCompact?: ClaudePlanCompactOwner
+  prompt: string
+  summaryHardMaxTokens: number
+  abortSignal: AbortSignal
+  limit: AbortController
+}): Promise<{ text: string }> {
+  if (!params.claudePlanCompact) {
+    throw new ClaudePlanError('consumer_unsupported', 'This summary feature cannot use the Claude plan. Choose a separate API-compatible summary preset. Nothing ran.')
+  }
+  const sampling = params.selection.sampling
+    ? Object.fromEntries(Object.entries(params.selection.sampling).filter(([, value]) => !(Array.isArray(value) && value.length === 0)))
+    : null
+  const [{ readClaudePlanReadiness }, runtime] = await Promise.all([import('./claudePlanReadiness'), import('./claudePlanModel')])
+  const admission = await admitClaudePlanSelection({
+    connection: params.selection.connection,
+    modelId: params.selection.modelId,
+    settings: params.selection.settings,
+    sampling,
+    consumer: 'compact',
+    readiness: () => readClaudePlanReadiness()
+  })
+  params.abortSignal.throwIfAborted()
+  const model = new runtime.ClaudePlanModel({
+    modelId: admission.modelId,
+    cliModel: admission.cliModel,
+    effort: admission.effort,
+    alwaysThinking: admission.alwaysThinking,
+    owner: { userId: params.userId, sessionId: params.claudePlanCompact.sessionId, agentId: typeof params.agent.id === 'string' ? params.agent.id : null, kind: 'primary' },
+    workingDirectory: await runtime.resolveClaudePlanWorkingDirectory({ userId: params.userId, projectPath: null })
+  })
+  try {
+    const streaming = streamText({ model, messages: [{ role: 'user', content: params.prompt }], abortSignal: params.abortSignal, maxRetries: 0, onError: () => {} })
+    let text = ''
+    for await (const part of streaming.stream) {
+      if (part.type === 'error') throw part.error
+      // BL-2368: Compact offers no tools, so any call (a misnamed one the run lets through) means the words
+      // so far are not a summary: nothing is compacted.
+      if (part.type === 'tool-input-start' || part.type === 'tool-call' || part.type === 'tool-error' || part.type === 'tool-result') {
+        throw new ClaudePlanError('summary_tool_call', 'Claude asked for a tool during Compact, which offers none, so nothing was compacted. Try Compact again.')
+      }
+      if (part.type === 'text-delta') {
+        text += part.text
+        if (estimateTokens(text) > params.summaryHardMaxTokens) {
+          params.limit.abort('summary_output_limit')
+          throw new ClaudePlanError('summary_output_limit', 'Claude exceeded the Compact summary budget. Nothing was compacted. Choose a larger summary budget or another summary preset.')
+        }
+      }
+    }
+    return { text }
+  } finally {
+    model.endReply()
+  }
+}
+
 async function generateApiSummary(params: {
   userId: string
   agent: AgentRecord
@@ -296,11 +376,12 @@ async function generateApiSummary(params: {
   summaryHardMaxTokens: number
   abortSignal?: AbortSignal
   retainPlanLease?: (lease: PlanLease) => void
+  claudePlanCompact?: ClaudePlanCompactOwner
 }): Promise<SummaryGenerationResult> {
   const summaryModel = await resolveSummaryModel({
     userId: params.userId,
     agent: params.agent,
-    choice: params.choice
+    choice: params.choice, abortSignal: params.abortSignal
   })
 
   // BL-622 (C6): the call ends at its limit, or when its caller stops it (a Compact's Stop).
@@ -312,7 +393,9 @@ async function generateApiSummary(params: {
     : limit.signal
   let result: { text: string }
   try {
-    if (summaryModel.plan) {
+    if (summaryModel.claudePlan) {
+      result = await generateClaudePlanSummary({ ...params, selection: summaryModel.claudePlan, abortSignal, limit })
+    } else if (summaryModel.plan) {
       // Only Compact's route accepts responsibility through its actual writes.
       // Shared memory/nap callers cannot silently acquire this grant.
       if (!params.retainPlanLease) throw new ChatgptPlanError('consumer_unsupported', 'This summary feature cannot use ChatGPT plan credentials. Choose a separate API-compatible summary preset.')
@@ -367,50 +450,11 @@ async function generateApiSummary(params: {
   }
 }
 
-function buildCliCompactWorkerPrompt(prompt: string) {
-  return [
-    'You are running as Batshit\'s hidden CLI compact worker. This is maintenance work for context continuity, not a normal visible assistant reply.',
-    'Return only the compact summary. Do not call tools, run shell commands, inspect files, use web search, ask follow-up questions, or mention these worker instructions.',
-    'Remember: manually unzipped zip items and active clips remain live in the next Primary Agent context, so mention them only when their existence or purpose matters.',
-    '',
-    prompt
-  ].join('\n')
-}
-
-async function generateCodexCliSummary(params: {
-  userId: string
-  agent: AgentRecord
-  prompt: string
-  abortSignal?: AbortSignal
-}): Promise<SummaryGenerationResult> {
-  const { CodexBridge } = await import('$lib/server/services/codexBridge')
-  const bridge = new CodexBridge()
-  const codexSettings = buildCodexRuntimeSettings(
-    params.agent.codex_settings ?? params.agent.provider_specific_settings ?? null
-  )
-  const result = await bridge.generateHiddenText({
-    prompt: buildCliCompactWorkerPrompt(params.prompt),
-    userId: params.userId,
-    agentId: params.agent.id,
-    model: params.agent.primary_model_name,
-    providerSettings: params.agent.provider_specific_settings ?? null,
-    codexSettings,
-    abortSignal: params.abortSignal
-  })
-
-  return {
-    summary: result.text,
-    modelLabel: result.modelLabel,
-    provider: 'openai-codex',
-    modelId: result.modelId
-  }
-}
-
 /**
- * Generate a summary through the explicit model choice. 'current' rides the agent's
- * own runtime where that is possible (API generation; the Codex CLI hidden-text
- * worker) and refuses loudly where it is not (Claude CLI, n8n) — the caller's UI
- * names the preset fix. Never a silent fallback.
+ * Generate a summary through the explicit model choice ('current' rides the agent's own API
+ * model, 'preset' a saved compact preset). SA-139 R4 (D14): a retired Primary Agent type
+ * (the Claude Code CLI lane, Codex CLI, n8n) is refused loudly in BOTH modes, before any
+ * model call. Never a silent fallback.
  */
 export async function generateModelSummary(params: {
   userId: string
@@ -419,34 +463,16 @@ export async function generateModelSummary(params: {
   prompt: string
   summaryHardMaxTokens: number
   /**
-   * A Compact's Stop ends its API or hidden Codex summary. API calls also end at
-   * `SUMMARY_CALL_LIMIT_MS`; the Codex worker retains its own independent 180 s limit.
+   * A Compact's Stop ends its API summary. API calls also end at `SUMMARY_CALL_LIMIT_MS`.
    */
   abortSignal?: AbortSignal
   /** Internal Compact owner, absent from shared memory/nap consumers. */
   retainPlanLease?: (lease: PlanLease) => void
+  /** The Claude plan's Compact owner (its chat), set only by the Compact route (SA-139 P4, D11). */
+  claudePlanCompact?: ClaudePlanCompactOwner
 }): Promise<SummaryGenerationResult> {
-  if (params.choice.modelMode === 'current') {
-    const runtime = resolveCurrentModelCompactRuntime(params.agent)
-    if (runtime === 'codex-cli') {
-      return generateCodexCliSummary({
-        userId: params.userId,
-        agent: params.agent,
-        prompt: params.prompt,
-        abortSignal: params.abortSignal
-      })
-    }
-    if (runtime === 'claude-cli') {
-      throw new Error(
-        'Current-model compacting for Claude CLI is not implemented yet. Choose an API-compatible saved compact model preset.'
-      )
-    }
-    if (runtime === 'n8n') {
-      throw new Error(
-        'Current-model compacting cannot run for a record that uses the retired n8n Primary Agent type. Delete that agent and create an API or CLI agent.'
-      )
-    }
-  }
+  const retired = retiredPrimaryAgentRefusal(params.agent)
+  if (retired) throw new Error(`${retired.error} ${retired.details}`)
 
   return generateApiSummary(params)
 }

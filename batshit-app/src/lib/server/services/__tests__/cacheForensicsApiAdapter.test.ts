@@ -41,6 +41,53 @@ describe('cacheForensics API adapter (P4)', () => {
   })
 
   describe('segmentProviderRequestBody', () => {
+    // History cache blocks (2026-10-21): direct Anthropic sends the compiled chat as one text
+    // block per history turn plus a tail block. Joined back, it segments exactly as one block.
+    it('segments a history split into blocks exactly as the one block it joins back to', () => {
+      const history = '<conversation>\n<user time="Mon">\nA\n</user>\n\n<assistant>\nB\n</assistant>'
+      const turn2 = '\n\n<user time="Mon">\nC\n</user>\n\n<assistant>\nD\n</assistant>'
+      const tail = '\n</conversation>\n\n<user time="Tue">\nE\n</user>\n\n<dynamic_info>\nx\n</dynamic_info>'
+      const whole = { model: 'm', system: [{ type: 'text', text: 'S' }], messages: [{ role: 'user', content: [{ type: 'text', text: history + turn2 + tail }] }] }
+      const split = {
+        model: 'm',
+        system: [{ type: 'text', text: 'S' }],
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: history },
+          { type: 'text', text: turn2, cache_control: { type: 'ephemeral' } },
+          { type: 'text', text: tail }
+        ] }]
+      }
+      const a = segmentProviderRequestBody(whole).segments
+      const b = segmentProviderRequestBody(split).segments
+      expect(b).toEqual(a)
+      // OpenRouter's first call also marks the tail block (BL-1976's step-start marker): same segments.
+      const tailMarked = structuredClone(split)
+      ;(tailMarked.messages[0].content[2] as Record<string, unknown>).cache_control = { type: 'ephemeral' }
+      expect(segmentProviderRequestBody(tailMarked).segments).toEqual(a)
+      expect(a.filter((segment) => segment.label.includes('history')).length).toBeGreaterThan(1)
+    })
+
+    // BL-1991: direct OpenAI (GPT-5.6+) sends the same parts as Responses `input_text`, the last two
+    // history parts carrying `prompt_cache_breakpoint`. Joined back, they segment as the one part.
+    it('segments an OpenAI Responses history split exactly as the one input_text it joins back to', () => {
+      const history = '<conversation>\n<user time="Mon">\nA\n</user>\n\n<assistant>\nB\n</assistant>'
+      const turn2 = '\n\n<user time="Mon">\nC\n</user>\n\n<assistant>\nD\n</assistant>'
+      const tail = '\n</conversation>\n\n<user time="Tue">\nE\n</user>\n\n<dynamic_info>\nx\n</dynamic_info>'
+      const developer = { role: 'developer', content: 'S' }
+      const whole = { model: 'gpt-6.1-sol', input: [developer, { role: 'user', content: [{ type: 'input_text', text: history + turn2 + tail }] }] }
+      const split = {
+        model: 'gpt-6.1-sol',
+        input: [developer, { role: 'user', content: [
+          { type: 'input_text', text: history, prompt_cache_breakpoint: { mode: 'explicit' } },
+          { type: 'input_text', text: turn2, prompt_cache_breakpoint: { mode: 'explicit' } },
+          { type: 'input_text', text: tail }
+        ] }]
+      }
+      const a = segmentProviderRequestBody(whole).segments
+      expect(segmentProviderRequestBody(split).segments).toEqual(a)
+      expect(a.filter((segment) => segment.label.includes('history')).length).toBeGreaterThan(1)
+    })
+
     it('expands arrays per element in wire order with name/role suffixes', () => {
       const { segments, parsed } = segmentProviderRequestBody(ANTHROPIC_BODY)
       expect(parsed).toBe(true)

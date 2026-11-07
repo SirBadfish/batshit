@@ -342,8 +342,12 @@ export function parseSemanticGlb(
   if (buffers.length !== 1) {
     fail(prefix, "GLB must contain exactly one embedded buffer");
   }
+  const embeddedBuffer = record(buffers[0], "gltf.buffers[0]", prefix);
+  if (Object.prototype.hasOwnProperty.call(embeddedBuffer, "uri")) {
+    fail(prefix, "GLB embedded buffer must not declare a URI");
+  }
   const declaredBinaryLength = integer(
-    record(buffers[0], "gltf.buffers[0]", prefix).byteLength,
+    embeddedBuffer.byteLength,
     "gltf.buffers[0].byteLength",
     prefix,
   );
@@ -447,6 +451,7 @@ function readComponent(
   normalized: boolean,
   context: string,
   prefix: string,
+  preserveSignedZero = false,
 ): number {
   const bytes = COMPONENT_BYTES[componentType];
   if (!bytes || offset < 0 || offset + bytes > view.byteLength) {
@@ -486,7 +491,8 @@ function readComponent(
         `${context} uses unsupported componentType ${componentType}`,
       );
   }
-  return finite(value, context, prefix);
+  const checked = finite(value, context, prefix);
+  return preserveSignedZero ? value : checked;
 }
 
 type SemanticGlbDataViewPlan = {
@@ -620,6 +626,7 @@ function readSemanticGlbDataViewRow(
   row: number,
   destination: Float64Array,
   binaryView: DataView,
+  preserveSignedZero = false,
 ): void {
   const prefix = parsed.diagnosticPrefix;
   if (!Number.isSafeInteger(row) || row < 0 || row >= plan.rows) {
@@ -637,6 +644,7 @@ function readSemanticGlbDataViewRow(
       plan.normalized,
       `${plan.context}[${row}][${component}]`,
       prefix,
+      preserveSignedZero,
     );
   }
 }
@@ -822,6 +830,7 @@ function visitSemanticGlbAccessorPlanRows(
   parsed: SemanticGlbDocument,
   plan: SemanticGlbAccessorPlan,
   visitor: SemanticGlbAccessorRowVisitor,
+  preserveSignedZero = false,
 ): void {
   const binaryView = new DataView(
     parsed.binary.buffer,
@@ -846,7 +855,7 @@ function visitSemanticGlbAccessorPlanRows(
   for (let row = 0; row < plan.count; row += 1) {
     rowValues.fill(0);
     if (plan.base !== null) {
-      readSemanticGlbDataViewRow(parsed, plan.base, row, rowValues, binaryView);
+      readSemanticGlbDataViewRow(parsed, plan.base, row, rowValues, binaryView, preserveSignedZero);
     }
     if (plan.sparse !== null && sparseIndex === row) {
       readSemanticGlbDataViewRow(
@@ -855,6 +864,7 @@ function visitSemanticGlbAccessorPlanRows(
         sparseRow,
         rowValues,
         binaryView,
+        preserveSignedZero,
       );
       sparseRow += 1;
       if (sparseRow < plan.sparse.count) {
@@ -917,21 +927,25 @@ export function visitSemanticGlbAccessorScalars(
   return accessorInfo(plan);
 }
 
+/** Semantic reads normalize signed zero by default. Immutable performance buffers
+ * opt in to preserving it; allocation, finite-value and sparse checks are shared. */
 export function decodeSemanticGlbAccessor(
   parsed: SemanticGlbDocument,
   accessorIndex: unknown,
+  options: { preserveSignedZero?: boolean } = {},
 ): SemanticGlbAccessor {
   const plan = planSemanticGlbAccessor(parsed, accessorIndex);
   const values = new Float64Array(plan.count * plan.components);
   visitSemanticGlbAccessorPlanRows(parsed, plan, (row, rowValues) => {
     values.set(rowValues, row * plan.components);
-  });
+  }, options.preserveSignedZero === true);
   for (let index = 0; index < values.length; index += 1) {
-    values[index] = finite(
+    const checked = finite(
       values[index],
       `${plan.context} value ${index}`,
       parsed.diagnosticPrefix,
     );
+    if (options.preserveSignedZero !== true) values[index] = checked;
   }
   return { ...accessorInfo(plan), values };
 }

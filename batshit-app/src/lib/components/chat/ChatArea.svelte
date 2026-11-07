@@ -6,12 +6,23 @@
   import SteerBubble from './SteerBubble.svelte'
   import HeldMessageReceipt from './HeldMessageReceipt.svelte'
   import { resolveHeldMessageReceipt } from '$lib/utils/heldForApproval'
+  import { resolveKeptSendReceipts } from '$lib/utils/keptSendReceipt'
   import * as steerInbox from '$lib/stores/steerInbox.svelte'
   import { onDestroy, onMount, tick } from 'svelte'
   import { zippingService } from '$lib/services/zipping'
   import { calculateAgentMessagesFromEndByIndex } from '$lib/utils/zipMessageAge'
   import { resolveWakeTurnsByIndex } from '$lib/utils/jevJuice'
   import { normalizeId } from '$lib/utils/idNormalizer'
+  import { page } from '$app/state'
+  import { untrack } from 'svelte'
+  import * as agentStore from '$lib/stores/agents.svelte'
+  import * as sessionStore from '$lib/stores/session.svelte'
+  import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+  import { resolveApiReasoningRetention } from '$lib/utils/reasoningRetention'
+  import { resolveBrokerToolToggles } from '$lib/utils/brokerAvailability'
+  import { onUserChannelEvent } from '$lib/services/userChannel'
+  import { createWhiteboardPanelController, emptyWhiteboardPanelState, fetchWhiteboardPanel, resolveWhiteboardAnchor } from '$lib/stores/whiteboardPanel'
+  import WhiteboardPanel from './WhiteboardPanel.svelte'
   
   let { 
     messages = [], 
@@ -31,7 +42,8 @@
     canResendDroppedSteer = null,
     sessionBusy = false,
     onSendHeldMessage = null,
-    onSendWaitingSendNow = null
+    onSendWaitingSendNow = null,
+    onSendKeptMessage = null
   } = $props<{ 
     messages: Message[],
     trimmedMessageIds?: string[],
@@ -55,6 +67,8 @@
     onSendHeldMessage?: ((messageId: string) => void) | null
     /** BL-713: Send now on a message that waits in the chat's line at an approval card. */
     onSendWaitingSendNow?: ((steerId: string) => void) | null
+    /** BL-903 (a): Send now on a kept send's receipt drawn from its record. */
+    onSendKeptMessage?: ((messageId: string) => void) | null
   }>()
   
   const BOTTOM_THRESHOLD_PX = 64
@@ -77,6 +91,34 @@
   // a flagged message started can say so. Display only.
   const wakeTurnByIndex = $derived(resolveWakeTurnsByIndex(messages))
 
+  // State belongs above individual messages: streaming/remounts and a same-owner reply carry it.
+  let whiteboardState = $state(emptyWhiteboardPanelState())
+  const whiteboardController = createWhiteboardPanelController({
+    read: fetchWhiteboardPanel,
+    changed: (state) => { whiteboardState = state }
+  })
+  const whiteboardAnchor = $derived(resolveWhiteboardAnchor(messages, sessionId))
+  const whiteboardAgent = $derived(whiteboardAnchor ? agentStore.getAgentById(whiteboardAnchor.agentId) : null)
+  const whiteboardSettings = $derived.by(() => {
+    if (!whiteboardAgent || normalizePrimaryAgentType(whiteboardAgent) !== 'api') return null
+    return resolveApiReasoningRetention(whiteboardAgent)
+  })
+  const isGroupChat = $derived(Boolean(sessionStore.getSessions().find((session) => session.id === sessionId)?.metadata?.group_chat))
+  $effect(() => {
+    const owner = sessionId && page.data.user?.id && whiteboardAnchor && whiteboardSettings && !isGroupChat
+      ? { userId: page.data.user.id, sessionId, agentId: whiteboardAnchor.agentId } : null
+    const target = owner && whiteboardAnchor ? {
+      owner, anchorMessageId: whiteboardAnchor.messageId,
+      // The board needs Batshit Tools, as the compiler's gate does (BL-1565): with them off the
+      // agent has no board, so no empty panel (SA-126 made Whiteboard the factory mode).
+      visible: Boolean(whiteboardSettings?.whiteboardEnabled && whiteboardSettings?.showWhiteboard &&
+        resolveBrokerToolToggles(whiteboardAgent?.provider_specific_settings).batshitToolsEnabled)
+    } : null
+    untrack(() => whiteboardController.setTarget(target))
+  })
+  onMount(() => onUserChannelEvent((event) => whiteboardController.handleEvent(event)))
+  onDestroy(() => whiteboardController.destroy())
+
   /**
    * SA-114 P3 (DL-114-14) — steers with nowhere to live yet.
    *
@@ -96,6 +138,21 @@
    * message; a send the chat's line kept at the same card may stand after it (BL-905).
    */
   const heldReceipt = $derived(resolveHeldMessageReceipt({ messages, busy: sessionBusy }))
+
+  /**
+   * BL-903 (a) — the "Not sent" receipt of a send the chat's line kept, from the message's own
+   * record (`metadata.keptSend`), so it survives a reload and shows in every tab. The tab that sent
+   * it already shows that receipt as the send's own bubble (with the words it was written with),
+   * so a message with a bubble here gets no second one, and one the user dismissed here stays gone.
+   */
+  const keptReceiptById = $derived.by(() => {
+    const byId: Record<string, ReturnType<typeof resolveKeptSendReceipts>[number]> = {}
+    for (const receipt of resolveKeptSendReceipts({ messages, busy: sessionBusy })) {
+      if (steerInbox.getSteer(receipt.messageId) || steerInbox.wasReceiptRetired(receipt.messageId)) continue
+      byId[receipt.messageId] = receipt
+    }
+    return byId
+  })
 
   // Update pinning service when session changes
   $effect(() => {
@@ -412,9 +469,12 @@
           thinkingSubject={thinkingSubjects?.[message.id]}
           planSubject={planSubjects?.[message.id]}
           {voiceSettings}
+          whiteboard={whiteboardState.visible && whiteboardState.anchorMessageId === message.id ? whiteboardPanel : undefined}
         />
         {#if heldReceipt && heldReceipt.messageId === message.id}
           <HeldMessageReceipt receipt={heldReceipt} onSendNow={onSendHeldMessage} />
+        {:else if keptReceiptById[message.id]}
+          <HeldMessageReceipt receipt={keptReceiptById[message.id]} onSendNow={onSendKeptMessage} />
         {/if}
       {/each}
       {#each pendingSteers as steer (steer.steerId)}
@@ -430,6 +490,10 @@
     {/if}
   </div>
 </div>
+
+{#snippet whiteboardPanel()}
+  <WhiteboardPanel state={whiteboardState} budgetTokens={whiteboardSettings?.whiteboardBudgetTokens ?? 0} onOpenChange={whiteboardController.setOpen} onRefresh={whiteboardController.refresh} />
+{/snippet}
 
 <style>
   .chat-scroll-region {

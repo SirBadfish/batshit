@@ -495,7 +495,7 @@
       <SettingsInfoMenu ariaLabel="About Local AI" contentClass="w-80">
         <p>
           Configure the local runtimes Batshit can call directly, keep their endpoints healthy, and
-          expose their local model lists to API agents.
+          expose their local model lists to your agents.
         </p>
       </SettingsInfoMenu>
     </div>

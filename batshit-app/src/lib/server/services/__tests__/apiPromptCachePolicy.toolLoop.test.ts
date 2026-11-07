@@ -63,7 +63,7 @@ describe('BL-77 tool-loop cache point (apiPromptCachePolicy)', () => {
       type: 'ephemeral',
     })
     expect(result.metadata.applied).toContain('anthropic.cacheControl')
-    expect(result.metadata.applied).toContain('anthropic.toolLoop.cacheControl.fromStep2')
+    expect(result.metadata.applied).toContain('anthropic.toolLoop.cacheControl.fromStep1')
   })
 
   it('does not move, copy, or reorder a single message to do it', () => {
@@ -101,7 +101,7 @@ describe('BL-77 tool-loop cache point (apiPromptCachePolicy)', () => {
       namespace: 'openrouter',
       cacheControl: { type: 'ephemeral' },
     })
-    expect(claude.metadata.applied).toContain('openrouter.toolLoop.cache_control.lastMessage.fromStep2')
+    expect(claude.metadata.applied).toContain('openrouter.toolLoop.cache_control.lastMessage.fromStep1')
     expect(other.stepProviderOptions).toBeUndefined()
     expect(other.toolLoopTailMarker).toBeUndefined()
   })
@@ -262,7 +262,7 @@ describe('BL-77 tool-loop cache point (apiPromptCachePolicy)', () => {
       expect(countExplicitCachePoints(result.messages, tools)).toBe(4)
       expect(result.stepProviderOptions).toBeUndefined()
       expect(result.metadata.omitted.map((entry) => entry.option)).toContain(
-        'anthropic.toolLoop.cacheControl.fromStep2',
+        'anthropic.toolLoop.cacheControl.fromStep1',
       )
     })
   })
@@ -435,9 +435,75 @@ describe('BL-185 placeToolLoopTailMarker (OpenRouter tail marker)', () => {
     expect(JSON.stringify(out[2].content)).not.toContain('cacheControl')
   })
 
-  it('never marks a compiled message, even when the loop has not added one yet', () => {
+  it('never marks a compiled message when it is not handed the step-start message', () => {
     const messages = compiled()
     expect(placeToolLoopTailMarker(messages, 2, marker)).toEqual(messages)
+  })
+
+  // BL-1976 (Josh, 2026-10-21): the tail point starts on the first call.
+  describe('BL-1976 the first step marks a copy of the step-start message; the next step puts it back', () => {
+    it('first step: the last compiled message carries the marker on a copy, and nothing else changes', () => {
+      const messages = compiled()
+      const stepStart = messages[1]
+      const out = placeToolLoopTailMarker(messages, 2, marker, stepStart)
+      // A string-content user message is marked at message level (the provider then sends it as a
+      // one-block array with the marker).
+      expect(out[1]).toEqual({ role: 'user', content: 'compiled chat', providerOptions: { openrouter: { cacheControl: { type: 'ephemeral' } } } })
+      expect(out[1]).not.toBe(stepStart)
+      expect(stepStart).toEqual({ role: 'user', content: 'compiled chat' })
+      // The system point is untouched.
+      expect(out[0]).toBe(messages[0])
+    })
+
+    it('a parts message is marked on its last part', () => {
+      const messages = [compiled()[0], { role: 'user', content: [{ type: 'text', text: 'a' }, { type: 'image', image: 'x' }] }] as any[]
+      const out = placeToolLoopTailMarker(messages, 2, marker, messages[1])
+      expect(out[1].content[0]).toBe(messages[1].content[0])
+      expect(out[1].content[1].providerOptions.openrouter.cacheControl).toEqual({ type: 'ephemeral' })
+    })
+
+    it('next step: the compiled original is back and the loop tail carries the one marker', () => {
+      const messages = compiled()
+      const stepStart = messages[1]
+      const first = placeToolLoopTailMarker(messages, 2, marker, stepStart)
+      const second = placeToolLoopTailMarker([...first, assistantCall(1), toolResults(1)], 2, marker, stepStart)
+      expect(second[1]).toBe(stepStart)
+      expect(second[3].content[0].providerOptions.openrouter.cacheControl).toEqual({ type: 'ephemeral' })
+      expect(JSON.stringify(second.slice(1, 3))).not.toContain('cacheControl')
+      expect(second[0]).toBe(messages[0])
+    })
+
+    it('a first step whose only loop message is a one-text user message still marks the step-start copy', () => {
+      const messages = [...compiled(), { role: 'user', content: [{ type: 'text', text: 'deferred note' }] }] as any[]
+      const out = placeToolLoopTailMarker(messages, 2, marker, messages[1])
+      expect(out[1].providerOptions.openrouter.cacheControl).toEqual({ type: 'ephemeral' })
+      expect(out[2]).toBe(messages[2])
+    })
+
+    it('a last compiled message that is a tool message is marked on its last part', () => {
+      const messages = [...compiled(), assistantCall(0), toolResults(0, 2)]
+      const out = placeToolLoopTailMarker(messages, 4, marker, messages[3])
+      expect(out[3].content.map((part: any) => part.providerOptions?.openrouter?.cacheControl ?? null)).toEqual([null, { type: 'ephemeral' }])
+      expect(out.slice(0, 3)).toEqual(messages.slice(0, 3))
+    })
+
+    it('a step-start message that already carries a cache marker, or a system message, is never marked or put back', () => {
+      const premarked = { role: 'user', content: [{ type: 'text', text: 'x', providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } } }] } as any
+      const withPremarked = [compiled()[0], premarked]
+      expect(placeToolLoopTailMarker(withPremarked, 2, marker, premarked)).toBe(withPremarked)
+      const later = placeToolLoopTailMarker([...withPremarked, toolResults(1)], 2, marker, premarked)
+      expect(later[1]).toBe(premarked)
+      const systemOnly = [compiled()[0]]
+      expect(placeToolLoopTailMarker(systemOnly, 1, marker, systemOnly[0])).toBe(systemOnly)
+    })
+
+    it('never mutates the step-start message or what it was given', () => {
+      const messages = compiled()
+      const before = JSON.stringify(messages)
+      const first = placeToolLoopTailMarker(messages, 2, marker, messages[1])
+      placeToolLoopTailMarker([...first, assistantCall(1), toolResults(1)], 2, marker, messages[1])
+      expect(JSON.stringify(messages)).toBe(before)
+    })
   })
 
   it('uses the lifetime it was given', () => {

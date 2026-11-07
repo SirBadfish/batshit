@@ -1,13 +1,12 @@
 import { redis } from '$lib/server/redis'
 
 /**
- * SA-129 DL-06 (BL-1484, Josh 2026-10-13): the zip control permission is parked behind the hidden
- * `zip_agent_control_experiment` key, and its two older keys are retired. Josh is the only user and
- * there is no compatibility to keep, so startup removes them for real, not only ignores them:
- * `global_zip_settings.zip_agent_control_enabled` and `global_zip_settings.zip_control_mode` on every
- * `user:{userId}:settings` record, and `zip_agent_control_enabled` and `zip_control_mode` on every
- * `agent:{id}` and `subagent:{id}` record (the Subagent zip form once wired the old control too).
- * Most stored `true` values came from BL-231's first-save bug, not a choice.
+ * SA-129 DL-06 (BL-1484, Josh 2026-10-13) and decision 7 (Josh 2026-10-23): agent zip control is
+ * retired, its last key `zip_agent_control_experiment` with it, after its two older keys. Josh is the
+ * only user and there is no compatibility to keep, so startup removes them for real, not only ignores
+ * them: each key under `global_zip_settings` on every `user:{userId}:settings` record, and each key on
+ * every `agent:{id}` and `subagent:{id}` record (the Subagent zip form once wired the old control too).
+ * Most stored `true` values of the older keys came from BL-231's first-save bug, not a choice.
  *
  * Each record is one atomic script of RedisJSON path deletes (never a whole-record write, so no
  * sibling field moves, and never node-redis `json.del(key, path)`, which can drop the whole document:
@@ -16,7 +15,7 @@ import { redis } from '$lib/server/redis'
  * on the next start. No new key, so backup and restore need nothing new.
  */
 
-const RETIRED_FIELDS = ['zip_agent_control_enabled', 'zip_control_mode'] as const
+const RETIRED_FIELDS = ['zip_agent_control_enabled', 'zip_control_mode', 'zip_agent_control_experiment'] as const
 
 const SETTINGS_PATHS = RETIRED_FIELDS.map((field) => `$.global_zip_settings.${field}`)
 const AGENT_PATHS = RETIRED_FIELDS.map((field) => `$.${field}`)

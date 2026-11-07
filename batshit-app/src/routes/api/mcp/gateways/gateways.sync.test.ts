@@ -20,11 +20,11 @@ const apiKeyService = {
   store: vi.fn()
 }
 
-const syncAgentCodexProfiles = vi.fn()
 const syncAgentClaudeProfiles = vi.fn()
 const writeDockerMcpProfileEnv = vi.fn()
 
-vi.mock('$lib/server/services/mcpGatewayService', () => ({
+vi.mock('$lib/server/services/mcpGatewayService', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$lib/server/services/mcpGatewayService')>()),
   mcpGatewayService
 }))
 
@@ -38,10 +38,6 @@ vi.mock('$lib/server/redis', () => ({
 
 vi.mock('$lib/services/apiKey.server', () => ({
   apiKeyService
-}))
-
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles
 }))
 
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
@@ -71,7 +67,6 @@ describe('/api/mcp/gateways profile sync hooks', () => {
       workflowDiscovery.discoverDirectMCPClients,
       redis.execute,
       apiKeyService.store,
-      syncAgentCodexProfiles,
       syncAgentClaudeProfiles,
       writeDockerMcpProfileEnv
     ]) mock.mockReset()
@@ -96,54 +91,8 @@ describe('/api/mcp/gateways profile sync hooks', () => {
     itemRoute = await import('./[id]/+server')
   })
 
-  it('POST syncs both Codex and Claude managed profiles', async () => {
-    const request = new Request('http://localhost/api/mcp/gateways', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        name: 'Gateway 1',
-        type: 'custom',
-        url: 'http://localhost:8080/mcp',
-        enabled: true
-      })
-    })
-
-    const response = await collectionRoute.POST({
-      request,
-      locals: { user: { id: 'josh' } }
-    } as any)
-
-    expect(response.status).toBe(201)
-    expect(syncAgentCodexProfiles).toHaveBeenCalledWith('josh')
-    expect(syncAgentClaudeProfiles).toHaveBeenCalledWith('josh')
-  })
-
-  it('PUT and DELETE sync both Codex and Claude managed profiles', async () => {
-    const putRequest = new Request('http://localhost/api/mcp/gateways/gw_1', {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ enabled: false })
-    })
-
-    const putResponse = await itemRoute.PUT({
-      request: putRequest,
-      locals: { user: { id: 'josh' } },
-      params: { id: 'gw_1' }
-    } as any)
-
-    expect(putResponse.status).toBe(200)
-    expect(syncAgentCodexProfiles).toHaveBeenCalledWith('josh')
-    expect(syncAgentClaudeProfiles).toHaveBeenCalledWith('josh')
-
-    const deleteResponse = await itemRoute.DELETE({
-      locals: { user: { id: 'josh' } },
-      params: { id: 'gw_1' }
-    } as any)
-
-    expect(deleteResponse.status).toBe(200)
-    expect(syncAgentCodexProfiles).toHaveBeenCalledTimes(2)
-    expect(syncAgentClaudeProfiles).toHaveBeenCalledTimes(2)
-  })
+  // SA-139 R4 removed the Primary profile sync after a gateway POST, PUT and DELETE, and the two
+  // cases that pinned it.
 
   it('clears stale Docker MCP tools when the selected profile changes', async () => {
     const firstRead = {
@@ -165,16 +114,22 @@ describe('/api/mcp/gateways profile sync hooks', () => {
     mcpGatewayService.get
       .mockResolvedValueOnce(firstRead)
       .mockImplementation(async () => structuredClone(stored))
-    mcpGatewayService.update.mockImplementation(async (_userId, _id, change) => {
+    const { assertHumanGatewaySource, humanGatewaySourceRevision } = await import('$lib/server/services/mcpGatewayService')
+    const { captureSettingsLifecycle } = await import('$lib/server/services/appActions/settings/lifecycle')
+    const expectedGatewaySource = humanGatewaySourceRevision('josh', stored)
+    mcpGatewayService.update.mockImplementation(async (_userId, _id, change, _options, human) => {
+      assertHumanGatewaySource(_userId, stored, human.expectedGatewaySource,
+        captureSettingsLifecycle([`mcp_gateways:${_userId}`]))
       const fields = typeof change === 'function' ? change(structuredClone(stored)) : change
       stored = { ...stored, ...fields }
+      human.onSaved({ gateway: structuredClone(stored), sourceRevision: humanGatewaySourceRevision(_userId, stored) })
       return structuredClone(stored)
     })
 
     const putRequest = new Request('http://localhost/api/mcp/gateways/gw_1', {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ metadata: { dockerProfile: 'batshit' } })
+      body: JSON.stringify({ expectedGatewaySource, metadata: { dockerProfile: 'batshit' } })
     })
 
     const response = await itemRoute.PUT({
@@ -195,7 +150,6 @@ describe('/api/mcp/gateways profile sync hooks', () => {
       lastDiscovery: 0,
       metadata: { dockerProfile: 'batshit', serverNote: 'newer stored note' }
     })
-    expect(syncAgentCodexProfiles).toHaveBeenCalledWith('josh')
-    expect(syncAgentClaudeProfiles).toHaveBeenCalledWith('josh')
+    expect(syncAgentClaudeProfiles).not.toHaveBeenCalled()
   })
 })

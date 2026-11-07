@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte'
+  import { onDestroy, onMount, untrack } from 'svelte'
   import { Button } from '$lib/components/ui/button'
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
   import { Slider } from '$lib/components/ui/slider'
@@ -41,6 +41,12 @@
     filterGoonAnimationFilesForLane,
     resolveGoonAnimationName
   } from '$lib/goons/animationLoadPlan'
+  import {
+    captureGoonCompatibilityBasis, collectGoonCompatibilityMotionFiles, compatibilityModelBasis,
+    isValidGoonMotionSources, isValidMotionFileRef,
+    type GoonCompatibilityBasis
+  } from '$lib/goons/goonCompatibilityBasis'
+  import { canonicalRecipeString } from '$lib/goons/recipe/recipeCanonical'
   import {
     hasRenderableGoonAvatar,
     resolveGoonEyeContactMode,
@@ -92,10 +98,12 @@
   } from '$lib/goons/mountedLiveGoon'
   import { voiceService } from '$lib/services/voice'
   import { updateGoon as updateGoonRecord } from '$lib/services/goons'
-  import { getGoons } from '$lib/stores/goons.svelte'
+  import { getGoons, getGoonsReadState, getGoonsMotionSourceRevision } from '$lib/stores/goons.svelte'
+  import { getGoonAnimationLibraryReadState } from '$lib/stores/goonAnimationLibrary.svelte'
   import {
     getUserSettings,
     getUserSettingsReadState,
+    getUserSettingsReadError,
     confirmUserSettings as setUserSettings,
     failUserSettingsRead
   } from '$lib/stores/userSettings.svelte'
@@ -162,7 +170,7 @@
     onDesktopModeChange = () => {},
     onQualityChange = (_value: GoonEngineQuality) => {},
     onLipSyncChange = (_value: boolean) => {},
-    onCompatibilityReport = (_report: GoonCompatibilityReport) => {},
+    onCompatibilityReport = (_report: GoonCompatibilityReport, _basis: GoonCompatibilityBasis, _current: () => boolean) => {},
     onCameraChange = (_camera: GoonCamera) => {},
     onHandoffMountedStateConsumed = (_state: GoonMountedRuntimeState) => {}
   } = $props<{
@@ -188,12 +196,39 @@
     onDesktopModeChange?: () => void
     onQualityChange?: (value: GoonEngineQuality) => void
     onLipSyncChange?: (value: boolean) => void
-    onCompatibilityReport?: (report: GoonCompatibilityReport) => void
+    onCompatibilityReport?: (report: GoonCompatibilityReport, basis: GoonCompatibilityBasis, current: () => boolean) => void
     onCameraChange?: (camera: GoonCamera) => void
     onHandoffMountedStateConsumed?: (state: GoonMountedRuntimeState) => void
   }>()
 
   const goons = $derived(getGoons())
+  const invalidMotionSources = $derived.by(() =>
+    goons.some((entry) => !isValidGoonMotionSources(entry)) ||
+    (Array.isArray(sharedAnimations) && sharedAnimations.some((file) => !isValidMotionFileRef(file)))
+  )
+  const compatibilityModelKey = $derived.by(() => {
+    if (!goon) return null
+    try { return canonicalRecipeString(compatibilityModelBasis(goon)) } catch { return null }
+  })
+  const compatibilityPlanInputsKey = $derived.by(() => JSON.stringify([
+    goon?.defaults?.baseLoop ?? null, goon?.cues ?? null,
+    goonsSettings?.kitchen?.cues ?? null, goonsSettings?.kitchen?.emojiMap ?? null
+  ]))
+  const currentCompatibilityBasis = $derived.by(() => {
+    compatibilityModelKey
+    compatibilityPlanInputsKey
+    getGoonsMotionSourceRevision()
+    const target = untrack(() => goon)
+    if (!target) return null
+    const sourceGoons = untrack(() => getGoons())
+    const shared = Array.isArray(sharedAnimations) ? sharedAnimations : []
+    try {
+      const files = collectGoonCompatibilityMotionFiles(sourceGoons, shared)
+      const plan = buildMountedLiveGoonAnimationPlan(target, files, goonsSettings)
+      return captureGoonCompatibilityBasis(target, sourceGoons, shared, plan)
+    } catch { return null }
+  })
+  const currentCompatibilityKey = $derived.by(() => currentCompatibilityBasis ? canonicalRecipeString(currentCompatibilityBasis) : null)
   const readyGoons = $derived.by(() => goons.filter(isGoonRuntimeReady))
   const dockAgent = $derived.by(() =>
     activeSpeakerId ? agentStore.getAgentById(activeSpeakerId) : agentStore.getCurrentAgent()
@@ -217,6 +252,18 @@
   let animationSignature = $state('')
   let swapActive = $state(false)
   let swapToken = 0
+  type CompatibilityEngineOwner = {
+    engine: GoonEngine | null
+    activationKey: string
+    token: number
+    basis: GoonCompatibilityBasis | null
+    basisKey: string | null
+    pending: GoonCompatibilityReport | null
+    accepted: boolean
+    inputEpoch: number
+    current: () => boolean
+  }
+  let compatibilityEngineOwner = $state.raw<CompatibilityEngineOwner | null>(null)
   let handoffMountedStateInFlight: GoonMountedRuntimeState | null = null
   let consumedHandoffMountedState: GoonMountedRuntimeState | null = null
   let isDocumentHidden = $state(false)
@@ -402,6 +449,7 @@
   let lastBaseLoopSignature = ''
   let lastSceneSignature = ''
   let lastClosetSignature = ''
+  let closetRuntimeRequest = 0
   let lastAppearanceDialsSignature = ''
   let lastFacialArtworkSignature = ''
   let lastEyeAppearanceSignature = ''
@@ -478,6 +526,7 @@
     if (!mountedRendererReadyForDesktop) return null
     const mountedState = captureMountedRuntimeState()
     swapToken += 1
+    compatibilityEngineOwner = null
     liveActivationGate = new GoonLiveActivationGate()
     handoffMountedStateInFlight = null
     failedLiveActivationKey = ''
@@ -614,24 +663,51 @@
   }
 
   function collectDockAnimationFiles() {
-    const files: GoonFileRef[] = []
-    const seen = new Set<string>()
-    const addFile = (file?: GoonFileRef | null) => {
-      if (!file) return
-      const key = file.url || file.filename
-      if (!key || seen.has(key)) return
-      seen.add(key)
-      files.push(file)
+    return collectGoonCompatibilityMotionFiles(
+      goons,
+      Array.isArray(sharedAnimations) ? sharedAnimations : []
+    )
+  }
+
+  function captureDockCompatibilityBasis(target: GoonRecord, plan = buildAnimationLoadPlan(target)) {
+    try {
+      return captureGoonCompatibilityBasis(target, goons,
+        Array.isArray(sharedAnimations) ? sharedAnimations : [], plan)
+    } catch {
+      return null
     }
-    for (const file of Array.isArray(sharedAnimations) ? sharedAnimations : []) {
-      addFile(file)
-    }
-    for (const entry of goons) {
-      for (const file of Array.isArray(entry.files?.animations) ? entry.files?.animations ?? [] : []) {
-        addFile(file)
-      }
-    }
-    return files
+  }
+
+  function compatibilityInputsConfirmed() {
+    const goonRead = getGoonsReadState()
+    const motionRead = getGoonAnimationLibraryReadState()
+    return Boolean(goon && goonRead.owner === goon.user_id && motionRead.owner === goon.user_id) &&
+      goonRead.confirmed && !goonRead.loading && !goonRead.error &&
+      motionRead.confirmed && !motionRead.loading && !motionRead.error &&
+      getUserSettingsReadState() === 'confirmed' && !getUserSettingsReadError()
+  }
+
+  function isCurrentCompatibilityOwner(owner: CompatibilityEngineOwner) {
+    if (!owner.basis || owner.token !== swapToken || !goon ||
+      resolveGoonLiveActivationKey(goon) !== owner.activationKey) return false
+    return Boolean(currentCompatibilityKey && currentCompatibilityKey === owner.basisKey)
+  }
+
+  function setCompatibilityOwnerBasis(owner: CompatibilityEngineOwner, basis: GoonCompatibilityBasis | null) {
+    owner.basis = basis
+    owner.basisKey = basis ? canonicalRecipeString(basis) : null
+    owner.pending = null
+    const epoch = ++owner.inputEpoch
+    owner.current = () => owner.inputEpoch === epoch && owner.accepted && owner.engine === engine &&
+      isCurrentCompatibilityOwner(owner) && compatibilityInputsConfirmed()
+  }
+
+  function publishCompatibilityIfCurrent(owner: CompatibilityEngineOwner) {
+    if (!owner.pending || !owner.accepted || owner.engine !== engine ||
+      !isCurrentCompatibilityOwner(owner) || !compatibilityInputsConfirmed()) return
+    const report = owner.pending
+    owner.pending = null
+    onCompatibilityReport(report, owner.basis!, owner.current)
   }
 
   function normalizeDockMotionTags(tags: string[] = []) {
@@ -1079,10 +1155,11 @@
     return buildMountedLiveGoonClosetSignature(targetGoon, goonsSettings)
   }
 
-  async function applyClosetAssignments(targetEngine: GoonEngine, targetGoon: GoonRecord) {
+  async function applyClosetAssignments(targetEngine: GoonEngine, targetGoon: GoonRecord, isCurrent: () => boolean) {
     await applyMountedLiveGoonClosetAssignments(targetEngine, {
       goon: targetGoon,
-      goonsSettings: goonsSettings ?? null
+      goonsSettings: goonsSettings ?? null,
+      isCurrent
     })
   }
 
@@ -1093,6 +1170,10 @@
     if (!hasRenderableGoonAvatar(nextGoon)) return
     const activationKey = activation.key
     const token = ++swapToken
+    const compatibilityOwner: CompatibilityEngineOwner = {
+      engine: null, activationKey, token, basis: null, basisKey: null, pending: null, accepted: false,
+      inputEpoch: 0, current: () => false
+    }
     const replacingSameGoon = currentGoonId === nextGoon.id && Boolean(engine)
     const claimedHandoffMountedState = claimHandoffMountedState()
     const mountedState =
@@ -1145,10 +1226,15 @@
         eyeContactMode: resolveGoonEyeContactMode(nextGoon, goonsSettings),
         eyeContactTuning: resolveGoonEyeContactTuning(nextGoon, goonsSettings),
         onRuntimeStatus: (status) => handleRuntimeStatus(status),
-        onCompatibility: (report) => onCompatibilityReport(report),
+        onCompatibility: (report) => {
+          if (!isCurrentCompatibilityOwner(compatibilityOwner)) return
+          compatibilityOwner.pending = report
+          publishCompatibilityIfCurrent(compatibilityOwner)
+        },
         onPerformance: (stats) => handlePerformance(stats),
         onCameraChange: (camera) => handleDockCameraChange(camera)
       })
+      compatibilityOwner.engine = incomingEngine
       loadingEngines.add(incomingEngine)
     } catch (error) {
       runtimeError = toGoonRuntimeError(error)
@@ -1180,6 +1266,7 @@
         initialFov: viewFov,
         mountedState
       })
+      setCompatibilityOwnerBasis(compatibilityOwner, captureDockCompatibilityBasis(nextGoon, loadPlan.animationPlan))
       const loadResult = await loadMountedLiveGoon(incomingEngine, loadPlan)
       if (loadResult.status === 'cancelled') {
         disposeLoadingEngine(incomingEngine)
@@ -1237,9 +1324,12 @@
     loadingEngines.delete(incomingEngine)
     swapEngine = engine
     engine = incomingEngine
+    compatibilityOwner.accepted = true
+    compatibilityEngineOwner = compatibilityOwner
     activeSlot = incomingSlot
     swapReady = true
     currentGoonId = nextGoon.id
+    publishCompatibilityIfCurrent(compatibilityOwner)
     lastSceneSignature = incomingSceneSignature
     lastBaseLoopSignature = incomingBaseLoopSignature
     animationSignature = incomingAnimationSignature
@@ -2078,7 +2168,8 @@
       eyeContactMode: currentEyeContactMode,
       eyeContactTuning: currentEyeContactTuning,
       onRuntimeStatus: (status) => handleRuntimeStatus(status),
-      onCompatibility: (report) => onCompatibilityReport(report),
+      // This initial renderer has no mounted Goon. An accepted activation owns reports.
+      onCompatibility: () => {},
       onPerformance: (stats) => handlePerformance(stats),
       onCameraChange: (camera) => handleDockCameraChange(camera)
     })
@@ -2124,6 +2215,7 @@
 
   onDestroy(() => {
     swapToken += 1
+    compatibilityEngineOwner = null
     clearCueTimers()
     clearVoicePauseCueTimer()
     clearDockPreviewTimer()
@@ -2337,12 +2429,27 @@
     if (!engine) return
     const plan = buildAnimationLoadPlan(goon)
     const signature = buildAnimationSignature(plan)
-    if (signature === animationSignature) return
+    const owner = compatibilityEngineOwner
+    if (signature === animationSignature) {
+      if (owner) publishCompatibilityIfCurrent(owner)
+      return
+    }
     animationSignature = signature
-    void engine.syncAnimations(plan.eager, { deferredFiles: plan.deferred }).then(() => {
-      if (!engine) return
-      dockAnimationCatalog = engine.getAnimationCatalog()
+    const targetEngine = engine
+    if (owner?.engine === targetEngine && goon && owner.token === swapToken &&
+      resolveGoonLiveActivationKey(goon) === owner.activationKey) {
+      setCompatibilityOwnerBasis(owner, captureDockCompatibilityBasis(goon, plan))
+    }
+    void targetEngine.syncAnimations(plan.eager, { deferredFiles: plan.deferred }).then(() => {
+      if (engine !== targetEngine) return
+      dockAnimationCatalog = targetEngine.getAnimationCatalog()
     })
+  })
+
+  $effect(() => {
+    const confirmed = compatibilityInputsConfirmed()
+    const owner = compatibilityEngineOwner
+    if (confirmed && owner) publishCompatibilityIfCurrent(owner)
   })
 
   $effect(() => {
@@ -2379,8 +2486,11 @@
     const signature = buildClosetRuntimeSignature(goon)
     if (signature === lastClosetSignature) return
     lastClosetSignature = signature
-    engine.resetMaterialOverrides()
-    void applyClosetAssignments(engine, goon)
+    const targetEngine = engine, targetGoon = goon, request = ++closetRuntimeRequest
+    const isCurrent = () => engine === targetEngine && goon != null && goon.id === targetGoon.id &&
+      resolveGoonKind(goon) !== 'custom' && closetRuntimeRequest === request
+    targetEngine.resetMaterialOverrides()
+    void applyClosetAssignments(targetEngine, targetGoon, isCurrent)
   })
 
   // Legacy/non-Recipe authoring packages remain live-editable. Durable Recipe
@@ -2558,9 +2668,13 @@
             </span>
           </div>
         {/if}
-        {#if goon && resolveRuntimeBadge(runtimeStatus)}
-          <div class="goon-dock-runtime-badge">
-            {resolveRuntimeBadge(runtimeStatus)}
+        {#if goon && (resolveRuntimeBadge(runtimeStatus) || invalidMotionSources)}
+          <div class="goon-dock-runtime-badge" role="status">
+            {#if resolveRuntimeBadge(runtimeStatus)}{resolveRuntimeBadge(runtimeStatus)}{/if}
+            {#if invalidMotionSources}
+              {#if resolveRuntimeBadge(runtimeStatus)} · {/if}
+              <span title="Some saved Motion details could not be confirmed. The Goon remains available; check its Motions in Settings.">Motion data unverified</span>
+            {/if}
           </div>
         {/if}
         {#if showLipSyncLab && goon}

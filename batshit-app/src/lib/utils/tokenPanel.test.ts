@@ -1,12 +1,11 @@
 import { describe, expect, it } from 'vitest'
+import { normalizeId } from '$lib/utils/idNormalizer'
 
 import type { Agent } from '$lib/stores/agents.svelte'
 import type { Message } from '$lib/stores/messages.svelte'
 import type { SavedModel } from '$lib/types/savedModels'
 import type { ExecutionSnapshot } from '$lib/types/executionViewer'
-import { cliContextSettingsKey, reportForCliSnapshot } from '$lib/utils/cliContextWindow'
 import {
-  CLI_WRAPPER_OVERHEAD_TOKENS,
   applyManualTrimToMessages,
   calculateTrimmedTokens,
   extendTrimmedMessageIds,
@@ -22,6 +21,7 @@ import {
   generateReferenceScanTexts,
   idRunsAfter
 } from '$lib/test-utils/referenceScanTexts'
+import { scanClipReferences, scanZipReferences } from '$lib/utils/zipReferenceSafety'
 
 describe('ChatGPT plan cost identity', () => {
   it('keeps plan monetary cost unknown even when an imported preset carries paid prices', () => {
@@ -34,6 +34,33 @@ describe('ChatGPT plan cost identity', () => {
     const snapshot = { ...buildSnapshot(), delegated: { runs: [{ id: 'plan-delegate', provider: 'chatgpt-plan', model: buildModel().modelId, type: 'api', usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 } }] } } as unknown as ExecutionSnapshot
     const summary = summarizeRunningCost([snapshot], buildModel(), buildAgent(), [buildModel()])
     expect(summary.delegatedTokens).toBe(25); expect(summary.delegatedCost).toBeNull(); expect(summary.delegatedCostUnknownRuns).toBe(1)
+  })
+})
+
+describe('Claude plan cost identity (SA-139 D12)', () => {
+  it('never prices a Claude plan reply as paid Anthropic tokens, even with a paid price on an imported preset', () => {
+    const plan = { ...buildModel(), provider: 'anthropic', modelId: 'claude-opus-5-5', connection: { id: 'claude-plan:local', type: 'direct', service: 'claude-plan' } } as SavedModel
+    const summary = summarizeRunningCost([buildSnapshot()], plan, buildAgent())
+    expect(summary.cost).toBeNull(); expect(summary.state).toBe('unknown')
+    expect(summary.note).toContain('https://claude.ai/settings/usage')
+  })
+  it('counts delegated Claude plan tokens with unknown cost, never zero', () => {
+    const snapshot = { ...buildSnapshot(), delegated: { runs: [{ id: 'plan-delegate', provider: 'claude-plan', model: buildModel().modelId, type: 'api', usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 } },
+      { id: 'plan-unknown', provider: 'claude-plan', model: buildModel().modelId, type: 'api', usage: {} }] } } as unknown as ExecutionSnapshot
+    const summary = summarizeRunningCost([snapshot], buildModel(), buildAgent(), [buildModel()])
+    expect(summary.delegatedTokens).toBe(25); expect(summary.delegatedCost).toBeNull(); expect(summary.delegatedCostUnknownRuns).toBe(2)
+    expect(summary.delegatedUsageUnknownRuns).toBe(1)
+  })
+  it('never prices a delegated run with a paid preset when its provider or its matched preset is the Claude plan', () => {
+    const paid = { ...buildModel(), id: 'paid-opus', provider: 'anthropic', modelId: 'claude-opus-5-5', connection: { id: 'direct:anthropic', type: 'direct', service: 'anthropic' } } as SavedModel
+    const plan = { ...paid, id: 'plan-opus', connection: { id: 'claude-plan:local', type: 'direct', service: 'claude-plan' }, pricing: {} } as SavedModel
+    const run = (provider: string) => ({ id: `run-${provider}`, provider, model: 'claude-opus-5-5', type: 'api', usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 } })
+    const spelled = { ...buildSnapshot(), delegated: { runs: [run('claude-plan:local'), run('direct:claude-plan')] } } as unknown as ExecutionSnapshot
+    const viaPreset = { ...buildSnapshot(), delegated: { runs: [run('claude-plan')] } } as unknown as ExecutionSnapshot
+    expect(summarizeRunningCost([spelled], buildModel(), buildAgent(), [paid])).toMatchObject({ delegatedCost: null, delegatedCostUnknownRuns: 2, delegatedTokens: 50 })
+    expect(summarizeRunningCost([viaPreset], buildModel(), buildAgent(), [plan, paid])).toMatchObject({ delegatedCost: null, delegatedCostUnknownRuns: 1 })
+    const matchedPlan = { ...buildSnapshot(), delegated: { runs: [run('anthropic')] } } as unknown as ExecutionSnapshot
+    expect(summarizeRunningCost([matchedPlan], buildModel(), buildAgent(), [plan])).toMatchObject({ delegatedCost: null, delegatedCostUnknownRuns: 1 })
   })
 })
 
@@ -334,8 +361,8 @@ describe('tokenPanel utilities', () => {
             runs: [
               {
                 kind: 'subagent',
-                name: 'Workflow Helper',
-                type: 'n8n-workflow',
+                name: 'Local Helper',
+                type: 'cli',
                 model: null,
                 provider: null,
                 usage: null,
@@ -734,162 +761,9 @@ describe('tokenPanel utilities', () => {
     expect(summary.contextPercent).toBeLessThan(1)
   })
 
-  it('adds the CLI wrapper reserve only to pre-send estimates', () => {
-    const model = buildModel()
-    const agent: Agent = {
-      ...buildAgent(),
-      agentType: 'cli',
-      primary_model_provider: 'openai',
-      primary_model_name: 'gpt-5.3-codex',
-      primary_model_connection: {
-        type: 'direct',
-        service: 'codex'
-      }
-    }
-    const messages = [buildMessage('m1', 'A'.repeat(4000))]
-    const visibleOnlySummary = summarizeContextUsage({
-      messages,
-      snapshots: [],
-      activeModel: model,
-      agent
-    })
-
-    expect(visibleOnlySummary.state).toBe('estimated')
-    expect(visibleOnlySummary.displayTokens).toBe(
-      visibleOnlySummary.visibleEstimateTokens + CLI_WRAPPER_OVERHEAD_TOKENS
-    )
-  })
-
-  it('uses a CLI choice window and only the matching model runtime report', () => {
-    const model: SavedModel = {
-      ...buildModel(), contextWindow: undefined, provider: 'anthropic-claude-cli',
-      connection: { id: 'claude-cli', type: 'direct', service: 'anthropic-claude-cli', useDeveloperPrefix: false }
-    }
-    const agent = {
-      ...buildAgent(), agentType: 'cli', claude_settings: { permissionMode: 'default', model: 'sonnet[1m]' },
-      primary_model_provider: 'anthropic-claude-cli',
-      primary_model_connection: { type: 'direct', service: 'anthropic-claude-cli' }
-    } as Agent
-    const snapshot = buildSnapshot({
-      runtime: {
-        runtimeId: 'claude', providerId: 'anthropic-claude-cli', connectionId: 'claude-cli',
-        modelName: 'sonnet[1m]', metadata: { cliContextWindow: reportForCliSnapshot({
-          runtime: 'claude', model: 'sonnet[1m]', actualModel: 'claude-sonnet-5',
-          contextWindow: 900_000, evidence: 'runtime'
-        }, agent, model.contextWindow) }
-      }
-    })
-    const base = { messages: [buildMessage('m1', 'hello')], activeModel: model, agent }
-    expect(summarizeContextUsage({ ...base, snapshots: [] }).contextLimit).toBe(1_000_000)
-    expect(summarizeContextUsage({ ...base, snapshots: [snapshot] }).contextLimit).toBe(900_000)
-    const reloadedSnapshot = JSON.parse(JSON.stringify(snapshot)) as ExecutionSnapshot
-    expect(summarizeContextUsage({ ...base, snapshots: [reloadedSnapshot] }).contextLimit).toBe(900_000)
-    const changedAgent = { ...agent, claude_settings: { permissionMode: 'default', model: 'opus' } } as Agent
-    expect(summarizeContextUsage({ ...base, agent: changedAgent, snapshots: [snapshot] }).contextLimit).toBe(1_000_000)
-    const newerUnknown = buildSnapshot({
-      id: 'snap-2', createdAt: '2026-03-28T00:00:00.000Z',
-      runtime: {
-        runtimeId: 'claude', providerId: 'anthropic-claude-cli', connectionId: 'claude-cli',
-        modelName: 'sonnet[1m]', metadata: { cliContextWindow: {
-          runtime: 'claude', model: 'sonnet[1m]', actualModel: 'unlisted-new-model',
-          contextWindow: null, evidence: 'unresolved',
-          settingsKey: cliContextSettingsKey('claude', agent, model.contextWindow)
-        } }
-      }
-    })
-    expect(summarizeContextUsage({ ...base, snapshots: [snapshot, newerUnknown] }).contextLimit).toBeNull()
-    expect(summarizeContextUsage({ ...base, snapshots: [snapshot, newerUnknown], liveContextLimit: 200_000 }).contextLimit)
-      .toBeNull()
-  })
-
-  it('honors the server environment cap before any live preview and refuses a differently capped report', () => {
-    const model: SavedModel = { ...buildModel(), contextWindow: undefined, provider: 'anthropic-claude-cli',
-      connection: { id: 'claude-cli', type: 'direct', service: 'anthropic-claude-cli', useDeveloperPrefix: false } }
-    const agent = { ...buildAgent(), agentType: 'cli', claude_settings: { permissionMode: 'default', model: 'sonnet' },
-      primary_model_provider: 'anthropic-claude-cli', primary_model_connection: { type: 'direct', service: 'anthropic-claude-cli' }
-    } as Agent
-    const snapshot = buildSnapshot({ runtime: { runtimeId: 'claude', metadata: { cliContextWindow: reportForCliSnapshot({
-      runtime: 'claude', model: 'sonnet', actualModel: 'claude-sonnet-5', contextWindow: 1_000_000,
-      evidence: 'runtime', disableClaude1M: false
-    }, agent, model.contextWindow) } } })
-    const base = { messages: [buildMessage('m1', 'hello')], activeModel: model, agent,
-      claudeContextEnvironment: { disable1M: true, externalRoute: false } }
-    expect(summarizeContextUsage({ ...base, snapshots: [] }).contextLimit).toBe(200_000)
-    expect(summarizeContextUsage({ ...base, snapshots: [snapshot] }).contextLimit).toBe(200_000)
-    expect(summarizeContextUsage({ ...base, snapshots: [snapshot],
-      claudeContextEnvironment: { disable1M: false, externalRoute: false } }).contextLimit).toBe(1_000_000)
-  })
-
-  it('keeps a failed send-time window lookup unknown until newer credible evidence', () => {
-    const model: SavedModel = {
-      ...buildModel(), contextWindow: undefined, provider: 'anthropic-claude-cli',
-      connection: { id: 'claude-cli', type: 'direct', service: 'anthropic-claude-cli', useDeveloperPrefix: false }
-    }
-    const agent = { ...buildAgent(), agentType: 'cli',
-      claude_settings: { permissionMode: 'default', model: 'sonnet' },
-      primary_model_provider: 'anthropic-claude-cli',
-      primary_model_connection: { type: 'direct', service: 'anthropic-claude-cli' }
-    } as Agent
-    const warning = 'Could not read the saved CLI context limit. The context limit is unknown for this send.'
-    const snapshot = buildSnapshot({
-      runtime: { runtimeId: 'claude' },
-      executionMetadata: { promptBudget: {
-        contextLimit: null, contextWindowWarning: warning, contextWindowCheckedAt: 100,
-        contextWindowSettingsKey: cliContextSettingsKey('claude', agent, model.contextWindow)
-      } }
-    })
-    const base = { messages: [buildMessage('m1', 'hello')], snapshots: [snapshot], activeModel: model, agent }
-    const summary = summarizeContextUsage(base)
-    expect(summary.contextLimit).toBeNull()
-    expect(summary.contextPercent).toBeNull()
-    expect(summary.displayTokens).toBeGreaterThan(0)
-    expect(summary.detail).toContain(warning)
-    expect(summarizeContextUsage({ ...base, liveContextLimit: 1_000_000, liveContextCheckedAt: 99 }).contextLimit).toBeNull()
-    const refreshed = summarizeContextUsage({ ...base, liveContextLimit: 1_000_000, liveContextCheckedAt: 101 })
-    expect(refreshed.contextLimit).toBe(1_000_000)
-    expect(refreshed.detail).not.toContain(warning)
-    const changed = { ...agent, claude_settings: { permissionMode: 'default', model: 'opus' } } as Agent
-    expect(summarizeContextUsage({ ...base, agent: changed }).detail).not.toContain(warning)
-    expect(summarizeContextUsage({ ...base, snapshots: [], liveContextWindowWarning: warning }).contextLimit).toBeNull()
-    const runtimeReport = reportForCliSnapshot({
-      runtime: 'claude', model: 'sonnet', actualModel: 'claude-sonnet-5',
-      contextWindow: 900_000, evidence: 'runtime', reportedAt: 200
-    }, agent, model.contextWindow)
-    const completed = { ...snapshot, runtime: { runtimeId: 'claude' as const, metadata: { cliContextWindow: runtimeReport } } }
-    const runtimeSummary = summarizeContextUsage({ ...base, snapshots: [completed],
-      liveContextWindowWarning: warning, liveContextCheckedAt: 150 })
-    expect(runtimeSummary.contextLimit).toBe(900_000)
-    expect(runtimeSummary.detail).not.toContain(warning)
-    const oldRuntime = { ...completed, runtime: { ...completed.runtime,
-      metadata: { cliContextWindow: { ...runtimeReport, reportedAt: 50 } } } }
-    expect(summarizeContextUsage({ ...base, snapshots: [oldRuntime],
-      liveContextWindowWarning: warning, liveContextCheckedAt: 150 }).contextLimit).toBeNull()
-  })
-
-  it('does not reuse a saved Codex window when opaque overrides have no reusable key', () => {
-    const secret = 'SENTINEL-PRIVATE-HEADER-value-123'
-    const model: SavedModel = {
-      ...buildModel(), contextWindow: undefined, provider: 'openai-codex',
-      connection: { id: 'codex-cli', type: 'direct', service: 'openai-codex', useDeveloperPrefix: false }
-    }
-    const agent = {
-      ...buildAgent(), agentType: 'cli', primary_model_provider: 'openai-codex',
-      primary_model_connection: { type: 'direct', service: 'openai-codex' },
-      codex_settings: { permissionMode: 'chat', model: 'gpt-6-sol',
-        configOverrides: [{ key: 'model_providers.custom.http_headers.Authorization', value: secret }] }
-    } as Agent
-    const report = reportForCliSnapshot({
-      runtime: 'codex', model: 'gpt-6-sol', contextWindow: 100_000, evidence: 'runtime'
-    }, agent, model.contextWindow)
-    expect(JSON.stringify(report)).not.toContain(secret)
-    expect(report).not.toHaveProperty('settingsKey')
-    const snapshot = buildSnapshot({
-      runtime: { runtimeId: 'codex', providerId: 'openai-codex', connectionId: 'codex-cli',
-        modelName: 'gpt-6-sol', metadata: { cliContextWindow: report } }
-    })
-    expect(summarizeContextUsage({ messages: [buildMessage('m1', 'hello')], snapshots: [snapshot],
-      activeModel: model, agent }).contextLimit).toBe(258_400)
-  })
+  // SA-139 R4: the CLI wrapper reserve, the CLI choice window and its runtime report, the Claude
+  // context-environment cap and the send-time CLI window warning left the Token Panel with the
+  // Claude Code CLI Primary.
 
   it('uses the manual trim preview estimate while trim is active', () => {
     const model = buildModel()
@@ -1531,38 +1405,58 @@ describe('A parent run with no usage makes the running cost unknown, never exact
 
 /**
  * BL-707: manual trim protection (the server's trim preview, context preview, and memory
- * graduation, and the chat page) reads the zip and clip ids a message references. Its patterns'
- * description part searched to the first `}` again from every opener, seconds of the one Node
- * process for a message of openers that never close. One scan each now, with the same rules; the
- * old patterns are kept here only as oracles.
+ * graduation, and the chat page) reads the zip and clip ids a message references, each in one
+ * scan: the old patterns' description part searched to the first `}` again from every opener,
+ * seconds of the one Node process for a message of openers that never close.
+ *
+ * BL-609: it reads them with the trust reader's shapes (`scanZipReferences`, `scanClipReferences`),
+ * so an odd id (a `{`, a line break, more than 160 characters) protects nothing the chat view and
+ * the compile do not read as a reference either. The shapes are the oracle here.
  */
-describe('manual trim protection reads references once (BL-707)', () => {
-  const OLD_PATTERNS = {
-    zip: /\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/g,
-    clip: /\{\{batshit-clip:([^:}]+)(?::::[^}]*)?\}\}/g
-  }
-  const oldReferenceIds = (content: string, type: 'zip' | 'clip') => {
-    const ids = new Set<string>()
-    for (const match of content.matchAll(OLD_PATTERNS[type])) {
-      const id = match[1]?.trim()
-      if (id) ids.add(id)
-    }
-    return ids
-  }
+describe('manual trim protection reads references once, with the trust reader\'s shapes (BL-707, BL-609)', () => {
+  const sharedReferenceIds = (content: string, type: 'zip' | 'clip') =>
+    new Set(
+      (type === 'zip' ? scanZipReferences(content) : scanClipReferences(content))
+        .map((reference) => reference.id.trim())
+        .filter(Boolean)
+    )
+  // What the reader does with an id it read: a held zip matches the raw id or the state id made
+  // from it once (BL-1512); an active clip matches as is.
+  const zipExpected = (ids: Set<string>, held: string) =>
+    [...ids].some((id) => id === held.trim() || normalizeId(id) === held.trim())
   const protectsZip = (content: string, id: string) =>
     isMessageProtectedFromManualTrim(buildMessage('m', content), { protectedUnzippedZipIds: [id] })
   const protectsClip = (content: string, id: string) =>
     isMessageProtectedFromManualTrim(buildMessage('m', content), { activeClipIds: [id] })
 
-  it('protects a message for exactly the zip and clip ids the old patterns read', () => {
+  it('protects a message for an odd reference exactly as the trust reader reads it', () => {
+    const ZIP = 'cool_tool_1790500000000_abcde'
+    const long = `cool_tool_${'1'.repeat(150)}_abcde`
+    const cases: Array<[string, string, boolean]> = [
+      [`{{batshit-zip:${ZIP}:::}}`, ZIP, true], // an empty description: a reference
+      ['{{batshit-zip:cool_tool_1790500000001_ab{cd:::x}}', 'cool_tool_1790500000001_ab{cd', false], // a `{`
+      ['{{batshit-zip:cool_tool_1790500000002_ab\ncd}}', 'cool_tool_1790500000002_ab\ncd', false], // a line break
+      [`{{batshit-zip:${long}}}`, long, false], // longer than 160 characters
+      ['{{batshit-zip:cool_tool_1790500000003_abcde :::x}}', 'cool_tool_1790500000003_abcde', true], // a space
+      [`{{batshit-zip:${ZIP}:::Tool execution: read}}`, ZIP, true]
+    ]
+    for (const [text, id, expected] of cases) {
+      expect(protectsZip(text, id), JSON.stringify(text)).toBe(expected)
+      expect(zipExpected(sharedReferenceIds(text, 'zip'), id), JSON.stringify(text)).toBe(expected)
+    }
+    expect(protectsClip('{{batshit-clip:clip_1790500000000_abcd1234 x}}', 'clip_1790500000000_abcd1234 x')).toBe(false)
+    expect(protectsClip('{{batshit-clip:clip_1790500000000_abcd1234:::}}', 'clip_1790500000000_abcd1234')).toBe(true)
+  })
+
+  it('protects a message for exactly the zip and clip ids the trust reader\'s shapes read', () => {
     const texts = [...REFERENCE_SCAN_HAND_CASES, ...generateReferenceScanTexts(3_000, 3_707)]
     const counts = { zipProtected: 0, zipNot: 0, clipProtected: 0, clipNot: 0 }
     for (const text of texts) {
       const label = JSON.stringify(text)
-      const zipIds = oldReferenceIds(text, 'zip')
-      const clipIds = oldReferenceIds(text, 'clip')
+      const zipIds = sharedReferenceIds(text, 'zip')
+      const clipIds = sharedReferenceIds(text, 'clip')
       for (const id of [...idRunsAfter(text, '{{batshit-zip:'), 'zip_absent']) {
-        const expected = zipIds.has(id.trim())
+        const expected = zipExpected(zipIds, id)
         expect(protectsZip(text, id), `${label} zip ${JSON.stringify(id)}`).toBe(expected)
         counts[expected ? 'zipProtected' : 'zipNot']++
       }
@@ -1572,8 +1466,9 @@ describe('manual trim protection reads references once (BL-707)', () => {
         counts[expected ? 'clipProtected' : 'clipNot']++
       }
     }
+    // Both answers for both kinds (the shape reads fewer protected ids than the older one did).
     for (const [kind, count] of Object.entries(counts)) {
-      expect(count, kind).toBeGreaterThan(1_000)
+      expect(count, kind).toBeGreaterThan(500)
     }
   })
 
@@ -1593,5 +1488,29 @@ describe('manual trim protection reads references once (BL-707)', () => {
       expect(protect(), shape).toBe(false)
       expect(performance.now() - started, shape).toBeLessThan(200)
     }
+  })
+})
+
+describe('manual trim protection matches a held zip by its state id (BL-1512)', () => {
+  // A hold is recorded under `normalizeId(<raw id>)` (BL-476); a message names the raw id.
+  const held = (rawIds: string[]) => ({ protectedUnzippedZipIds: rawIds.map((id) => normalizeId(id)) })
+
+  it('protects a message naming a held zip, whether or not its random part is all digits', () => {
+    for (const raw of ['cool_tool_1790500000000_abcde', 'cool_tool_1790500000000_48213']) {
+      const inText = buildMessage('m1', `Read it: {{batshit-zip:${raw}:::Tool execution: read}}`)
+      expect(isMessageProtectedFromManualTrim(inText, held([raw])), raw).toBe(true)
+      const inMetadata = { ...buildMessage('m2', 'A card.'), metadata: { zipIds: [raw] } } as Message
+      expect(isMessageProtectedFromManualTrim(inMetadata, held([raw])), raw).toBe(true)
+      // The trim passes over it.
+      const messages = [inText, buildMessage('m3', 'B'.repeat(4000)), buildMessage('m4', 'latest')]
+      expect(extendTrimmedMessageIds(messages, [], 500, { protections: held([raw]) }), raw).toEqual(['m3'])
+    }
+  })
+
+  it('still protects for a raw id passed as is, and not for an unrelated zip', () => {
+    const raw = 'cool_tool_1790500000000_48213'
+    const message = buildMessage('m1', `{{batshit-zip:${raw}:::Tool execution: read}}`)
+    expect(isMessageProtectedFromManualTrim(message, { userUnzippedZipIds: [raw] })).toBe(true)
+    expect(isMessageProtectedFromManualTrim(message, held(['error_1790500000000_abcde']))).toBe(false)
   })
 })

@@ -16,8 +16,10 @@ export class GoonLiveActivationGate {
 
   request(key: string): GoonLiveActivationTicket | null {
     if (!key) return null
-    if (this.acceptedKey === key) return null
     if (this.pending?.key === key) return null
+    // Reselecting the visible Goon while another activation is pending must
+    // supersede that pending ticket, even when this key was already accepted.
+    if (this.acceptedKey === key && !this.pending) return null
     if (this.failedKey === key) return null
     const ticket = { key, generation: ++this.generation }
     this.pending = ticket

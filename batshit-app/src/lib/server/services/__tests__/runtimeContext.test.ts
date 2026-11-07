@@ -17,6 +17,7 @@ describe('resolveRuntimeContext', () => {
     expect(context.mode).toBe('mac-app')
     expect(context.macApp).toBe(true)
     expect(context.containerized).toBe(false)
+    expect(context.windowsWsl).toBe(false)
     expect(context.adminCards.macAppRequiredRuntime).toBe(true)
     expect(context.adminCards.appleContainerSandbox).toBe(true)
   })
@@ -40,6 +41,7 @@ describe('resolveRuntimeContext', () => {
     expect(context.mode).toBe('docker')
     expect(context.macApp).toBe(false)
     expect(context.containerized).toBe(true)
+    expect(context.windowsWsl).toBe(false)
     expect(context.adminCards.macAppRequiredRuntime).toBe(false)
     expect(context.adminCards.appleContainerSandbox).toBe(false)
   })
@@ -61,6 +63,7 @@ describe('resolveRuntimeContext', () => {
     expect(context.mode).toBe('native')
     expect(context.label).toBe('Pinokio')
     expect(context.pinokio).toBe(true)
+    expect(context.windowsWsl).toBe(false)
     expect(context.macApp).toBe(false)
     expect(context.adminCards.macAppRequiredRuntime).toBe(false)
     expect(context.adminCards.dockerSandbox).toBe(true)
@@ -74,6 +77,7 @@ describe('resolveRuntimeContext', () => {
 
     expect(context.mode).toBe('docker')
     expect(context.pinokio).toBe(false)
+    expect(context.windowsWsl).toBe(false)
   })
 
   it('falls back to source checkout context', () => {
@@ -82,6 +86,7 @@ describe('resolveRuntimeContext', () => {
     expect(context.mode).toBe('native')
     expect(context.label).toBe('Source checkout')
     expect(context.pinokio).toBe(false)
+    expect(context.windowsWsl).toBe(false)
     expect(context.adminCards.macAppRequiredRuntime).toBe(false)
     expect(context.adminCards.appleContainerSandbox).toBe(false)
     expect(context.adminCards.dockerSandbox).toBe(true)
@@ -96,8 +101,10 @@ describe('resolveRuntimeContext', () => {
     const context = resolveRuntimeContext(runtimeEnv, 'linux')
     expect(context.label).toBe('Pinokio (Windows, WSL2)')
     expect(context.mode).toBe('native')
+    expect(context.windowsWsl).toBe(true)
     expect(context.localVoiceEngineStopPolicy).toBe('all-owned')
     for (const platform of ['darwin', 'win32'] as const) {
+      expect(resolveRuntimeContext(runtimeEnv, platform).windowsWsl).toBe(false)
       expect(resolveRuntimeContext(runtimeEnv, platform).localVoiceEngineStopPolicy).toBe('per-engine')
     }
     for (const overrides of [
@@ -109,6 +116,7 @@ describe('resolveRuntimeContext', () => {
       { BATSHIT_PINOKIO_ENGINE_STOP_POLICY: undefined },
       { BATSHIT_PINOKIO_ENGINE_STOP_POLICY: 'force' }
     ]) {
+      expect(resolveRuntimeContext({ ...runtimeEnv, ...overrides }, 'linux').windowsWsl).toBe(false)
       expect(resolveRuntimeContext({ ...runtimeEnv, ...overrides }, 'linux').localVoiceEngineStopPolicy).toBe('per-engine')
     }
   })
@@ -120,6 +128,7 @@ describe('resolveRuntimeContext', () => {
       HOST: 'windows-wsl'
     }, 'linux')
     expect(context.label).toBe('Pinokio')
+    expect(context.windowsWsl).toBe(false)
     expect(context.localVoiceEngineStopPolicy).toBe('per-engine')
   })
 })

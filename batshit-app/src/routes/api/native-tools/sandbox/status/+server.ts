@@ -1,8 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
-import { refuseDelegatedRunOutsideList } from '$lib/server/services/actingAgentIdentity'
-import { apiFailure } from '$lib/server/services/apiResponses'
 import { nativeToolService } from '$lib/server/services/nativeTools'
+import { readTypedFileToolsHost } from '$lib/server/services/typedFileToolsHost.server'
 
 export const GET: RequestHandler = async ({ request, locals }) => {
   try {
@@ -15,12 +14,12 @@ export const GET: RequestHandler = async ({ request, locals }) => {
       return json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const delegatedRefusal = refuseDelegatedRunOutsideList(auth, null)
-    if (delegatedRefusal) {
-      return apiFailure(delegatedRefusal.message, 403, { code: delegatedRefusal.code })
-    }
-
     const url = new URL(request.url)
+    // Round 2: Settings asks only what this computer is (Refreshed File Reads availability), so
+    // this mode reads the runtime facts and probes no sandbox. Authentication still runs first.
+    if (url.searchParams.get('hostOnly') === '1') {
+      return json({ success: true, typedFileToolsHost: readTypedFileToolsHost() })
+    }
     const backend = nativeToolService.normalizeNativeExecutionBackend(
       url.searchParams.get('backend')
     )
@@ -30,7 +29,8 @@ export const GET: RequestHandler = async ({ request, locals }) => {
         : await nativeToolService.getSandboxBackendStatus()
     return json({
       success: true,
-      ...status
+      ...status,
+      typedFileToolsHost: readTypedFileToolsHost()
     })
   } catch (error) {
     console.error('[Native Tools] sandbox/status failed:', error)

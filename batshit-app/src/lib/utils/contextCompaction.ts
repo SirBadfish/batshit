@@ -8,7 +8,6 @@ import {
   resolveCompiledMessageElement,
   type CompiledSpeakerView
 } from '$lib/utils/compiledChatTags'
-import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 import { approvalSummaryIsPending } from '$lib/utils/heldForApproval'
 
 export const AUTO_COMPACT_SMART_TRIGGER_PERCENT = 0.15
@@ -76,7 +75,6 @@ export type AutoCompactAgentModelMode = 'inherit' | AutoCompactModelMode
 export type AutoCompactPromptMode = 'default' | 'custom'
 export type AutoCompactAgentPromptMode = 'inherit' | AutoCompactPromptMode
 export type AutoCompactEventMode = 'manual' | 'auto'
-export type CurrentModelCompactRuntime = 'api' | 'codex-cli' | 'claude-cli' | 'n8n'
 
 export interface GlobalAutoCompactSettings {
   mode: AutoCompactMode
@@ -143,14 +141,6 @@ export interface CompactionSelection {
   compactedMessageCount: number
   protectedMessageCount: number
   sourceTokenEstimate: number
-}
-
-type CompactRuntimeAgentLike = Parameters<typeof normalizePrimaryAgentType>[0] & {
-  primary_model_connection?: {
-    id?: string | null
-    service?: string | null
-    type?: string | null
-  } | null
 }
 
 export const DEFAULT_AUTO_COMPACT_PROMPT = [
@@ -323,38 +313,6 @@ export function resolveAutoCompactTriggerTokens(
     return settings.remainingTokens
   }
   return getSmartAutoCompactTriggerTokens(contextLimit)
-}
-
-function includesAny(value: unknown, needles: string[]) {
-  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
-  return normalized.length > 0 && needles.some((needle) => normalized.includes(needle))
-}
-
-export function resolveCurrentModelCompactRuntime(
-  agent?: CompactRuntimeAgentLike | null
-): CurrentModelCompactRuntime {
-  const type = normalizePrimaryAgentType(agent)
-  if (type === 'api') return 'api'
-  if (type === 'n8n') return 'n8n'
-
-  const codexNeedles = ['codex', 'openai-codex', 'codex-cli']
-  const claudeNeedles = ['claude-cli', 'anthropic-claude-cli']
-  const connection = agent?.primary_model_connection ?? null
-  const codexHint =
-    includesAny(agent?.primary_model_provider, codexNeedles) ||
-    includesAny(agent?.primary_model_name, codexNeedles) ||
-    includesAny(connection?.id, codexNeedles) ||
-    includesAny(connection?.service, codexNeedles) ||
-    includesAny(connection?.type, codexNeedles)
-  const claudeHint =
-    includesAny(agent?.primary_model_provider, claudeNeedles) ||
-    includesAny(agent?.primary_model_name, claudeNeedles) ||
-    includesAny(connection?.id, claudeNeedles) ||
-    includesAny(connection?.service, claudeNeedles) ||
-    includesAny(connection?.type, claudeNeedles)
-
-  if (claudeHint && !codexHint) return 'claude-cli'
-  return 'codex-cli'
 }
 
 export function getContextCompactionState(metadata?: Record<string, any> | null): ContextCompactionState {

@@ -1,109 +1,47 @@
 #!/usr/bin/env node
+// The old per-skill downloads are frozen publication inputs. Both historical
+// entrypoints verify their exact bytes; neither writes the published tree.
+// New authoring lives in src/lib/server/system-plugins/batshit.
 import { promises as fs } from 'node:fs'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
-const manifestPath = path.join(repoRoot, 'batshit-portable-skills/portable-skills.manifest.json')
-
-function usage() {
-  console.error('Usage: node tools/portable-skills/sync-portable-skills.mjs --check|--write')
-}
-
-function toPosix(value) {
-  return value.split(path.sep).join('/')
-}
-
-async function readJson(file) {
-  return JSON.parse(await fs.readFile(file, 'utf8'))
-}
-
-async function sameFile(left, right) {
-  try {
-    const [leftRaw, rightRaw] = await Promise.all([
-      fs.readFile(left, 'utf8'),
-      fs.readFile(right, 'utf8')
-    ])
-    return leftRaw === rightRaw
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return false
-    throw error
-  }
-}
-
-async function syncFile({ source, destination, write }) {
-  const matches = await sameFile(source, destination)
-  if (matches) return { changed: false, destination }
-  if (!write) return { changed: true, destination }
-
-  await fs.mkdir(path.dirname(destination), { recursive: true })
-  await fs.copyFile(source, destination)
-  return { changed: true, destination }
-}
+const frozenRoot = path.join(repoRoot, 'batshit-portable-skills')
+const inventoryPath = path.join(repoRoot, 'tools/portable-skills/frozen-distribution.json')
 
 async function main() {
-  const mode = process.argv.includes('--write')
-    ? 'write'
-    : process.argv.includes('--check')
-      ? 'check'
-      : null
-
-  if (!mode) {
-    usage()
-    process.exit(2)
+  const mode = process.argv.includes('--write') ? 'write' : process.argv.includes('--check') ? 'check' : null
+  if (!mode) throw new Error('Usage: node tools/portable-skills/sync-portable-skills.mjs --check|--write')
+  const inventory = JSON.parse(await fs.readFile(inventoryPath, 'utf8'))
+  if (inventory.version !== 1 || !inventory.files || typeof inventory.files !== 'object') {
+    throw new Error(`Invalid frozen distribution inventory: ${inventoryPath}`)
   }
-
-  const manifest = await readJson(manifestPath)
-  if (!manifest || !Array.isArray(manifest.bundles)) {
-    throw new Error(`Invalid portable skills manifest: ${manifestPath}`)
-  }
-
-  const drifted = []
-  let copied = 0
-
-  for (const bundle of manifest.bundles) {
-    if (!bundle || typeof bundle !== 'object') continue
-    const sourceRoot = path.join(repoRoot, bundle.sourceSkillRoot)
-    const portableRoot = path.join(repoRoot, bundle.portableRoot)
-    const references = Array.isArray(bundle.sharedReferences) ? bundle.sharedReferences : []
-    const files = Array.isArray(bundle.sharedFiles) ? bundle.sharedFiles : []
-
-    for (const relativeFile of [...references, ...files]) {
-      const source = path.join(sourceRoot, relativeFile)
-      const destination = path.join(portableRoot, relativeFile)
-      const result = await syncFile({
-        source,
-        destination,
-        write: mode === 'write'
-      })
-      if (result.changed) {
-        if (mode === 'write') {
-          copied += 1
-        } else {
-          drifted.push(toPosix(path.relative(repoRoot, result.destination)))
-        }
-      }
+  const actual = new Map()
+  async function walk(directory) {
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      const full = path.join(directory, entry.name)
+      if (entry.isDirectory()) await walk(full)
+      else if (entry.isFile()) {
+        actual.set(path.relative(frozenRoot, full).split(path.sep).join('/'), createHash('sha256').update(await fs.readFile(full)).digest('hex'))
+      } else throw new Error(`Frozen distribution contains a non-regular entry: ${path.relative(frozenRoot, full)}`)
     }
   }
-
-  if (mode === 'check' && drifted.length > 0) {
-    console.error('Portable skill reference drift detected:')
-    for (const file of drifted) {
-      console.error(`- ${file}`)
-    }
-    console.error('Run: node tools/portable-skills/sync-portable-skills.mjs --write')
-    process.exit(1)
+  await walk(frozenRoot)
+  const problems = []
+  for (const [file, hash] of Object.entries(inventory.files)) {
+    if (actual.get(file) !== hash) problems.push(`missing or changed: ${file}`)
   }
-
-  if (mode === 'write') {
-    console.log(`Synced ${copied} portable skill file${copied === 1 ? '' : 's'}.`)
-  } else {
-    console.log('Portable skill files are in sync.')
+  for (const file of actual.keys()) {
+    if (!Object.hasOwn(inventory.files, file)) problems.push(`unexpected file: ${file}`)
   }
+  if (problems.length) throw new Error(`Frozen portable distribution differs from its published inventory:\n${problems.join('\n')}`)
+  console.log(`Frozen portable distribution verified (${actual.size} files). ${mode === 'write' ? '--write performs no writes; ' : ''}Author the canonical Batshit plugin; published downloads remain unchanged.`)
 }
 
 main().catch((error) => {
-  console.error(error)
+  console.error(error.message)
   process.exit(1)
 })

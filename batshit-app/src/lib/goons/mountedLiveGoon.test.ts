@@ -76,10 +76,13 @@ const animationFiles: GoonFileRef[] = [
 
 function createEngineHarness() {
   const goonLoadToken = 7
+  const avatarRoot = {}
   const calls = {
     init: vi.fn().mockResolvedValue(undefined),
     setCameraFov: vi.fn(),
     beginGoonLoad: vi.fn(() => goonLoadToken),
+    getGoonLoadGeneration: vi.fn(() => goonLoadToken),
+    getAvatarRootObject: vi.fn(() => avatarRoot),
     isCurrentGoonLoad: vi.fn((token: number) => token === goonLoadToken),
     finishGoonLoad: vi.fn((_token: number) => undefined),
     loadGoon: vi.fn().mockResolvedValue(undefined),
@@ -90,6 +93,7 @@ function createEngineHarness() {
     resetCamera: vi.fn(),
     syncAnimations: vi.fn().mockResolvedValue(undefined),
     getMaterialNames: vi.fn(() => []),
+    hideClosetMaterial: vi.fn().mockReturnValue(true),
     applyMaterialTexture: vi.fn().mockResolvedValue(true),
     applyMaterialColorOverride: vi.fn(),
     applyXWearMaterial: vi.fn().mockResolvedValue(true),
@@ -313,7 +317,8 @@ describe('mounted Live Goon loading', () => {
 
     expect(calls.applyMaterialTexture).toHaveBeenCalledWith(
       'N00_004_01_Tops_01_CLOTH',
-      '/closet/hoodie.png'
+      '/closet/hoodie.png',
+      { isCurrent: expect.any(Function) }
     )
     expect(calls.applyMaterialColorOverride).toHaveBeenCalledWith(
       'N00_004_01_Tops_01_CLOTH',
@@ -324,4 +329,44 @@ describe('mounted Live Goon loading', () => {
     })
     expect(calls.setGuidedOutfitPieceVisible).toHaveBeenCalledWith('cape', false)
   })
+
+  it('does not publish a superseded same-engine Closet refresh after a newer one wins', async () => {
+    const { engine, calls } = createEngineHarness()
+    const slot = 'N00_004_01_Tops_01_CLOTH'
+    calls.getMaterialNames.mockReturnValue([slot])
+    let resolveOld!: () => void
+    const oldLoad = new Promise<void>((resolve) => { resolveOld = resolve })
+    calls.applyMaterialTexture.mockImplementationOnce(async () => { await oldLoad; return true })
+      .mockResolvedValueOnce(true)
+    const goon = (id: string, color: string): GoonRecord => ({
+      ...baseGoon,
+      closet: { items: { [id]: { id, name: id, category: 'top',
+        texture: { url: `/${id}.png`, filename: `${id}.png` }, materialColors: { baseHex: color } } } },
+      closetAssignments: { [slot]: { mode: 'item', itemId: id } }
+    })
+    let current = 1
+    const old = applyMountedLiveGoonClosetAssignments(engine, {
+      goon: goon('red', '#ff0000'), goonsSettings: null, isCurrent: () => current === 1
+    })
+    current = 2
+    await applyMountedLiveGoonClosetAssignments(engine, {
+      goon: goon('blue', '#0000ff'), goonsSettings: null, isCurrent: () => current === 2
+    })
+    resolveOld()
+    await old
+    expect(calls.applyMaterialColorOverride).toHaveBeenCalledTimes(1)
+    expect(calls.applyMaterialColorOverride).toHaveBeenCalledWith(slot, { baseHex: '#0000FF', shadeHex: undefined })
+    expect(calls.applyBodyConceal).toHaveBeenCalledTimes(1)
+  })
+
+
+  it('does not publish a mounted Goon after its load is superseded during animation sync', async () => {
+    const { engine, calls } = createEngineHarness()
+    calls.syncAnimations.mockImplementationOnce(async () => { calls.isCurrentGoonLoad.mockReturnValue(false) })
+    const plan = buildMountedLiveGoonLoadPlan(baseGoon, { goonsSettings, animationFiles, sceneMode: 'none' })
+    await expect(loadMountedLiveGoon(engine, plan)).resolves.toEqual({ status: 'cancelled', kind: 'vrm' })
+    expect(calls.setGoonVisible).not.toHaveBeenCalled()
+    expect(calls.applyBodyConceal).not.toHaveBeenCalled()
+  })
+
 })

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { buildDelegatedExecutionSummary } from '../delegatedRunAccounting'
 
 describe('buildDelegatedExecutionSummary', () => {
+  // Stored history: a Codex CLI child result saved before SA-139 R1 removed that lane still reads.
   it('keeps returned Codex observations separate from known sibling usage and deduplicates results', () => {
     const observedUsage = { completeness: 'partial', parts: [{ source: 'codex-app-server-progress', counts: { inputTokens: 100, outputTokens: 0 } }] }
     const failed = { toolCallId: 'failed-codex', toolOutput: { kind: 'subagent', status: 'failed', subagentType: 'cli', provider: 'openai-codex', usage: { inputTokens: 100, outputTokens: 0 }, observedUsage } }
@@ -26,6 +27,22 @@ describe('buildDelegatedExecutionSummary', () => {
     expect(summary.runs[2]).toMatchObject({ name: 'Known', usage: { totalTokens: 22 } })
     expect(summary.totals).toMatchObject({ usageKnownRuns: 1, usageUnknownRuns: 2, usage: { totalTokens: 22 } })
   })
+  it('delegation limits: a run its step limit stopped counts as partial, its spend kept, for a Subagent and a Worker', () => {
+    // Before the partial status existed, a reader that met an unknown status dropped the run,
+    // and its spend disappeared from the Token Panel and the Execution Viewer.
+    const summary = buildDelegatedExecutionSummary([
+      { toolCallId: 'sub', toolOutput: { kind: 'subagent', status: 'partial', subagentName: 'Builder', usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } },
+      { toolCallId: 'batch', toolOutput: { kind: 'workers', workers: [
+        { name: 'Worker 1', status: 'partial', usage: { totalTokens: 7 } },
+        { name: 'Worker 2', status: 'completed', usage: { totalTokens: 3 } },
+      ] } },
+    ])!
+    expect(summary.runs.map((run) => [run.name, run.status])).toEqual([
+      ['Builder', 'partial'], ['Worker 1', 'partial'], ['Worker 2', 'completed'],
+    ])
+    expect(summary.totals).toMatchObject({ runs: 3, completed: 1, failed: 0, timedOut: 0, partial: 2, usage: { totalTokens: 25 } })
+  })
+
   it('normalizes direct API Subagent results and preserves unknown values honestly', () => {
     const summary = buildDelegatedExecutionSummary([
       {
@@ -44,12 +61,12 @@ describe('buildDelegatedExecutionSummary', () => {
         },
       },
       {
-        toolCallId: 'call-n8n',
-        toolName: 'workflow_helper',
+        toolCallId: 'call-unknown-usage',
+        toolName: 'local_helper',
         toolOutput: {
           kind: 'subagent',
-          subagentName: 'Workflow Helper',
-          subagentType: 'n8n-workflow',
+          subagentName: 'Local Helper',
+          subagentType: 'cli',
           modelId: null,
           provider: null,
           usage: null,
@@ -74,8 +91,8 @@ describe('buildDelegatedExecutionSummary', () => {
           thread: 'fresh',
         },
         {
-          name: 'Workflow Helper',
-          type: 'n8n-workflow',
+          name: 'Local Helper',
+          type: 'cli',
           usage: null,
           durationMs: 44_200,
           thread: 'resumed',

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
@@ -17,6 +17,13 @@ import {
   resetUserSettings
 } from '$lib/stores/userSettings.svelte'
 import type { GoonsSettings } from '$lib/types/goons'
+import type { GoonRecord } from '$lib/types/goons'
+import { getGoons } from '$lib/stores/goons.svelte'
+import {
+  beginGoonAnimationLibraryOperation, failGoonAnimationLibraryOperation,
+  setGoonAnimationLibrary
+} from '$lib/stores/goonAnimationLibrary.svelte'
+import { captureGoonCompatibilityBasis, compatibilityOwnerForBasis } from '$lib/goons/goonCompatibilityBasis'
 
 /**
  * The old Goons panel called the full-object helper. Keep that legacy shape available only in this
@@ -41,6 +48,7 @@ vi.mock('$lib/services/goonsSettingsPersistence', async (importOriginal) => {
 })
 
 import GoonsSettingsPanel from './GoonsSettingsPanel.svelte'
+import TooltipProviderWrapper from '$lib/test-utils/TooltipProviderWrapper.svelte'
 
 useRedisTestServer()
 
@@ -98,16 +106,21 @@ let failedSettingsReads = false
 let routedFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 let posts: Array<{ body: Record<string, any> }> = []
 let counts: { reads: number } = { reads: 0 }
+let routedGoons: GoonRecord[] = []
+let routedMotions: GoonRecord['files']['animations'] = []
+let failedMotionReads = false
 
 beforeAll(async () => {
   settingsRoute = await loadUserSettingsRoute()
 }, 60_000)
 
 async function seedSettings() {
-  await redis.updateUserSettings(USER, {
-    displayName: 'Probe',
-    goons_settings: structuredClone(SAVED)
-  } as any)
+  // This is a retained legacy Closet record, not a new production write.
+  // Seed the historical fixture directly; the tested Settings route still
+  // exercises the real guard and must preserve this exact sibling.
+  await redis.json.set(`user:${USER}:settings`, '$', {
+    id: 'settings', user_id: USER, displayName: 'Probe', goons_settings: structuredClone(SAVED)
+  })
 }
 
 function installRoutes() {
@@ -116,8 +129,10 @@ function installRoutes() {
     route: settingsRoute,
     failGetsWith: () => failedSettingsReads ? 500 : null,
     extra: (path) => {
-      if (path === '/api/goons') return jsonResponse({ goons: [] })
-      if (path === '/api/goons/animations') return jsonResponse({ library: { vrma: [] } })
+      if (path === '/api/goons') return jsonResponse({ ownerId: 'josh', goons: routedGoons })
+      if (path === '/api/goons/animations') return failedMotionReads
+        ? new Response('Unavailable', { status: 503 })
+        : jsonResponse({ ownerId: 'josh', library: { vrma: routedMotions } })
       if (path === '/api/goons/animations/converter') return jsonResponse({ installed: false })
       return undefined
     }
@@ -128,7 +143,7 @@ function installRoutes() {
 }
 
 function renderPanel() {
-  return render(GoonsSettingsPanel, { props: { active: true } })
+  return render(TooltipProviderWrapper, { props: { component: GoonsSettingsPanel, props: { active: true } } })
 }
 
 describe('Goons Settings requires a confirmed user-settings read (BL-975)', () => {
@@ -138,6 +153,9 @@ describe('Goons Settings requires a confirmed user-settings read (BL-975)', () =
     failedSettingsReads = false
     posts = []
     counts = { reads: 0 }
+    routedGoons = []
+    routedMotions = []
+    failedMotionReads = false
     vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.spyOn(console, 'warn').mockImplementation(() => {})
     await seedSettings()
@@ -164,6 +182,76 @@ describe('Goons Settings requires a confirmed user-settings read (BL-975)', () =
     if (fullHeight) await fireEvent.click(fullHeight)
     await waitFor(() => expect(posts).toEqual([]))
     expect(await storedUserSettings(USER)).toMatchObject({ goons_settings: SAVED })
+  }, 60_000)
+
+  it('shows a current Tier A report issue while preserving a legacy report as unverified', async () => {
+    const current = {
+      id: 'current', user_id: 'josh', name: 'Current Goon', kind: 'vrm',
+      files: { vrm: { url: '/current.vrm', filename: 'current.vrm' }, animations: [] },
+      created_at: '2026-10-29T00:00:00Z', updated_at: '2026-10-29T00:00:00Z'
+    } as GoonRecord
+    const legacy = {
+      id: 'legacy', user_id: 'josh', name: 'Legacy Goon', kind: 'vrm',
+      files: { vrm: { url: '/legacy.vrm', filename: 'legacy.vrm' }, animations: [] },
+      compatibility: { tier: 'A', issues: ['old motion warning'], animationNames: ['old-motion'],
+        boneCoverage: { present: 7, total: 7 } },
+      created_at: '2026-10-29T00:00:00Z', updated_at: '2026-10-29T00:00:00Z'
+    } as GoonRecord
+    const basis = captureGoonCompatibilityBasis(current, [current, legacy], [], { eager: [], deferred: [] })
+    current.compatibility = { tier: 'A', issues: ['No matching motion tracks'],
+      boneCoverage: { present: 7, total: 7 }, owner: compatibilityOwnerForBasis(basis) }
+    routedGoons = [current, legacy]
+    confirmUserSettings({ goons_settings: SAVED })
+    renderPanel()
+    const tier = await screen.findByText('Tier A', {}, { timeout: 10_000 })
+    expect(tier.className).toContain('is-warning')
+    const legacyCard = screen.getByText('Legacy Goon').closest('.batshit-settings-display-card')
+    if (!legacyCard) throw new Error('Legacy Goon card missing')
+    expect(within(legacyCard as HTMLElement).getByText('Pending')).toBeTruthy()
+    expect(getGoons().find((goon) => goon.id === 'legacy')?.compatibility).toEqual(legacy.compatibility)
+    const trigger = tier.closest('button')
+    if (!trigger) throw new Error('Tier tooltip trigger missing')
+    await fireEvent.pointerEnter(trigger)
+    await screen.findByText('No matching motion tracks', {}, { timeout: 3_000 })
+  }, 60_000)
+
+  it('keeps a saved global Mood motion visible when the library is unavailable', async () => {
+    const settings = structuredClone(SAVED)
+    settings.kitchen!.cues!.saved_cue.animationName = 'saved-wave'
+    await redis.json.set(`user:${USER}:settings`, '$', {
+      id: 'settings', user_id: USER, displayName: 'Probe', goons_settings: settings
+    })
+    confirmUserSettings({ goons_settings: settings })
+    failedMotionReads = true
+    renderPanel()
+    await fireEvent.click(await screen.findByRole('tab', { name: 'Kitchen' }))
+    await fireEvent.click(await screen.findByText('Moods'))
+    await fireEvent.click(await screen.findByText('Saved cue'))
+    const picker = await screen.findByRole('button', { name: 'Select Mood Loop Motion' })
+    expect(picker.textContent).toContain('saved-wave')
+    expect(picker.textContent).toContain('Saved · unverified')
+    expect(posts).toEqual([])
+  }, 60_000)
+
+  it('retains a transient preview selection while its Motion inventory is unverified', async () => {
+    routedGoons = [{ id: 'preview', user_id: 'josh', name: 'Preview Goon', files: { animations: [] },
+      created_at: '2026-10-29T00:00:00Z', updated_at: '2026-10-29T00:00:00Z' } as GoonRecord]
+    routedMotions = [{ url: '/wave.glb', filename: 'wave.glb' }]
+    confirmUserSettings({ goons_settings: SAVED })
+    renderPanel()
+    await fireEvent.click(await screen.findByRole('tab', { name: 'Kitchen' }))
+    const trigger = await screen.findByRole('button', { name: 'Select preview Motion' })
+    await waitFor(() => expect(trigger.hasAttribute('disabled')).toBe(false))
+    await fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false })
+    await fireEvent.click(await screen.findByText('wave'))
+    await waitFor(() => expect(trigger.getAttribute('title')).toBe('Preview Motion: wave'))
+    // Batch an unavailable read with a changed projection so the real panel
+    // effect sees no options while the saved source is unconfirmed.
+    setGoonAnimationLibrary({ vrma: [] })
+    const ticket = beginGoonAnimationLibraryOperation('josh')
+    failGoonAnimationLibraryOperation(ticket, 'Unavailable')
+    await waitFor(() => expect(trigger.getAttribute('title')).toBe('Preview Motion: wave'))
+    expect(posts).toEqual([])
   }, 60_000)
 
   it('Retry confirms a successful fresh settings response and then exposes the saved cards', async () => {

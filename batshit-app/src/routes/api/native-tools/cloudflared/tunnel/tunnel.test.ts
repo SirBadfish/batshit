@@ -192,4 +192,38 @@ describe('/api/native-tools/cloudflared/tunnel', () => {
       }
     })
   })
+
+  it('preserves saved tunnel settings when native stop cannot confirm exit', async () => {
+    const status = dockerStatus({
+      supportLevel: 'native-managed', installScope: 'system',
+      tunnel: {
+        ...dockerStatus().tunnel,
+        running: true,
+        pid: 41000,
+        publicUrl: 'https://retained.trycloudflare.com'
+      }
+    })
+    mocks.getCloudflaredRuntimeStatus.mockResolvedValue(status)
+    mocks.stopManagedCloudflaredTunnel.mockResolvedValue({
+      stopped: false, status: status.tunnel, reason: 'Managed tunnel exit was not confirmed.'
+    })
+    const response = await POST(authedEvent({ action: 'stop' }))
+    expect(response.status).toBe(503)
+    expect(mocks.updateUserSettings).not.toHaveBeenCalled()
+    expect(mocks.controlRuntimeAddon).not.toHaveBeenCalled()
+    await expect(response.json()).resolves.toMatchObject({
+      error: 'Managed tunnel exit was not confirmed.', tunnel: { pid: 41000, running: true }
+    })
+  })
+
+  it('preserves saved tunnel settings when native retargeting is refused', async () => {
+    mocks.getCloudflaredRuntimeStatus.mockResolvedValue(dockerStatus({ supportLevel: 'native-managed', installScope: 'system' }))
+    mocks.ensureManagedCloudflaredTunnel.mockResolvedValue({
+      started: false, status: { running: true }, reason: 'Predecessor exit was not confirmed.'
+    })
+    const response = await POST(authedEvent({ action: 'start', targetUrl: 'http://localhost:5614' }))
+    expect(response.status).toBe(500)
+    expect(mocks.updateUserSettings).not.toHaveBeenCalled()
+    await expect(response.json()).resolves.toMatchObject({ error: 'Predecessor exit was not confirmed.' })
+  })
 })

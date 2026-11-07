@@ -5,6 +5,7 @@
   import { Button } from '$lib/components/ui/button'
   import SettingsAccordionCard from '$lib/components/settings/SettingsAccordionCard.svelte'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
+  import AdminAutomaticBackupSettings from './AdminAutomaticBackupSettings.svelte'
   import { confirmDialog, confirmDialogWithCheckbox } from '$lib/stores/confirmDialog'
   import type { BackupUploadCheck } from '$lib/types/backupUploadCheck'
   import type { BackupPartialRequest } from '$lib/utils/backupPartialSummary'
@@ -149,6 +150,7 @@
       </p>
     </SettingsInfoMenu>
   {/snippet}
+  <AdminAutomaticBackupSettings disabled={exportBusy || preflightBusy || restoreBusy} />
   <div class="space-y-4">
     <div class="batshit-settings-form-stack">
       <div class="batshit-settings-form-row">

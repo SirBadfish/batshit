@@ -5,21 +5,17 @@
   import * as agentStore from '$lib/stores/agents.svelte';
   import { onMount } from 'svelte';
   import { ProjectService } from '$lib/services/projects';
-  import { loadProjectTree, refreshProjectTree } from '$lib/projects/fileTreeActions';
+  import { loadProjectTree } from '$lib/projects/fileTreeActions';
   import IconRenderer from '$lib/components/icons/IconRenderer.svelte';
   import { DEFAULT_PROJECT_ICON_REF } from '$lib/icons/iconCatalog';
   import { normalizeIconRef } from '$lib/icons/iconLegacy';
   import { toast } from 'svelte-sonner';
-  import {
-    rememberLastProjectForAgent,
-    resolveProjectIdForAgent
-  } from '$lib/utils/projectAgentMemory';
+  import { rememberLastProjectForAgent } from '$lib/utils/projectAgentMemory';
   
   const { data } = $props();
   
   // State
   let open = $state(false);
-  let lastRestoredAgentId = $state<string | null>(null);
   function openProjectsSettings(mode: 'list' | 'create' = 'list') {
     window.dispatchEvent(
       new CustomEvent('batshit:open-settings', {
@@ -28,47 +24,18 @@
     );
   }
   
-  // Get reactive values
-  const projects = $derived(projectStore.getProjects());
+  // Get reactive values. BL-2373: the Default Project (when the user has a Default Project Path)
+  // is listed first, beside the saved projects.
+  const projects = $derived(projectStore.getSelectableProjects());
   const currentProject = $derived(projectStore.getCurrentProject());
-  const currentAgentId = $derived(agentStore.getCurrentAgentId());
   const projectTriggerLabel = $derived.by(() =>
     currentProject ? `Select project (${currentProject.name})` : 'Select project'
   );
 
-  function rememberProjectForCurrentAgent(projectId: string) {
-    rememberLastProjectForAgent(agentStore.getCurrentAgentId(), projectId);
-  }
-
-  function resolveProjectForAgent(agentId: string | null, availableProjects: projectStore.Project[]) {
-    return resolveProjectIdForAgent({
-      agentId,
-      projects: availableProjects,
-      defaultProjectId: agentStore.getCurrentAgent()?.default_project_id
-    });
-  }
-
-  async function restoreProjectForAgent(
-    agentId: string | null,
-    availableProjects: projectStore.Project[],
-    options: { notify?: boolean } = {}
-  ) {
-    if (availableProjects.length === 0) return;
-    const projectId = resolveProjectForAgent(agentId, availableProjects);
-    if (!projectId) return;
-    if (agentId) {
-      lastRestoredAgentId = agentId;
-    }
-    await handleSelect(projectId, { notify: options.notify ?? false });
-  }
-
-  $effect(() => {
-    const agentId = currentAgentId;
-    const projectIds = projects.map((project) => project.id).join('|');
-    if (!agentId || !projectIds || agentId === lastRestoredAgentId) return;
-    lastRestoredAgentId = agentId;
-    void restoreProjectForAgent(agentId, projects, { notify: false });
-  });
+  // BL-2372: which project an agent gets when the sidebar opens, after an agent switch, or after
+  // a saved default changes is decided by `watchAgentProjectSelection` (mounted by
+  // ProjectsSidebar, which exists whether or not this selector is open). The selector only records
+  // the user's own pick, against the agent's saved default so that a newer save outranks it.
   
   // Load projects on mount
   onMount(() => {
@@ -79,10 +46,6 @@
           const projectService = new ProjectService();
           const loadedProjects = await projectService.loadProjects(data.user.id);
           projectStore.setProjects(loadedProjects);
-          
-          if (loadedProjects.length > 0) {
-            await restoreProjectForAgent(agentStore.getCurrentAgentId(), loadedProjects, { notify: false });
-          }
         } catch (error) {
           console.error('Error loading projects:', error);
           toast.error(error instanceof Error ? error.message : 'Failed to load projects');
@@ -90,39 +53,25 @@
       }
     })();
     
-    // Listen for project settings updates
-    const handleProjectUpdate = async (event: Event) => {
-      const customEvent = event as CustomEvent;
-      const { projectId } = customEvent.detail;
-      if (projectId === projectStore.getCurrentProjectId()) {
-        // Exclusions/settings changed: refresh clears the per-directory cache,
-        // reloads the root, and re-fetches the expanded directories.
-        const project = projectStore.getProjects().find(p => p.id === projectId);
-        if (project) {
-          await refreshProjectTree(project, { notify: false });
-        }
-      }
-    };
-    
-    window.addEventListener('project-settings-updated', handleProjectUpdate);
-    
-    // Cleanup listener on unmount
-    return () => {
-      window.removeEventListener('project-settings-updated', handleProjectUpdate);
-    };
+    // BL-2391: a changed root or exclusions of the shown project reloads its tree from the store
+    // (`ProjectsSidebar`); the old `project-settings-updated` listener here had no sender.
   });
   
   // Handle project selection — lazy load: only the root level is fetched here,
   // the background @ mention index walk runs after (see fileTreeActions).
-  async function handleSelect(projectId: string, options: { notify?: boolean } = {}) {
-    const notify = options.notify ?? true;
+  async function handleSelect(projectId: string) {
     projectStore.setCurrentProject(projectId);
-    rememberProjectForCurrentAgent(projectId);
+    rememberLastProjectForAgent({
+      agentId: agentStore.getCurrentAgentId(),
+      projectId,
+      projects: projectStore.getSelectableProjects(),
+      defaultProjectId: agentStore.getCurrentAgent()?.default_project_id
+    });
     open = false;
 
-    const project = projectStore.getProjects().find(p => p.id === projectId);
+    const project = projectStore.getSelectableProjects().find(p => p.id === projectId);
     if (project) {
-      await loadProjectTree(project, { notify });
+      await loadProjectTree(project, { notify: true });
     }
   }
   

@@ -2,7 +2,7 @@
 
 Batshit alpha updates are manual for now. There is no automatic in-app updater yet.
 
-When Batshit can reach the internet, it periodically checks the official GitHub release feed. If a newer alpha is available, you will see an update icon in the top header. Open it to see your current version, the latest version, the release link, and a backup-first reminder.
+On the Mac app and Docker paths, when Batshit can reach the internet, it periodically checks the official GitHub release feed. If a newer alpha is available, you will see an update icon in the top header. Open it to see your current version, the latest version, the release link, and a backup-first reminder.
 
 Before updating, export a normal backup:
 
@@ -68,6 +68,15 @@ git pull
 The launcher rebuilds/recreates the needed containers with the current Compose files and keeps your Docker volumes unless you explicitly delete them.
 
 Do not run destructive Docker cleanup commands unless you mean to remove local data. In particular, deleting volumes can remove the Redis data for that Docker instance.
+
+## Pinokio updates
+
+1. Finish active work and export a backup as above.
+2. Stop Batshit using Pinokio’s stop button.
+3. Click **Update** in the Batshit launcher and let it finish.
+4. Start Batshit if it has not started automatically, then choose **Open Batshit**.
+
+Update installs the release selected by Batshit’s launcher and rebuilds it while preserving your data. Windows keeps its dedicated Linux disk. Pinokio uses this Update button instead of the in-app release notification. If an update stops partway through, **Install** retries the selected release; **Update** checks for a newer one. See [Install with Pinokio](install-pinokio.md).
 
 ## After updating
 

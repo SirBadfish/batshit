@@ -2,7 +2,7 @@
 import { ChevronDown, Settings, Plus, Edit, Bot } from '@lucide/svelte';
 import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 import * as Avatar from '$lib/components/ui/avatar';
-import { onMount, untrack } from 'svelte';
+import { onMount, onDestroy, untrack } from 'svelte';
 import { toast } from 'svelte-sonner';
 import type { SavedModel } from '$lib/types/savedModels';
 import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte';
@@ -12,11 +12,10 @@ import SettingsPanel from '$lib/components/settings/SettingsPanel.svelte';
 import { getSavedModelBadgeProvider, resolveSavedModelConnection } from '$lib/utils/modelConnections';
 import type { CatalogConnectionOption } from '$lib/types/modelCatalog';
 import { getModelPresetAvailability } from '$lib/utils/modelPresetAvailability';
-import { buildPickedPresetModelFields } from '$lib/utils/modelPresetPick';
-import { presetModelSettings } from '$lib/utils/agentProviderSettings';
+import { buildPickedPresetSelection } from '$lib/utils/modelPresetPick';
+import { MODEL_SELECTION_REVISION_HEADER, captureModelSelectionBaseline, sameModelSelection, withModelSelection, type ModelSelectionBaseline } from '$lib/appActions/settings/modelSelectionBaseline';
+import { onUserChannelEvent } from '$lib/services/userChannel';
 import { LIVE_SETTINGS_EVENTS } from '$lib/utils/liveSettingsEvents';
-import { isCliPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType';
-import type { PrimaryAgentType } from '$lib/utils/primaryAgentType';
 	
 	// Props
 let {
@@ -42,13 +41,47 @@ let settingsPanelInitialModelId = $state<string | null>(null);
 	
 // Get current agent to determine default model
 const currentAgent = $derived(agentStore.getCurrentAgent());
-let agentTypeForFiltering = $state<PrimaryAgentType>('api');
 let connectionOptions = $state<CatalogConnectionOption[] | null>(null);
 let connectionOptionsLoading = $state(false);
 let connectionOptionsError = $state<string | null>(null);
+let connectionReadGeneration = 0;
+let activeConnectionRead: number | null = null;
+let pendingConnectionRead = false;
+let selectionBaseline = $state<ModelSelectionBaseline | null>(null);
+let selectionReadError = $state<string | null>(null);
+let selectionSaving = $state(false);
+let selectionReadGeneration = 0;
+let alive = true;
+onDestroy(() => { alive = false; selectionReadGeneration += 1; connectionReadGeneration += 1; pendingConnectionRead = false; });
 
+async function loadSelectionBaseline() {
+  const shown = currentAgent;
+  const generation = ++selectionReadGeneration;
+  selectionBaseline = null;
+  selectionReadError = null;
+  if (!shown) return;
+  try {
+    const response = await fetch(`/api/agents/${encodeURIComponent(shown.id)}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error('The saved model selection could not be read. Close and reopen this menu to retry.');
+    const row = await response.json();
+    const baseline = captureModelSelectionBaseline('agent', row, response.headers.get(MODEL_SELECTION_REVISION_HEADER));
+    if (!baseline || baseline.id !== shown.id || row.user_id !== shown.user_id) throw new Error('The saved model selection is unavailable. Close and reopen this menu to retry.');
+    if (!alive || generation !== selectionReadGeneration || currentAgent?.id !== shown.id || !open) return;
+    if (currentAgent.user_id !== shown.user_id || currentAgent.agentType !== shown.agentType || !sameModelSelection('agent', shown as unknown as Record<string, unknown>, currentAgent as unknown as Record<string, unknown>)) {
+      throw new Error('The model changed while this menu was opening. Close and reopen it to review the saved choice.');
+    }
+    agentStore.updateAgent(shown.id, { ...withModelSelection('agent', currentAgent as unknown as Record<string, unknown>, row), agentType: row.agentType } as Partial<agentStore.Agent>);
+    selectionBaseline = baseline;
+  } catch (error) {
+    if (alive && generation === selectionReadGeneration && currentAgent?.id === shown.id && open) selectionReadError = error instanceof Error ? error.message : 'The saved model selection could not be read.';
+  }
+}
+
+const selectionAgentId = $derived(currentAgent?.id ?? null);
 $effect(() => {
-	agentTypeForFiltering = isCliPrimaryAgentType(normalizePrimaryAgentType(currentAgent)) ? 'cli' : 'api';
+  open;
+  selectionAgentId;
+  untrack(() => { if (open && !selectionSaving) void loadSelectionBaseline(); else if (!open) { selectionReadGeneration += 1; selectionBaseline = null; } });
 });
 
 const modelMenuItems = $derived.by(() => {
@@ -56,7 +89,7 @@ const modelMenuItems = $derived.by(() => {
 		model,
 		availability: getModelPresetAvailability({
 			model,
-			agentType: agentTypeForFiltering,
+			agentType: 'api',
 			connectionOptions
 		})
 	}));
@@ -65,8 +98,10 @@ const modelMenuItems = $derived.by(() => {
 });
 
 async function loadConnectionOptions(options: { force?: boolean } = {}) {
-	if (connectionOptionsLoading) return;
+	if (connectionOptionsLoading) { if (activeConnectionRead !== connectionReadGeneration) pendingConnectionRead = true; return; }
 	if (connectionOptions && !options.force) return;
+	const generation = connectionReadGeneration;
+	activeConnectionRead = generation;
 	connectionOptionsLoading = true;
 	connectionOptionsError = null;
 	try {
@@ -75,13 +110,32 @@ async function loadConnectionOptions(options: { force?: boolean } = {}) {
 			throw new Error(`Failed to load model connections (${response.status})`);
 		}
 		const payload = await response.json();
-		connectionOptions = payload?.data?.connections ?? null;
+		if (!alive || generation !== connectionReadGeneration) return;
+		const connections = payload?.data?.connections;
+		if (!Array.isArray(connections) || connections.some((option) =>
+			!option || typeof option !== 'object' || Array.isArray(option) ||
+			typeof option.id !== 'string' || !option.id.trim() ||
+			(option.status !== 'ready' && option.status !== 'locked')
+		)) {
+			throw new Error('Connection status could not be read. Close and reopen this menu to retry.');
+		}
+		connectionOptions = connections;
 	} catch (error) {
+		if (!alive || generation !== connectionReadGeneration) return;
 		console.error('[ModelSelector] Failed to load model connections:', error);
 		connectionOptionsError = error instanceof Error ? error.message : 'Failed to load model connections';
 	} finally {
-		connectionOptionsLoading = false;
+		activeConnectionRead = null;
+		if (alive) {
+			connectionOptionsLoading = false;
+			if (pendingConnectionRead) { pendingConnectionRead = false; void loadConnectionOptions({ force: true }); }
+		}
 	}
+}
+function invalidateConnectionOptions() {
+	connectionReadGeneration += 1;
+	connectionOptions = null;
+	connectionOptionsError = null;
 }
 
 // Once per mount. The load reads and writes the states its own fetch flips (loading, options,
@@ -99,7 +153,7 @@ $effect(() => {
 $effect(() => {
 	if (!open) return;
 	untrack(() => {
-		if (connectionOptionsError) void loadConnectionOptions({ force: true });
+		if (connectionOptionsError || !connectionOptions) void loadConnectionOptions({ force: true });
 	});
 });
 
@@ -160,8 +214,7 @@ $effect(() => {
 // Load saved models on mount
 onMount(() => {
 	const handleModelConnectionsUpdated = () => {
-		connectionOptions = null;
-		connectionOptionsError = null;
+		invalidateConnectionOptions();
 		void loadConnectionOptions({ force: true });
 	};
 
@@ -171,8 +224,14 @@ onMount(() => {
 	);
 
 	void savedModelsStore.loadSavedModels();
+	const stopSettingsEvents = onUserChannelEvent((event) => {
+		// The shared channel owns one pure stored-list refresh. Reconnect invalidates
+		// cached connection observations without a catalog/account read or draft rebase.
+		if (event.type === 'reconnected') invalidateConnectionOptions();
+	});
 
 	return () => {
+		stopSettingsEvents();
 		window.removeEventListener(
 			LIVE_SETTINGS_EVENTS.modelConnectionsUpdated,
 			handleModelConnectionsUpdated
@@ -195,24 +254,17 @@ onMount(() => {
 		return `Run: ${setupCommand}`;
 	}
 
-	function isCliLoginSetupConnectionOption(option: CatalogConnectionOption | null | undefined) {
-		return Boolean(
-			option &&
-				(option.id === 'codex-cli' || option.id === 'claude-cli') &&
-				option.status === 'locked' &&
-				option.setupCommand
-		);
-	}
-	
 		// Handle model selection
 	async function handleSelectModel(presetId: string) {
+		const baseline = selectionBaseline;
+		const ownerId = currentAgent?.id;
+		if (!ownerId || !baseline || baseline.id !== ownerId || selectionSaving || connectionOptionsLoading || !connectionOptions || connectionOptionsError) return;
 			// Find the saved model
 		const selectedModel = chatModels.find((model) => model.id === presetId);
-		let setupWarningDescription: string | undefined;
 		if (selectedModel) {
 			const availability = getModelPresetAvailability({
 				model: selectedModel,
-				agentType: agentTypeForFiltering,
+				agentType: 'api',
 				connectionOptions
 			});
 			if (availability.disabled) {
@@ -221,29 +273,25 @@ onMount(() => {
 				});
 				return;
 			}
-			if (isCliLoginSetupConnectionOption(availability.connectionOption)) {
-				setupWarningDescription = formatSetupCommandDescription(availability.connectionOption);
-			}
 		}
 		
 		if (selectedModel && currentAgent) {
+			selectionSaving = true;
 			try {
-				await agentStore.updateAgentSettings(currentAgent.id, {
-					// BL-515: a value the preset does not set is sent as null (stored as absent).
-					...buildPickedPresetModelFields(selectedModel),
-					primary_model_connection: resolveSavedModelConnection(selectedModel),
-					// BL-514: only the preset's model keys; the server keeps the agent's own keys.
-					provider_specific_settings: presetModelSettings(selectedModel.settings),
-					primary_model_capabilities: selectedModel.capabilities ?? currentAgent.primary_model_capabilities ?? null
-				});
-				if (setupWarningDescription) {
-					toast.warning('Model selected, CLI login still needed', {
-						description: setupWarningDescription
-					});
-				}
+        // Primary/no-seed keeps its ORIGINAL model-group hash; the optional native pair is
+        // not a substitute or an extra gate. Detach the exact issued pick before any await.
+        const issued = JSON.parse(JSON.stringify({
+					...buildPickedPresetSelection(selectedModel),
+					expectedModelSelection: baseline.revision
+				}));
+				await agentStore.updateAgentSettings(ownerId, issued);
 			} catch (error) {
 				console.error('Failed to update agent model:', error);
-				toast.error('Unable to save model selection');
+				const knownRefusal = ['model_selection_base_required', 'model_selection_settings_changed', 'model_preset_unavailable', 'cli_selection_changes_unadopted_native_controls', 'MANAGED_PROFILE_SOURCE_CHANGED'].includes((error as { code?: string }).code ?? '');
+				toast.error(knownRefusal ? 'The model changed while you were choosing. Your selection was not saved. Reopen the menu and choose again.' : 'This model save is unconfirmed. Reopen the menu to read the saved selection before making a new choice.');
+			} finally {
+				selectionBaseline = null;
+				selectionSaving = false;
 			}
 		}
 
@@ -373,6 +421,11 @@ function handleEditClick(e: Event, presetId: string) {
 	
 	<DropdownMenu.Content align="start" class="model-selector-dropdown">
 		<DropdownMenu.Label>Available Models</DropdownMenu.Label>
+		{#if selectionReadError}
+			<DropdownMenu.Item disabled>{selectionReadError}</DropdownMenu.Item>
+		{:else if currentAgent && !selectionBaseline}
+			<DropdownMenu.Item disabled>Reading saved model selection…</DropdownMenu.Item>
+		{/if}
 
 		{#if connectionOptionsLoading}
 			<DropdownMenu.Item disabled>
@@ -382,6 +435,8 @@ function handleEditClick(e: Event, presetId: string) {
 			<DropdownMenu.Item disabled>
 				<span class="text-muted-foreground">{connectionOptionsError}</span>
 			</DropdownMenu.Item>
+		{:else if !connectionOptions}
+			<DropdownMenu.Item disabled><span class="text-muted-foreground">Reopen this menu to refresh connection status.</span></DropdownMenu.Item>
 		{/if}
 		
 		{#if modelMenuItems.length > 0}
@@ -392,7 +447,7 @@ function handleEditClick(e: Event, presetId: string) {
 						<DropdownMenu.Item
 							onSelect={() => handleSelectModel(model.id)}
 							class="model-selector-menu-item flex items-center gap-2 flex-1 text-sm"
-							disabled={availability.disabled}
+							disabled={availability.disabled || !selectionBaseline || selectionSaving || connectionOptionsLoading || !connectionOptions || Boolean(connectionOptionsError)}
 						>
 							<ModelProviderIcon 
 								modelId={model.modelId} 

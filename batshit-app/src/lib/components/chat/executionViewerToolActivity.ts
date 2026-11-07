@@ -55,11 +55,11 @@ function parseJsonObject(text: string): Record<string, any> | null {
 /**
  * The server responses one step's OUTPUT may carry, in the order they are tried.
  *
- * On the API lane the output is the control result object itself. On the managed CLI lanes
- * it is the MCP result envelope the helper returned — `{ content: [{ type: 'text', text }] }`
- * where `text` is `JSON.stringify` of the route's whole response
- * (`scripts/lib/cli-tool-result-content.cjs`), stored as-is by `codexEventAdapter` and
- * `claudeEventAdapter` (which may also hand over the blocks bare, or the text alone). The
+ * On the API lane the output is the control result object itself. In a step saved by the
+ * managed CLI lanes (the last went in SA-139 R5) it is the MCP result envelope the helper returned —
+ * `{ content: [{ type: 'text', text }] }` where `text` is `JSON.stringify` of the route's whole
+ * response, stored as-is by the removed `claudeEventAdapter` (which may also have handed over the
+ * blocks bare, or the text alone). The
  * route's `actingAgentId` sits at the TOP level of that JSON, so the envelope is opened one
  * level and nothing deeper is read — a `result.agentId` inside the control's own payload is
  * the control's business, not a server-bound actor.

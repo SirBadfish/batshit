@@ -2,26 +2,19 @@
 
 A Primary Agent is the AI you chat with directly in Batshit. It owns the conversation turn, decides when to answer or use tools, and can call Subagents you've assigned to it.
 
-Batshit has two Primary Agent types: `API` and `CLI`.
+Every Primary Agent works the same way: Batshit runs it, with Batshit's tools and features, on the saved model you pick. The model's connection decides how it reaches the model and how it pays: an API key, a Local AI runtime, your ChatGPT plan or your Claude plan.
 
-| Type | What it means | Best when you want | Usually requires |
-| --- | --- | --- | --- |
-| `API` | Batshit talks directly to model providers through its built-in API path. | Fast setup, direct provider keys, Batshit-native tools, Group Chat, Voice, Artifacts, and strong all-around behavior. | Provider API keys or local provider connections saved in Batshit. |
-| `CLI` | Batshit runs a managed CLI agent such as Codex or Claude Code inside the chat. | Code-heavy work, file edits, shell/search behavior, and CLI-native reasoning. | The CLI installed and authenticated where Batshit runs. |
-
-These are peer choices, not quality tiers. Pick the path that matches the work: direct provider chat or a managed CLI agent.
-
-n8n remains a first-class automation and tool platform. `API` and `CLI` Primary Agents can call n8n workflows as tools or as [n8n Workflow Subagents](../subagents/overview.md); n8n is not a Primary Agent type.
+For Claude models on your own Claude plan, pick a model on the [Claude plan](../providers/claude-plan.md) connection. Claude Code then acts only as the model, and Batshit runs every tool.
 
 ## Parallel chats
 
 Batshit can keep more than one chat working at once. You can start a response in one session, switch to another, and keep working while the first finishes. Sessions that are still running show a small status in the chat sidebar.
 
-`API` and `CLI` Primary Agents can run in parallel across sessions, up to three active chats at a time. When three are already running, Batshit asks you to stop or finish one before starting another.
+Primary Agents can run in parallel across sessions, up to three active chats at a time. When three are already running, Batshit asks you to stop or finish one before starting another.
 
 ## What stays the same
 
-Whichever type you choose, the core workspace stays the same:
+Whichever model you choose, the core workspace stays the same:
 
 - Chat sessions and saved history.
 - Projects and file references.
@@ -29,100 +22,64 @@ Whichever type you choose, the core workspace stays the same:
 - Zips for large outputs and tool results.
 - Execution Viewer evidence.
 - Artifacts and published Artifact tools.
-- n8n workflow tools and n8n Workflow Subagents.
+- n8n workflow tools.
 - Tool rendering, Voice, and Goons where the selected runtime supports them.
 
 What changes is the path used to reach the model.
 
-## `API` Primary Agents
+## How a Primary Agent reaches its model
 
-An `API` Primary Agent uses Batshit's direct provider path. You save provider keys or local provider connections in Batshit, choose a model, and chat.
+A Primary Agent uses Batshit's own path to its model's connection. You save provider keys, local provider connections or a plan connection in Batshit, choose a saved model, and chat.
 
 Batshit automatically makes API requests cache-friendly where the selected provider supports prompt/input caching. You do not need to hand-fill normal cache settings for everyday use: Batshit keeps the stable prompt/tool setup at the front of the request, adds provider-safe cache options for OpenAI, Anthropic, OpenRouter, and Vercel AI Gateway, and reads Gemini's implicit cache telemetry when Google reports it. Provider token minimums and time-to-live rules still apply, so short prompts may not show cache hits.
 
-Use an `API` Primary Agent when:
 
-- You want the simplest direct chat path.
-- You want Batshit-native tools without running a coding CLI.
-- You want Group Chat, Voice, or Goon behavior close to the chat runtime.
-- You want n8n workflows to be callable tools or Workflow Subagents.
-- You want to connect direct cloud providers or Local AI.
+## What a chat message lets the agent do
 
-## `CLI` Primary Agents
+An agent works in the Work mode you pick in the chat bar or in **Agent Settings**: Plan, Agent, or Dangerous (shown as **Batshit Crazy**). Both places save the same setting to the agent. [Bash access modes](../tools/overview.md#bash-access-modes) says what each mode allows.
 
-A `CLI` Primary Agent lets Batshit host a managed CLI agent inside the chat. Batshit still owns the session, history, Clips, Zips, tool rendering, and UI; the CLI owns its provider-native command, search, and edit behavior.
-
-Use a `CLI` Primary Agent when:
-
-- The work is code-heavy.
-- You want CLI-native project-file behavior.
-- You want the agent to use its own command, edit, and search abilities.
-- You want Batshit to keep the chat, Artifacts, Clips, Zips, and workspace around that CLI run.
-- You want n8n workflow tools or Workflow Subagents available beside CLI-native work.
-
-Docker note: a Docker install needs the CLI authenticated inside the app container. For Codex, Batshit shows the Docker-aware login command in Agent Settings. Provider keys saved in Batshit do not log the Codex CLI into the container.
-
-### What a chat message lets the agent do
-
-A Codex or Claude agent works in a mode. You pick it in the chat bar or in **Agent Settings**; both save it to the agent.
-
-- **Codex:** Chat (read-only), Agent (workspace write), or Agent (full access). Each mode has its own **Sandbox Level**: Read-only, Workspace write, or Danger full access. Picking a mode also sets its own level.
-- **Claude Code:** Plan, Ask before edits, Edit automatically, or Bypass permissions. Agent Settings offers all four; an older saved Ask-before-edits mode stays shown as that choice.
-
-In Agent Settings, a Codex record with no saved Sandbox Level shows its mode's own level. **Agent (full access)** keeps the Sandbox Level control disabled. An older full-access record with a tighter saved level keeps that level; opening Settings or changing another field does not widen it. Pick **Agent** to adjust the Sandbox Level.
-
-**What Agent Settings shows is the most the agent can do.** A message runs with the tighter of the chat bar's mode and what Agent Settings holds for that agent, never with more:
-
-- If you set a tighter Sandbox Level by hand in Agent Settings (for example Agent with Read-only), a message uses that level. Open the chat bar's Codex mode menu to see it: the chosen mode has a second line, such as "Sandbox Level from Agent Settings: Read-only". Picking a mode in that menu sets the mode's own level again.
-- A Sandbox Level that is looser than its mode (for example Chat with Workspace write) is not used by a chat message: Chat stays read-only.
-- In a group chat, each member runs with its own mode, never with more than its own Agent Settings allow, whatever the sender's chat bar shows.
+- In a group chat, each member runs with its own saved mode.
 - A message that waits (in the chat's line, or behind a reply that is still running) uses the agent's settings as they are when its turn starts. If you make an agent tighter while a message waits, the tighter settings apply to it.
-- If Agent Settings made a reply run tighter than the chat bar's mode (for example an older window still showed a looser mode), the reply says so in one line under it, such as "Codex ran as Chat, Read-only, because Agent Settings holds that for this agent; the chat bar sent Agent (full access)."
+- If an agent is deleted while a message for it waits, the message is not sent: it stays in the chat, unanswered.
 
-When you change the mode in the chat bar and send at once, Batshit waits for the change to save first, so the message runs with the mode you just picked. If the change could not be saved, the chat bar shows the earlier mode again and the message runs with that one. If an agent is deleted while a message for it waits, the message is not sent: it stays in the chat, unanswered.
+## Claude Code CLI agents were removed
+
+Batshit no longer runs a Primary Agent on the Claude Code CLI lane, where Claude Code ran the whole agent with its own tools and loop. If you still have such an agent, it stays in your list, but it won't run: a message to it, a schedule, a wake-up or a DM says "The Claude Code CLI lane was removed from Batshit." It never quietly turns into another kind of agent. Its Agent Settings show a short notice, they can't be saved, and the agent can't join a Group. Deleting it is the only thing you can do with it (see [Deleting an agent](#deleting-an-agent)).
+
+To keep working with Claude, create a new agent and pick a Claude plan model. Batshit's own tools, Work modes, approval cards, Sandbox and lists then apply to everything it does. Claude Code's own Web Search, Web Fetch and Chrome switches went with the old lane: use Batshit's Web Search tool, Agent Browser for browsing, and Workers for helpers that run side by side.
+
+Claude Code CLI Subagents were removed too. For a Claude helper, make an ordinary Subagent on a Claude plan model; see [Subagents](../subagents/overview.md).
 
 ## Choosing a Primary Agent
 
-| If you mostly want... | Start with... |
-| --- | --- |
-| Direct AI chat with Batshit-native tools | `API` |
-| Coding, shell, and repository work through a managed CLI agent | `CLI` |
-| Group Chat | `API` or `CLI` |
-| Existing n8n automations used as tools | `API` or `CLI` |
-| An n8n workflow acting as a specialist | `API` or `CLI`, with an n8n Workflow Subagent |
-
-You can create more than one. A common setup is one `API` agent for general work and one `CLI` agent for code.
+Create a Primary Agent and pick its saved model. Create more than one when you want different models, connections, prompts or tools; each agent keeps its own settings.
 
 ## Setup checklist
 
 For any Primary Agent:
 
 1. Create or edit the agent in Settings.
-2. Pick `API` or `CLI`.
-3. Choose a model or runtime that's actually configured.
-4. Add a clear description and system prompt.
-5. Assign Projects, Subagents, Tools, Voice, and Goons only when you need them.
-6. Send a tiny test message before giving the agent a large task.
+2. Choose a saved model whose connection is set up.
+3. Add a clear description and system prompt.
+4. Assign Projects, Subagents, Tools, Voice, and Goons only when you need them.
+5. Send a tiny test message before giving the agent a large task.
 
-For `API`:
+For a provider key or Local AI:
 
 1. Save provider keys or local provider connections in Settings.
 2. Choose a model preset or provider/model pair.
 3. Enable only the tools the agent should discover.
 
-For `CLI`:
+For your Claude plan:
 
-1. Make sure the CLI is installed in the same runtime where Batshit runs it.
-2. Authenticate the CLI there.
-3. In Docker, authenticate inside the `app` container, not just on the host.
-4. Keep project paths visible from the runtime. Docker projects normally live under `/workspace`.
+1. Open Settings → API Keys → Claude Plan. Install Claude Code from the card if needed, and sign in with your Claude plan until the card says **Ready**.
+2. Make a model preset on the **Claude Plan** connection and pick it for the agent. See [Claude plan](../providers/claude-plan.md).
 
 To add n8n:
 
 1. Connect an existing n8n instance or start Batshit's optional Docker n8n profile.
-2. Publish the workflows you want agents to call as tools, or import the official n8n Workflow Subagent template.
-3. Create an `n8n Workflow Subagent` when the workflow should behave like a specialist assistant.
-4. Assign the workflow tool or Subagent to the relevant `API` or `CLI` Primary Agent.
+2. Publish the workflows you want agents to call as tools.
+3. Enable the workflow tool for the Primary Agent that should use it.
 
 See [Connect n8n](connect-n8n.md) for exact setup and URL guidance.
 
@@ -146,7 +103,7 @@ A new agent can't use a name a Subagent already uses (their skill and artifact a
 
 ## Deleting an agent
 
-Settings → Agents → the agent → **Delete Primary Agent**. This removes the agent and everything that is only its own: its settings, avatar pictures (the one it shows now and any you replaced earlier), memories, DMs sent to it, schedules, wake-up webhooks, and, for a `CLI` agent, the folders its Workers ran in under `~/.batshit/agents/` (they hold the CLI's own log of the Workers' prompts). It also drops the agent from any Group it was in, and from any skill or artifact list that named it.
+Settings → Agents → the agent → **Delete Primary Agent**. This removes the agent and everything that is only its own: its settings, avatar pictures (the one it shows now and any you replaced earlier), memories, DMs sent to it, schedules, wake-up webhooks, and any Claude Code folders the removed CLI lanes left for it under `~/.batshit/agents/` (they hold the CLI's own log of those prompts). It also drops the agent from any Group it was in, and from any skill or artifact list that named it.
 
 The confirm dialog has an **Also delete its chats** box, checked by default. Leave it checked and the agent's own chats go with it, including its Infinite Session. Uncheck it to keep the chats. Two things never go: a Group chat (it belongs to every agent in the group; the agent is only removed from the roster), and a chat you locked yourself (unlock it first if you want it gone too; the dialog tells you how many are kept).
 
@@ -156,18 +113,22 @@ The avatar pictures are stored by batshit-server, so Batshit checks that batshit
 
 | Symptom | Likely cause | What to check |
 | --- | --- | --- |
-| `API` agent says no model is configured | Provider key or model preset is missing. | Settings → API Keys and model settings. |
-| `CLI` agent fails with auth errors | The CLI is installed but not logged in where Batshit runs it. | In Docker, run the login command inside the app container. |
-| An n8n Workflow Subagent fails | Its production webhook, credentials, callback URL, or model node is wrong. | n8n execution history and [n8n troubleshooting](../troubleshooting/n8n.md). |
+| An agent says no model is configured | Provider key or model preset is missing. | Settings → API Keys and model settings. |
+| An agent on the Claude plan is not signed in | Claude Code needs your plan sign-in. | Settings → API Keys → Claude Plan. |
+| An agent says its CLI lane was removed | It is a leftover agent of a removed type. | Copy anything you need, delete it and create a new agent on a saved model. |
+| An n8n workflow tool fails | Its production webhook, credentials, or model node is wrong. | n8n execution history and [n8n troubleshooting](../troubleshooting/n8n.md). |
 | Tools don't appear | Tool Grid discoverability is off, or the gateway is offline. | Agent Tools settings and MCP gateway health. |
-| A Group can't use an agent | The agent record is missing, retired, or not a live `API`/`CLI` type. | Delete retired records and create an `API` or `CLI` agent. |
+| A Group cannot use an agent | The saved record is missing or is a leftover of a removed type. | Delete the leftover and create a new agent. |
 
 ## Letting an agent adjust its own preferences
 
 A Primary Agent with the relevant Fabric Controls can read its own display name, Awareness/Triggers/Recalled Lane Budgets and the linger defaults for trigger and recalled memories. It can change that name and request your approval for those memory changes. It cannot use these actions to edit another agent, change access, expose credentials or prepare a provider. A newer edit blocks an older request. If another change conflicts with yours in Agent Settings, Batshit protects the newer saved values. Check the current setting and use **Retry** if Batshit still cannot save your edit. See [Fabric](../fabric/overview.md#asking-an-agent-to-use-the-current-view).
 
+See [App Actions](../fabric/app-actions.md) for approved changes an agent can make to supported settings, with your selected scope and permission.
+
 ## Related docs
 
+- [Claude plan](../providers/claude-plan.md)
 - [Connect n8n](connect-n8n.md)
 - [Subagents](../subagents/overview.md)
 - [Group Chat](../groups/overview.md)

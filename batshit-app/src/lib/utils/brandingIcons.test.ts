@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { getModelProviderIcons, getProviderIconEntry, needsDarkModeInvert } from './brandingIcons'
+import { getModelProviderIcons, getProviderBackground, getProviderIconEntry, needsDarkModeInvert } from './brandingIcons'
 
 describe('branding icon dark-mode inversion', () => {
   it('treats bundled mono brand icons as light-on-dark regardless of source paint', () => {
@@ -18,10 +18,33 @@ describe('branding icon dark-mode inversion', () => {
 })
 
 describe('branding icon resolution', () => {
+  it('treats malformed runtime provider and fallback values as unknown without coercing or changing them', () => {
+    let conversions = 0
+    const raw = Object.freeze({ provider: 'deepgram', [Symbol.toPrimitive]() { conversions += 1; return 'deepgram' } })
+    for (const value of [42, true, ['deepgram'], raw]) {
+      expect(Reflect.apply(getProviderIconEntry, undefined, [value])).toEqual(getProviderIconEntry('provider-without-a-logo'))
+      expect(Reflect.apply(getProviderIconEntry, undefined, ['provider-without-a-logo', 'dark', value])).toEqual(getProviderIconEntry('provider-without-a-logo', 'dark'))
+      expect(Reflect.apply(getProviderIconEntry, undefined, ['deepgram', 'dark', value])).toEqual(getProviderIconEntry('deepgram', 'dark'))
+      expect(Reflect.apply(getProviderIconEntry, undefined, [value, 'dark', 'deepgram'])).toEqual(getProviderIconEntry('deepgram', 'dark'))
+      expect(Reflect.apply(getModelProviderIcons, undefined, ['unknown-model', value, undefined, undefined, 'dark', value])).toMatchObject({
+        modelIcon: '/batshit-icon-dark-ios.png', providerIcon: '/batshit-icon-dark-ios.png', needsBackground: false, backgroundColor: undefined
+      })
+      expect(Reflect.apply(getProviderBackground, undefined, [value])).toBeUndefined()
+    }
+    expect(conversions).toBe(0)
+    expect(raw.provider).toBe('deepgram')
+  })
+  it('retains valid provider aliases, explicit fallbacks and both theme paths', () => {
+    for (const theme of ['dark', 'light'] as const) {
+      expect(getProviderIconEntry('Codex', theme)).toEqual(getProviderIconEntry('codex', theme))
+      expect(getProviderIconEntry('Claude', theme)).toEqual(getProviderIconEntry('anthropic', theme))
+      expect(getProviderIconEntry('provider-without-a-logo', theme, 'deepgram')).toEqual(getProviderIconEntry('deepgram', theme))
+    }
+  })
   it('uses the refreshed color assets for the requested providers', () => {
     expect(getProviderIconEntry('anthropic').icon).toBe('/ai-branding/claude-color.svg')
     expect(getProviderIconEntry('openrouter').icon).toBe('/ai-branding/openrouter-color.svg')
-    expect(getProviderIconEntry('codex-cli').icon).toBe('/ai-branding/codex-color.svg')
+    expect(getProviderIconEntry('codex').icon).toBe('/ai-branding/codex-color.svg')
     expect(getProviderIconEntry('mimo').icon).toBe('/ai-branding/mimo-color.svg')
     expect(getProviderIconEntry('deepgram').icon).toBe('/ai-branding/deepgram-color.svg')
     expect(getProviderIconEntry('async').icon).toBe('/ai-branding/async-color.svg')

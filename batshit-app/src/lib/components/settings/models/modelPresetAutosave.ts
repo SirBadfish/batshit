@@ -1,9 +1,8 @@
 // Persistence admission outlives a mounted editor: reopening must wait for its old writes.
 let saveCompletion: Promise<void> = Promise.resolve()
 
-export type ModelPresetDraft<F, C, P = unknown> = {
+export type ModelPresetDraft<F, P = unknown> = {
   form: F
-  codex: C
   signature: string
   persistedSignature: string | null
   error: string | null
@@ -12,9 +11,9 @@ export type ModelPresetDraft<F, C, P = unknown> = {
   payload: P | null
 }
 // Volatile editor continuation only. Saved records still belong to the existing route/store.
-const retainedDrafts = new Map<string, ModelPresetDraft<unknown, unknown>>()
-export function getModelPresetDrafts<F, C, P = unknown>() {
-  return retainedDrafts as Map<string, ModelPresetDraft<F, C, P>>
+const retainedDrafts = new Map<string, ModelPresetDraft<unknown>>()
+export function getModelPresetDrafts<F, P = unknown>() {
+  return retainedDrafts as Map<string, ModelPresetDraft<F, P>>
 }
 
 export function runModelPresetSave<T>(save: () => Promise<T>): Promise<T> {

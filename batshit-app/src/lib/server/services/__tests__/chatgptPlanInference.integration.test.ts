@@ -21,6 +21,8 @@ import { ChatgptPlanRuntime, PLAN_AGENT, type PlanLease } from '../chatgptPlanRu
 import { VercelAIBrain } from '../vercelBrain'
 import { generateModelSummary } from '../summaryGeneration'
 import { assertPlanApprovalSource } from '../approvalResumeReplay'
+import { reasoningOverrideKey } from '$lib/utils/modelReasoningControls'
+import { fingerprintRegisteredTools, serializeRegisteredTools } from '../toolDefinitionFingerprint'
 
 const cleanup: (() => void)[] = []
 afterEach(() => { for (const release of cleanup.splice(0).reverse()) release(); vi.restoreAllMocks(); slot.preset = null; slot.paidCalls = 0 })
@@ -49,18 +51,47 @@ function setup(events: unknown[][] = [answer]) {
 function request(f: ReturnType<typeof setup>) { return { model: 'fixture-model', connection: f.connection, chatgptPlanLease: f.lease, userId: 'fixture-user', sessionId: 'fixture-session', messages: [{ role: 'system' as const, content: 'Fixture canonical identity' }, { role: 'user' as const, content: '<conversation>prior fixture turn</conversation><current_message>current fixture turn</current_message>' }], providerSettings: {}, maxToolRounds: 3 } }
 
 describe('installed SDK through production plan callsites', () => {
+  it('SA-132: current-model Compact uses the agent choice; an explicit summary preset is independent', async () => {
+    const f = setup([answer, answer])
+    slot.preset.modelId = slot.preset.effectiveModelId = 'gpt-6.1-sol'
+    slot.preset.settings = { reasoningEffort: 'low' }
+    const key = reasoningOverrideKey({ presetId: slot.preset.id, connection: f.connection, effectiveModelId: 'gpt-6.1-sol' }, 'effort')
+    const agent = { id: 'fixture-agent', agentType: 'api', primary_model_preset_id: slot.preset.id,
+      model_reasoning_overrides: { [key]: { mode: 'value', value: 'max' } } } as any
+    for (const modelMode of ['current', 'preset'] as const) {
+      let retained: PlanLease | undefined
+      await generateModelSummary({ userId: 'fixture-user', agent,
+        choice: { modelMode, modelPresetId: modelMode === 'preset' ? slot.preset.id : null },
+        prompt: 'Fixture history', summaryHardMaxTokens: 5000, retainPlanLease: lease => { retained = lease } })
+      retained!.release()
+    }
+    expect(f.bodies.map(body => body.reasoning?.effort)).toEqual(['max', 'low'])
+    expect(slot.preset.settings).toEqual({ reasoningEffort: 'low' })
+  })
   it.each(['stream', 'delegated'])('runs %s brain namespace tools with full history and no paid provider', async lane => {
     const item = { type: 'function_call', id: 'fc_fixture', call_id: 'call_fixture', name: 'work', namespace: 'batshit', arguments: '{"value":"fixture"}', status: 'completed' }
     const f = setup([[created, { type: 'response.output_item.added', output_index: 0, item: { ...item, arguments: '', status: 'in_progress' } }, { type: 'response.function_call_arguments.delta', item_id: item.id, output_index: 0, delta: item.arguments }, { type: 'response.output_item.done', output_index: 0, item }, completed], answer])
     const work = vi.fn(async (input, options) => { expect(options.abortSignal).toBeInstanceOf(AbortSignal); return { echoed: input.value } })
     const brain = new VercelAIBrain()
-    vi.spyOn(brain as any, 'buildToolsForMode3').mockResolvedValue({ tools: { work: tool({ description: 'Fixture', inputSchema: jsonSchema({ type: 'object', properties: { value: { type: 'string' } }, required: ['value'] }), execute: work }) }, maps: { workflowTools: new Map(), gatewayTools: new Map(), subagentTools: new Map() }, toolApprovals: {}, ephemeralImages: null })
+    const build = vi.spyOn(brain as any, 'buildToolsForMode3').mockResolvedValue({ tools: { work: tool({ description: 'Fixture', inputSchema: jsonSchema({ type: 'object', properties: { value: { type: 'string' } }, required: ['value'] }), execute: work }), later: tool({ description: 'Later fixture', inputSchema: jsonSchema({ type: 'object', properties: {} }), execute: async () => ({ ok: true }) }) }, maps: { workflowTools: new Map(), gatewayTools: new Map(), subagentTools: new Map() }, toolApprovals: {}, ephemeralImages: null })
+    const actualRequest = request(f)
+    const prepared = await brain.prepareApiToolset(actualRequest)
+    const actualTools = (brain as any).preparedApiToolsets.get(prepared).tools
+    const definitions = serializeRegisteredTools(actualTools)
+    expect(definitions.map(entry => entry.name)).toEqual(['work', 'later'])
+    expect(definitions.map(entry => entry.providerOptions?.openai?.namespace)).toEqual([
+      { name: 'batshit', description: 'Batshit client tools' }, { name: 'batshit', description: 'Batshit client tools' }
+    ])
+    expect(prepared.fingerprint).toBe(fingerprintRegisteredTools(actualTools))
+    const preparedRequest = { ...actualRequest, preparedApiToolset: prepared }
     if (lane === 'stream') {
-      const result = await brain.streamNativeMode(request(f)); for await (const _part of result.stream) { /* Drain the real loop. */ }
+      const result = await brain.streamNativeMode(preparedRequest); for await (const _part of result.stream) { /* Drain the real loop. */ }
       expect(await result.text).toBe('Completed fixture answer.')
-    } else expect((await brain.processNativeMode(request(f))).content).toBe('Completed fixture answer.')
+    } else expect((await brain.processNativeMode(preparedRequest)).content).toBe('Completed fixture answer.')
+    expect(build).toHaveBeenCalledTimes(1)
     expect(work).toHaveBeenCalledTimes(1); expect(f.bodies).toHaveLength(2)
     f.bodies.forEach(body => { expect(body.stream).toBe(true); expect(body.store).toBe(false); expect(body.input[0].role).toBe('developer'); expect(body.tools[0].type).toBe('namespace'); expect(body).not.toHaveProperty('max_output_tokens'); expect(body).not.toHaveProperty('prompt_cache_retention') })
+    f.bodies.forEach(body => expect(body.tools[0].tools.map((entry: any) => entry.name)).toEqual(['work', 'later']))
     expect(f.bodies[1].input).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'function_call_output', call_id: 'call_fixture' })]))
     expect(slot.paidCalls).toBe(0)
   })

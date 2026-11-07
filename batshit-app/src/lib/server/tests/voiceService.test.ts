@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -23,7 +23,8 @@ vi.mock('$lib/server/redis', () => ({
     get: (...args: any[]) => mockRedisGet(...args),
     getVoiceProfile: (...args: any[]) => mockGetVoiceProfile(...args),
     createVoiceProfile: (...args: any[]) => mockCreateVoiceProfile(...args),
-    deleteVoiceProfile: (...args: any[]) => mockDeleteVoiceProfile(...args)
+    deleteVoiceProfile: (...args: any[]) => mockDeleteVoiceProfile(...args),
+    execute: async (operation: any) => operation({ type: async () => 'none', get: async () => null })
   }
 }))
 
@@ -88,6 +89,122 @@ describe('voiceService engine defaults', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
     vi.unstubAllEnvs()
+  })
+
+  it('bounds the legacy Alibaba audio fetch and preserves the returned custom HTTPS audio', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) => service === 'alibaba' ? 'test-key' : null)
+    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({ output: { audio: { url: 'https://voice-gateway.example/audio.wav?token=private' } } })))
+      .mockResolvedValueOnce(new Response(new Uint8Array([1,2,3]), { headers: { 'content-type': 'audio/wav' } }))
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    const result = await synthesizeSpeech({ userId: 'user-1', provider: 'alibaba', model: 'qwen3-tts-flash', voiceId: 'Cherry', text: 'Hello' })
+    expect(Array.from(result.audio)).toEqual([1,2,3])
+    expect(mockFetch.mock.calls[0][1]).toMatchObject({ redirect: 'error', signal: expect.any(AbortSignal) })
+    expect(mockFetch.mock.calls[1]).toEqual(['https://voice-gateway.example/audio.wav?token=private', expect.objectContaining({ redirect: 'error', signal: expect.any(AbortSignal) })])
+  })
+
+  it('refuses oversized legacy Alibaba audio and does not disclose a signed URL or provider error', async () => {
+    mockRetrieveApiKey.mockResolvedValue('test-key')
+    const bytes = new Uint8Array(1024 * 1024)
+    let chunks = 0
+    const oversized = new ReadableStream<Uint8Array>({ pull(controller) { if (chunks++ < 65) controller.enqueue(bytes); else controller.close() } })
+    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({ url: 'https://voice-gateway.example/audio?secret=private' })))
+      .mockResolvedValueOnce(new Response(oversized))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ url: 'https://voice-gateway.example/audio?secret=private' })))
+      .mockRejectedValueOnce(new Error('redirect or timeout included secret=private'))
+      .mockResolvedValueOnce(new Response('secret=private', { status: 429 }))
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    const input = { userId: 'user-1', provider: 'alibaba' as const, model: 'qwen3-tts-flash', voiceId: 'Cherry', text: 'Hello' }
+    await expect(synthesizeSpeech(input)).rejects.toThrow('exceeds the download limit')
+    const downloadError = await synthesizeSpeech(input).catch(error => error)
+    expect(downloadError.message).toBe('Failed to download synthesized audio.')
+    expect(JSON.stringify(downloadError)).not.toContain('secret=private')
+    expect(downloadError.cause).toBeUndefined()
+    const requestError = await synthesizeSpeech(input).catch(error => error)
+    expect(requestError.message).toBe('Failed to synthesize speech with Alibaba Cloud.')
+    expect(JSON.stringify(requestError)).not.toContain('secret=private')
+    expect(requestError.cause).toBeUndefined()
+  })
+
+  it('upgrades only a recognized signed Alibaba OSS HTTP result', async () => {
+    mockRetrieveApiKey.mockResolvedValue('test-key')
+    const signed = 'http://example-bucket.oss-cn-beijing.aliyuncs.com/a.wav?OSSAccessKeyId=id&Expires=123&Signature=a%2Bb'
+    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({ output: { url: signed } })))
+      .mockResolvedValueOnce(new Response('audio'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ audio: { url: 'http://example.com/audio' } })))
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    const input = { userId: 'user-1', provider: 'alibaba' as const, model: 'qwen3-tts-flash', voiceId: 'Cherry', text: 'Hello' }
+    await synthesizeSpeech(input)
+    expect(mockFetch.mock.calls[1][0]).toBe('https:' + signed.slice('http:'.length))
+    await expect(synthesizeSpeech(input)).rejects.toThrow('unsupported audio URL')
+    expect(mockFetch).toHaveBeenCalledTimes(3)
+  })
+
+  it('A10 exposes the actual built-in TTS constants without keys, engine migration/status or provider listing', async () => {
+    const { configuredBuiltinTtsCatalog } = await import('../services/voiceService')
+    const catalog = configuredBuiltinTtsCatalog()
+    expect(catalog.find(provider => provider.id === 'openai')).toMatchObject({ models: ['gpt-4o-mini-tts', 'tts-1', 'tts-1-hd'], catalog: 'static-complete' })
+    expect(catalog.find(provider => provider.id === 'openai')?.voices).toContain('marin')
+    expect(catalog.find(provider => provider.id === 'elevenlabs')?.catalog).toBe('configured-subset')
+    expect(catalog.some(provider => provider.id.startsWith('byo:'))).toBe(false)
+    for (const owner of [mockRetrieveApiKey, mockGetVoiceEngineRecordByProviderId, mockListVoiceEngineRecords, mockListVoiceEngineSummaries, mockFetch]) expect(owner).not.toHaveBeenCalled()
+  })
+
+  it('rejects overlong saved StepAudio 2.5 instructions without contacting the provider or changing saved values', async () => {
+    const instructions = 'x'.repeat(201)
+    const saved = { voice_settings: { ttsEngineSettings: { stepfun: { common: { instructions } } } } }
+    mockGetUserSettings.mockResolvedValue(saved)
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    const error = await synthesizeSpeech({ text: 'Hello', userId: 'user-1', provider: 'stepfun', model: 'stepaudio-2.5-tts', voiceId: 'lively-girl' }).catch(error => error)
+    const { classifyVoiceApiError } = await import('../services/voiceApiErrors')
+    expect(classifyVoiceApiError(error, 'tts')).toMatchObject({ status: 400, logLevel: 'warn', error: expect.stringContaining('at most 200') })
+    expect(mockRetrieveApiKey).not.toHaveBeenCalled()
+    expect(mockFetch).not.toHaveBeenCalled()
+    expect(saved.voice_settings.ttsEngineSettings.stepfun.common.instructions).toBe(instructions)
+  })
+
+  it('keeps runtime provider reads local and refreshes the external catalog only on explicit picker intent', async () => {
+    const { buildVoiceProviderSummary } = await import('../services/voiceService')
+    await buildVoiceProviderSummary('user-1')
+    expect(mockFetch).not.toHaveBeenCalled()
+    mockFetch.mockResolvedValueOnce(new Response('{}', { headers: { 'content-type': 'application/json' } }))
+    await buildVoiceProviderSummary('user-1', { refreshCatalog: true })
+    expect(mockFetch).toHaveBeenCalledExactlyOnceWith('https://api.batshit.ai/registry/voice-model-catalog.json', expect.objectContaining({ credentials: 'omit', redirect: 'error', method: 'GET' }))
+  })
+
+  it('BL-1682 metadata ignores an inherited profile from a different provider', async () => {
+    mockGetVoiceProfile.mockResolvedValue({ id: 'fish_profile', provider: 'fish', model: 's2.1-pro', voiceId: 'fish-owned' })
+    const { resolveVoiceConfigForMetadata } = await import('../services/voiceService')
+    const result = await resolveVoiceConfigForMetadata({
+      userSettings: { user_id: 'user-1', voice_settings: { schemaVersion: 2, tts: { providerId: 'fish', profileId: 'fish_profile' } } } as any,
+      agent: { id: 'agent-1', user_id: 'user-1', agentType: 'api', voice_profile: { tts: { providerId: 'openai' } } } as any
+    })
+    expect(result).toMatchObject({ provider: 'openai', profileId: null, model: null, voiceId: null })
+    expect(mockGetVoiceProfile).not.toHaveBeenCalled()
+    for (const owner of [mockRetrieveApiKey, mockListVoiceEngineRecords, mockListVoiceEngineSummaries, mockFetch]) expect(owner).not.toHaveBeenCalled()
+  })
+
+  it.each(['openai', undefined])('metadata retains inherited profiles with matching or blank provider %s', async providerId => {
+    mockGetVoiceProfile.mockResolvedValue({ id: 'openai_profile', provider: 'openai', model: 'tts-1', voiceId: 'alloy' })
+    const { resolveVoiceConfigForMetadata } = await import('../services/voiceService')
+    const result = await resolveVoiceConfigForMetadata({
+      userSettings: { user_id: 'user-1', voice_settings: { schemaVersion: 2, tts: { providerId, profileId: 'openai_profile' } } } as any,
+      agent: { voice_profile: { tts: { providerId: 'openai' } } } as any
+    })
+    expect(result).toMatchObject({ provider: 'openai', profileId: 'openai_profile', model: 'tts-1', voiceId: 'alloy' })
+    expect(mockGetVoiceProfile).toHaveBeenCalledWith('openai_profile')
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('metadata retains an explicit profile override and applicable agent precedence', async () => {
+    mockGetVoiceProfile.mockImplementation(async id => ({ id, provider: 'openai', model: 'tts-1', voiceId: 'alloy' }))
+    const { resolveVoiceConfigForMetadata } = await import('../services/voiceService')
+    const input = {
+      userSettings: { user_id: 'user-1', voice_settings: { schemaVersion: 2, tts: { providerId: 'openai', profileId: 'global_profile' } } } as any,
+      agent: { voice_profile: { tts: { profileId: 'agent_profile' } } } as any
+    }
+    expect(await resolveVoiceConfigForMetadata(input)).toMatchObject({ provider: 'openai', profileId: 'agent_profile' })
+    expect(await resolveVoiceConfigForMetadata({ ...input, metadata: { voiceProvider: 'openai', voiceProfileId: 'request_profile' } })).toMatchObject({ provider: 'openai', profileId: 'request_profile' })
+    expect(mockFetch).not.toHaveBeenCalled()
   })
 
   const createTinyWav = () => {
@@ -429,6 +546,61 @@ describe('voiceService engine defaults', () => {
       mediaType: 'audio/wav'
     })
     expect(Array.from(result.audio)).toEqual([9, 10, 11])
+  })
+
+  function mimoAudioResponse() {
+    return new Response(JSON.stringify({ choices: [{ message: { audio: { data: Buffer.from([9, 10, 11]).toString('base64') } } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  it('MiMo design uses final resolved engine/profile/request instructions and never sends the saved preset voice', async () => {
+    const saved = { user_id: 'user-1', voice_settings: { schemaVersion: 2, tts: { providerId: 'mimo', modelId: 'mimo-v2.5-tts-voicedesign', voiceId: 'Chloe', profileId: 'mimo-design-profile' },
+      ttsEngineSettings: { mimo: { common: { instructions: 'Engine description' } } }, ttsEnginePrompts: { mimo: { prompt: 'Not a request instruction' } } } }
+    mockGetUserSettings.mockResolvedValue(saved)
+    mockGetVoiceProfile.mockResolvedValue({ id: 'mimo-design-profile', user_id: 'user-1', name: 'Configured design', provider: 'mimo', model: 'mimo-v2.5-tts-voicedesign', voiceId: 'Chloe', settings: { common: { instructions: 'Saved profile description' } } })
+    mockRetrieveApiKey.mockImplementation(async (service: string) => service === 'mimo' ? 'mimo-test-key' : null)
+    mockFetch.mockImplementation(async () => mimoAudioResponse())
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    const inherited = await synthesizeSpeech({ text: 'Say this', provider: 'mimo', userId: 'user-1' })
+    let body = JSON.parse(String(mockFetch.mock.calls[0][1].body))
+    expect(body.messages).toEqual([{ role: 'user', content: 'Saved profile description' }, { role: 'assistant', content: 'Say this' }])
+    expect(body.audio).toEqual({ format: 'wav' }); expect(inherited.voiceId).toBeNull()
+    await synthesizeSpeech({ text: 'Say this', provider: 'mimo', userId: 'user-1', options: { common: { instructions: 'Request description' } } })
+    body = JSON.parse(String(mockFetch.mock.calls[1][1].body))
+    expect(body.messages[0]).toEqual({ role: 'user', content: 'Request description' })
+    expect(saved.voice_settings.tts).toEqual({ providerId: 'mimo', modelId: 'mimo-v2.5-tts-voicedesign', voiceId: 'Chloe', profileId: 'mimo-design-profile' })
+  })
+  it('MiMo engine prompts do not satisfy a missing design request description or trigger key/provider work', async () => {
+    mockGetUserSettings.mockResolvedValue({ user_id: 'user-1', voice_settings: { schemaVersion: 2, tts: { providerId: 'mimo' }, ttsEnginePrompts: { mimo: { prompt: 'Speak warmly' } } } })
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    await expect(synthesizeSpeech({ text: 'Say this', provider: 'mimo', model: 'mimo-v2.5-tts-voicedesign', voiceId: 'Chloe', userId: 'user-1' })).rejects.toMatchObject({ code: 'mimo_voice_input_invalid', status: 400 })
+    expect(mockRetrieveApiKey).not.toHaveBeenCalled(); expect(mockFetch).not.toHaveBeenCalled()
+  })
+  it('MiMo clone preserves the resolved reference but never echoes it in the actual synthesis response header', async () => {
+    const uri = 'data:audio/wav;base64,AQID'
+    const saved = { user_id: 'user-1', voice_settings: { schemaVersion: 2, tts: { providerId: 'mimo', modelId: 'mimo-v2.5-tts-voiceclone', voiceId: uri } } }
+    mockGetUserSettings.mockResolvedValue(saved)
+    mockRetrieveApiKey.mockImplementation(async (service: string) => service === 'mimo' ? 'mimo-test-key' : null)
+    mockFetch.mockImplementation(async () => mimoAudioResponse())
+    const { POST } = await import('../../../routes/api/voice/synthesize/+server')
+    const response = await POST({ locals: { user: { id: 'user-1' } }, request: new Request('http://local/api/voice/synthesize', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'Say this', provider: 'mimo' }) }) } as never)
+    expect(response.status).toBe(200); expect(response.headers.get('x-voice-id')).toBe('')
+    expect([...response.headers.values()].join(' ')).not.toContain(uri)
+    expect(JSON.parse(String(mockFetch.mock.calls[0][1].body)).audio.voice).toBe(uri)
+    expect(saved.voice_settings.tts.voiceId).toBe(uri)
+  })
+  it('ignores caller compatibility fields at the actual POST boundary instead of choosing a private serializer', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) => service === 'mimo' ? 'mimo-test-key' : null)
+    mockFetch.mockImplementation(async () => mimoAudioResponse())
+    const { POST } = await import('../../../routes/api/voice/synthesize/+server')
+    const response = await POST({ locals: { user: { id: 'user-1' } }, request: new Request('http://local/api/voice/synthesize', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Say this', provider: 'mimo', model: 'custom-mimo-id', voiceId: 'Chloe', compatibilityProfileId: 'mimo.chat-voice-design.v1', options: { compatibilityProfileId: 'mimo.chat-voice-clone.v1' } }) }) } as never)
+    expect(response.status).toBe(200)
+    expect(JSON.parse(String(mockFetch.mock.calls[0][1].body))).toMatchObject({ model: 'custom-mimo-id', audio: { voice: 'Chloe' }, messages: [{ role: 'assistant', content: 'Say this' }] })
+    expect(response.headers.get('x-voice-id')).toBe('Chloe')
+  })
+  it.each([undefined, 'Chloe', 'data:audio/ogg;base64,AQID'])('MiMo clone refuses missing/preset/unsupported resolved reference before credential issue: %s', async voiceId => {
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    await expect(synthesizeSpeech({ text: 'Say this', provider: 'mimo', model: 'mimo-v2.5-tts-voiceclone', voiceId, userId: 'user-1' })).rejects.toMatchObject({ code: 'mimo_voice_input_invalid', status: 400 })
+    expect(mockRetrieveApiKey).not.toHaveBeenCalled(); expect(mockFetch).not.toHaveBeenCalled()
   })
 
   it('uses the separate MiMo Token Plan endpoint and key for speech on a Dev copy that allows paused plans', async () => {
@@ -1198,6 +1370,89 @@ describe('voiceService engine defaults', () => {
     expect(result.find((entry) => entry.id === 'deepgram')?.supports.streaming).toBe(false)
   })
 
+  it('A10 Fish account source reads one workspace page and retains safe count/extent facts without compatibility claims', async () => {
+    const key = 'FISH_ACCOUNT_SYNTHETIC_PRIVATE_KEY'
+    mockFetch.mockResolvedValue(new Response(JSON.stringify({ total: 20, total_is_exact: false, window_limited: true, accessible_upper_bound: 10, max_offset: 9, has_more: true,
+      items: [{ _id: 'owned-voice', title: 'Owned Voice', state: 'trained', preview_url: 'PRIVATE_PREVIEW_URL', description: 'PRIVATE_DESCRIPTION' },
+        { _id: 'training-voice', state: 'training' }, { _id: ' invalid-id', title: 'Bad ID' }, { _id: 'long-label', title: '😀'.repeat(60) }] }), { headers: { 'content-type': 'application/json' } }))
+    const { readFishConfiguredAccountVoicePage } = await import('../services/voiceService')
+    const result = await readFishConfiguredAccountVoicePage({ apiKey: key, page: 1, deadlineAt: Date.now() + 30000 })
+    expect(result.status).toBe('listed')
+    if (result.status !== 'listed') throw new Error('Expected source page')
+    expect(result.page).toMatchObject({ providerId: 'fish', extent: 'credential-workspace', page: 1, pageSize: 100, rawCount: 4, filteredCount: 1, rejectedCount: 1,
+      reportedTotal: 20, totalExact: false, windowLimited: true, accessibleUpperBound: 10, maxOffset: 9, hasMore: true, nextPage: 2 })
+    expect(result.page.choices[0]).toMatchObject({ voiceId: 'owned-voice', modelId: null, modelScope: 'unknown', profileId: null })
+    expect(result.page.choices[1]).toMatchObject({ label: '😀'.repeat(50), labelTruncated: true })
+    expect(JSON.stringify(result)).not.toMatch(/PRIVATE_|preview|description|https:/)
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+    const [url, options] = mockFetch.mock.calls[0]
+    const request = new URL(String(url))
+    expect(request.origin + request.pathname).toBe('https://api.fish.audio/model')
+    expect(Object.fromEntries(request.searchParams)).toEqual({ self: 'true', page_size: '100', page_number: '1', sort_by: 'created_at' })
+    expect(options).toMatchObject({ redirect: 'error', headers: { Authorization: `Bearer ${key}` } })
+    expect(mockRetrieveApiKey).not.toHaveBeenCalled()
+  })
+  it('A10 Fish missing terminal metadata is unknown and a terminal capped page never invents more requests', async () => {
+    const { readFishConfiguredAccountVoicePage } = await import('../services/voiceService')
+    mockFetch.mockResolvedValueOnce(new Response('{"items":[]}', { headers: { 'content-type': 'application/json' } }))
+    expect(await readFishConfiguredAccountVoicePage({ apiKey: 'FISH_PRIVATE_KEY', page: 1, deadlineAt: Date.now() + 30000 })).toMatchObject({ status: 'listed', page: { hasMore: null, nextPage: null, reportedTotal: null, totalExact: null } })
+    mockFetch.mockResolvedValueOnce(new Response('{"items":[{"_id":"voice"}],"has_more":true}', { headers: { 'content-type': 'application/json' } }))
+    expect(await readFishConfiguredAccountVoicePage({ apiKey: 'FISH_PRIVATE_KEY', page: 10, deadlineAt: Date.now() + 30000 })).toMatchObject({ status: 'listed', page: { hasMore: true, nextPage: null, limitReached: true } })
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+  })
+  it('A10 Fish refuses malformed/ambiguous/reflected metadata and strips denied provider bodies', async () => {
+    const { readFishConfiguredAccountVoicePage } = await import('../services/voiceService')
+    const key = 'FISH_PRIVATE_SYNTHETIC_KEY'
+    for (const payload of [null, {}, { items: [] , has_more: 'false' }, { items: [], total: -1 }, { items: [], has_more: true },
+      { items: [{ _id: 'same' }, { _id: 'same' }] }, { items: [{ _id: 'voice', title: key }] }, { items: [{ _id: 'voice', title: 'https://api.fish.audio/private' }] }]) {
+      mockFetch.mockResolvedValueOnce(new Response(JSON.stringify(payload), { headers: { 'content-type': 'application/json' } }))
+      expect(await readFishConfiguredAccountVoicePage({ apiKey: key, page: 1, deadlineAt: Date.now() + 30000 })).toEqual({ status: 'unavailable', reason: 'invalid_payload' })
+    }
+    const denied = new Response(`${key} PRIVATE_ERROR_BODY`, { status: 403 })
+    const text = vi.spyOn(denied, 'text')
+    mockFetch.mockResolvedValueOnce(denied)
+    expect(await readFishConfiguredAccountVoicePage({ apiKey: key, page: 1, deadlineAt: Date.now() + 30000 })).toEqual({ status: 'unavailable', reason: 'list_denied' })
+    expect(text).not.toHaveBeenCalled()
+  })
+  it('A10 Fish bounds advertised and streamed bytes before JSON parsing', async () => {
+    const { readFishConfiguredAccountVoicePage } = await import('../services/voiceService')
+    mockFetch.mockResolvedValueOnce(new Response('{}', { headers: { 'content-type': 'application/json', 'content-length': String(2 * 1024 * 1024 + 1) } }))
+    expect(await readFishConfiguredAccountVoicePage({ apiKey: 'FISH_PRIVATE_KEY', page: 1, deadlineAt: Date.now() + 30000 })).toEqual({ status: 'unavailable', reason: 'source_limit' })
+    mockFetch.mockResolvedValueOnce(new Response(new Uint8Array(2 * 1024 * 1024 + 1), { headers: { 'content-type': 'application/json' } }))
+    expect(await readFishConfiguredAccountVoicePage({ apiKey: 'FISH_PRIVATE_KEY', page: 1, deadlineAt: Date.now() + 30000 })).toEqual({ status: 'unavailable', reason: 'source_limit' })
+  })
+  it('A10 Fish hears genuine Stop before request and while the body is pending', async () => {
+    const { readFishConfiguredAccountVoicePage } = await import('../services/voiceService')
+    const early = new AbortController(); early.abort()
+    expect(await readFishConfiguredAccountVoicePage({ apiKey: 'FISH_PRIVATE_KEY', page: 1, deadlineAt: Date.now() + 30000, signal: early.signal })).toEqual({ status: 'unavailable', reason: 'list_stopped' })
+    expect(mockFetch).not.toHaveBeenCalled()
+    const cancel = vi.fn(), stopped = new AbortController()
+    mockFetch.mockResolvedValue(new Response(new ReadableStream<Uint8Array>({ cancel }), { headers: { 'content-type': 'application/json' } }))
+    const pending = readFishConfiguredAccountVoicePage({ apiKey: 'FISH_PRIVATE_KEY', page: 1, deadlineAt: Date.now() + 30000, signal: stopped.signal })
+    await Promise.resolve(); await Promise.resolve(); stopped.abort()
+    expect(await pending).toEqual({ status: 'unavailable', reason: 'list_stopped' })
+    expect(cancel).toHaveBeenCalled()
+  })
+  it('A10 Fish deadline spans pending headers/body and cancels a late ignored-abort reply', async () => {
+    const { readFishConfiguredAccountVoicePage } = await import('../services/voiceService')
+    vi.useFakeTimers()
+    try {
+      let release: (response: Response) => void = () => {}
+      mockFetch.mockImplementationOnce(() => new Promise<Response>(resolve => { release = resolve }))
+      const pending = readFishConfiguredAccountVoicePage({ apiKey: 'FISH_PRIVATE_KEY', page: 1, deadlineAt: Date.now() + 30000 })
+      await vi.advanceTimersByTimeAsync(10000)
+      expect(await pending).toEqual({ status: 'unavailable', reason: 'list_timeout' })
+      const lateCancel = vi.fn()
+      release(new Response(new ReadableStream<Uint8Array>({ cancel: lateCancel }), { headers: { 'content-type': 'application/json' } }))
+      await Promise.resolve(); await Promise.resolve()
+      expect(lateCancel).toHaveBeenCalled()
+      mockFetch.mockResolvedValueOnce(new Response(new ReadableStream<Uint8Array>(), { headers: { 'content-type': 'application/json' } }))
+      const body = readFishConfiguredAccountVoicePage({ apiKey: 'FISH_PRIVATE_KEY', page: 1, deadlineAt: Date.now() + 30000 })
+      await vi.advanceTimersByTimeAsync(10000)
+      expect(await body).toEqual({ status: 'unavailable', reason: 'list_timeout' })
+    } finally { vi.useRealTimers() }
+  })
+
   it('lists Fish Audio user models and popular public models as voices', async () => {
     mockRetrieveApiKey.mockImplementation(async (service: string) =>
       service === 'fish' ? 'fish-test-key-1234567890' : null
@@ -1447,7 +1702,7 @@ describe('voiceService engine defaults', () => {
         'gpt-4o-transcribe-diarize',
         'whisper-1'
       ],
-      realtimeSttModels: ['gpt-realtime-whisper']
+      realtimeSttModels: []
     })
     expect(result.find((entry) => entry.id === 'google')).toMatchObject({
       supports: {
@@ -1506,7 +1761,7 @@ describe('voiceService engine defaults', () => {
       defaultSttModel: 'scribe_v2',
       defaultRealtimeSttModel: 'scribe_v2_realtime',
       sttModels: ['scribe_v2'],
-      realtimeSttModels: ['scribe_v2_realtime'],
+      realtimeSttModels: [],
       ttsModels: ['eleven_v3', 'eleven_multilingual_v2', 'eleven_flash_v2_5', 'eleven_flash_v2']
     })
     expect(result.find((entry) => entry.id === 'mistral')).toMatchObject({
@@ -1518,7 +1773,7 @@ describe('voiceService engine defaults', () => {
       defaultRealtimeSttModel: 'voxtral-mini-transcribe-realtime-2602',
       ttsModels: ['voxtral-mini-tts-2603'],
       sttModels: ['voxtral-mini-latest', 'voxtral-mini-2602'],
-      realtimeSttModels: ['voxtral-mini-transcribe-realtime-2602']
+      realtimeSttModels: []
     })
   })
 
@@ -2870,6 +3125,86 @@ describe('voiceService engine defaults', () => {
 
     expect(body.input).toBe('Hello there')
     expect(body.instruct).toBeUndefined()
+  })
+
+  describe('BL-2118 failed clone-profile saves preserve reference audio', () => {
+    const request = { audio: new Uint8Array([1, 2, 3, 4]), provider: 'byo:preserve-clone' as const,
+      name: 'Preserved sample', filename: 'reference.wav', userId: 'user-1' }
+    beforeEach(() => {
+      mockGetVoiceEngineRecordByProviderId.mockResolvedValue({ id: 'preserve-clone', name: 'Preserve Clone',
+        enabled: true, supportsTts: true, supportsStt: false, supportsClone: true,
+        baseUrl: 'http://127.0.0.1:9999', requestFormat: 'openai-compatible', ttsPath: '/v1/audio/speech' })
+    })
+
+    it.each(['generic', 'lifecycle', 'non-OK'] as const)('keeps sample bytes after a fake saved-then-rejected %s writer and preserves the exact error', async kind => {
+      const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'batshit-clone-preserve-'))
+      vi.stubEnv('BATSHIT_HOME_DIR', tempRoot)
+      const { SettingsLifecycleRefusal } = await import('../services/appActions/settings/lifecycle')
+      const nestedCause = new Error('original nested cause')
+      const failure = kind === 'lifecycle'
+        ? Object.assign(new SettingsLifecycleRefusal('An existing write outcome is unknown.'), { cause: nestedCause })
+        : Object.assign(new Error(kind === 'non-OK' ? 'Voice profile save outcome is unconfirmed.' : 'Redis reply was lost.', { cause: nestedCause }),
+          kind === 'generic' ? { code: 'ECONNRESET' } : {})
+      const original = { status: (failure as any).status, code: (failure as any).code, cause: failure.cause, stack: failure.stack }
+      const stored = new Map<string, any>()
+      mockCreateVoiceProfile.mockImplementationOnce(async (profile: any) => { stored.set(profile.id, profile); throw failure })
+      try {
+        const { cloneVoice } = await import('../services/voiceService')
+        const rejected = await cloneVoice(request).then(() => undefined, error => error)
+        expect(rejected).toBe(failure)
+        expect({ status: rejected.status, code: rejected.code, cause: rejected.cause, stack: rejected.stack }).toEqual(original)
+        expect(mockCreateVoiceProfile).toHaveBeenCalledTimes(1)
+        const profile = mockCreateVoiceProfile.mock.calls[0][0]
+        expect(stored.get(profile.id)).toBe(profile)
+        expect(await readFile(profile.settings.batshitManagedReferenceAudioPath)).toEqual(Buffer.from(request.audio))
+        expect(mockFetch).not.toHaveBeenCalled()
+      } finally { await rm(tempRoot, { recursive: true, force: true }) }
+    })
+
+    it('keeps a pre-existing directory sentinel as well as the sample after failure', async () => {
+      const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'batshit-clone-sentinel-'))
+      vi.stubEnv('BATSHIT_HOME_DIR', tempRoot)
+      const profileId = 'voice_1850000000000_i'
+      const dir = path.join(tempRoot, 'voice-profiles', profileId)
+      await mkdir(dir, { recursive: true })
+      await writeFile(path.join(dir, 'existing-reference.txt'), 'pre-existing user material')
+      const now = vi.spyOn(Date, 'now').mockReturnValue(1850000000000)
+      const random = vi.spyOn(Math, 'random').mockReturnValue(0.5)
+      const failure = new Error('profile publication unconfirmed')
+      mockCreateVoiceProfile.mockRejectedValueOnce(failure)
+      try {
+        const { cloneVoice } = await import('../services/voiceService')
+        await expect(cloneVoice(request)).rejects.toBe(failure)
+        expect(mockCreateVoiceProfile).toHaveBeenCalledTimes(1)
+        expect(mockCreateVoiceProfile.mock.calls[0][0].id).toBe(profileId)
+        expect(await readFile(path.join(dir, 'existing-reference.txt'), 'utf8')).toBe('pre-existing user material')
+        expect(await readFile(path.join(dir, 'reference.wav'))).toEqual(Buffer.from(request.audio))
+      } finally {
+        now.mockRestore(); random.mockRestore()
+        await rm(tempRoot, { recursive: true, force: true })
+      }
+    })
+
+    it('keeps the operator-returned host-path sample on a failed Docker profile save', async () => {
+      const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'batshit-clone-host-preserve-'))
+      vi.stubEnv('BATSHIT_CONTAINERIZED', '1')
+      const audioPath = path.join(tempRoot, 'reference.wav')
+      const sentinel = path.join(tempRoot, 'operator-owned.txt')
+      await writeFile(audioPath, request.audio)
+      await writeFile(sentinel, 'host owner remains')
+      mockSaveHostVoiceReferenceAudioViaOperator.mockResolvedValue({ success: true, audioPath, dirPath: tempRoot })
+      const failure = Object.assign(new Error('Host profile save unconfirmed'), { code: 'HOST_SAVE_UNKNOWN' })
+      mockCreateVoiceProfile.mockRejectedValueOnce(failure)
+      try {
+        const { cloneVoice } = await import('../services/voiceService')
+        await expect(cloneVoice(request)).rejects.toBe(failure)
+        expect(mockSaveHostVoiceReferenceAudioViaOperator).toHaveBeenCalledTimes(1)
+        expect(mockCreateVoiceProfile).toHaveBeenCalledTimes(1)
+        expect(mockCreateVoiceProfile.mock.calls[0][0].settings.batshitManagedReferenceAudioPath).toBe(audioPath)
+        expect(await readFile(audioPath)).toEqual(Buffer.from(request.audio))
+        expect(await readFile(sentinel, 'utf8')).toBe('host owner remains')
+      } finally { await rm(tempRoot, { recursive: true, force: true }) }
+    })
   })
 
   it('creates a managed reference-audio profile for clone-capable BYO engines', async () => {

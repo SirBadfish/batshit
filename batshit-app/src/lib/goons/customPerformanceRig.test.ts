@@ -711,6 +711,27 @@ describe('CustomPerformanceRigRuntime', () => {
     expect(rig.jaw.position.distanceTo(mixerJawPosition)).toBeLessThan(1e-12)
   })
 
+  it('detects only currently applied overlays that can move the selected skin', () => {
+    const rig = buildRig(), body = new THREE.SkinnedMesh(), unrelatedBody = new THREE.SkinnedMesh(), unrelatedBone = new THREE.Bone()
+    rig.root.add(body, unrelatedBody, unrelatedBone); rig.root.updateMatrixWorld(true)
+    body.bind(new THREE.Skeleton([rig.head])); unrelatedBody.bind(new THREE.Skeleton([unrelatedBone]))
+    expect(rig.runtime.affectsMotionSkin(body)).toBe(false)
+    rig.runtime.apply({ ...NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION, headYaw: 1 }, new Map())
+    expect(rig.runtime.affectsMotionSkin(body)).toBe(true)
+    expect(rig.runtime.affectsMotionSkin(unrelatedBody)).toBe(false)
+    rig.runtime.removeOverlay()
+    expect(rig.runtime.affectsMotionSkin(body)).toBe(false)
+  })
+
+  it('exposes all possible performance write nodes even while neutral, and revokes them on dispose', () => {
+    const rig = buildRig()
+    expect(new Set(rig.runtime.getMotionWriteNodes())).toEqual(new Set([rig.head, rig.neck, rig.leftEye, rig.rightEye, rig.jaw]))
+    rig.runtime.apply({ ...NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION, headYaw: 1 }, new Map())
+    expect(new Set(rig.runtime.getMotionWriteNodes())).toEqual(new Set([rig.head, rig.neck, rig.leftEye, rig.rightEye, rig.jaw]))
+    rig.runtime.dispose()
+    expect(rig.runtime.getMotionWriteNodes()).toBeNull()
+  })
+
   it('drives generic transforms from the shared final target weights and cleans up on dispose', () => {
     const rig = buildRig()
     const basePosition = rig.jaw.position.clone()

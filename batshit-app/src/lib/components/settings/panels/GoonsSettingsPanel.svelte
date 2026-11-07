@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount, tick } from 'svelte'
+  import { onDestroy, onMount, tick, untrack } from 'svelte'
   import { bytesToBlob, bytesToFile } from '$lib/utils/binary'
   import { downloadBlob } from '$lib/utils/download'
   import * as Card from '$lib/components/ui/card'
@@ -91,6 +91,9 @@
   import GoonsDeleteDialogs from '$lib/components/settings/goons/GoonsDeleteDialogs.svelte'
   import GoonsPackDialogs from '$lib/components/settings/goons/GoonsPackDialogs.svelte'
   import GoonsUnsavedExitDialog from '$lib/components/settings/goons/GoonsUnsavedExitDialog.svelte'
+  import GoonOperationOverlay, { type GoonOperationState } from '$lib/components/settings/goons/GoonOperationOverlay.svelte'
+  import { createRecipePreviewAttempt, type RecipePreviewAttempt } from '$lib/goons/recipe/recipePreviewAttempt'
+  import type { RecipeSourceIdentity } from '$lib/goons/recipe/packageMetadata'
   import RecipeWorkflowController from '$lib/components/settings/goons/recipe/RecipeWorkflowController.svelte'
   import {
     resolveGoonSettingsPreviewTarget,
@@ -247,6 +250,7 @@
     parseHairState,
     verifyHairAsset,
     type HairAssetV1,
+    validateHairStateBinding,
     type HairRefitSourceV1,
     type HairStateV2
   } from '$lib/goons/hairAssets'
@@ -348,6 +352,7 @@
   import type {
     GoonBasePosture,
     GoonRecord,
+    GoonCompatibilityReport,
     GoonCueDefinition,
     GoonCueKind,
     GoonCueMap,
@@ -432,6 +437,7 @@
     resetRetiredGoonHair,
     loadGoonAnimationLibrary,
     updateGoon as updateGoonRecord,
+    updateGoonWithCompatibilityReset,
     persistGoonCamera,
     uploadGoonAnimation,
     deleteGoonAnimation,
@@ -474,6 +480,8 @@
     type RecipeStageResponse,
     type RecipeStateSnapshot
   } from '$lib/goons/recipe'
+  import { captureGoonCompatibilityResetBasis, captureGoonCompatibilitySources, compatibilitySourcesSha256, isCurrentGoonCompatibilityReport, isGoonCompatibilityModelReplacement, isSafeMotionLoadFile, isValidGoonMotionSources, isValidMotionFileRef, preserveSavedMotionOption } from '$lib/goons/goonCompatibilityBasis'
+  import { canonicalRecipeString } from '$lib/goons/recipe/recipeCanonical'
   import {
     persistGoonsSettingsPatchRequest,
     refreshUserSettingsRequest
@@ -483,8 +491,8 @@
   import {
     importGoonLibraryExportBundle
   } from '$lib/goons/packs'
-  import { getGoons } from '$lib/stores/goons.svelte'
-  import { getGoonAnimationLibrary } from '$lib/stores/goonAnimationLibrary.svelte'
+  import { getGoons, getGoonsReadState, getGoonsMotionSourceRevision, replaceGoon } from '$lib/stores/goons.svelte'
+  import { getGoonAnimationLibrary, getGoonAnimationLibraryReadState } from '$lib/stores/goonAnimationLibrary.svelte'
   import { goonMotionPreviewGenerationActive } from '$lib/stores/goonMotionPreviewGeneration'
   import {
     confirmUserSettings,
@@ -542,8 +550,9 @@
     state: RecipeStateSnapshot
     preview: RecipeFittedPreviewState
     side: 'current' | 'updated'
+    liveEnvelope?: RecipeStageResponse['envelope']
   }
-  type GoonPreviewMode = 'editor' | 'library' | 'recipe-live-candidate'
+  type GoonPreviewMode = 'editor' | 'library' | 'recipe-live-candidate' | 'recipe-saved-preview'
   const MOTION_LIBRARY_PREVIEW_GOON_ID = '__motion_library_preview__'
   const SCENE_PROXY_PREVIEW_GOON_ID = '__scene_proxy_preview__'
 
@@ -819,6 +828,27 @@
   // large editor even though no rendered control reads the camera object.
   let editorCamera: GoonCamera = {}
   let editorDirty = $state(false)
+  // Monotonic across close/reopen so an older Retry cannot clear a newer draft.
+  let editorDirtyEpoch = 0
+  let editorInstanceEpoch = $state(0)
+  let editorDirtyHasOther = false
+  function markEditorDirty(kind: 'hair' | 'other' = 'other') {
+    editorDirtyEpoch += 1
+    if (kind === 'other') editorDirtyHasOther = true
+    editorDirty = true
+  }
+  function invalidateRetrySettlement() {
+    editorDirtyEpoch += 1
+  }
+  function setEditorArtworkUploadBusy(busy: boolean) {
+    if (busy) invalidateRetrySettlement()
+    editorFacialArtworkUploadBusy = busy
+  }
+  function clearEditorDirty() {
+    editorDirtyEpoch += 1
+    editorDirtyHasOther = false
+    editorDirty = false
+  }
   let editorSaving = $state(false)
   let editorFacialArtworkUploadBusy = $state(false)
   let editorFacialArtworkCreditDraft = $state<FacialArtworkUploadCreditDraft>(
@@ -833,6 +863,11 @@
   let editorPendingAdvancedPackageUpdate = $state<AdvancedGoonPackageUploadResult | null>(null)
   let recipeWorkflowController = $state<RecipeWorkflowControllerHandle | null>(null)
   let recipeWorkflowBusy = $state(false)
+  let recipeWorkflowOperation = $state<GoonOperationState | null>(null)
+  let savedPreviewAttempt = $state.raw<RecipePreviewAttempt | null>(null)
+  let stagedPreviewAttempt = $state.raw<RecipePreviewAttempt | null>(null)
+  let recipeComparisonAttempt = $state.raw<RecipePreviewAttempt | null>(null)
+  let recipeStagedPreviewGoon = $state<GoonRecord | null>(null)
   let retiredHairRecoveryBusy = $state(false)
   let recipeEditorPreviewTarget = $state<RecipeEditorPreviewTarget | null>(null)
   let recipeEditorDraftPreview = $state<RecipeFittedPreviewState | null>(null)
@@ -910,6 +945,7 @@
   let scenePropInput = $state<HTMLInputElement | null>(null)
   let roomTextureInput = $state<HTMLInputElement | null>(null)
   let hairAssets = $state<HairAssetV1[]>([])
+  let retainedHairBuiltinAssets = $state<HairAssetV1[]>([])
   let hairRefitSources = $state<HairRefitSourceV1[]>([])
   let hairCatalogLoaded = $state(false)
   let hairCatalogLoading = $state(false)
@@ -917,6 +953,9 @@
   let editorHairState = $state<HairStateV2>(createHairState(null))
   let editorHairStateError = $state<string | null>(null)
   let hairPreviewBusy = $state(false)
+  let hairPreviewOperation = 0
+  let hairColorEditOperation = 0
+  let hairMotionEditOperation = 0
   let hairPreviewError = $state<string | null>(null)
   let editorHairImportOpen = $state(false)
   let hairImportInitialFile = $state<File | null>(null)
@@ -924,6 +963,9 @@
   let hairImportInitialInspection = $state<HairImportInspection | null>(null)
   let hairImportRefitAsset = $state<HairAssetV1 | null>(null)
   let hairImportRefitSource = $state<HairRefitSourceV1 | null>(null)
+  export function hasActiveHairImport() {
+    return editorHairImportOpen || hairImportRefitAsset !== null || hairImportInitialFile !== null
+  }
   let editorScrollElement = $state<HTMLElement | null>(null)
   let hairImportWizardElement = $state<HTMLElement | null>(null)
   let hairImportCandidate = $state<HairImportPreparedCandidate | null>(null)
@@ -940,7 +982,7 @@
     intensity: HAIR_MOTION_DEFAULT_INTENSITY
   })
   let hairCatalogPromise: Promise<HairAssetCatalog> | null = null
-  let editorHairHydrationGoonId = ''
+  let editorHairHydrationGoonId = $state('')
   let editorHairStoredSignature = ''
   let sceneUploadBusy = $state(false)
   let sceneRoomShellBusy = $state(false)
@@ -1049,6 +1091,13 @@
   let previewCustomExpressions = $state<string[]>([])
   let closetAssignments = $state<Record<string, GoonClosetAssignment>>({})
   let closetBusy = $state(false)
+  // Each manual selection supersedes only older preview work, not its draft.
+  let closetPreviewRequest = 0
+
+  function beginClosetPreviewRequest() {
+    closetBusy = false
+    return ++closetPreviewRequest
+  }
   let previewContainer = $state<HTMLDivElement | null>(null)
   let previewEngine = $state<GoonEngine | null>(null)
   let previewHost = $state<HTMLDivElement | null>(null)
@@ -1058,6 +1107,9 @@
   let previewError = $state<string | null>(null)
   let previewRuntimeStatus = $state<GoonRendererRuntime | null>(null)
   let previewGoonId = $state<string | null>(null)
+  let previewLoadCompletion: Promise<void> | null = null
+  let previewAnimationSyncing = $state(false)
+  let previewAnimationSyncPromise: Promise<void> | null = null
   let previewToken = 0
   let pendingEditorOpeningFrameGoonId: string | null = null
   let previewAnimationSignature = $state('')
@@ -1110,8 +1162,6 @@
   let kitchenFacePreviewResumeToken = 0
   let goonDockPauseActive = false
   const GOON_DOCK_PAUSE_SOURCE = 'goons-settings-preview'
-  const TRANSPARENT_TEXTURE_URL =
-    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII='
   const ANIMATION_SORT_OPTIONS = [
     { value: 'alpha', label: 'Alphabetical' },
     { value: 'newest', label: 'Newest first' },
@@ -1254,6 +1304,16 @@
   const vrmaLibrary = $derived.by(() =>
     Array.isArray(animationLibrary?.vrma) ? [...animationLibrary.vrma] : []
   )
+  const compatibilitySourcesHash = $derived.by(() => {
+    const goonRead = getGoonsReadState()
+    const motionRead = getGoonAnimationLibraryReadState()
+    if (!goonRead.owner || goonRead.owner !== motionRead.owner ||
+      !goonRead.confirmed || goonRead.loading || goonRead.error ||
+      !motionRead.confirmed || motionRead.loading || motionRead.error) return null
+    getGoonsMotionSourceRevision()
+    try { return compatibilitySourcesSha256(captureGoonCompatibilitySources(untrack(() => getGoons()), vrmaLibrary).sources) }
+    catch { return null }
+  })
   // Unified motion library: one entry per animation name, holding every
   // format version (.vrma / .glb). Metadata reads come from the entry's
   // winner file; staged edits go to every version so pairs stay in lockstep.
@@ -1483,6 +1543,12 @@
     }
   })
   const editorRecipeSourceGoon = $derived(editorRecipeSourceProjection.goon)
+  const editorDefaultPreviewGoon = $derived(editorRecipeSourceGoon)
+  function editorPreviewModeFor(goon: GoonRecord): GoonPreviewMode {
+    if (goon === recipeStagedPreviewGoon) return 'recipe-live-candidate'
+    if (goon === recipeEditorPreviewTarget?.goon && recipeEditorPreviewTarget.liveEnvelope) return 'recipe-saved-preview'
+    return 'editor'
+  }
   const editorRecipeSourceError = $derived(editorRecipeSourceProjection.error)
   const editorGoonKind = $derived.by<GoonKind>(() => (editorGoon?.kind === 'custom' ? 'custom' : 'vrm'))
   const editorSourceProfile = $derived.by<GoonSourceProfile>(() => resolveGoonSourceProfile(editorGoon))
@@ -1625,7 +1691,7 @@
       : { label: 'VRMA', title: 'Plays on VRM Goons' }
   }
   const editorAnimationFiles = $derived.by(() =>
-    Array.isArray(editorGoon?.files?.animations) ? editorGoon?.files?.animations ?? [] : []
+    Array.isArray(editorGoon?.files?.animations) ? editorGoon.files.animations.filter(isValidMotionFileRef) : []
   )
   const editorKnownAnimationData = $derived.by(() =>
     collectKnownAnimationData(editorGoon, previewAnimationCatalog)
@@ -1662,11 +1728,17 @@
   const globalAnimationSourceByName = $derived.by(() =>
     new Map<string, GoonAnimationSource>(globalAnimationOptions.map((name) => [name, 'vrma']))
   )
+  const globalMotionInventoryConfirmed = $derived.by(() => {
+    const motion = getGoonAnimationLibraryReadState()
+    const goons = getGoonsReadState()
+    return Boolean(motion.owner && motion.owner === goons.owner && motion.confirmed && !motion.loading && !motion.error)
+  })
   const globalMotionPickerOptions = $derived.by(() =>
     buildMotionPickerOptions(
       globalAnimationOptions,
       globalAnimationSourceByName,
-      vrmaLibrary.map((file) => ({ file, source: 'vrma' as const }))
+      vrmaLibrary.map((file) => ({ file, source: 'vrma' as const })),
+      globalMotionInventoryConfirmed ? new Set<string>() : new Set(globalAnimationOptions)
     )
   )
   const editorMotionPickerOptions = $derived.by(() =>
@@ -1676,7 +1748,8 @@
       [
         ...vrmaLibrary.map((file) => ({ file, source: 'vrma' as const })),
         ...editorAnimationFiles.map((file) => ({ file, source: 'goon' as const }))
-      ]
+      ],
+      editorKnownAnimationData.unverifiedNames
     )
   )
   const globalPackMoodOptions = $derived.by(() =>
@@ -1764,7 +1837,8 @@
   function buildMotionPickerOptions(
     names: string[],
     sourceMap: Map<string, GoonAnimationSource>,
-    fileCandidates: Array<{ file: GoonFileRef; source: GoonAnimationSource }>
+    fileCandidates: Array<{ file: GoonFileRef; source: GoonAnimationSource }>,
+    unverifiedNames: Set<string> = new Set()
   ): GoonMotionPickerOption[] {
     const fileByName = new Map<string, { file: GoonFileRef; source: GoonAnimationSource }>()
     for (const candidate of fileCandidates) {
@@ -1786,7 +1860,8 @@
         return {
           name,
           label: file ? getMotionPickerFileLabel(file) : name,
-          sourceLabel: getMotionSourceLabel(source),
+          sourceLabel: unverifiedNames.has(name) ? 'Unverified' : getMotionSourceLabel(source),
+          disabled: unverifiedNames.has(name),
           posture,
           postureLabel: posture ? getPostureLabel(posture, motionStagePostureMap) : 'Any Posture',
           tags: file ? getMotionPickerFileTags(file) : []
@@ -2356,10 +2431,15 @@
     return getPaintedConcealCountLabel(selectedSavedItem?.paintedConcealMask)
   }
 
-  async function syncEditorGuidedOutfitPreview() {
+  async function syncEditorGuidedOutfitPreview(request = beginClosetPreviewRequest()) {
     if (!editorGoon || editorSourceProfile !== 'guided-custom-vrm') return
     if (previewGoonId !== editorGoon.id || !previewReady || !previewEngine) return
-    await previewEngine.configureGuidedOutfitPieces(
+    const engine = previewEngine, goonId = editorGoon.id, instance = editorInstanceEpoch, token = previewToken
+    const ownsPreview = captureClosetPreviewOwner(engine, () =>
+      request === closetPreviewRequest && editorGoonId === goonId && editorInstanceEpoch === instance && previewEngine === engine &&
+      previewGoonId === goonId && previewReady && token === previewToken)
+    if (!ownsPreview()) return
+    await engine.configureGuidedOutfitPieces(
       editorGuidedOutfitPiecesDraft,
       buildPersistedGuidedPieceStates(editorGuidedOutfitPiecesDraft),
       editorGuidedDufOverlays.map((overlay) => ({
@@ -2367,10 +2447,12 @@
         file: overlay.file
       }))
     )
-    previewEngine.resetMaterialOverrides()
-    await applyClosetAssignments(previewEngine, closetAssignments, {
+    if (!ownsPreview()) return
+    engine.resetMaterialOverrides()
+    await applyClosetAssignments(engine, closetAssignments, {
       guidedOutfitPieces: editorGuidedOutfitPiecesDraft,
-      guidedPieceStates: buildPersistedGuidedPieceStates(editorGuidedOutfitPiecesDraft)
+      guidedPieceStates: buildPersistedGuidedPieceStates(editorGuidedOutfitPiecesDraft),
+      isCurrent: ownsPreview
     })
   }
 
@@ -2423,12 +2505,13 @@
 
   function queueLoggedEditorPreviewUpdate(
     reason: string,
-    update: () => Promise<void>,
+    update: (request: number) => Promise<void>,
     details: Record<string, unknown> = {}
   ) {
+    const request = beginClosetPreviewRequest()
     editorPreviewUpdateQueue = editorPreviewUpdateQueue
       .catch(() => undefined)
-      .then(() => runLoggedEditorPreviewUpdate(reason, update, details))
+      .then(() => runLoggedEditorPreviewUpdate(reason, () => update(request), details))
     void editorPreviewUpdateQueue.catch((error: any) => {
       toast.error(error?.message || 'Goon preview update failed')
     })
@@ -2441,10 +2524,10 @@
     }
     editorGuidedActivePresetId = null
     editorActiveWardrobeOutfitId = null
-    editorDirty = true
+    markEditorDirty()
     queueLoggedEditorPreviewUpdate(
       'guided-piece-state',
-      () => syncEditorGuidedOutfitPreview(),
+      (request) => syncEditorGuidedOutfitPreview(request),
       { pieceId, nextChecked }
     )
   }
@@ -2495,10 +2578,10 @@
     closetAssignments = nextAssignments
     editorGuidedActivePresetId = null
     editorActiveWardrobeOutfitId = null
-    editorDirty = true
+    markEditorDirty()
     queueLoggedEditorPreviewUpdate(
       'standalone-guided-piece-selection',
-      () => syncEditorGuidedOutfitPreview(),
+      (request) => syncEditorGuidedOutfitPreview(request),
       { pieceId: piece.id, value }
     )
   }
@@ -2555,10 +2638,10 @@
     closetAssignments = nextAssignments
     editorGuidedActivePresetId = preset.id
     editorActiveWardrobeOutfitId = null
-    editorDirty = true
+    markEditorDirty()
     queueLoggedEditorPreviewUpdate(
       'guided-outfit-preset',
-      () => syncEditorGuidedOutfitPreview(),
+      (request) => syncEditorGuidedOutfitPreview(request),
       { presetId }
     )
   }
@@ -2665,7 +2748,7 @@
     if (changed) {
       editorClosetItems = nextItems
       closetAssignments = nextAssignments
-      editorDirty = true
+      markEditorDirty()
       await tick()
     }
 
@@ -2714,7 +2797,7 @@
     }
     editorGuidedActivePresetId = null
     editorActiveWardrobeOutfitId = activeOutfitId
-    editorDirty = true
+    markEditorDirty()
     if (editorIsGuidedCustomVrm) {
       await runLoggedEditorPreviewUpdate(
         'wardrobe-outfit-guided',
@@ -2811,7 +2894,7 @@
     newWardrobeOutfitName = ''
     editorWardrobeOutfitCreateOpen = false
     editorGuidedActivePresetId = null
-    editorDirty = true
+    markEditorDirty()
     await saveCueEditor({ successMessage: 'Outfit saved' })
   }
 
@@ -2835,7 +2918,7 @@
     }
     editorActiveWardrobeOutfitId = outfitId
     editorGuidedActivePresetId = null
-    editorDirty = true
+    markEditorDirty()
     await saveCueEditor({ successMessage: 'Outfit updated' })
   }
 
@@ -2846,7 +2929,7 @@
     if (editorActiveWardrobeOutfitId === outfitId) {
       editorActiveWardrobeOutfitId = null
     }
-    editorDirty = true
+    markEditorDirty()
     await saveCueEditor({ successMessage: 'Outfit deleted' })
   }
 
@@ -2865,10 +2948,10 @@
     )
     editorGuidedActivePresetId = null
     editorActiveWardrobeOutfitId = null
-    editorDirty = true
+    markEditorDirty()
     queueLoggedEditorPreviewUpdate(
       'guided-duf-overlay-remove',
-      () => syncEditorGuidedOutfitPreview(),
+      (request) => syncEditorGuidedOutfitPreview(request),
       { overlayId, removedPieceCount: removedPieceIds.size }
     )
   }
@@ -2885,6 +2968,7 @@
       return
     }
 
+    invalidateRetrySettlement()
     guidedDufClothesBusy = true
     try {
       const engine = await ensurePreviewGoonReady()
@@ -2917,7 +3001,7 @@
       }
       editorGuidedActivePresetId = null
       editorActiveWardrobeOutfitId = null
-      editorDirty = true
+      markEditorDirty()
       await runLoggedEditorPreviewUpdate(
         'guided-duf-overlay-add',
         () => syncEditorGuidedOutfitPreview(),
@@ -3005,12 +3089,27 @@
     }
   }
 
+  function hasCurrentCompatibility(goon: GoonRecord | null) {
+    if (!goon || !compatibilitySourcesHash || getGoonsReadState().owner !== goon.user_id) return false
+    try { return isCurrentGoonCompatibilityReport(goon.compatibility?.owner, goon, compatibilitySourcesHash) }
+    catch { return false }
+  }
+
+  function effectiveGoonCompatibility(goon: GoonRecord): GoonCompatibilityReport | null {
+    const report = goon.compatibility
+    if (!report) return null
+    if (report.tier === 'pending') return { tier: 'pending', issues: report.issues }
+    if (hasCurrentCompatibility(goon)) return report
+    return { tier: 'pending', issues: ['Compatibility analysis is unverified for this Goon and motion library.'] }
+  }
+
   function collectKnownAnimationData(
     goon: GoonRecord | null,
     runtimeCatalog: Array<{ name: string; source: 'vrm' | 'goon' | 'vrma' }> = []
   ) {
     const names = new Set<string>()
     const sourceMap = new Map<string, 'vrm' | 'goon' | 'vrma'>()
+    const unverifiedNames = new Set<string>()
 
     for (const entry of runtimeCatalog) {
       if (!entry?.name) continue
@@ -3018,17 +3117,28 @@
       sourceMap.set(entry.name, entry.source)
     }
 
+    const motionRead = getGoonAnimationLibraryReadState()
+    const goonRead = getGoonsReadState()
+    const sameOwner = Boolean(motionRead.owner && motionRead.owner === goonRead.owner &&
+      (!goon || goon.user_id === motionRead.owner))
+    const motionConfirmed = sameOwner && motionRead.confirmed && !motionRead.loading && !motionRead.error
     for (const file of vrmaLibrary) {
       const name = resolveAnimationName(file)
       if (!name) continue
+      if (!names.has(name) && !motionConfirmed) unverifiedNames.add(name)
+      if (motionConfirmed) unverifiedNames.delete(name)
       names.add(name)
       if (!sourceMap.has(name)) sourceMap.set(name, 'vrma')
     }
 
-    const goonFiles = Array.isArray(goon?.files?.animations) ? goon?.files?.animations ?? [] : []
+    const goonFiles = Array.isArray(goon?.files?.animations) ? goon.files.animations.filter(isValidMotionFileRef) : []
+    const goonsConfirmed = sameOwner && goonRead.confirmed && !goonRead.loading && !goonRead.error &&
+      goons.every(isValidGoonMotionSources)
     for (const file of goonFiles) {
       const name = resolveAnimationName(file)
       if (!name) continue
+      if (!names.has(name) && !goonsConfirmed) unverifiedNames.add(name)
+      if (goonsConfirmed) unverifiedNames.delete(name)
       names.add(name)
       if (!sourceMap.has(name)) sourceMap.set(name, 'goon')
     }
@@ -3036,14 +3146,19 @@
     const compatibilityNames = Array.isArray(goon?.compatibility?.animationNames)
       ? goon?.compatibility?.animationNames ?? []
       : []
+    const compatibilityCurrent = hasCurrentCompatibility(goon)
     for (const name of compatibilityNames) {
       if (!name) continue
+      if (!names.has(name) && !compatibilityCurrent) unverifiedNames.add(name)
+      if (compatibilityCurrent) unverifiedNames.delete(name)
       names.add(name)
     }
 
     return {
       names: Array.from(names).sort(),
-      sourceMap
+      sourceMap,
+      unverifiedNames,
+      inventoryConfirmed: Boolean(goon) && motionConfirmed && goonsConfirmed
     }
   }
 
@@ -3325,7 +3440,8 @@
     const tags = normalizeTagInput(animationTagInputs[filename] ?? (file.tags ?? []).join(', '))
     const motionMeta: GoonMotionMetadata = {}
     const posture = animationPostureInputs[filename] ?? file.motionMeta?.posture ?? ''
-    if (posture && motionStagePostureMap[posture]) {
+    // Preserve a saved posture even while its definition is unavailable.
+    if (posture) {
       motionMeta.posture = posture
     }
     const playback = animationPlaybackInputs[filename] ?? file.motionMeta?.playback ?? ''
@@ -3962,6 +4078,28 @@
     return resolveEditorClosetItemForGlobalSource(globalItem.id) ?? globalItem
   }
 
+  function createSavedClosetPreviewContext(goon: GoonRecord) {
+    // Saved previews own the selected Goon, never another open editor's draft.
+    const items = resolveEnabledCustomClosetItems(goon.closet?.items ?? {})
+    const itemsById = new Map(items.map((item) => [item.id, item]))
+    const globalItemsById = new Map(closetItemsById)
+    return {
+      resolveItem: (itemId?: string | null) => {
+        if (!itemId) return null
+        const localItem = itemsById.get(itemId)
+        if (localItem) return localItem
+        const globalItem = globalItemsById.get(itemId)
+        if (!globalItem) return null
+        const matches = items.filter((item) => item.sourceItemId === globalItem.id && !item.originalSource)
+        return [...matches].sort((left, right) =>
+          (right.updatedAt ?? right.createdAt ?? '').localeCompare(left.updatedAt ?? left.createdAt ?? '')
+        )[0] ?? globalItem
+      },
+      resolveOriginalSavedItem: (source: GoonClosetOriginalSource) =>
+        items.find((item) => originalSourceMatches(item.originalSource, source)) ?? null
+    }
+  }
+
   function resolveGuidedOutfitPiece(pieceId?: string | null) {
     if (!pieceId) return null
     return editorGuidedOutfitPiecesDraft.find((piece) => piece.id === pieceId) ?? null
@@ -4268,7 +4406,7 @@
     previewEngine?.setAuthoringPoseMode(false)
     queueLoggedEditorPreviewUpdate(
       'painted-conceal-close',
-      () => refreshEditorClosetPreview()
+      (request) => refreshEditorClosetPreview(request)
     )
   }
 
@@ -4346,7 +4484,7 @@
         [target.pieceId]: true
       }
     }
-    editorDirty = true
+    markEditorDirty()
   }
 
   function savePaintedConcealForClosetItemTarget(
@@ -4384,7 +4522,7 @@
         label: closetAssignments[target.slotName]?.label
       }
     }
-    editorDirty = true
+    markEditorDirty()
   }
 
   async function savePaintedConcealEditor() {
@@ -4611,7 +4749,7 @@
       ...editorClosetItems,
       [itemId]: nextItem
     }
-    editorDirty = true
+    markEditorDirty()
   }
 
   function resolveEditorClosetSourceItem(itemId: string) {
@@ -4969,13 +5107,22 @@
     }
   }
 
-  async function refreshEditorClosetPreview() {
+  async function refreshEditorClosetPreview(request = beginClosetPreviewRequest()) {
+    const goonId = editorGoonId, instance = editorInstanceEpoch
+    if (!goonId || request !== closetPreviewRequest) return
     const engine = await ensurePreviewGoonReady()
-    if (!engine) return
+    if (!engine || request !== closetPreviewRequest || editorGoonId !== goonId || editorInstanceEpoch !== instance ||
+        previewEngine !== engine || previewGoonId !== goonId || !previewReady || previewLoading) return
+    const token = previewToken
+    const ownsPreview = captureClosetPreviewOwner(engine, () =>
+      request === closetPreviewRequest && editorGoonId === goonId && editorInstanceEpoch === instance && previewEngine === engine &&
+      previewGoonId === goonId && previewReady && !previewLoading && previewToken === token)
+    if (!ownsPreview()) return
     engine.resetMaterialOverrides()
     await applyClosetAssignments(engine, closetAssignments, {
       guidedOutfitPieces: editorGuidedOutfitPiecesDraft,
-      guidedPieceStates: buildPersistedGuidedPieceStates(editorGuidedOutfitPiecesDraft)
+      guidedPieceStates: buildPersistedGuidedPieceStates(editorGuidedOutfitPiecesDraft),
+      isCurrent: ownsPreview
     })
   }
 
@@ -5067,7 +5214,7 @@
         label: closetAssignments[slotName]?.label
       }
     }
-    editorDirty = true
+    markEditorDirty()
     await tick()
     return nextItem
   }
@@ -5136,7 +5283,7 @@
       })
     }
 
-    editorDirty = true
+    markEditorDirty()
     editorActiveWardrobeOutfitId = null
     await tick()
     await refreshEditorClosetPreview()
@@ -5157,7 +5304,7 @@
       ...editorGuidedPieceStates,
       [piece.id]: true
     }
-    editorDirty = true
+    markEditorDirty()
     editorActiveWardrobeOutfitId = null
     await tick()
     await runLoggedEditorPreviewUpdate(
@@ -5293,7 +5440,7 @@
     if (activeTab === 'kitchen') {
       kitchenDirty = true
     } else {
-      editorDirty = true
+      markEditorDirty()
     }
   }
 
@@ -5307,7 +5454,7 @@
     const files: GoonFileRef[] = []
     const seen = new Set<string>()
     const addFile = (file?: GoonFileRef | null) => {
-      if (!file) return
+      if (!isSafeMotionLoadFile(file)) return
       const key = file.url || file.filename
       if (!key || seen.has(key)) return
       seen.add(key)
@@ -5444,7 +5591,7 @@
     const lane = resolveGoonMotionLaneForGoon(goon)
     const libraryFiles = filterGoonAnimationFilesForLane(vrmaLibrary, lane)
     const goonFiles = filterGoonAnimationFilesForLane(
-      Array.isArray(goon?.files?.animations) ? goon?.files?.animations ?? [] : [],
+      Array.isArray(goon?.files?.animations) ? goon.files.animations.filter(isSafeMotionLoadFile) : [],
       lane
     )
     const baseLoop = goon?.defaults?.baseLoop ?? 'base_stand'
@@ -5786,7 +5933,7 @@
     if (!kitchenScenes?.[editorSceneId]) {
       editorSceneId = ''
       if (editorGoonId) {
-        editorDirty = true
+        markEditorDirty()
       }
     }
   })
@@ -5913,6 +6060,7 @@
       previewAnimationName = ''
       return
     }
+    if (!editorKnownAnimationData.inventoryConfirmed || previewLoading || previewAnimationSyncing) return
     if (availableAnimationNames.length === 0) {
       previewAnimationName = ''
       return
@@ -5927,6 +6075,7 @@
       kitchenPreviewAnimationName = ''
       return
     }
+    if (!kitchenKnownAnimationData.inventoryConfirmed || kitchenPreviewLoading) return
     if (kitchenAvailableAnimationNames.length === 0) {
       kitchenPreviewAnimationName = ''
       return
@@ -5938,7 +6087,7 @@
 
   $effect(() => {
     if (activeSceneEdit?.type !== 'marker') return
-    if (!kitchenPreviewGoonId || activeMarkerMotionNames.length === 0) {
+    if (!kitchenPreviewGoonId || (kitchenKnownAnimationData.inventoryConfirmed && !kitchenPreviewLoading && activeMarkerMotionNames.length === 0)) {
       void cancelMarkerPlacement({ quiet: true })
     }
   })
@@ -6171,6 +6320,7 @@
     try {
       const catalog = await request
       hairAssets = catalog.assets
+      retainedHairBuiltinAssets = catalog.retainedBuiltinAssets
       hairRefitSources = catalog.refitSources
       hairCatalogLoaded = true
       return catalog
@@ -6184,10 +6334,16 @@
   }
 
   async function ensureHairCatalog() {
-    if (hairCatalogLoaded) {
-      return hairAssets
+    if (hairCatalogPromise) {
+      const catalog = await hairCatalogPromise
+      return [...catalog.assets, ...catalog.retainedBuiltinAssets]
     }
-    return (await refreshHairCatalog()).assets
+    if (hairCatalogLoaded) {
+      if (hairCatalogError) throw new Error(hairCatalogError)
+      return [...hairAssets, ...retainedHairBuiltinAssets]
+    }
+    const catalog = await refreshHairCatalog()
+    return [...catalog.assets, ...catalog.retainedBuiltinAssets]
   }
 
   function applyStoredHairDraft(goon: GoonRecord) {
@@ -6225,42 +6381,235 @@
     applyStoredHairDraft(goon)
   })
 
+  function captureEditorHairPreviewOwner(engine: GoonEngine) {
+    const goonId = editorGoonId
+    const source = editorHairRecipeSource ? { ...editorHairRecipeSource } : null
+    const sourceSignature = JSON.stringify(source)
+    const token = previewToken
+    const isCurrent = () => editorGoonId === goonId && editorHairHydrationGoonId === goonId && previewEngine === engine &&
+      previewToken === token && JSON.stringify(editorHairRecipeSource) === sourceSignature
+    const assertCurrent = () => {
+      if (!isCurrent()) {
+        throw new Error('The Goon or its Recipe Source changed while Hair was loading.')
+      }
+    }
+    return { source, isCurrent, assertCurrent }
+  }
+
+  function currentEditorHairPreviewContext() {
+    try {
+      const selected = resolveGoonSettingsPreviewTarget({
+        mode: 'editor', editorGoon, recipeSourceGoon: editorRecipeSourceGoon,
+        recipePreviewGoon: recipeStagedPreviewGoon ?? recipeEditorPreviewTarget?.goon
+      })
+      if (!selected || !hasRenderableGoonAvatar(selected)) return null
+      const mode = editorPreviewModeFor(selected)
+      const goon = resolveRecipePreviewGoonAssetUrls(selected, BATSHIT_SERVER_URL)
+      return { goonId: goon.id, signature: buildPreviewContextSignature(goon, mode), url: resolveGoonAvatarUrl(goon) }
+    } catch {
+      return null
+    }
+  }
+
+  function isMountedEditorHairPreview(context: ReturnType<typeof currentEditorHairPreviewContext>) {
+    return Boolean(context && !previewLoading && previewReady && previewEngine &&
+      previewGoonId === context.goonId && previewContextSignature === context.signature &&
+      previewVrmUrl === context.url)
+  }
+
+  function isSettledEditorHairPreview(context: ReturnType<typeof currentEditorHairPreviewContext>) {
+    return isMountedEditorHairPreview(context) && !previewAnimationSyncing
+  }
+
+  function captureEditorHairEditOwner() {
+    const goonId = editorGoonId
+    const sourceSignature = JSON.stringify(editorHairRecipeSource)
+    const selectionSignature = JSON.stringify(editorHairState.selected)
+    const selectionOperation = hairPreviewOperation
+    // A ready separate preview must not be replaced while an edit awaits it.
+    // An initial/structural preparation may legitimately create a new preview;
+    // in that case its returned engine must be the current ready target below.
+    const context = currentEditorHairPreviewContext()
+    const stableEngine = context?.goonId === goonId && isSettledEditorHairPreview(context) ? previewEngine : null
+    const stableToken = previewToken
+    const isCurrent = (engine?: GoonEngine | null) => {
+      if (editorGoonId !== goonId || editorHairHydrationGoonId !== goonId || JSON.stringify(editorHairRecipeSource) !== sourceSignature ||
+        JSON.stringify(editorHairState.selected) !== selectionSignature ||
+        hairPreviewOperation !== selectionOperation) return false
+      if (stableEngine && (previewEngine !== stableEngine || previewToken !== stableToken)) return false
+      if (!engine) return true
+      const currentContext = currentEditorHairPreviewContext()
+      return engine === previewEngine && currentContext?.goonId === goonId && isSettledEditorHairPreview(currentContext)
+    }
+    return { isCurrent }
+  }
+
+  async function ensureSeparateEditorHairPreview() {
+    const expected = currentEditorHairPreviewContext()
+    if (!expected) return null
+    if (previewLoading && previewLoadInFlightSignature === expected.signature && previewLoadCompletion) {
+      await previewLoadCompletion
+    }
+    const afterWait = currentEditorHairPreviewContext()
+    if (!afterWait || afterWait.goonId !== expected.goonId || afterWait.signature !== expected.signature ||
+      afterWait.url !== expected.url) {
+      throw new Error('The Goon preview changed before Hair could be edited.')
+    }
+    let engine = isMountedEditorHairPreview(afterWait) ? previewEngine : null
+    if (!engine) {
+      if (previewLoading) throw new Error('Another Goon preview is loading. Wait and try again.')
+      engine = await ensurePreviewGoonReady()
+    }
+    if (previewLoading && previewLoadInFlightSignature === expected.signature && previewLoadCompletion) {
+      await previewLoadCompletion
+    }
+    if (engine && previewAnimationSyncPromise) {
+      const token = previewToken
+      await previewAnimationSyncPromise
+      if (token !== previewToken) throw new Error('The Goon preview changed while its animations loaded.')
+    }
+    const current = currentEditorHairPreviewContext()
+    if (!engine || engine !== previewEngine || !current || current.goonId !== expected.goonId ||
+      current.signature !== expected.signature || current.url !== expected.url || !isSettledEditorHairPreview(current)) {
+      throw new Error('The Goon preview changed before Hair could be edited.')
+    }
+    return engine
+  }
+
+  function captureHairRetrySettlement(reviewed: RecipeStateSnapshot): ((committed: GoonRecord) => void) | null {
+    const pendingEditorWork = () => hasActiveHairImport() || hairPreviewBusy ||
+      closetXWearBusy || guidedDufClothesBusy ||
+      updateVrmBusy || advancedPackageUpdateBusy || editorFacialArtworkUploadBusy || guidedUploadBusy || customUploadBusy || animationUploadBusy || libraryUploadBusy ||
+      Boolean(editorPendingVrmFile || editorPendingVrmUpdate || editorPendingAdvancedPackageUpdate)
+    const goonId = editorGoonId
+    if (!goonId || !editorDirty || editorDirtyHasOther || pendingEditorWork() || editorHairStateError || !editorHairRecipeSource) return null
+    const reviewedHair = reviewed.siblings.find((entry) => entry.id === 'hairState' && entry.contract === 'hair-state/v2')
+    if (!reviewedHair) return null
+    let hair: string
+    let source: string
+    try {
+      hair = canonicalRecipeString(parseHairState(reviewedHair.state))
+      if (hair !== canonicalRecipeString(editorHairState)) return null
+      source = canonicalRecipeString(editorHairRecipeSource)
+    } catch {
+      return null
+    }
+    const reviewedSha = reviewed.stateSha256
+    const dirtyEpoch = editorDirtyEpoch
+    const instanceEpoch = editorInstanceEpoch
+    const previewOperation = hairPreviewOperation
+    const colorOperation = hairColorEditOperation
+    const motionOperation = hairMotionEditOperation
+    return (committed) => {
+      if (editorGoonId !== goonId || editorInstanceEpoch !== instanceEpoch || editorDirtyEpoch !== dirtyEpoch ||
+          !editorDirty || editorDirtyHasOther || pendingEditorWork() || editorHairStateError ||
+          hairPreviewOperation !== previewOperation || hairColorEditOperation !== colorOperation ||
+          hairMotionEditOperation !== motionOperation || committed.id !== goonId) return
+      const recipe = committed.recipe
+      if (recipe?.contract !== 'goon-recipe/v2' || recipe.liveStatus !== 'up_to_date' ||
+          !recipe.activeRevision || recipe.pendingJob || recipe.authoringRevision.state.stateSha256 !== reviewedSha) return
+      const savedHair = recipe.authoringRevision.state.siblings.find((entry) => entry.id === 'hairState' && entry.contract === 'hair-state/v2')
+      if (!savedHair) return
+      try {
+        if (canonicalRecipeString(editorHairRecipeSource) !== source ||
+            canonicalRecipeString(recipe.authoringRevision.source.identities) !== source ||
+            canonicalRecipeString(editorHairState) !== hair ||
+            canonicalRecipeString(parseHairState(savedHair.state)) !== hair) return
+      } catch {
+        return
+      }
+      clearEditorDirty()
+    }
+  }
+
+  async function loadSavedGoonPreview(savedGoon: GoonRecord) {
+    savedPreviewAttempt?.cancel()
+    const attempt = createRecipePreviewAttempt({ label: 'saved Goon' })
+    savedPreviewAttempt = attempt
+    try {
+      // Flush the committed revision and Source projection before choosing the
+      // editor target. Never substitute the staged, lean Live model for Source.
+      await tick()
+      attempt.signal.throwIfAborted()
+      if (editorGoonId !== savedGoon.id) throw new Error('The Goon editor changed during saving.')
+      const selected = editorDefaultPreviewGoon
+      if (!selected) throw new Error(editorRecipeSourceError ?? 'The saved Goon preview is unavailable.')
+      const mode = editorPreviewModeFor(selected)
+      const target = resolveRecipePreviewGoonAssetUrls(selected, BATSHIT_SERVER_URL)
+      const signature = buildPreviewContextSignature(target, mode)
+      if (previewLoadInFlightSignature === signature && previewLoadCompletion) {
+        await attempt.run(previewLoadCompletion)
+      }
+      if (previewReady && previewContextSignature === signature && !previewLoading) {
+        const token = previewToken
+        if (previewAnimationSyncPromise) await attempt.run(previewAnimationSyncPromise)
+        attempt.signal.throwIfAborted()
+        if (token !== previewToken || !previewReady) throw new Error('The saved Goon preview was replaced while loading.')
+      } else {
+        await attempt.run(loadPreviewGoon(target, mode, {
+          strict: true, awaitAnimations: true, signal: attempt.signal
+        }))
+      }
+      // Let the editor's mounted consumers apply the final appearance state.
+      await tick()
+      attempt.signal.throwIfAborted()
+    } finally {
+      attempt.finish()
+      if (savedPreviewAttempt === attempt) savedPreviewAttempt = null
+    }
+  }
+
   async function applyHairStatePreview(
     engine: GoonEngine,
-    stateValue: HairStateV2 | null | undefined
+    stateValue: HairStateV2 | null | undefined,
+    source: RecipeSourceIdentity | null,
+    assertCurrent: () => void
   ) {
     const state = stateValue ? parseHairState(stateValue) : createHairState(null)
+    assertCurrent()
     if (!state.selected) {
       engine.clearHairPreview()
       return null
     }
     const catalog = await ensureHairCatalog()
+    assertCurrent()
     const selection = resolveHairSelectionCatalogStatus(state, catalog)
     if (selection.status !== 'ready' || !selection.asset) {
       throw new Error(selection.message ?? 'The selected Hair style is unavailable.')
     }
+    if (!source) throw new Error('The selected Hair style requires a verified Recipe Source.')
+    await validateHairStateBinding({ asset: selection.asset, state, recipeSource: source })
+    assertCurrent()
     const summary = await engine.loadHairAssetPreview(
       selection.asset,
       state,
       resolveHairAssetBrowserUrl(selection.asset.geometry.main.ref, BATSHIT_SERVER_URL),
-      (ref) => resolveHairAssetBrowserUrl(ref, BATSHIT_SERVER_URL)
+      (ref) => resolveHairAssetBrowserUrl(ref, BATSHIT_SERVER_URL),
+      assertCurrent
     )
+    assertCurrent()
     const tuning = engine.getHairMotionPreviewTuning()
     if (tuning && engine === previewEngine) editorHairMotionTuning = tuning
     return summary
   }
 
-  function updateEditorHairMotionTuning(value: SecondaryMotionTuning) {
+  async function updateEditorHairMotionTuning(value: SecondaryMotionTuning) {
+    const operation = ++hairMotionEditOperation
+    const owner = captureEditorHairEditOwner()
+    let engine: GoonEngine | null = null
     hairPreviewError = null
     try {
-      if (!previewEngine) throw new Error('The current Goon preview is unavailable.')
+      engine = await ensureSeparateEditorHairPreview()
+      if (!engine) throw new Error('The current Goon preview is unavailable.')
+      if (hairMotionEditOperation !== operation || !owner.isCurrent(engine)) return
       const nextState = parseHairState({ ...editorHairState, motionSettings: value })
-      previewEngine.updateHairMotionPreviewTuning(nextState.motionSettings!)
+      engine.updateHairMotionPreviewTuning(nextState.motionSettings!)
       editorHairMotionTuning = nextState.motionSettings!
       editorHairState = nextState
       editorHairStateError = null
-      editorDirty = true
+      markEditorDirty('hair')
     } catch (error) {
+      if (hairMotionEditOperation !== operation || !owner.isCurrent(engine)) return
       hairPreviewError =
         error instanceof Error ? error.message : 'The Hair motion could not be previewed.'
       toast.error(hairPreviewError)
@@ -6272,24 +6621,29 @@
     highlightColor: string
   }) {
     if (!editorHairState.selected) return
-    const nextState = parseHairState({ ...editorHairState, ...colors })
-    if (hairStateEquals(editorHairState, nextState)) return
+    const operation = ++hairColorEditOperation
+    const owner = captureEditorHairEditOwner()
+    let engine: GoonEngine | null = null
     hairPreviewError = null
     try {
-      const engine = await ensurePreviewGoonReady()
+      engine = await ensureSeparateEditorHairPreview()
       if (!engine) throw new Error('The current Goon preview is unavailable.')
+      if (hairColorEditOperation !== operation || !owner.isCurrent(engine)) return
+      const nextState = parseHairState({ ...editorHairState, ...colors })
+      if (hairStateEquals(editorHairState, nextState)) return
       engine.updateHairPreviewColors(nextState)
       editorHairState = nextState
       editorHairStateError = null
-      editorDirty = true
+      markEditorDirty('hair')
     } catch (error) {
+      if (hairColorEditOperation !== operation || !owner.isCurrent(engine)) return
       hairPreviewError =
         error instanceof Error ? error.message : 'The Hair colors could not be previewed.'
       toast.error(hairPreviewError)
     }
   }
 
-  async function selectEditorHairAsset(asset: HairAssetV1 | null) {
+  async function selectEditorHairAsset(asset: HairAssetV1 | null, restoreState?: HairStateV2) {
     if (!editorHairSupported) {
       hairPreviewError = 'Hair Assets currently require an Advanced/GLB Goon.'
       return
@@ -6303,27 +6657,61 @@
       }
     }
     const previousState = editorHairState
-    const nextState = createHairCatalogSelection(asset, previousState)
+    const targetId = editorGoonId
+    const sourceSignature = JSON.stringify(editorHairRecipeSource)
+    const previousSignature = JSON.stringify(previousState)
+    let nextState: HairStateV2
+    try {
+      nextState = restoreState ? parseHairState(restoreState) : createHairCatalogSelection(asset, previousState)
+    } catch (error) {
+      hairPreviewError = error instanceof Error ? error.message : 'The previous Hair selection is invalid.'
+      toast.error(hairPreviewError)
+      return
+    }
+    if (restoreState && (!asset || resolveHairSelectionCatalogStatus(nextState, [asset]).status !== 'ready')) {
+      hairPreviewError = 'The previous Hair selection no longer matches its exact revision.'
+      toast.error(hairPreviewError)
+      return
+    }
     if (hairStateEquals(previousState, nextState)) return
+    const operation = ++hairPreviewOperation
+    const initialToken = previewToken
+    const initialEngine = previewEngine
+    let owner: ReturnType<typeof captureEditorHairPreviewOwner> | null = null
     hairPreviewBusy = true
     hairPreviewError = null
     try {
-      const engine = await ensurePreviewGoonReady()
+      const engine = await ensureSeparateEditorHairPreview()
       if (!engine) throw new Error('The current Goon preview is unavailable.')
-      const summary = await applyHairStatePreview(engine, nextState)
+      owner = captureEditorHairPreviewOwner(engine)
+      const capturedOwner = owner
+      const assertCurrent = () => {
+        capturedOwner.assertCurrent()
+        if (hairPreviewOperation !== operation || editorGoonId !== targetId || JSON.stringify(editorHairRecipeSource) !== sourceSignature ||
+          JSON.stringify(editorHairState) !== previousSignature) {
+          throw new Error('The Goon or Hair selection changed while Hair was loading.')
+        }
+      }
+      assertCurrent()
+      const summary = await applyHairStatePreview(engine, nextState, capturedOwner.source, assertCurrent)
+      assertCurrent()
       editorHairState = nextState
       editorHairStateError = null
-      editorDirty = true
+      markEditorDirty('hair')
       if (asset && summary) {
         toast.success(
           `${asset.display.name} previewed: ${summary.meshCount.toLocaleString()} pieces, ${summary.triangleCount.toLocaleString()} triangles.`
         )
       }
     } catch (error) {
+      if (hairPreviewOperation !== operation || editorGoonId !== targetId ||
+        JSON.stringify(editorHairRecipeSource) !== sourceSignature ||
+        JSON.stringify(editorHairState) !== previousSignature ||
+        (owner ? !owner.isCurrent() : previewToken !== initialToken || (initialEngine !== null && previewEngine !== initialEngine))) return
       hairPreviewError = error instanceof Error ? error.message : 'The Hair preview could not be updated.'
       toast.error(hairPreviewError)
     } finally {
-      hairPreviewBusy = false
+      if (hairPreviewOperation === operation) hairPreviewBusy = false
     }
   }
 
@@ -6428,6 +6816,7 @@
     hairImportRefitSource = refitSource
     hairImportCandidate = null
     hairImportFileName = asset.display.name
+    const operation = ++hairPreviewOperation
     hairPreviewBusy = true
     let inspection: HairImportInspection | null = null
     try {
@@ -6444,6 +6833,7 @@
       setTransientHairImportCamera(engine, 0)
       await waitForHairImportPreviewFrame()
       hairImportInitialInspection = inspection
+      invalidateRetrySettlement()
       editorHairImportOpen = true
       await tick()
       revealHairImportEditor(editorScrollElement, hairImportWizardElement)
@@ -6459,7 +6849,8 @@
       try {
         const engine = await ensurePreviewGoonReady()
         if (engine) {
-          await applyHairStatePreview(engine, hairImportOriginalState)
+          const capturedHairOwner = captureEditorHairPreviewOwner(engine)
+          await applyHairStatePreview(engine, hairImportOriginalState, capturedHairOwner.source, capturedHairOwner.assertCurrent)
           engine.setAppearanceDialValues(hairImportOriginalDials)
           if (hairImportOriginalCamera) engine.applyCamera(hairImportOriginalCamera)
         }
@@ -6469,7 +6860,7 @@
       resetEditorHairImportContext()
       toast.error(error instanceof Error ? error.message : 'The Hair refit could not be opened.')
     } finally {
-      hairPreviewBusy = false
+      if (hairPreviewOperation === operation) hairPreviewBusy = false
     }
   }
 
@@ -6730,7 +7121,8 @@
     try {
       const engine = await ensurePreviewGoonReady()
       if (engine) {
-        await applyHairStatePreview(engine, hairImportOriginalState)
+        const capturedHairOwner = captureEditorHairPreviewOwner(engine)
+        await applyHairStatePreview(engine, hairImportOriginalState, capturedHairOwner.source, capturedHairOwner.assertCurrent)
         engine.setAppearanceDialValues(hairImportOriginalDials)
         if (hairImportOriginalCamera) engine.applyCamera(hairImportOriginalCamera)
       }
@@ -6842,11 +7234,15 @@
         kitchenPreviewSceneSignature = buildGoonSceneSignature(scene)
         if (!isKitchenPreviewLoadRequestCurrent(activeRequestId)) return false
         if (kind === 'vrm') {
+          const ownsPreview = captureClosetPreviewOwner(engine, () =>
+            isKitchenPreviewLoadRequestCurrent(activeRequestId) && kitchenPreviewEngine === engine)
           await applyClosetAssignments(engine, targetGoon.closetAssignments ?? {}, {
+          goon: targetGoon,
             guidedOutfitPieces: targetGoon.guidedAvatar?.outfitPieces ?? [],
-            guidedPieceStates: targetGoon.guidedAvatar?.pieceStates ?? {}
+            guidedPieceStates: targetGoon.guidedAvatar?.pieceStates ?? {},
+            isCurrent: ownsPreview
           })
-          if (!isKitchenPreviewLoadRequestCurrent(activeRequestId)) return false
+          if (!ownsPreview()) return false
         }
         applyPreviewCamera(engine, targetGoon.camera ?? null, { forceResetIfMissing: true })
         if (!isKitchenPreviewLoadRequestCurrent(activeRequestId)) return false
@@ -7026,11 +7422,15 @@
         if (!isKitchenPreviewLoadRequestCurrent(requestId)) return null
       }
       if (closetSignature !== kitchenPreviewClosetSignature) {
+        const ownsPreview = captureClosetPreviewOwner(engine, () =>
+          isKitchenPreviewLoadRequestCurrent(requestId) && kitchenPreviewEngine === engine)
         await applyClosetAssignments(engine, targetGoon.closetAssignments ?? {}, {
+          goon: targetGoon,
           guidedOutfitPieces: targetGoon.guidedAvatar?.outfitPieces ?? [],
-          guidedPieceStates: targetGoon.guidedAvatar?.pieceStates ?? {}
+          guidedPieceStates: targetGoon.guidedAvatar?.pieceStates ?? {},
+          isCurrent: ownsPreview
         })
-        if (!isKitchenPreviewLoadRequestCurrent(requestId)) return null
+        if (!ownsPreview()) return null
         kitchenPreviewClosetSignature = closetSignature
       }
     }
@@ -7117,8 +7517,11 @@
       strict?: boolean
       awaitAnimations?: boolean
       hairState?: HairStateV2 | null
+      signal?: AbortSignal
+      comparisonState?: ReturnType<GoonEngine['captureComparisonPreviewState']> | null
     } = {}
   ): Promise<boolean> {
+    options.signal?.throwIfAborted()
     goon = resolveRecipePreviewGoonAssetUrls(goon, BATSHIT_SERVER_URL)
     const targetUrl = resolveGoonAvatarUrl(goon)
     if (!previewContainer || !targetUrl) {
@@ -7154,10 +7557,36 @@
       return false
     }
     const token = ++previewToken
+    const hairRecipeSource = goon.recipe?.contract === 'goon-recipe/v2' ? { ...goon.recipe.authoringRevision.source.identities } : null
+    const hairRecipeSourceSignature = JSON.stringify(hairRecipeSource)
+    let finishLoad!: () => void
+    const completion = new Promise<void>((resolve) => { finishLoad = resolve })
+    previewLoadCompletion = completion
     previewLoading = true
     previewLoadInFlightSignature = contextSignature
     previewLoadInFlightPriority = requestedPriority
     previewError = null
+
+    const cancelLoad = () => {
+      if (token !== previewToken) return
+      previewToken += 1
+      // Invalidate the engine's asset generation too: racing the Promise alone
+      // would still let a late model replace the restored preview.
+      previewEngine?.unloadGoon()
+      previewReady = false
+      previewLoading = false
+      previewAnimationSyncing = false
+      previewAnimationSyncPromise = null
+      previewContextSignature = ''
+      previewFailedContextSignature = ''
+      previewLoadInFlightSignature = ''
+      previewLoadInFlightPriority = null
+    }
+    options.signal?.addEventListener('abort', cancelLoad, { once: true })
+    const assertCurrent = () => {
+      options.signal?.throwIfAborted()
+      if (token !== previewToken) throw new Error('The Goon preview candidate was superseded while it loaded.')
+    }
 
     try {
       const engine = await ensurePreviewEngine()
@@ -7167,17 +7596,18 @@
         return false
       }
       engine.refreshLayout()
-      const comparisonState = previewGoonId === goon.id
+      const comparisonState = options.comparisonState ?? (previewGoonId === goon.id
         ? engine.captureComparisonPreviewState()
-        : null
+        : null)
 
       const avatar = await loadAvatarIntoEngine(engine, goon, {
         role:
-          mode === 'recipe-live-candidate'
+          (mode === 'recipe-live-candidate' || mode === 'recipe-saved-preview')
             ? 'recipe-live-candidate'
             : mode === 'editor' && goon.recipe?.contract === 'goon-recipe/v2'
             ? 'recipe-source'
-            : 'automatic'
+            : 'automatic',
+        signal: options.signal
       })
       if (avatar.role === 'cancelled') {
         if (options.strict) throw new Error('The Goon preview candidate was superseded while it loaded.')
@@ -7188,14 +7618,19 @@
         if (options.strict) throw new Error('The Goon preview candidate was superseded while it loaded.')
         return false
       }
-      if (kind === 'custom' && mode !== 'recipe-live-candidate') {
+      if (kind === 'custom' && mode !== 'recipe-live-candidate' && mode !== 'recipe-saved-preview') {
         const previewHairState = Object.prototype.hasOwnProperty.call(options, 'hairState')
           ? options.hairState
           : goon.id === editorGoonId && !recipeEditorPreviewTarget
             ? editorHairState
             : goon.hairState
         try {
-          await applyHairStatePreview(engine, previewHairState)
+          await applyHairStatePreview(engine, previewHairState, hairRecipeSource, () => {
+            assertCurrent()
+            if (previewEngine !== engine) throw new Error('The Hair preview engine changed while it loaded.')
+            const currentSource = goon.recipe?.contract === 'goon-recipe/v2' ? goon.recipe.authoringRevision.source.identities : null
+            if (JSON.stringify(currentSource) !== hairRecipeSourceSignature) throw new Error('The Recipe Source changed while Hair was loading.')
+          })
           hairPreviewError = null
         } catch (error) {
           hairPreviewError =
@@ -7225,10 +7660,15 @@
       )
       previewCustomExpressions = kind === 'vrm' ? engine.getCustomExpressionNames() : []
       if (kind === 'vrm') {
+        const ownsPreview = captureClosetPreviewOwner(engine, () =>
+          token === previewToken && previewEngine === engine && !options.signal?.aborted)
         await applyClosetAssignments(engine, resolveClosetAssignmentsForPreviewGoon(goon), {
+          goon: editorGoonId === goon.id ? undefined : goon,
           guidedOutfitPieces: resolveGuidedOutfitPiecesForPreviewGoon(goon),
-          guidedPieceStates: resolveGuidedPieceStatesForPreviewGoon(goon)
+          guidedPieceStates: resolveGuidedPieceStatesForPreviewGoon(goon),
+          isCurrent: ownsPreview
         })
+        if (!ownsPreview()) return false
       }
       if (token !== previewToken) {
         if (options.strict) throw new Error('The Goon preview candidate was superseded during scene setup.')
@@ -7247,8 +7687,9 @@
       previewVrmUrl = targetUrl
       previewReady = true
 
+      previewAnimationSyncing = true
       const syncAnimations = engine
-        .syncAnimations(animationPlan.eager, { deferredFiles: animationPlan.deferred })
+        .syncAnimations(animationPlan.eager, { deferredFiles: animationPlan.deferred, signal: options.signal })
         .then(() => {
           if (token !== previewToken) {
             if (options.strict) {
@@ -7267,7 +7708,13 @@
           console.warn('[GoonsSettings] Editor animation sync failed:', error)
           throw error
         })
-      if (options.awaitAnimations) await syncAnimations
+        .finally(() => {
+          if (token !== previewToken) return
+          previewAnimationSyncing = false
+          previewAnimationSyncPromise = null
+        })
+      previewAnimationSyncPromise = syncAnimations
+      if (options.awaitAnimations) { await syncAnimations; assertCurrent() }
       else void syncAnimations.catch(() => undefined)
       return true
     } catch (error: any) {
@@ -7280,6 +7727,9 @@
       if (options.strict) throw error
       return false
     } finally {
+      options.signal?.removeEventListener('abort', cancelLoad)
+      finishLoad()
+      if (previewLoadCompletion === completion) previewLoadCompletion = null
       if (token === previewToken) {
         previewLoading = false
         if (previewLoadInFlightSignature === contextSignature) {
@@ -7291,9 +7741,13 @@
   }
 
   function projectStagedRecipeLiveCandidate(staged: RecipeStageResponse): GoonRecord {
+    return projectRecipeLiveEnvelope(staged.goon, staged.envelope)
+  }
+
+  function projectRecipeLiveEnvelope(goon: GoonRecord, envelope: RecipeStageResponse['envelope']) {
     return applyRecipeRevisionProjection(
-      structuredClone(staged.goon),
-      staged.envelope,
+      structuredClone(goon),
+      envelope,
       (asset, role) => ({
         url: resolveRecipeAssetUrl(asset.ref, BATSHIT_SERVER_URL),
         filename: asset.ref.split('/').pop()?.trim() || `recipe-live-${role}`,
@@ -7303,8 +7757,16 @@
   }
 
   async function handleRecipeEditorPreviewTargetChange(
-    target: RecipeEditorPreviewTarget | null
+    target: RecipeEditorPreviewTarget | null,
+    options: { signal?: AbortSignal } = {}
   ) {
+    recipeComparisonAttempt?.cancel()
+    const attempt = createRecipePreviewAttempt({ signal: options.signal, label: 'Goon comparison' })
+    recipeComparisonAttempt = attempt
+    const previousPreview = recipeStagedPreviewGoon ?? recipeEditorPreviewTarget?.goon ?? editorDefaultPreviewGoon
+    const previousMode = previousPreview ? editorPreviewModeFor(previousPreview) : 'editor'
+    let mountStarted = false
+    let comparisonState: ReturnType<GoonEngine['captureComparisonPreviewState']> | null = null
     const resolvedTarget = target
       ? {
           ...target,
@@ -7316,16 +7778,49 @@
       : null
     recipePreviewTransitioning = true
     try {
+      attempt.signal.throwIfAborted()
       if (resolvedTarget) {
-        await loadPreviewGoon(resolvedTarget.goon, 'editor', {
+        let mode: GoonPreviewMode = 'editor'
+        if (resolvedTarget.liveEnvelope) {
+          resolvedTarget.goon = projectRecipeLiveEnvelope(resolvedTarget.goon, resolvedTarget.liveEnvelope)
+          mode = 'recipe-saved-preview'
+        }
+        attempt.signal.throwIfAborted()
+        comparisonState = previewEngine?.captureComparisonPreviewState() ?? null
+        mountStarted = true
+        await attempt.run(loadPreviewGoon(resolvedTarget.goon, mode, {
           strict: true,
           awaitAnimations: true,
-          hairState: resolvedTarget.goon.hairState ?? null
-        })
+          hairState: resolvedTarget.goon.hairState ?? null,
+          signal: attempt.signal
+        }))
       }
+      attempt.signal.throwIfAborted()
       recipeEditorPreviewTarget = resolvedTarget
+    } catch (error) {
+      if (recipeComparisonAttempt !== attempt) return
+      if (mountStarted && previousPreview) {
+        const recovery = createRecipePreviewAttempt({ timeoutMs: 30_000, label: 'previous Goon' })
+        recipeComparisonAttempt = recovery
+        try {
+          await recovery.run(loadPreviewGoon(previousPreview, previousMode, {
+            strict: true, awaitAnimations: true, hairState: previousPreview.hairState ?? null,
+            signal: recovery.signal, comparisonState
+          }))
+        } catch (restoreError) {
+          throw new AggregateError([error, restoreError], 'The previous-version preview failed, and the current Goon preview could not be restored.')
+        } finally {
+          recovery.finish()
+          if (recipeComparisonAttempt === recovery) recipeComparisonAttempt = attempt
+        }
+      }
+      throw error
     } finally {
-      recipePreviewTransitioning = false
+      attempt.finish()
+      if (recipeComparisonAttempt === attempt) {
+        recipeComparisonAttempt = null
+        recipePreviewTransitioning = false
+      }
     }
   }
 
@@ -7356,29 +7851,70 @@
     recipeEditorDraftPreview = preview
   }
 
-  async function previewStagedRecipeLiveCandidate(staged: RecipeStageResponse) {
+  async function previewStagedRecipeLiveCandidate(
+    staged: RecipeStageResponse,
+    options: { signal?: AbortSignal } = {}
+  ) {
+    options.signal?.throwIfAborted()
     const candidate = projectStagedRecipeLiveCandidate(staged)
-    const previousPreview = recipeEditorPreviewTarget?.goon ?? editorRecipeSourceGoon
+    const previousStaged = recipeStagedPreviewGoon
+    const previousPreview = previousStaged ?? recipeEditorPreviewTarget?.goon ?? editorDefaultPreviewGoon
+    const previousMode = previousPreview ? editorPreviewModeFor(previousPreview) : 'editor'
+    const comparisonState = previewEngine?.captureComparisonPreviewState() ?? null
+    stagedPreviewAttempt?.cancel()
+    const attempt = createRecipePreviewAttempt({ signal: options.signal, label: 'finished Goon' })
+    stagedPreviewAttempt = attempt
+    recipeStagedPreviewGoon = candidate
+    recipePreviewTransitioning = true
     try {
-      const loaded = await loadPreviewGoon(candidate, 'recipe-live-candidate', {
+      attempt.signal.throwIfAborted()
+      // The signal reaches the actual load owner, which unloads/increments the
+      // engine generation on abort and retains disposal of late model/animation
+      // work. Racing this await alone would leave that work able to publish.
+      const loaded = await attempt.run(loadPreviewGoon(candidate, 'recipe-live-candidate', {
         strict: true,
-        awaitAnimations: true
-      })
-      if (!loaded) throw new Error('The staged Recipe Live candidate did not become preview-ready.')
+        awaitAnimations: true,
+        signal: attempt.signal
+      }))
+      attempt.signal.throwIfAborted()
+      if (stagedPreviewAttempt !== attempt || !loaded) {
+        throw new Error('The staged Recipe Live candidate did not become preview-ready.')
+      }
     } catch (candidateError) {
+      // A replacement attempt or editor owns its own preview. Never restore an
+      // older candidate over it, and never resolve a superseded preview as ready.
+      if (stagedPreviewAttempt !== attempt) throw candidateError
+      recipeStagedPreviewGoon = previousStaged
       if (!previousPreview) throw candidateError
+      const recovery = createRecipePreviewAttempt({ timeoutMs: 30_000, label: 'previous Goon' })
+      stagedPreviewAttempt = recovery
       try {
-        await loadPreviewGoon(previousPreview, 'editor', {
+        const restored = await recovery.run(loadPreviewGoon(previousPreview, previousMode, {
           strict: true,
-          awaitAnimations: true
-        })
+          awaitAnimations: true,
+          signal: recovery.signal,
+          comparisonState
+        }))
+        recovery.signal.throwIfAborted()
+        if (!restored) throw new Error('The previous Goon preview did not become ready.')
       } catch (restoreError) {
         throw new AggregateError(
           [candidateError, restoreError],
           'The Recipe Live candidate failed to load, and the prior Settings preview could not be restored.'
         )
+      } finally {
+        recovery.finish()
+        if (stagedPreviewAttempt === recovery) stagedPreviewAttempt = attempt
       }
+      // The client awaits this complete recovery before recording failure or
+      // cleaning rejected assets. A canceled/expired candidate can never Commit.
       throw candidateError
+    } finally {
+      attempt.finish()
+      if (stagedPreviewAttempt === attempt) {
+        stagedPreviewAttempt = null
+        recipePreviewTransitioning = false
+      }
     }
   }
 
@@ -7457,11 +7993,12 @@
   }
 
   function resolveAppliedClosetColors(
+    engine: GoonEngine,
     materialName: string,
-    assignment: GoonClosetAssignment,
     item?: GoonClosetItem | null
   ) {
-    const sourceColors = resolveClosetSlotSourceColors(materialName, assignment)
+    const sourceColors = isSkinOverlayClosetSlotKey(materialName) ? null :
+      resolveClosetItemMaterialColors(item) ?? engine.getMaterialColorInfo(materialName)
     const itemColorOverride = item?.materialColors
     return {
       baseHex:
@@ -7479,16 +8016,25 @@
     assignment: GoonClosetAssignment,
     item?: GoonClosetItem | null
   ) {
-    const colors = resolveAppliedClosetColors(materialName, assignment, item)
+    const colors = resolveAppliedClosetColors(engine, materialName, item)
     if (!colors.baseHex && !colors.shadeHex) return false
     return engine.applyMaterialColorOverride(materialName, colors)
+  }
+
+  function captureClosetPreviewOwner(engine: GoonEngine, isOwnerCurrent: () => boolean) {
+    const root = engine.getAvatarRootObject(), generation = engine.getGoonLoadGeneration()
+    return () => Boolean(root) && isOwnerCurrent() && engine.getAvatarRootObject() === root &&
+      engine.isCurrentGoonLoad(generation)
   }
 
   async function applyClosetAssignment(
     engine: GoonEngine,
     materialName: string,
-    assignment: GoonClosetAssignment
+    assignment: GoonClosetAssignment,
+    isCurrent: () => boolean = () => true,
+    resolveItem: (itemId?: string | null) => GoonClosetItem | null = resolveClosetItem
   ) {
+    if (!isCurrent()) return
     const runtimeMaterialName =
       resolveClosetRuntimeMaterialName(materialName, engine.getMaterialNames()) ?? null
     if (!runtimeMaterialName) return
@@ -7498,20 +8044,22 @@
         engine.resetMaterialOverrides(runtimeMaterialName)
         return
       }
-      await engine.applyMaterialTexture(runtimeMaterialName, TRANSPARENT_TEXTURE_URL)
+      engine.hideClosetMaterial(runtimeMaterialName)
       applyClosetColorOverride(engine, runtimeMaterialName, assignment)
       return
     }
     if (assignment.mode === 'item') {
-      const item = resolveClosetItem(assignment.itemId)
+      const item = resolveItem(assignment.itemId)
       if (!item) return
       if (item.xwear) {
-        await engine.applyXWearMaterial(runtimeMaterialName, item.xwear as GoonXWearData)
+        await engine.applyXWearMaterial(runtimeMaterialName, item.xwear as GoonXWearData, { isCurrent })
+        if (!isCurrent()) return
         applyClosetColorOverride(engine, runtimeMaterialName, assignment, item)
         return
       }
       if (item.texture?.url) {
-        await engine.applyMaterialTexture(runtimeMaterialName, item.texture.url)
+        await engine.applyMaterialTexture(runtimeMaterialName, item.texture.url, { isCurrent })
+        if (!isCurrent()) return
       } else if (item.originalSource) {
         engine.resetMaterialOverrides(runtimeMaterialName)
       }
@@ -7528,15 +8076,24 @@
     options?: {
       guidedOutfitPieces?: GoonGuidedOutfitPiece[]
       guidedPieceStates?: Record<string, boolean>
+      isCurrent?: () => boolean
+      goon?: GoonRecord
     }
   ) {
-    for (const [materialName, assignment] of Object.entries(assignments)) {
-      await applyClosetAssignment(engine, materialName, assignment)
+    const isCurrent = options?.isCurrent ?? (() => true)
+    const itemContext = options?.goon ? createSavedClosetPreviewContext(options.goon) : {
+      resolveItem: resolveClosetItem,
+      resolveOriginalSavedItem: resolveOriginalSavedItemForConceal
     }
+    for (const [materialName, assignment] of Object.entries(assignments)) {
+      if (!isCurrent()) return
+      await applyClosetAssignment(engine, materialName, assignment, isCurrent, itemContext.resolveItem)
+    }
+    if (!isCurrent()) return
     const bodyConceal = resolveActiveWearableConceal({
       closetAssignments: assignments,
-      resolveClosetItem,
-      resolveOriginalSavedItem: resolveOriginalSavedItemForConceal,
+      resolveClosetItem: itemContext.resolveItem,
+      resolveOriginalSavedItem: itemContext.resolveOriginalSavedItem,
       guidedOutfitPieces: options?.guidedOutfitPieces,
       guidedPieceStates: options?.guidedPieceStates
     })
@@ -7546,10 +8103,11 @@
   }
 
   async function handleClosetSlotChange(materialName: string, value: string) {
+    const goonId = editorGoonId, instance = editorInstanceEpoch
+    const request = beginClosetPreviewRequest()
     closetBusy = true
     try {
-      const engine = await ensurePreviewGoonReady()
-      if (!engine) throw new Error('Preview not ready')
+      if (!goonId) return
       const editedOriginal = value === '__original__'
         ? resolveEditedOriginalWardrobeItemForSlot(materialName)
         : null
@@ -7566,22 +8124,35 @@
         editorGuidedActivePresetId = null
       }
       editorActiveWardrobeOutfitId = null
-      editorDirty = true
+      markEditorDirty()
+      const engine = await ensurePreviewGoonReady()
+      if (!engine) throw new Error('Preview not ready')
+      if (request !== closetPreviewRequest || editorGoonId !== goonId || editorInstanceEpoch !== instance ||
+          previewEngine !== engine || previewGoonId !== goonId || !previewReady || previewLoading) return
+      const token = previewToken
+      const ownsPreview = captureClosetPreviewOwner(engine, () =>
+        request === closetPreviewRequest && editorGoonId === goonId && editorInstanceEpoch === instance &&
+        previewEngine === engine && previewGoonId === goonId && previewReady && !previewLoading && token === previewToken)
+      if (!ownsPreview()) return
       await runLoggedEditorPreviewUpdate(
         'closet-slot-change',
         async () => {
+          if (!ownsPreview()) return
           engine.resetMaterialOverrides()
           await applyClosetAssignments(engine, nextAssignments, {
             guidedOutfitPieces: editorGuidedOutfitPiecesDraft,
-            guidedPieceStates: buildPersistedGuidedPieceStates(editorGuidedOutfitPiecesDraft)
+            guidedPieceStates: buildPersistedGuidedPieceStates(editorGuidedOutfitPiecesDraft),
+            isCurrent: ownsPreview
           })
         },
         { materialName, value }
       )
     } catch (error: any) {
-      toast.error(error?.message || 'Closet update failed')
+      if (request === closetPreviewRequest && editorGoonId === goonId && editorInstanceEpoch === instance) {
+        toast.error(error?.message || 'Closet update failed')
+      }
     } finally {
-      closetBusy = false
+      if (request === closetPreviewRequest) closetBusy = false
     }
   }
 
@@ -7743,16 +8314,18 @@
 
   $effect(() => {
     if (recipePreviewTransitioning) return
+    if (recipeWorkflowBusy && recipeStagedPreviewGoon) return
     const goon = recipeEditorPreviewTarget?.goon ?? editorRecipeSourceGoon
     if (!goon) return
+    const mode = editorPreviewModeFor(goon)
     const vrmUrl = resolveGoonAvatarUrl(goon)
     if (!vrmUrl || !previewContainer) return
-    const contextSignature = buildPreviewContextSignature(goon, 'editor')
+    const contextSignature = buildPreviewContextSignature(goon, mode)
     if (previewFailedContextSignature === contextSignature) return
     if (previewContextSignature === contextSignature && previewGoonId === goon.id && previewVrmUrl === vrmUrl) {
       return
     }
-    void loadPreviewGoon(goon, 'editor')
+    void loadPreviewGoon(goon, mode)
   })
 
   $effect(() => {
@@ -7762,6 +8335,8 @@
   })
 
   onDestroy(() => {
+    stagedPreviewAttempt?.cancel()
+    stagedPreviewAttempt = null
     if (goonDockPauseActive) {
       goonDockPauseActive = false
       setGoonDockPause(false)
@@ -7816,6 +8391,7 @@
       toast.error('Select an Advanced/Blender package first.')
       return
     }
+    invalidateRetrySettlement()
     guidedUploadBusy = true
     try {
       await createGoon({
@@ -7846,6 +8422,7 @@
       toast.error('Select an Advanced/GLB package first.')
       return
     }
+    invalidateRetrySettlement()
     customUploadBusy = true
     try {
       const created = await createGoon({
@@ -7951,6 +8528,7 @@
       toast.error('Select a Goon File Package first.')
       return
     }
+    invalidateRetrySettlement()
     advancedPackageUpdateBusy = true
     try {
       editorPendingAdvancedPackageUpdate = await uploadAdvancedGoonPackage(
@@ -8017,18 +8595,19 @@
 
       const current = editorGoon.files?.vrm
       const backup = editorGoon.files?.vrmBackup
-      await updateGoonRecord(editorGoonId, {
+      const updates: Partial<GoonRecord> = {
         files: {
           ...editorGoon.files,
           vrm: backup,
           vrmBackup: current
         },
-        compatibility: {
-          tier: 'pending',
-          issues: ['Awaiting VRM analysis']
-        },
         vrmUpdate: null
-      })
+      }
+      if (isGoonCompatibilityModelReplacement(editorGoon, updates)) {
+        await updateGoonWithCompatibilityReset(editorGoonId, updates, captureGoonCompatibilityResetBasis(editorGoon))
+      } else {
+        await updateGoonRecord(editorGoonId, updates)
+      }
       resetPreview()
       toast.success('Previous VRM restored')
     } catch (error: any) {
@@ -8088,6 +8667,7 @@
       toast.error('Select a .glb, .gltf, or .vrma animation file first.')
       return
     }
+    invalidateRetrySettlement()
     animationUploadBusy = true
     try {
       await uploadGoonAnimation(editorGoonId, animationUploadFile)
@@ -8138,6 +8718,7 @@
       return
     }
 
+    invalidateRetrySettlement()
     libraryUploadBusy = true
     libraryUploadTotal = files.length
     libraryUploadDone = 0
@@ -9311,6 +9892,14 @@
   }
 
   function openCueEditor(goon: GoonRecord) {
+    stagedPreviewAttempt?.cancel()
+    stagedPreviewAttempt = null
+    recipePreviewTransitioning = false
+    editorInstanceEpoch += 1
+    savedPreviewAttempt?.cancel()
+    recipeComparisonAttempt?.cancel()
+    recipeComparisonAttempt = null
+    recipeStagedPreviewGoon = null
     if (sceneSaving) return
     activeTab = 'goons'
     if (editorGoonId !== goon.id) {
@@ -9362,7 +9951,7 @@
     editorGuidedDufOverlays = [...(goon.guidedAvatar?.dufOverlays ?? [])]
     editorGuidedPieceStates = { ...(goon.guidedAvatar?.pieceStates ?? {}) }
     editorGuidedActivePresetId = goon.guidedAvatar?.activePresetId ?? null
-    editorDirty = false
+    clearEditorDirty()
     newEmoteEmoji = ''
     editorAddMoodOpen = false
     editorAddEmoteOpen = false
@@ -9443,7 +10032,7 @@
     if (enabled) {
       if (editorEnabledCueNames.includes(name)) return
       editorEnabledCueNames = [...editorEnabledCueNames, name]
-      editorDirty = true
+      markEditorDirty()
       return
     }
 
@@ -9455,7 +10044,7 @@
     }
     if (openMoodName === name) openMoodName = null
     if (openEmoteName === name) openEmoteName = null
-    editorDirty = true
+    markEditorDirty()
   }
 
   function resetEditorCueToShared(name: string) {
@@ -9489,7 +10078,7 @@
       delete nextDrafts[name]
     }
     editorEmoteEmojiDrafts = nextDrafts
-    editorDirty = true
+    markEditorDirty()
   }
 
   function setActiveCueMap(next: GoonCueMap) {
@@ -9499,7 +10088,7 @@
       return
     }
     editorCueMap = next
-    editorDirty = true
+    markEditorDirty()
   }
 
   function setActiveEmojiMap(next: GoonEmojiMap) {
@@ -9509,7 +10098,7 @@
       return
     }
     editorEmojiMap = next
-    editorDirty = true
+    markEditorDirty()
   }
 
   function getActiveFacePreviewSelection() {
@@ -9645,7 +10234,7 @@
     setActiveCueMap(next)
     if (activeTab !== 'kitchen') {
       editorEnabledCueNames = editorEnabledCueNames.map((entry) => (entry === name ? trimmed : entry))
-      editorDirty = true
+      markEditorDirty()
     }
 
     const emojiMap = activeTab === 'kitchen' ? kitchenEmojiMap : editorEmojiMap
@@ -10563,7 +11152,7 @@
 
   function updateEditorEyeContactTuning(patch: Partial<ResolvedGoonEyeContactTuning>) {
     applyEditorEyeContactTuning(normalizeGoonEyeContactTuning({ ...buildEditorEyeContactTuning(), ...patch }))
-    editorDirty = true
+    markEditorDirty()
   }
 
   function buildKitchenEyeContactSettings(): GoonGlobalEyeContactSettingsMap {
@@ -10637,7 +11226,7 @@
     const nextSettings = resolveGlobalEyeContactForGoon(goon)
     editorEyeContactMode = nextSettings.mode
     applyEditorEyeContactTuning(nextSettings.tuning)
-    editorDirty = true
+    markEditorDirty()
   }
 
   function updateEditorSocketEyeContact(value: SocketEyeContactSettingsV2) {
@@ -10645,7 +11234,7 @@
     if (JSON.stringify(parsed) === JSON.stringify(editorSocketEyeContact)) return
     editorSocketEyeContact = parsed
     previewEngine?.setSocketEyeContactSettings(parsed)
-    editorDirty = true
+    markEditorDirty()
   }
 
   function clampPreviewFov(value: number) {
@@ -11201,7 +11790,7 @@
     if (JSON.stringify(editorAppearanceDialsState) === JSON.stringify(state)) return
     editorAppearanceDialsState = state
     editorAppearanceDialsNotice = ''
-    editorDirty = true
+    markEditorDirty()
   }
 
   // ---------------- package-bound appearance surfaces (SA-090)
@@ -11741,7 +12330,7 @@
     editorFacialArtworkState = parsed
     editorFacialArtworkNotice = ''
     editorFacialArtworkPreviewError = ''
-    editorDirty = true
+    markEditorDirty()
     void pruneDetachedFacialArtworkDrafts(parsed)
   }
 
@@ -11752,7 +12341,7 @@
     editorEyeAppearanceState = parsed
     editorEyeAppearanceNotice = ''
     editorFacialArtworkPreviewError = ''
-    editorDirty = true
+    markEditorDirty()
   }
 
   function updateEditorOralAppearance(state: OralAppearanceStateV1) {
@@ -11762,7 +12351,7 @@
     editorOralAppearanceState = parsed
     editorOralAppearanceNotice = ''
     editorFacialArtworkPreviewError = ''
-    editorDirty = true
+    markEditorDirty()
   }
 
   function updateEditorLipArtwork(state: LipArtworkStateV2 | null) {
@@ -11775,7 +12364,7 @@
     editorLipArtworkState = parsed
     editorLipArtworkNotice = ''
     editorFacialArtworkPreviewError = ''
-    editorDirty = true
+    markEditorDirty()
     if (detached && detached.filename !== parsed?.artwork.filename) {
       const draft = editorLipArtworkDraftUploads.get(detached.filename)
       if (draft && editorGoonId) {
@@ -11797,7 +12386,7 @@
     editorLipArtworkPresence = next
     editorLipArtworkNotice = ''
     editorFacialArtworkPreviewError = ''
-    editorDirty = true
+    markEditorDirty()
   }
 
   function updateEditorNailSurface(state: NailSurfaceStateV1) {
@@ -11814,7 +12403,7 @@
     editorNailSurfaceState = parsed
     editorNailSurfaceNotice = ''
     editorNailSurfacePreviewError = ''
-    editorDirty = true
+    markEditorDirty()
     for (const upload of detached.values()) {
       const draft = editorNailArtworkDraftUploads.get(upload.filename)
       if (draft && editorGoonId) {
@@ -11836,7 +12425,7 @@
     editorNailSurfacePresence = next
     editorNailSurfaceNotice = ''
     editorNailSurfacePreviewError = ''
-    editorDirty = true
+    markEditorDirty()
   }
 
   function updateEditorSkinAppearance(state: SkinAppearanceStateV2) {
@@ -11852,7 +12441,7 @@
     editorSkinAppearanceState = parsed
     editorSkinAppearanceNotice = ''
     editorSkinAppearancePreviewError = ''
-    editorDirty = true
+    markEditorDirty()
     for (const upload of detached) {
       const draft = editorSkinSurfaceDraftUploads.get(upload.filename)
       if (draft && editorGoonId) {
@@ -12545,7 +13134,7 @@
     setActiveCueMap(next)
     if (activeTab !== 'kitchen' && !editorEnabledCueNames.includes(trimmed)) {
       editorEnabledCueNames = [...editorEnabledCueNames, trimmed]
-      editorDirty = true
+      markEditorDirty()
     }
     if (activeTab !== 'kitchen' && kind === 'mood' && !editorBaseLoop) {
       editorBaseLoop = trimmed
@@ -12622,7 +13211,7 @@
     setActiveCueMap({ ...map, [candidate]: clone })
     if (activeTab !== 'kitchen' && !editorEnabledCueNames.includes(candidate)) {
       editorEnabledCueNames = [...editorEnabledCueNames, candidate]
-      editorDirty = true
+      markEditorDirty()
     }
   }
 
@@ -12811,7 +13400,7 @@
 
   function discardCueEditorChanges() {
     if (!editorGoonId) {
-      editorDirty = false
+      clearEditorDirty()
       return
     }
 
@@ -12820,10 +13409,34 @@
       void discardFacialArtworkDraftUploads()
       openCueEditor(currentGoon)
       restorePackageOwnedEditorDrafts(currentGoon)
+      const goonId = currentGoon.id, instance = editorInstanceEpoch
+      const engine = previewEngine, token = previewToken
+      const completion = previewLoading ? previewLoadCompletion : null
+      const root = completion ? null : engine?.getAvatarRootObject() ?? null
+      const generation = engine?.getGoonLoadGeneration()
+      queueLoggedEditorPreviewUpdate('discard-closet-preview', async (request) => {
+        if (completion) {
+          const attempt = createRecipePreviewAttempt({ label: 'saved Closet', timeoutMs: 30_000 })
+          try {
+            await attempt.run(completion)
+          } catch (error) {
+            if (request !== closetPreviewRequest || editorGoonId !== goonId || editorInstanceEpoch !== instance) return
+            throw error
+          } finally {
+            attempt.finish()
+          }
+        }
+        if (editorGoonId !== goonId || editorInstanceEpoch !== instance) return
+        if (engine && (previewEngine !== engine || previewToken !== token ||
+            generation === undefined || !engine.isCurrentGoonLoad(generation) ||
+            (root && engine.getAvatarRootObject() !== root))) return
+        if (editorIsGuidedCustomVrm) await syncEditorGuidedOutfitPreview(request)
+        else await refreshEditorClosetPreview(request)
+      })
       return
     }
 
-    editorDirty = false
+    clearEditorDirty()
     editorGoonId = null
   }
 
@@ -14166,10 +14779,6 @@
             activePresetId: null,
             dufOverlays: editorGuidedDufOverlays
           }
-          updates.compatibility = {
-            tier: 'pending',
-            issues: ['Awaiting Advanced/Blender Goon analysis']
-          }
           updates.vrmUpdate = null
         } else {
           const validPresetIds = new Set(
@@ -14194,13 +14803,11 @@
           vrmBackup: currentGoon?.files?.vrm,
           vrmPending: undefined
         }
-        updates.compatibility = {
-          tier: 'pending',
-          issues: ['Awaiting VRM analysis']
-        }
         updates.vrmUpdate = stagedVrmReport ?? null
       }
-      const savedGoon = await updateGoonRecord(editorGoonId, updates)
+      const savedGoon = currentGoon && isGoonCompatibilityModelReplacement(currentGoon, updates)
+        ? await updateGoonWithCompatibilityReset(editorGoonId, updates, captureGoonCompatibilityResetBasis(currentGoon))
+        : await updateGoonRecord(editorGoonId, updates)
       await reconcileFacialArtworkUploadsAfterSave(
         currentGoon?.facialArtwork,
         savedGoon.facialArtwork
@@ -14233,7 +14840,7 @@
         closetAssignments = advancedPackageDraft.closetAssignments
       }
       editorPendingAdvancedPackageUpdate = null
-      editorDirty = false
+      clearEditorDirty()
       if (options.successMessage !== null) {
         toast.success(options.successMessage ?? 'Goon settings updated')
       }
@@ -14566,23 +15173,24 @@
   }
 
   function getCompatibilityIssues(goon: GoonRecord): string[] {
-    return Array.isArray(goon.compatibility?.issues) ? goon.compatibility?.issues ?? [] : []
+    const report = effectiveGoonCompatibility(goon)
+    return Array.isArray(report?.issues) ? report.issues : []
   }
 
   function hasRigWarning(goon: GoonRecord): boolean {
-    const coverage = goon.compatibility?.boneCoverage
+    const coverage = effectiveGoonCompatibility(goon)?.boneCoverage
     if (!coverage) return false
     return coverage.present < coverage.total
   }
 
   function hasTierWarning(goon: GoonRecord): boolean {
-    const tier = goon.compatibility?.tier
+    const tier = effectiveGoonCompatibility(goon)?.tier
     if (!tier) return false
-    return tier !== 'A'
+    return tier !== 'A' || getCompatibilityIssues(goon).length > 0
   }
 
   function getRigTooltipText(goon: GoonRecord): string[] {
-    const coverage = goon.compatibility?.boneCoverage
+    const coverage = effectiveGoonCompatibility(goon)?.boneCoverage
     const issues = getCompatibilityIssues(goon)
     const lines: string[] = []
 
@@ -14600,11 +15208,11 @@
   }
 
   function getTierTooltipText(goon: GoonRecord): string[] {
-    const tier = goon.compatibility?.tier
+    const tier = effectiveGoonCompatibility(goon)?.tier
     const issues = getCompatibilityIssues(goon)
 
     if (tier === 'A') {
-      return ['Tier A = mouth + core expressions + core bones detected.']
+      return ['Tier A = mouth + core expressions + core bones detected.', ...issues]
     }
 
     if (tier === 'B') {
@@ -14857,7 +15465,8 @@
   })
 
   $effect(() => {
-    if (!goonsUnsavedState || typeof window === 'undefined') return
+    // An unfinished Hair fit is a transient draft even when the Goon itself is clean.
+    if ((!goonsUnsavedState && !hasActiveHairImport()) || typeof window === 'undefined') return
 
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
       event.preventDefault()
@@ -14877,6 +15486,12 @@
     discardDraftSceneAssetUploads()
     onUnsavedStateChange(null)
   })
+  $effect(() => {
+    if (recipeWorkflowBusy || !recipeStagedPreviewGoon) return
+    const owner = editorGoon?.recipe
+    if (owner?.contract !== 'goon-recipe/v2' || !owner.pendingJob) recipeStagedPreviewGoon = null
+  })
+  onDestroy(() => { savedPreviewAttempt?.cancel(); recipeComparisonAttempt?.cancel() })
 </script>
 
 <div class="flex h-screen max-h-screen min-h-0 items-stretch overflow-hidden bg-background p-6">
@@ -16473,21 +17088,17 @@
                                 class="col-span-4"
                               />
                               <div class="col-span-8">
-                                {#if globalAnimationOptions.length > 0}
+                                {#if globalAnimationOptions.length > 0 || cue.animationName}
                                   <GoonMotionPicker
-                                    options={globalMotionPickerOptions}
-                                    value={
-                                      cue.animationName && globalAnimationOptions.includes(cue.animationName)
-                                        ? cue.animationName
-                                        : ''
-                                    }
+                                    options={preserveSavedMotionOption(globalMotionPickerOptions, cue.animationName)}
+                                    value={cue.animationName ?? ''}
                                     ariaLabel="Select Mood Loop Motion"
                                     onChange={(value) =>
                                       updateCueField(cue.name, { animationName: value || undefined })}
                                   />
                                 {:else}
                                   <div class="batshit-settings-form-label">
-                                    Upload a motion to select one.
+                                    {globalMotionInventoryConfirmed ? 'Upload a motion to select one.' : 'Motion library unavailable.'}
                                   </div>
                                 {/if}
                               </div>
@@ -17412,6 +18023,7 @@
             {#each goons as goon}
               {@const formatVisual = goonFormatVisual(goon)}
               {@const recipeReadiness = resolveRecipeProductReadiness(goon)}
+              {@const compatibility = effectiveGoonCompatibility(goon)}
               <div class="batshit-settings-muted-panel batshit-settings-display-card space-y-2">
               <div class="flex items-start justify-between gap-3">
                 <div class="min-w-0 flex-1">
@@ -17439,14 +18051,14 @@
                     {/if}
                     <span class="batshit-goon-kind-label">{formatVisual.label}</span>
                   </Badge>
-                  {#if goon.compatibility?.boneCoverage}
+                  {#if compatibility?.boneCoverage}
                     <Tooltip.Root>
                       <Tooltip.Trigger class="inline-flex">
                         <Badge
                           variant="outline"
                           class={`batshit-settings-status-badge uppercase ${hasRigWarning(goon) ? 'is-warning' : ''}`}
                         >
-                          Rig {goon.compatibility.boneCoverage.present}/{goon.compatibility.boneCoverage.total}
+                          Rig {compatibility.boneCoverage.present}/{compatibility.boneCoverage.total}
                         </Badge>
                       </Tooltip.Trigger>
                       <Tooltip.Content side="top" class="max-w-[260px] space-y-1 text-xs">
@@ -17462,7 +18074,7 @@
                         variant="outline"
                         class={`batshit-settings-status-badge ${hasTierWarning(goon) ? 'is-warning' : ''}`}
                       >
-                        {tierLabel(goon.compatibility?.tier)}
+                        {tierLabel(compatibility?.tier)}
                       </Badge>
                     </Tooltip.Trigger>
                     <Tooltip.Content side="top" class="max-w-[260px] space-y-1 text-xs">
@@ -17590,13 +18202,14 @@
             {#if kitchenAvailableAnimationNames.length > 0}
               {#each kitchenAvailableAnimationNames as animationName}
                 <DropdownMenu.Item
+                  disabled={kitchenKnownAnimationData.unverifiedNames.has(animationName)}
                   onSelect={() => {
                     kitchenPreviewAnimationName = animationName
                     void triggerKitchenPreviewAnimation()
                   }}
                 >
                   <span class="truncate">
-                    {animationName}{kitchenPreviewAnimationName === animationName ? ' • Current' : ''}
+                    {animationName}{kitchenKnownAnimationData.unverifiedNames.has(animationName) ? ' • Unverified' : ''}{kitchenPreviewAnimationName === animationName ? ' • Current' : ''}
                   </span>
                 </DropdownMenu.Item>
               {/each}
@@ -17789,7 +18402,7 @@
                     placeholder="Goon name"
                     bind:value={editorName}
                     oninput={() => {
-                      editorDirty = true
+                      markEditorDirty()
                     }}
                   />
                   </div>
@@ -17832,7 +18445,7 @@
                     checked={editorLipSync}
                     onCheckedChange={(checked) => {
                       editorLipSync = Boolean(checked)
-                      editorDirty = true
+                      markEditorDirty()
                     }}
                   />
                   </div>
@@ -17852,7 +18465,7 @@
                     value={editorQuality}
                     onValueChange={(value: string) => {
                       editorQuality = value as GoonEngineQuality
-                      editorDirty = true
+                      markEditorDirty()
                     }}
                   >
                     <Select.Trigger>
@@ -17881,7 +18494,7 @@
                     value={editorBaseLoop}
                     onValueChange={(value: string) => {
                       editorBaseLoop = value
-                      editorDirty = true
+                      markEditorDirty()
                     }}
                   >
                     <Select.Trigger>
@@ -17910,7 +18523,7 @@
                     value={editorSceneId}
                     onValueChange={(value: string) => {
                       editorSceneId = value
-                      editorDirty = true
+                      markEditorDirty()
                     }}
                   >
                     <Select.Trigger>
@@ -17978,7 +18591,7 @@
                   coordinationInfo={EDITOR_EYE_CONTACT_COORDINATION_INFO}
                   onModeChange={(mode) => {
                     editorEyeContactMode = mode
-                    editorDirty = true
+                    markEditorDirty()
                   }}
                   onTuningChange={updateEditorEyeContactTuning}
                 />
@@ -18094,7 +18707,7 @@
                           onChange={updateEditorFacialArtwork}
                           onEyeAppearanceChange={updateEditorEyeAppearance}
                           onUpload={uploadEditorFacialArtwork}
-                          onUploadBusyChange={(busy) => (editorFacialArtworkUploadBusy = busy)}
+                          onUploadBusyChange={(busy) => setEditorArtworkUploadBusy(busy)}
                         />
                       {:else}
                         <p class="batshit-settings-form-error" role="alert">
@@ -18161,7 +18774,7 @@
                               onChange={updateEditorLipArtwork}
                               onSurfaceEnabledChange={updateEditorLipArtworkPresence}
                               onUpload={uploadEditorLipArtwork}
-                              onUploadBusyChange={(busy) => (editorFacialArtworkUploadBusy = busy)}
+                              onUploadBusyChange={(busy) => setEditorArtworkUploadBusy(busy)}
                             />
                           {/if}
                         {:else if regionId === 'face.cheeks' && editorSkinAppearanceDefinition && editorSkinAppearanceState}
@@ -18333,6 +18946,9 @@
             <Collapsible.Content class={`${goonLevel1AccordionContentClass} pt-3`}>
               <HairCatalogEditor
                 assets={hairAssets}
+                retainedBuiltinAssets={retainedHairBuiltinAssets}
+                ownerId={editorGoonId}
+                stateOwnerId={editorHairHydrationGoonId || null}
                 refitSources={hairRefitSources}
                 valueState={editorHairState}
                 recipeSource={editorHairRecipeSource}
@@ -18347,7 +18963,7 @@
                       onReset: resetEditorRetiredHair
                     }
                   : null}
-                disabled={editorSaving || recipeWorkflowBusy || Boolean(editorRetiredHairSibling)}
+                disabled={editorSaving || recipeWorkflowBusy || recipePreviewTransitioning || editorHairHydrationGoonId !== editorGoonId || Boolean(editorRetiredHairSibling)}
                 onRefresh={() => refreshHairCatalog().then(() => undefined).catch(() => undefined)}
                 onSelect={selectEditorHairAsset}
                 onImport={openEditorHairImport}
@@ -19199,14 +19815,10 @@
                                   class="col-span-4"
                                 />
                                 <div class="col-span-8">
-                                  {#if availableAnimationNames.length > 0}
+                                  {#if availableAnimationNames.length > 0 || cue.animationName}
                                     <GoonMotionPicker
-                                      options={editorMotionPickerOptions}
-                                      value={
-                                        cue.animationName && availableAnimationNames.includes(cue.animationName)
-                                          ? cue.animationName
-                                          : ''
-                                      }
+                                      options={preserveSavedMotionOption(editorMotionPickerOptions, cue.animationName)}
+                                      value={cue.animationName ?? ''}
                                       ariaLabel="Select Mood Loop Motion"
                                       onChange={(value) =>
                                         updateCueField(cue.name, { animationName: value || undefined })
@@ -20131,7 +20743,10 @@
 	                        onSaveEditorDraft={() =>
 	                          saveCueEditor({ successMessage: null, skipRecipeWorkflow: true })}
 	                        onDiscardEditorDraft={discardCueEditorChanges}
-	                        onDraftPreviewStateChange={handleRecipeEditorDraftPreviewStateChange}
+	                        onRetryBegin={captureHairRetrySettlement}
+                        onLoadSavedPreview={loadSavedGoonPreview}
+                        onWorkflowOperationChange={(operation) => { recipeWorkflowOperation = operation }}
+                        onDraftPreviewStateChange={handleRecipeEditorDraftPreviewStateChange}
 	                        onPreviewTargetChange={handleRecipeEditorPreviewTargetChange}
 	                        onPreviewLiveCandidate={previewStagedRecipeLiveCandidate}
 	                        autoPrepare={isRecipePreparationRequired(editorGoon)}
@@ -20360,7 +20975,7 @@
             saveLabel="Save Description"
             onSave={(value) => {
               editorDescription = value
-              editorDirty = true
+              markEditorDirty()
             }}
           />
 	          <Dialog.Root
@@ -20672,13 +21287,14 @@
                 {#if availableAnimationNames.length > 0}
                   {#each availableAnimationNames as animationName}
                     <DropdownMenu.Item
+                      disabled={editorKnownAnimationData.unverifiedNames.has(animationName)}
                       onSelect={() => {
                         previewAnimationName = animationName
                         void triggerPreviewAnimation()
                       }}
                     >
                       <span class="truncate">
-                        {animationName}{previewAnimationName === animationName ? ' • Current' : ''}
+                        {animationName}{editorKnownAnimationData.unverifiedNames.has(animationName) ? ' • Unverified' : ''}{previewAnimationName === animationName ? ' • Current' : ''}
                       </span>
                     </DropdownMenu.Item>
                   {/each}
@@ -20720,7 +21336,7 @@
             qualityOptions={qualityOptions}
             onQualityChange={(value) => {
               editorQuality = value
-              editorDirty = true
+              markEditorDirty()
             }}
           />
         </SettingsLivePreviewPane>
@@ -22728,13 +23344,14 @@
                   {#if kitchenAvailableAnimationNames.length > 0}
                     {#each kitchenAvailableAnimationNames as animationName}
                       <DropdownMenu.Item
+                        disabled={kitchenKnownAnimationData.unverifiedNames.has(animationName)}
                         onSelect={() => {
                           kitchenPreviewAnimationName = animationName
                           void triggerKitchenPreviewAnimation()
                         }}
                       >
                         <span class="truncate">
-                          {animationName}{kitchenPreviewAnimationName === animationName ? ' • Current' : ''}
+                          {animationName}{kitchenKnownAnimationData.unverifiedNames.has(animationName) ? ' • Unverified' : ''}{kitchenPreviewAnimationName === animationName ? ' • Current' : ''}
                         </span>
                       </DropdownMenu.Item>
                     {/each}
@@ -22874,3 +23491,5 @@
 	    </Tabs.Root>
 </div>
 </div>
+
+<GoonOperationOverlay operation={recipeWorkflowOperation} />

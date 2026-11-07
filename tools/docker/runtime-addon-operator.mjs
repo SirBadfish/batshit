@@ -8,6 +8,7 @@ import os from 'node:os'
 import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeSync } from 'node:fs'
 import { realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { createSandboxLifecycleGate } from './sandbox-lifecycle-gate.mjs'
+import { resolveOperatorWorkspaceMapping, validateWorkspaceAdmissionRequest } from './sandbox-workspace-policy.mjs'
 import { limitedOutput } from './agent-browser-sidecar/output-limit.mjs'
 // "Stop with Batshit" for host voice engines: the SAME records and decision the Mac supervisor
 // and the native launcher use, so a runtime several engines share stops only if every one of
@@ -118,7 +119,7 @@ const SBX_CREATE_TIMEOUT_MS = MAX_RUN_TIMEOUT_MS
 // Reported by /health; `start-docker` restarts an operator that reports less. It is the
 // operator's protocol revision, raised for any change the app or `start-docker` must wait for,
 // not only the sandbox lane.
-const SANDBOX_REVISION = 12
+const SANDBOX_REVISION = 13
 // F-P5-1: every create and remove of a named sandbox goes through this gate, so a chat's
 // parallel first bash calls share one `create`.
 const sandboxGate = createSandboxLifecycleGate()
@@ -883,66 +884,37 @@ function isPathWithinRoot(candidate, root) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
-async function assertDirectory(value, label) {
-  const details = await stat(value).catch(() => null)
-  if (!details?.isDirectory()) {
-    throw new Error(`${label} is not a readable directory: ${value}`)
-  }
-  return await realpath(value)
+async function resolveWorkspaceMapping({ workspaceRoot, cwd }) {
+  return resolveOperatorWorkspaceMapping({
+    operatorRoot: ROOT,
+    containerRoot: SANDBOX_CONTAINER_WORKSPACE_ROOT,
+    hostRoot: SANDBOX_HOST_WORKSPACE_ROOT_RAW,
+    workspaceRoot,
+    cwd
+  })
 }
 
-async function resolveWorkspaceMapping({ workspaceRoot, cwd }) {
-  const containerRoot = path.posix.resolve('/', SANDBOX_CONTAINER_WORKSPACE_ROOT)
-  if (!SANDBOX_HOST_WORKSPACE_ROOT_RAW.trim()) {
-    throw new Error(
-      'Docker Sandbox operator requires BATSHIT_SANDBOX_HOST_WORKSPACE_ROOT or BATSHIT_WORKSPACE_MOUNT so /workspace can map to a real host directory.'
-    )
+async function handleSandboxWorkspaceAdmission(req, res) {
+  if (!isAuthorized(req)) {
+    json(res, 401, { ok: false, admitted: false, error: 'Unauthorized.' })
+    return
   }
-
-  const hostRootCandidate = path.isAbsolute(SANDBOX_HOST_WORKSPACE_ROOT_RAW)
-    ? SANDBOX_HOST_WORKSPACE_ROOT_RAW
-    : path.resolve(ROOT, SANDBOX_HOST_WORKSPACE_ROOT_RAW)
-  const hostRoot = await assertDirectory(hostRootCandidate, 'Sandbox host workspace root')
-
-  const mapOne = async (value, label) => {
-    const raw = String(value || '').trim()
-    if (!raw || !path.posix.isAbsolute(raw)) {
-      throw new Error(`${label} must be an absolute path inside ${containerRoot}.`)
+  try {
+    const body = validateWorkspaceAdmissionRequest(await readBody(req))
+    if (process.platform !== 'darwin') {
+      json(res, 503, { ok: false, admitted: false, v: 1, error: 'Typed Docker Sandbox workspace admission requires a darwin host operator.' })
+      return
     }
-
-    if (raw === hostRoot || raw.startsWith(`${hostRoot}/`)) {
-      const resolved = await assertDirectory(raw, label)
-      if (!isPathWithinRoot(resolved, hostRoot)) {
-        throw new Error(`${label} is outside the sandbox host workspace root.`)
-      }
-      return resolved
-    }
-
-    const normalized = path.posix.normalize(raw)
-    if (normalized !== containerRoot && !normalized.startsWith(`${containerRoot}/`)) {
-      throw new Error(`${label} must be under ${containerRoot}; received ${raw}.`)
-    }
-
-    const relative = path.posix.relative(containerRoot, normalized)
-    const mapped = path.resolve(hostRoot, relative)
-    const resolved = await assertDirectory(mapped, label)
-    if (!isPathWithinRoot(resolved, hostRoot)) {
-      throw new Error(`${label} maps outside the sandbox host workspace root.`)
-    }
-    return resolved
-  }
-
-  const hostWorkspaceRoot = await mapOne(workspaceRoot || containerRoot, 'workspaceRoot')
-  const hostCwd = await mapOne(cwd || workspaceRoot || containerRoot, 'cwd')
-  if (!isPathWithinRoot(hostCwd, hostWorkspaceRoot)) {
-    throw new Error('cwd must stay inside workspaceRoot after host workspace mapping.')
-  }
-
-  return {
-    containerRoot,
-    hostRoot,
-    hostWorkspaceRoot,
-    hostCwd
+    const mapping = await resolveOperatorWorkspaceMapping({
+      operatorRoot: ROOT,
+      containerRoot: SANDBOX_CONTAINER_WORKSPACE_ROOT,
+      hostRoot: SANDBOX_HOST_WORKSPACE_ROOT_RAW,
+      ...body,
+      containerNamespaceOnly: true
+    })
+    json(res, 200, { ok: true, admitted: true, v: 1, hostPlatform: 'darwin', ...mapping })
+  } catch (error) {
+    json(res, 400, { ok: false, admitted: false, v: 1, error: error instanceof Error ? error.message : 'Workspace admission failed.' })
   }
 }
 
@@ -1007,7 +979,13 @@ async function prepareSandbox({ userId, sessionId, workspaceRoot, cwd }) {
 }
 
 // Runs inside `sandboxGate.ensure`, so one call at a time per sandbox name.
-async function startSandbox({ sandboxName, hostWorkspaceRoot }) {
+async function startSandbox({ sandboxName, mapping }) {
+  // Recheck after this caller waited at the lifecycle gate, before even listing a reusable VM.
+  const current = await resolveWorkspaceMapping({ workspaceRoot: mapping.requestedWorkspaceRoot, cwd: mapping.requestedCwd })
+  if (['containerRoot', 'configuredHostRoot', 'hostRoot', 'hostWorkspaceRoot', 'hostCwd'].some((key) => current[key] !== mapping[key])) {
+    throw new Error('Sandbox workspace mapping changed before create or reuse.')
+  }
+  const { hostWorkspaceRoot } = current
   const usable = (entry) =>
     Boolean(entry) && isReusableSbxSandbox(entry) && sbxSandboxHasWorkspace(entry, hostWorkspaceRoot)
   const existing = (await listSandboxes()).find((entry) => entry.name === sandboxName)
@@ -1043,7 +1021,7 @@ async function ensureSandboxReady(prepared) {
   await sandboxGate.ensure(prepared.sandboxName, () =>
     startSandbox({
       sandboxName: prepared.sandboxName,
-      hostWorkspaceRoot: prepared.mapping.hostWorkspaceRoot
+      mapping: prepared.mapping
     })
   )
   return prepared
@@ -1901,6 +1879,7 @@ function handleHealth(req, res) {
     // 9 = Windows host voice stop with process identity checks.
     // 12 = the Pinokio admission folder joins the shared protected-home policy, with sandbox
     // mount version 4 (BL-1277): an operator started with the older list must not keep serving.
+    // 13 = read-only workspace admission and strict mapped-host policy before sbx create/reuse.
     sandboxRevision: SANDBOX_REVISION,
     // How it stops with Docker Batshit (revision 6): `start-docker` restarts an operator whose
     // login item is not the current one, so an older item (KeepAlive true) never lingers.
@@ -2083,6 +2062,11 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/v1/sandbox/status') {
     await handleSandboxStatus(req, res)
+    return
+  }
+
+  if (req.method === 'POST' && url.pathname === '/v1/sandbox/workspace/admit') {
+    await handleSandboxWorkspaceAdmission(req, res)
     return
   }
 

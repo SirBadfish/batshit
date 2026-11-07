@@ -165,6 +165,19 @@ describe('Custom Goon manifest summary', () => {
     expect(ready.summary.recipeReady).toBe(true);
     expect(ready.summary.anatomyFitReady).toBe(false);
 
+    const male = uploadRouter.parseCustomGoonManifest(JSON.stringify({
+      recipeSource: { contract: 'recipe-source/v1', baseId: 'batshit-base-m-v1', fitFamily: 'batshit-base-m-v1' },
+      appearanceDials: { contract: 'appearance-dials/v2' },
+      recipeUpdates: { contract: 'recipe-updates/v1', edges: [] }
+    }));
+    expect(male.summary.recipeReady).toBe(false);
+    const mixed = uploadRouter.parseCustomGoonManifest(JSON.stringify({
+      recipeSource: { contract: 'recipe-source/v1', baseId: 'batshit-base-m-v1', fitFamily: 'batshit-base-f-v1' },
+      appearanceDials: { contract: 'appearance-dials/v2' },
+      recipeUpdates: { contract: 'recipe-updates/v1', edges: [] }
+    }));
+    expect(mixed.summary.recipeReady).toBe(false);
+
     const fitting = uploadRouter.parseCustomGoonManifest(
       JSON.stringify({
         recipeSource: {

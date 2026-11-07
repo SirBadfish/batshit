@@ -1,3 +1,4 @@
+import { projectPluginCommand, listAgentPlugins, refusePluginMemberWrite, AgentPluginError } from '$lib/server/services/agentPlugins'
 import { json, type RequestHandler } from '@sveltejs/kit'
 
 import { redis } from '$lib/server/redis'
@@ -16,7 +17,8 @@ import { parseIconRef, type IconRef } from '$lib/icons/iconTypes'
 import { normalizeOptionalIconRef } from '$lib/icons/iconLegacy'
 import type { SlashCommandRow } from '$lib/types/database'
 import { sanitizeId } from '$lib/utils/idSanitizer'
-import { writeSlashCommandRecord } from '$lib/server/services/agentAccessLists'
+import { parseAccessAgentIds, writeSlashCommandRecord } from '$lib/server/services/agentAccessLists'
+import { beginSlashCommandWrite, captureSlashCommandWriteBasis, isSlashCommandMutationError, COMMAND_ACCESS_FIELDS, saveSlashCommandRecord } from '$lib/server/services/slashCommandRevision'
 
 function normalizeInvocation(value: string) {
   const trimmed = value.trim()
@@ -58,14 +60,6 @@ function sanitizeTags(input: unknown): string[] {
     .map((tag) => (typeof tag === 'string' ? tag.trim() : ''))
     .filter((tag) => tag.length > 0)
   return Array.from(new Set(tags))
-}
-
-function sanitizeAgentIds(input: unknown): string[] {
-  if (!Array.isArray(input)) return []
-  const normalized = input
-    .map((value) => sanitizeId(String(value ?? '').trim()))
-    .filter((value) => value.length > 0)
-  return Array.from(new Set(normalized))
 }
 
 function normalizeCommandType(input: unknown): SlashCommandRow['type'] | null {
@@ -150,17 +144,20 @@ export const GET: RequestHandler = async ({ locals }) => {
   }
 
   try {
+    const preparation = beginSlashCommandWrite(locals.user.id)
     await ensureSystemSlashCommands(locals.user.id)
 
     const pattern = `slash_command:${locals.user.id}:*`
     const keys = await redis.keys(pattern)
 
+    const plugins = await listAgentPlugins(locals.user.id)
     const slashCommands: SlashCommandRow[] = []
     for (const key of keys) {
+      const basis = await captureSlashCommandWriteBasis(preparation, [key.slice(`slash_command:${locals.user.id}:`.length)])
       let command = (await redis.json.get(key)) as SlashCommandRow | null
       if (!command) continue
 
-      if (command.type === 'skill' && command.skill_id) {
+      if (!plugins.some(plugin => plugin.skills.some(skill => skill.commandId === command!.id || skill.skillId === command!.skill_id)) && command.type === 'skill' && command.skill_id) {
         const skill = await getSkill(locals.user.id, command.skill_id).catch((error) => {
           console.warn('[slash-commands GET] Failed to refresh skill metadata for command:', command?.id, error)
           return null
@@ -175,20 +172,22 @@ export const GET: RequestHandler = async ({ locals }) => {
             synchronized.updated_at = new Date().toISOString()
             // BL-544: a metadata refresh never changes who may use the skill (see the command
             // route's GET): the per-agent list is kept as stored at the write.
-            const storedCommand = await writeSlashCommandRecord(key, synchronized, { keepAgentAccess: true })
+            const storedCommand = await writeSlashCommandRecord(key, synchronized, { keepAgentAccess: true, preserveAccess: COMMAND_ACCESS_FIELDS }, basis)
             if (!storedCommand) continue
             command = storedCommand
           }
         }
       }
 
-      slashCommands.push(command)
+      slashCommands.push(await projectPluginCommand(locals.user.id, command, plugins))
     }
 
     slashCommands.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
 
     return json({ slashCommands })
   } catch (error) {
+    if (error instanceof AgentPluginError) return json({ error: error.message, code: error.code }, { status: error.status })
+    if (isSlashCommandMutationError(error)) return json({ error: error.message, code: error.code }, { status: error.status })
     console.error('Error getting slash commands:', error)
     return json({ error: 'Failed to get slash commands' }, { status: 500 })
   }
@@ -201,6 +200,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   }
 
   try {
+    const preparation = beginSlashCommandWrite(locals.user.id)
     const body = (await request.json()) as Record<string, unknown>
 
     const rawName = typeof body.name === 'string' ? body.name.trim() : ''
@@ -215,6 +215,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       return json({ error: 'Unable to derive a valid command id' }, { status: 400 })
     }
 
+    await refusePluginMemberWrite(locals.user.id, { id: commandId, skill_id: typeof body.skill_id === 'string' ? body.skill_id : undefined, plugin_id: typeof body.plugin_id === 'string' ? body.plugin_id : undefined })
+    const basis = await captureSlashCommandWriteBasis(preparation, [commandId])
     const exists = await redis.exists(`slash_command:${locals.user.id}:${commandId}`)
     if (exists) {
       return json(
@@ -237,9 +239,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       return json({ error: 'Invocation must start with / and use only letters, numbers, :, -, or _.' }, { status: 400 })
     }
 
+    const payloadSkill = body.skill && typeof body.skill === 'object' ? body.skill as Record<string, unknown> : null
+    if (payloadSkill) await refusePluginMemberWrite(locals.user.id, { id: commandId, skill_id: normalizeSkillId(typeof payloadSkill.id === 'string' ? payloadSkill.id : undefined, typeof payloadSkill.name === 'string' ? payloadSkill.name : rawName) })
     const now = new Date().toISOString()
     const parameters = sanitizeParameters(body.parameters)
-    const enabledAgentIds = sanitizeAgentIds(body.enabled_agent_ids)
+    const enabledAgentIds = body.enabled_agent_ids === undefined ? [] : parseAccessAgentIds(body.enabled_agent_ids)
     const enabledForAllAgents = body.enabled_for_all_agents === true
 
     let skillId: string | undefined
@@ -426,10 +430,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       updated_at: now
     }
 
-    await redis.json.set(`slash_command:${locals.user.id}:${commandId}`, '$', slashCommand)
-
-    return json({ slashCommand })
+    const stored = await saveSlashCommandRecord(locals.user.id, { record: slashCommand, mode: 'create' }, basis)
+    if (!stored) return json({ error: 'That command changed before it could be created. Reload and try again.' }, { status: 409 })
+    return json({ slashCommand: stored })
   } catch (error) {
+    if (error instanceof AgentPluginError) return json({ error: error.message, code: error.code }, { status: error.status })
+    if (isSlashCommandMutationError(error)) return json({ error: error.message, code: error.code }, { status: error.status })
     // BL-369: a user skill whose files are missing is named, never a generic 500.
     if (isSkillFilesMissingError(error)) {
       return json({ error: error.message, code: error.code }, { status: 409 })

@@ -1,44 +1,39 @@
 # Agents and runtime paths
 
-Batshit has two Primary Agent types: `API` and `CLI`. They are peer choices, not quality tiers. n8n remains an automation runtime that Primary Agents use through workflow tools and n8n Workflow Subagents.
+Every Primary Agent runs in Batshit, on the saved model you pick. The model's connection decides how Batshit reaches the model: an API key, a Local AI runtime, your ChatGPT plan or your Claude plan. n8n remains an automation runtime that Primary Agents use through workflow tools.
 
-## One experience, two Primary Agent runtimes
+## One experience, one Primary Agent runtime
 
-- **`API`** — Batshit talks directly to a model provider or Local AI runtime. Batshit builds the request, supplies enabled tools, and streams the reply.
-- **`CLI`** — Batshit runs a managed Codex or Claude Code agent. The CLI brings its own coding-oriented command, search, and file-edit behavior while Batshit owns the chat, history, settings, and visual output.
+Batshit builds the request, supplies the enabled tools, runs every tool itself, and streams the reply, whatever the connection. On the Claude plan connection, Claude Code acts only as the model: its own tools are off, and the model sees only the Batshit tools you allow.
 
-Both types share the same user experience: chats, Projects, Clips, Zips, tools, memory, voice, Goons, and the Execution Viewer. Pick API for broad provider access and Local AI; pick CLI when a native coding agent is the better fit.
+Every agent shares the same user experience: chats, Projects, Clips, Zips, tools, memory, voice, Goons, and the Execution Viewer, where its model supports them. [Claude plan](../providers/claude-plan.md) lists what that connection does not run.
+
+The older Claude Code CLI lane, where Claude Code ran a whole agent with its own tools and loop, was removed. A leftover agent from it can only be deleted; see [Primary Agents](../primary-agents/overview.md#claude-code-cli-agents-were-removed).
 
 ## One compiler and one event contract
 
-API and CLI Primary Agents use one server-side compiler for system prompts, chat history, memory, project context, Tool Grid scope, and the current-message information block. That avoids two implementations silently assembling different requests.
+Batshit uses one server-side compiler for every Primary Agent's system prompt, chat history, memory, project context, Tool Grid scope, and current-message information block, whatever the model connection. That avoids two implementations silently assembling different requests.
 
-Their runtimes emit different native events, but Batshit normalizes both into one event contract for text, reasoning, tool calls, tool results, errors, and completion. The renderer therefore uses the same tool cards, Zip behavior, and spectator-tab replay regardless of whether the run came from a direct provider, Codex, or Claude.
+Each connection emits its own native events, but Batshit normalizes them into one event contract for text, reasoning, tool calls, tool results, errors, and completion. The renderer therefore uses the same tool cards, Zip behavior, and spectator-tab replay whichever connection the run used.
 
 ## Where n8n fits
 
-n8n is a Category 2 automation platform in Batshit:
+n8n is an automation platform in Batshit, not a kind of agent:
 
 - **Workflow tools** let a Primary Agent call a normal n8n workflow for a task.
-- **n8n Workflow Subagents** let a Primary Agent delegate to a dedicated n8n AI Agent workflow.
+- **Wake-up webhooks** let an n8n workflow start a chat for one of your agents.
 
-n8n does not appear as a Primary Agent type. You do not chat directly through an n8n Primary webhook, and the retired n8n Subnode Subagent type is not available.
+## Subagents
 
-## Subagent lanes
+A Primary Agent can call Subagents: Batshit-managed runs on their own saved model, on any connection, the Claude plan included. They compile from the same base pattern as every agent, run as non-streaming tool-like calls, inherit only the parent Project path, and use their own Tool Grid settings. On the Claude plan, Claude Code acts only as the model for a Subagent too.
 
-API and CLI Primary Agents can call three kinds of Subagent:
-
-- **n8n Workflow Subagent** — a dedicated n8n webhook workflow.
-- **API Subagent** — a Batshit-managed direct provider run.
-- **CLI Subagent** — a Batshit-managed one-shot Codex or Claude run.
-
-All three compile from the same base pattern, run as non-streaming tool-like calls, inherit only the parent Project path, and use their own Tool Grid settings.
+The Claude Code CLI Subagent, where Claude Code ran the Subagent with its own tools, was removed. A leftover one can only be deleted; see [Subagents](../subagents/overview.md).
 
 ## Why this matters
 
-The runtime choice determines where the model runs, how it authenticates, and which native capabilities it can reach. It does not define a premium tier.
+The connection choice determines where the model runs, how it authenticates and pays, and which model features it offers. It does not define a premium tier.
 
-A common setup is an API Primary Agent for general work, a CLI Primary Agent for code, and n8n Workflow Subagents or workflow tools for automation-heavy jobs.
+A common setup is one agent on a fast everyday model, another on a strong coding model (on an API key or your Claude plan), and n8n workflow tools for automation-heavy jobs.
 
 ## Related
 

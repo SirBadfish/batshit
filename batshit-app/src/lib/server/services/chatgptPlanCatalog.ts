@@ -9,7 +9,7 @@ export function chatgptPlanConnectionOptions(userId: string): CatalogConnectionO
     id: chatgptPlanConnectionId(account.id), label: `ChatGPT Plan${account.email ? ` (${account.email})` : ''}`,
     transport: 'direct', service: 'chatgpt-plan', providers: ['openai'], status: account.state === 'ready' ? 'ready' : 'locked',
     lockedReason: account.state === 'ready' ? undefined : account.state === 'identity-only' ? 'Signed in, but ChatGPT plan use was not granted. Continue with ChatGPT in API Keys.' : 'Reconnect this ChatGPT account in Settings → API Keys.',
-    description: 'ChatGPT plan text inference for API agents and Compact. Account-specific models; no paid API-key fallback.',
+    description: 'ChatGPT plan text inference for agents and Compact. Account-specific models; no paid API-key fallback.',
     n8nStatus: 'locked', n8nDescription: 'ChatGPT credentials remain in the Mac app and are unavailable to n8n.'
   }))
 }

@@ -10,9 +10,9 @@
  * - `<agent name="…">`: any other agent, by its current display name.
  * - `<note>`: Batshit's own entry (a Compact summary, a woken turn's DM, a group follow-up).
  *
- * History sits inside `<conversation>`, the new message follows it, and the other sections of
- * the message (`<dynamic_info>`, `<zip_index>`, `<awareness_media>`, `<clipped_items>`,
- * `<remembered_media>`) are one element each.
+ * History sits inside `<conversation>`, the new message follows it inside `<current_message>`
+ * (decision 11, Josh 2026-10-24), and the other sections of the message (`<dynamic_info>`,
+ * `<zip_index>`, `<awareness_media>`, `<clipped_items>`, `<remembered_media>`) are one element each.
  *
  * DL-05: content never carries a live tag of this grammar. `disarmCompiledTags` rewrites the
  * `<` of any of these tag names inside content to `&lt;`, the same way every time, so a pasted
@@ -26,6 +26,8 @@ export const COMPILED_TAG = {
   assistant: 'assistant',
   agent: 'agent',
   note: 'note',
+  /** Decision 11: wraps the message to answer now (its `<user>` or `<note>`), never history. */
+  currentMessage: 'current_message',
   dynamicInfo: 'dynamic_info',
   zipIndex: 'zip_index',
   awarenessMedia: 'awareness_media',
@@ -144,6 +146,47 @@ export function compiledElement(
   attributes: Array<[string, string | null | undefined]> = []
 ): string {
   return `${compiledOpenTag(tag, attributes)}\n${disarmCompiledTags(body)}\n</${tag}>`
+}
+
+/**
+ * Decision 11 (Josh, 2026-10-24: "it needs to be really obvious where that is"): the message to
+ * answer now, its `<user>` or `<note>` element, inside `<current_message>`. The element is already
+ * compiled (its content disarmed), so it is wrapped as it is, not disarmed again. Only the current
+ * message gets it; history elements never do, and a compile with no current message has none.
+ */
+export function compiledCurrentMessage(element: string): string {
+  return `${compiledOpenTag(COMPILED_TAG.currentMessage)}
+${element}
+</${COMPILED_TAG.currentMessage}>`
+}
+
+/** Decision 5: the Zip Index's status headings, the words the zip guidance teaches (one source). */
+export const ZIP_INDEX_STATUS_HEADINGS = {
+  settings: 'Current Auto-Zip Settings',
+  zippedThisTurn: 'Zipped this turn',
+  holds: 'Zip Holds',
+  /** SA-120 P5: what Judge Juice's Smart Zip keeps open for a few messages; never a hold. */
+  judgeJuice: 'Opened by Judge Juice'
+} as const
+
+/**
+ * Decision 5 (Josh, 2026-10-23): the Zip Index's status sections (`buildZipIndexStatusLines`) go
+ * at the top of the history's `<zip_index>` element, a blank line before its index; when the
+ * history has none (nothing is open, or the inline layout) they become the element, after
+ * `<conversation>`. Content is disarmed (DL-05), so the only `<zip_index>` line in a history is
+ * the compiler's own. No lines, no change.
+ */
+export function withZipIndexStatus(history: string, statusLines: readonly string[]): string {
+  if (statusLines.length === 0) return history
+  const status = statusLines.join('\n')
+  const open = `${compiledOpenTag(COMPILED_TAG.zipIndex)}\n`
+  const at = history.startsWith(open) ? 0 : history.lastIndexOf(`\n${open}`) + 1
+  if (at === 0 && !history.startsWith(open)) {
+    const element = compiledElement(COMPILED_TAG.zipIndex, status)
+    return history ? `${history}\n\n${element}` : element
+  }
+  const bodyStart = at + open.length
+  return `${history.slice(0, bodyStart)}${disarmCompiledTags(status)}\n\n${history.slice(bodyStart)}`
 }
 
 /**

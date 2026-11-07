@@ -5,7 +5,8 @@ import { dirname, resolve } from 'node:path'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import ts from 'typescript'
-import { describe, it } from 'vitest'
+import { describe, expect, it } from 'vitest'
+import { defaultAppActionsPolicy } from '$lib/appActions/settings/managementContract'
 
 // Execute the actual helper/suite bytes with captured Vitest hook registration and
 // no socket-capable dependency. This is hook/admission proof, never real Redis proof.
@@ -13,6 +14,9 @@ const sourceRoot = process.env.SA122_ADMISSION_SOURCE_ROOT || resolve(dirname(fi
 const requireNode = createRequire(import.meta.url)
 const harnessSource = readFileSync(resolve(sourceRoot, 'src/lib/test-utils/redis-memory.ts'), 'utf8')
 const suiteSource = readFileSync(resolve(sourceRoot, 'src/lib/server/services/appActions/settings/conditionalAgentSettings.redis.test.ts'), 'utf8')
+// a3229efda moved the suite's strict allocation/client admission into this shared helper.
+const admissionSource = readFileSync(resolve(sourceRoot, 'src/lib/test-utils/settingsRedisAdmission.ts'), 'utf8')
+const subjectAdmissionSource = readFileSync(resolve(sourceRoot, 'src/lib/test-utils/skillSessionCommitTwin.ts'), 'utf8')
 const runId = 'a'.repeat(40)
 const port = 59123
 const originalUrl = 'redis://127.0.0.1:59123/15'
@@ -26,17 +30,28 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
-function fixture(real = true) {
+function fixture(real = true, ci = false) {
+  const fixturePort = ci ? 6379 : port
+  const initialUrl = `redis://127.0.0.1:${fixturePort}/15`
+  const serviceId = 'c'.repeat(64)
+  let platform: string = ci ? 'linux' : process.platform
+  let allocationMode = 0o100600
+  let allocationAlias = false
   const hooks = { beforeAll: [] as (() => Promise<void>)[], beforeEach: [] as (() => Promise<void>)[],
     afterEach: [] as (() => Promise<void>)[], afterAll: [] as (() => Promise<void>)[], tests: [] as (() => Promise<void>)[] }
+  const deletedKeys: string[] = []
   const effects = { create: 0, scan: 0, unlink: 0, seed: 0, del: 0, adminDisconnect: 0, adminQuit: 0,
     appExecute: 0, appDisconnect: 0, appCommandDisconnect: 0, reset: 0, record: 0, sync: 0, fileClose: 0, dirSync: 0, dirClose: 0 }
   const env: Record<string, string | undefined> = { VITEST_USE_REAL_REDIS: real ? 'true' : 'false',
-    BATSHIT_REDIS_TEST_URL: originalUrl, REDIS_URL: originalUrl, VITEST_POOL_ID: '1',
-    SA122_SETTINGS_REDIS_ALLOCATION: allocationPath }
-  const dynamicEnv: Record<string, string | undefined> = { REDIS_URL: originalUrl }
-  let allocation: any = { schemaVersion: 1, allocationId: '11111111-1111-4111-8111-111111111111',
-    createdAt: new Date().toISOString(), host: '127.0.0.1', port, database: 14, runId, receiptPath }
+    BATSHIT_REDIS_TEST_URL: initialUrl, REDIS_URL: initialUrl, VITEST_POOL_ID: '1',
+    SA122_SETTINGS_REDIS_ALLOCATION: allocationPath,
+    ...(ci ? { GITHUB_ACTIONS: 'true', GITHUB_RUN_ID: '900001', GITHUB_RUN_ATTEMPT: '2',
+      RUNNER_TEMP: '/fresh-owned-evidence', BATSHIT_REDIS_CI_SERVICE_ID: serviceId } : {}) }
+  const dynamicEnv: Record<string, string | undefined> = { REDIS_URL: initialUrl }
+  let allocation: any = { schemaVersion: ci ? 2 : 1, allocationId: '11111111-1111-4111-8111-111111111111',
+    createdAt: new Date().toISOString(), host: '127.0.0.1', port: fixturePort, database: 14, runId, receiptPath,
+    ...(ci ? { ciOwner: { kind: 'github-actions-service', serviceId, githubRunId: '900001',
+      githubRunAttempt: '2', localAddress: '172.18.0.2:6379' } } : {}) }
   let rawAllocation: string | undefined
   let receipt: any
   let recordGate: Promise<void> | undefined
@@ -60,15 +75,19 @@ function fixture(real = true) {
   let appLateEnvSync = false
   const makeClient = (id: number) => ({
     isOpen: false, isReady: false,
-    connection: { id, db: 14, laddr: `127.0.0.1:${port}`, user: 'must-not-be-recorded' } as any,
-    server: `# Server\r\nredis_version:8.10.1\r\nrun_id:${runId}\r\ntcp_port:${port}\r\n`,
+    connection: { id, db: 14, laddr: ci ? '172.18.0.2:6379' : `127.0.0.1:${port}`, user: 'must-not-be-recorded' } as any,
+    server: `# Server\r\nredis_version:8.10.1\r\nrun_id:${runId}\r\ntcp_port:${fixturePort}\r\nprocess_id:45678\r\n`,
     size: 0 as any, jsonReply: null as any,
     async connect() { this.isOpen = true; if (adminConnectFailure) throw new Error('connect failed'); this.isReady = true },
     async ping() { return 'PONG' },
     async clientInfo() { if ((id === 11 && adminReadFailure) || (id === 12 && appReadFailure)) throw new Error('read failed'); return this.connection },
     async info(section: string) { assert.equal(section, 'server'); return this.server },
     async dbSize() { return this.size },
-    async sendCommand(command: string[]) { assert.deepEqual(Array.from(command), ['JSON.GET', 'sa122:settings:admission:missing', '$']); return this.jsonReply },
+    async sendCommand(command: string[]) {
+      if (JSON.stringify(command) === JSON.stringify(['MODULE', 'LIST'])) return [['name', 'ReJSON', 'ver', 81000], ['name', 'search', 'ver', 81000]]
+      assert.deepEqual(Array.from(command), ['JSON.GET', 'sa122:settings:admission:missing', '$']); return this.jsonReply
+    },
+    async configGet(name: string) { assert.equal(name, 'dir'); return { dir: '/data' } },
     async scan() { effects.scan++; return { cursor: '0', keys: ['test:key'] } },
     async unlink() { effects.unlink++; return 1 },
     async disconnect() {
@@ -92,10 +111,15 @@ function fixture(real = true) {
     async disconnect() { effects.appDisconnect++; app.isOpen = false; app.isReady = false; if (appCloseFailure) throw appCloseError },
     async __resetTestStore() { effects.reset++ },
     json: { async set() { effects.seed++ }, async get() { return null } },
-    async del() { effects.del++; return 1 }
+    async del(key: unknown) { effects.del++; deletedKeys.push(String(key)); return 1 }
   }
   const mockedFs = {
-    async lstat(path: string) { assert.equal(path, allocationPath); return { isFile: () => regularFile, isSymbolicLink: () => !regularFile } },
+    async lstat(path: string) {
+      assert([allocationPath, '/fresh-owned-evidence'].includes(path))
+      return { isFile: () => path === allocationPath && regularFile, isDirectory: () => path === '/fresh-owned-evidence',
+        isSymbolicLink: () => !regularFile, mode: path === allocationPath ? allocationMode : 0o40700, uid: 1000 }
+    },
+    async realpath(path: string) { return allocationAlias && path === allocationPath ? path + '-alias' : path },
     async readFile(path: string, encoding: string) { assert.equal(path, allocationPath); assert.equal(encoding, 'utf8'); return rawAllocation ?? JSON.stringify(allocation) },
     async open(path: string, flags: string, mode?: number) {
       if (path === receiptPath) {
@@ -121,7 +145,12 @@ function fixture(real = true) {
     afterEach: (callback: () => Promise<void>) => hooks.afterEach.push(callback),
     afterAll: (callback: () => Promise<void>) => hooks.afterAll.push(callback),
     describe: { runIf: (gate: boolean) => (_name: string, callback: () => void) => { if (gate) callback() } },
-    it: (_name: string, callback: () => Promise<void>) => hooks.tests.push(callback),
+    it: Object.assign((_name: string, callback: () => Promise<void>) => hooks.tests.push(callback), {
+      // The suite's table cases (a3229efda): one captured body per row, in order.
+      each: (rows: readonly unknown[]) => (_name: string, callback: (row: any) => Promise<void>) => {
+        for (const row of rows) hooks.tests.push(() => callback(row))
+      }
+    }),
     expect: () => { throw new Error('Real test assertions must not execute in this admission proof.') }
   }
   const load = (source: string, filename: string, extra: Record<string, unknown> = {}) => {
@@ -135,14 +164,18 @@ function fixture(real = true) {
       if (name === '$lib/server/redis') return { redis: service }
       if (name === 'node:fs/promises') return mockedFs
       if (name === 'node:path') return requireNode(name)
+      if (name === 'node:net') return { isIP: requireNode('node:net').isIP }
       throw new Error(`Unexpected dependency ${name}; no real Redis/network dependency is permitted.`)
     }
     const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }, fileName: filename })
-    vm.runInNewContext(compiled.outputText, { module, exports, require, process: { env }, URL, Date, Error, AggregateError, Promise }, { filename })
+    vm.runInNewContext(compiled.outputText, { module, exports, require,
+      process: { env, get platform() { return platform }, getuid: () => 1000 }, URL, Date, Error, AggregateError, Promise }, { filename })
     return module.exports as any
   }
   const helper = load(harnessSource, 'redis-memory.ts')
-  return { hooks, effects, env, dynamicEnv, admin, app, service, helper, receiptErrors, appCloseError, adminCloseError,
+  return { hooks, effects, deletedKeys, env, dynamicEnv, admin, app, service, helper, receiptErrors, appCloseError, adminCloseError, initialUrl,
+    set platform(value: string) { platform = value }, set allocationMode(value: number) { allocationMode = value },
+    set allocationAlias(value: boolean) { allocationAlias = value },
     get allocation() { return allocation }, set allocation(value: any) { allocation = value },
     set rawAllocation(value: string) { rawAllocation = value }, get receipt() { return receipt },
     set recordGate(value: Promise<void>) { recordGate = value }, set receiptFailure(value: typeof receiptFailure) { receiptFailure = value },
@@ -155,19 +188,143 @@ function fixture(real = true) {
     set appLateEnvSync(value: boolean) { appLateEnvSync = value },
     loadSuite() { load(suiteSource, 'conditionalAgentSettings.redis.test.ts', {
       '$lib/test-utils/redis-memory': helper,
+      // Supply the genuine browser-safe export; unknown VM dependencies still refuse.
+      '$lib/appActions/settings/managementContract': { defaultAppActionsPolicy },
+      // The actual admission helper bytes, under the same no-socket loader.
+      '$lib/test-utils/settingsRedisAdmission': load(admissionSource, 'settingsRedisAdmission.ts'),
+      // The suite's case-level owners: never reached before admission; any call fails loudly.
+      ...Object.fromEntries(SUITE_CASE_OWNERS.map((name) => [name, inertOwner(name)])),
       './conditionalAgentSettings': {
         createConditionalSettingsStore: () => ({ async read() { throw new Error('Offline admission proof stops at the real Lua case boundary.') } }),
         CONDITIONAL_SETTINGS_WRITE_SCRIPT: '', SETTINGS_SNAPSHOT_PATHS: []
       }
     }) },
+    loadSubjectHarness() {
+      admin.connection.db = app.connection.db = 15
+      env.BATSHIT_SKILL_COMMIT_REDIS_ADMISSION = JSON.stringify({ port: fixturePort, pid: 45678, runId, directory: '/data',
+        ...(ci ? { ciOwner: allocation.ciOwner } : {}) })
+      const subject = load(subjectAdmissionSource, 'skillSessionCommitTwin.ts', {
+        vitest: { ...capturedVitest, expect }, '$lib/test-utils/redis-memory': helper,
+        '$lib/test-utils/settingsRedisAdmission': load(admissionSource, 'settingsRedisAdmission.ts'),
+        '$lib/server/services/skillSessionCommit': { SKILL_SESSION_COMMIT_SCRIPT: '' }
+      })
+      return subject.useSkillSessionRedisTestServer()
+    },
     async teardown() { for (const hook of hooks.afterAll) await hook() }
   }
+}
+
+/** Modules the suite imports for its cases only. Admission must finish before any of them runs. */
+const SUITE_CASE_OWNERS = [
+  '$lib/server/autoCompactGuard', './autoCompactAdapter', '$lib/server/instructionsGuard', '$lib/server/modelSelectionGuard',
+  '$lib/server/subagentRecordUpdate', '$lib/appActions/settings/instructionPreferences', './instructionTextSnapshot',
+  './instructionAdapter', './lifecycle', './report', '$lib/appActions/settings/memoryPreferences'
+]
+function inertOwner(name: string) {
+  return new Proxy({}, { get: (_target, key) => typeof key === 'symbol' || key === '__esModule' ? undefined
+    : () => { throw new Error(`${name}.${String(key)} must not run in this admission proof.`) } })
 }
 
 function noMutations(f: ReturnType<typeof fixture>) {
   assert.equal(f.effects.scan, 0); assert.equal(f.effects.unlink, 0)
   assert.equal(f.effects.seed, 0); assert.equal(f.effects.del, 0)
 }
+
+describe('current Actions service admission without sockets', () => {
+  it('binds both Settings clients to the captured container address before private receipt or cleanup', async () => {
+    const f = fixture(true, true); f.loadSuite()
+    await f.hooks.beforeAll[0]()
+    noMutations(f)
+    assert.equal(f.effects.record, 1)
+    assert.equal(f.receipt.admin.client.localAddress, '172.18.0.2:6379')
+    assert.equal(f.receipt.app.client.localAddress, '172.18.0.2:6379')
+    await f.hooks.beforeEach[0]()
+    assert.equal(f.effects.scan, 1); assert.equal(f.effects.unlink, 1)
+    await f.teardown()
+  })
+
+  for (const [name, alter] of [
+    ['bare CI flag', (f: any) => { delete f.allocation.ciOwner }],
+    ['different service', (f: any) => { f.env.BATSHIT_REDIS_CI_SERVICE_ID = 'd'.repeat(64) }],
+    ['different run', (f: any) => { f.env.GITHUB_RUN_ID = '900002' }],
+    ['different attempt', (f: any) => { f.env.GITHUB_RUN_ATTEMPT = '3' }],
+    ['non-Actions process', (f: any) => { delete f.env.GITHUB_ACTIONS }],
+    ['non-Linux process', (f: any) => { f.platform = 'darwin' }],
+    ['unknown owner flag', (f: any) => { f.allocation.ciOwner.allowCleanup = true }],
+    ['writable allocation', (f: any) => { f.allocationMode = 0o100644 }],
+    ['aliased allocation', (f: any) => { f.allocationAlias = true }],
+    ['outside runner temp', (f: any) => { f.env.RUNNER_TEMP = '/different-runner-root' }],
+    ['local shape at runtime port', (f: any) => { f.allocation.schemaVersion = 1; delete f.allocation.ciOwner }],
+    ['different app address', (f: any) => { f.app.connection.laddr = '172.18.0.9:6379' }],
+    ['different admin address', (f: any) => { f.admin.connection.laddr = '127.0.0.1:6379' }]
+  ] as const) {
+    it(`refuses Settings ${name} before cleanup or fixtures`, async () => {
+      const f = fixture(true, true); alter(f); f.loadSuite(); await refused(f)
+      assert.equal(f.effects.record, 0)
+    })
+  }
+
+  it('binds subject population to the same current container with actual worker DB15', async () => {
+    const f = fixture(true, true); const admission = f.loadSubjectHarness()
+    for (const hook of f.hooks.beforeAll) await hook()
+    admission.requireAdmission(); noMutations(f)
+    assert.equal(f.effects.appExecute, 1)
+    await f.hooks.beforeEach[0]()
+    assert.equal(f.effects.scan, 1); assert.equal(f.effects.unlink, 1)
+    await f.teardown()
+  })
+
+  it('closes a rejected subject app client once and does not close it again at teardown', async () => {
+    const f = fixture(true, true); f.loadSubjectHarness(); f.appReadFailure = true
+    await assert.rejects(async () => { for (const hook of f.hooks.beforeAll) await hook() }, /read failed/)
+    assert.equal(f.effects.appDisconnect, 1); assert.equal(f.app.isOpen, false)
+    await f.teardown(); noMutations(f)
+    assert.equal(f.effects.appDisconnect, 1); assert.equal(f.effects.appCommandDisconnect, 0)
+  })
+
+  it('retains a subject app admission failure together with its owned close failure', async () => {
+    const f = fixture(true, true); f.loadSubjectHarness(); f.appReadFailure = true; f.appCloseFailure = true
+    await assert.rejects(async () => { for (const hook of f.hooks.beforeAll) await hook() },
+      (error: any) => error instanceof AggregateError && error.errors.length === 2)
+    await f.teardown(); noMutations(f)
+    assert.equal(f.effects.appDisconnect, 1); assert.equal(f.app.isOpen, false)
+  })
+
+  it('settles a subject client acquired after teardown without late admission or a second physical close', async () => {
+    const f = fixture(true, true); const gate = deferred(); f.appAcquireGate = gate.promise
+    const admission = f.loadSubjectHarness()
+    const start = (async () => { for (const hook of f.hooks.beforeAll) await hook() })()
+    const refusedStart = assert.rejects(start, /after teardown/)
+    for (let step = 0; step < 100 && !f.effects.appExecute; step++) await Promise.resolve()
+    assert.equal(f.effects.appExecute, 1)
+    const end = f.teardown()
+    for (let step = 0; step < 100 && !f.effects.appDisconnect; step++) await Promise.resolve()
+    gate.resolve(); await refusedStart; await end
+    assert.throws(() => admission.requireAdmission()); noMutations(f)
+    assert.equal(f.effects.appCommandDisconnect, 1)
+    assert.equal(f.admin.isOpen, false); assert.equal(f.app.isOpen, false)
+  })
+
+  for (const [name, alter] of [
+    ['unowned low-port allocation', (f: any) => {
+      const value = JSON.parse(f.env.BATSHIT_SKILL_COMMIT_REDIS_ADMISSION); delete value.ciOwner
+      f.env.BATSHIT_SKILL_COMMIT_REDIS_ADMISSION = JSON.stringify(value)
+    }],
+    ['different current run', (f: any) => { f.env.GITHUB_RUN_ID = '900002' }],
+    ['different app container address', (f: any) => { f.app.connection.laddr = '172.18.0.9:6379' }],
+    ['wrong admin database', (f: any) => { f.admin.connection.db = 14 }]
+  ] as const) {
+    it(`refuses subject ${name} without cleanup or fixtures`, async () => {
+      const f = fixture(true, true); const admission = f.loadSubjectHarness(); alter(f)
+      await assert.rejects(async () => { for (const hook of f.hooks.beforeAll) await hook() })
+      assert.throws(() => admission.requireAdmission())
+      await assert.rejects(f.hooks.beforeEach[0]()); noMutations(f)
+      await f.teardown()
+      assert.equal(f.admin.isOpen, false); assert.equal(f.app.isOpen, false)
+    })
+  }
+})
+
 async function refused(f: ReturnType<typeof fixture>, validateError?: (error: unknown) => boolean) {
   if (validateError) await assert.rejects(f.hooks.beforeAll[0](), validateError)
   else await assert.rejects(f.hooks.beforeAll[0]())
@@ -178,7 +335,7 @@ async function refused(f: ReturnType<typeof fixture>, validateError?: (error: un
   noMutations(f)
   await f.teardown()
   assert.equal(f.admin.isOpen, false); assert.equal(f.app.isOpen, false)
-  assert.equal(f.env.REDIS_URL, originalUrl); assert.equal(f.dynamicEnv.REDIS_URL, originalUrl)
+  assert.equal(f.env.REDIS_URL, f.initialUrl); assert.equal(f.dynamicEnv.REDIS_URL, f.initialUrl)
 }
 
 describe('real Redis harness: optional admission without sockets', () => {
@@ -250,7 +407,8 @@ describe('Settings DB14 admission: actual suite hooks with read-only fakes', () 
     assert.equal(f.effects.record, 1); assert.equal(f.effects.appExecute, 1)
     await assert.rejects(f.hooks.beforeEach[0]()); for (const hook of f.hooks.afterEach) await hook(); noMutations(f)
     gate.resolve(); await start
-    assert.equal(f.hooks.tests.length, 9); assert.equal(f.effects.sync, 1); assert.equal(f.effects.fileClose, 1)
+    // The current owner captures 46 cases: the prior 37 plus nine MCP prerequisite cases.
+    assert.equal(f.hooks.tests.length, 46); assert.equal(f.effects.sync, 1); assert.equal(f.effects.fileClose, 1)
     assert.equal(f.effects.dirSync, 1); assert.equal(f.effects.dirClose, 1)
     assert.equal(f.receipt.admin.client.database, 14); assert.equal(f.receipt.app.client.database, 14)
     assert.equal(f.receipt.admin.server.runId, runId); assert.equal(f.receipt.app.server.runId, runId)
@@ -258,7 +416,14 @@ describe('Settings DB14 admission: actual suite hooks with read-only fakes', () 
     await f.hooks.beforeEach[0](); assert.equal(f.effects.scan, 1); assert.equal(f.effects.unlink, 1)
     await assert.rejects(f.hooks.tests[0](), /stops at the real Lua case boundary/)
     assert.equal(f.effects.seed, 1)
-    for (const hook of f.hooks.afterEach) await hook(); assert.equal(f.effects.del, 1)
+    // Every captured cleanup runs here (the capture keeps no describe scope). All four
+    // afterEach blocks delete only owned probe keys after admission, retaining duplicate deletions.
+    for (const hook of f.hooks.afterEach) await hook()
+    assert.deepEqual([...f.deletedKeys].sort(), ['agent:sa122_settings_atomic_probe', 'agent:sa122_settings_atomic_probe',
+      'agent:sa122_settings_atomic_probe', 'agent:sa122_settings_atomic_probe',
+      'mcp_gateways:sa122_settings_probe_user', 'mcp_test_reference:sa122_settings_probe_user',
+      'subagent:sa122_settings_atomic_probe_sub', 'user:sa122_settings_probe_user:agents',
+      'user:sa122_settings_probe_user:settings', 'user:sa122_settings_probe_user:settings', 'user:sa122_settings_probe_user:subagents'])
     await f.teardown(); assert.equal(f.effects.appDisconnect, 1); assert.equal(f.effects.adminQuit, 1)
   })
   it('teardown during a pending receipt prevents late suite admission and fixture effects', async () => {

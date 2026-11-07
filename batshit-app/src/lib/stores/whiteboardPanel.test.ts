@@ -1,0 +1,157 @@
+import { describe, expect, it, vi } from 'vitest'
+import { createWhiteboardPanelController, emptyWhiteboardPanelState, resolveWhiteboardAnchor, type WhiteboardOwner } from './whiteboardPanel'
+
+const owner = { userId: 'user', sessionId: 'chat', agentId: 'agent' }
+const target = { owner, anchorMessageId: 'reply', visible: true }
+const board = (version: number, content: string | null = `Notes ${version}`, own = owner) => ({
+  schema_version: 1, user_id: own.userId, session_id: own.sessionId, agent_id: own.agentId,
+  version, content, updated_at: `2026-10-15T12:00:${String(version).padStart(2, '0')}.000Z`
+})
+const event = (version: number) => ({ type: 'whiteboard_changed', sessionId: owner.sessionId, agentId: owner.agentId, version })
+
+function harness() {
+  let state = emptyWhiteboardPanelState()
+  const requests: Array<{ owner: WhiteboardOwner; resolve: (value: unknown) => void; reject: (error: unknown) => void }> = []
+  const read = vi.fn((own: WhiteboardOwner) => new Promise<unknown>((resolve, reject) => requests.push({ owner: own, resolve, reject })))
+  const controller = createWhiteboardPanelController({ read, changed: (next) => { state = next } })
+  return { controller, requests, read, state: () => state }
+}
+async function flush() { for (let index = 0; index < 8; index += 1) await Promise.resolve() }
+const reply = (id: string, agent_id = 'agent', extra: Record<string, unknown> = {}) => ({ id, session_id: 'chat', agent_id, role: 'assistant', ...extra })
+
+describe('Whiteboard reply ownership', () => {
+  it('keeps the latest started authored reply through user sends and pending retry placeholders', () => {
+    const messages = [reply('one'), reply('user', 'picker', { role: 'user' }), reply('retry', 'picker', { metadata: { client_waiting_placeholder: true } })]
+    expect(resolveWhiteboardAnchor(messages, 'chat')).toEqual({ messageId: 'one', agentId: 'agent' })
+    messages.push(reply('started', 'other'))
+    expect(resolveWhiteboardAnchor(messages, 'chat')).toEqual({ messageId: 'started', agentId: 'other' })
+    messages.pop()
+    expect(resolveWhiteboardAnchor(messages, 'chat')?.messageId).toBe('one')
+  })
+  it('skips synthetic summaries and other chats, and never supplies a fallback owner', () => {
+    expect(resolveWhiteboardAnchor([reply('one'), reply('summary', 'other', { metadata: { contextCompactSummary: true } }), reply('elsewhere', 'other', { session_id: 'else' })], 'chat')?.messageId).toBe('one')
+    expect(resolveWhiteboardAnchor([reply('one'), reply('ownerless', '')], 'chat')).toBeNull()
+    expect(resolveWhiteboardAnchor([], 'chat')).toBeNull()
+    expect(resolveWhiteboardAnchor([reply('one')], null)).toBeNull()
+  })
+})
+
+describe('Whiteboard panel read controller', () => {
+  it('starts closed and carries open state to the same owner, closing on another owner or display off', async () => {
+    const h = harness()
+    h.controller.setTarget(target)
+    expect(h.state().open).toBe(false)
+    h.requests[0].resolve({ board: board(1) })
+    await flush()
+    h.controller.setOpen(true)
+    h.controller.setTarget({ ...target, anchorMessageId: 'next-reply' })
+    expect(h.state()).toMatchObject({ open: true, anchorMessageId: 'next-reply' })
+    expect(h.read).toHaveBeenCalledTimes(1)
+    h.controller.setTarget({ ...target, visible: false })
+    expect(h.state()).toMatchObject({ open: false, visible: false, board: board(1), confirmed: true })
+    h.controller.setTarget(target)
+    expect(h.state().open).toBe(false)
+    h.requests[1].resolve({ board: board(1) })
+    await flush()
+    h.controller.setOpen(true)
+    h.controller.setTarget({ ...target, owner: { ...owner, agentId: 'other' } })
+    expect(h.state()).toMatchObject({ open: false, confirmed: false, board: null })
+    h.controller.destroy()
+    h.requests[2].resolve({ board: null })
+    await flush()
+  })
+  it('coalesces matching events and reconnects into one trailing read, ignoring other owners', async () => {
+    const h = harness()
+    h.controller.setTarget(target)
+    h.controller.handleEvent({ ...event(99), agentId: 'other' })
+    h.controller.handleEvent(event(2))
+    h.controller.handleEvent(event(3))
+    h.controller.handleEvent({ type: 'reconnected' })
+    expect(h.requests).toHaveLength(1)
+    h.requests[0].resolve({ board: board(1) })
+    await flush()
+    expect(h.requests).toHaveLength(2)
+    expect(h.state().confirmed).toBe(false)
+    h.requests[1].resolve({ board: board(3) })
+    await flush()
+    expect(h.state()).toMatchObject({ board: board(3), confirmed: true, loading: false, error: null })
+    h.controller.handleEvent(event(2))
+    h.controller.handleEvent(event(3))
+    expect(h.requests).toHaveLength(2)
+  })
+  it('retires a late response on chat/agent change without overlapping reads', async () => {
+    const h = harness()
+    h.controller.setTarget(target)
+    const nextOwner = { ...owner, sessionId: 'next-chat', agentId: 'next-agent' }
+    h.controller.setTarget({ ...target, owner: nextOwner, anchorMessageId: 'next' })
+    expect(h.requests).toHaveLength(1)
+    h.requests[0].resolve({ board: board(8) })
+    await flush()
+    expect(h.requests).toHaveLength(2)
+    expect(h.requests[1].owner).toEqual(nextOwner)
+    expect(h.state().board).toBeNull()
+    h.requests[1].resolve({ board: board(1, 'Other board', nextOwner) })
+    await flush()
+    expect(h.state().board?.content).toBe('Other board')
+  })
+  it('refreshes for effective settings invalidation only for the displayed owner', async () => {
+    const h = harness()
+    h.controller.setTarget(target)
+    h.requests[0].resolve({ board: board(1) })
+    await flush()
+    h.controller.handleEvent({ type: 'agent_settings_changed', agentId: 'other', family: 'retention' })
+    h.controller.handleEvent({ type: 'agent_settings_changed', agentId: owner.agentId, family: 'memory' })
+    expect(h.requests).toHaveLength(1)
+    h.controller.handleEvent({ type: 'agent_settings_changed', agentId: owner.agentId, family: 'retention' })
+    h.controller.handleEvent({ type: 'reconnected' })
+    expect(h.requests).toHaveLength(2)
+    h.requests[1].resolve({ board: board(1) })
+    await flush()
+    expect(h.requests).toHaveLength(3)
+    h.requests[2].resolve({ board: board(1) })
+    await flush()
+    h.controller.setTarget({ ...target, visible: false })
+    h.controller.handleEvent({ type: 'reconnected' })
+    expect(h.requests).toHaveLength(3)
+    expect(h.state()).toMatchObject({ visible: false, open: false, board: board(1) })
+  })
+  it('keeps acknowledged notes and update time on failure, malformed reads and version regression', async () => {
+    const h = harness()
+    h.controller.setTarget(target)
+    h.requests[0].resolve({ board: board(3) })
+    await flush()
+    for (const payload of [{ board: { ...board(4), agent_id: 'wrong' } }, { board: board(2) }, { board: null }, {}]) {
+      h.controller.refresh()
+      h.requests.at(-1)!.resolve(payload)
+      await flush()
+      expect(h.state().board).toEqual(board(3))
+      expect(h.state().error).toBeTruthy()
+    }
+    h.controller.refresh()
+    h.requests.at(-1)!.reject(new Error('Network unavailable'))
+    await flush()
+    expect(h.state()).toMatchObject({ confirmed: true, board: board(3), error: 'Network unavailable', loading: false })
+    h.controller.refresh()
+    h.requests.at(-1)!.resolve({ board: board(4, null) })
+    await flush()
+    expect(h.state()).toMatchObject({ board: board(4, null), error: null })
+  })
+  it('distinguishes a confirmed missing board from failed initial loading, and stops after disposal', async () => {
+    const h = harness()
+    h.controller.setTarget(target)
+    h.requests[0].reject(new Error('Read failed'))
+    await flush()
+    expect(h.state()).toMatchObject({ confirmed: false, board: null, error: 'Read failed' })
+    h.controller.refresh()
+    h.requests[1].resolve({ board: null })
+    await flush()
+    expect(h.state()).toMatchObject({ confirmed: true, board: null, error: null })
+    h.controller.refresh()
+    h.controller.handleEvent({ type: 'reconnected' })
+    h.controller.destroy()
+    h.requests[2].resolve({ board: board(1) })
+    await flush()
+    expect(h.requests).toHaveLength(3)
+    expect(h.state().board).toBeNull()
+  })
+})

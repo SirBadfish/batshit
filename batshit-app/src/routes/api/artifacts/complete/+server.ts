@@ -7,7 +7,6 @@ import { generateMessageId } from '$lib/utils/messageId'
 import { VercelAIBrain } from '$lib/server/services/vercelBrain'
 import { ProviderManager } from '$lib/server/services/providers'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
-import { refuseDelegatedRunOutsideList } from '$lib/server/services/actingAgentIdentity'
 import { env } from '$env/dynamic/private'
 import { apiKeyService } from '$lib/services/apiKey.server'
 // SA-011 Phase 1: Image generation support
@@ -26,6 +25,8 @@ import { fetchVercelModelCatalog, type VercelCatalogEntry } from '$lib/server/se
 import type { ArtifactModelConfig, ArtifactModelRole } from '$lib/types/artifacts'
 import { normalizeArtifactModelConfig } from '$lib/utils/artifactModelConfig'
 import type { ModelConnectionInfo, ModelPurpose, SavedModel } from '$lib/types/savedModels'
+import { isClaudePlanSelection } from '$lib/utils/claudePlanConnection'
+import { ClaudePlanError } from '$lib/server/services/claudePlanAdmission'
 import {
   isOpaqueArtifactRuntimeRequest,
   requireArtifactRuntimeClaims,
@@ -41,9 +42,11 @@ import {
   recordArtifactRunEvent,
   startArtifactRunLog
 } from '$lib/server/artifacts/artifactRunLogs'
-import { PINOKIO_APP_BRAIN_TYPE, readPinokioArtifactBinding } from '$lib/artifacts/pinokioArtifact'
-import { PinokioAppRunError, runPinokioAppArtifact } from '$lib/server/services/pinokioAppRunner'
+import { PINOKIO_APP_BRAIN_TYPE } from '$lib/artifacts/pinokioArtifact'
+import { completePinokioAppArtifact } from '$lib/server/artifacts/pinokioAppCompletion'
 
+/** SA-139 (D11): the one refusal every artifact mode gives for a Claude plan selection. */
+const ARTIFACTS_NOT_ON_CLAUDE_PLAN = 'Artifacts cannot use the Claude plan connection. Choose a separate API-compatible preset for artifacts.'
 
 const RATE_LIMIT_WINDOW_SECONDS = 60
 const RATE_LIMIT_MAX_REQUESTS = 10
@@ -1818,10 +1821,13 @@ async function generateViaObjectStream({
     service: connection?.service ?? null
   })
 
+  // SA-139: artifacts never run on the Claude plan, whatever spelling the selection carries.
+  if (isClaudePlanSelection(connection)) throw new ClaudePlanError('consumer_unsupported', ARTIFACTS_NOT_ON_CLAUDE_PLAN)
   const manager = await ProviderManager.createForUser(userId)
   const languageModel = manager.getModel(model, {
     transport: connection?.type,
-    service: connection?.service ?? undefined
+    service: connection?.service ?? undefined,
+    connectionId: connection?.id ?? null
   })
 
   // Convert JSON Schema to AI SDK schema format for Output.object
@@ -1914,110 +1920,6 @@ async function generateViaObjectStream({
   await writer.close()
 }
 
-async function streamViaPinokioApp(input: {
-  artifact: any
-  artifactId: string
-  userId: string
-  runId: string
-  messageId: string
-  fields: Record<string, any> | null
-  context: unknown
-  streamAdapter: StreamEventAdapter
-  writer: WritableStreamDefaultWriter<Uint8Array>
-  stream: TransformStream
-}): Promise<Response> {
-  const { artifact, artifactId, userId, runId, messageId, streamAdapter, writer } = input
-  const binding = readPinokioArtifactBinding(artifact)
-  if (!binding) {
-    const message =
-      'This artifact has brain_type "pinokio_app" but no Pinokio app binding (metadata.runtime_manager "pinokio", metadata.pinokio_app_id, and a source_type of comfyui, gradio, or custom).'
-    await finishArtifactRunLog({ userId, artifactId, runId, status: 'error', errorMessage: message, source: 'pinokio_binding' })
-    throw error(400, message)
-  }
-  await markArtifactRunPrepared({
-    userId,
-    artifactId,
-    runId,
-    role: 'primary',
-    configuredSource: null,
-    resolvedModel: null,
-    requestModel: null,
-    connectionService: 'pinokio',
-    chosenTransport: 'pinokio-app'
-  })
-  // The panel sends its form as `context`; an agent's typed call sends `fields`. Fields win.
-  const values: Record<string, unknown> = {
-    ...(input.context && typeof input.context === 'object' && !Array.isArray(input.context) ? (input.context as Record<string, unknown>) : {}),
-    ...(input.fields ?? {})
-  }
-
-  ;(async () => {
-    let finalStatus: 'success' | 'error' = 'success'
-    let finalError: string | null = null
-    let finalException: unknown = null
-    try {
-      await streamAdapter.emitStart({
-        messageId,
-        metadata: { transport: 'pinokio-app', runId, runtimeManager: 'pinokio', appId: binding.appId }
-      })
-      const result = await runPinokioAppArtifact(
-        { artifactId, binding, metadata: artifact.metadata ?? {}, values, userId },
-        {
-          chunk: async (text) => {
-            await streamAdapter.emitChunk({ content: text })
-          },
-          file: async (file, index) => {
-            await streamAdapter.emitFile({ base64: file.base64, mediaType: file.mediaType, index, metadata: file.metadata })
-          }
-        }
-      )
-      await streamAdapter.emitFinish({})
-      await streamAdapter.emitEnd({ content: result.text, zipReferences: [], metadata: result.metadata })
-      await streamAdapter.emitComplete()
-      await writer.close()
-    } catch (err) {
-      finalStatus = 'error'
-      finalException = err
-      finalError = artifactErrorMessage(err)
-      if (isArtifactStreamWriteError(err)) {
-        console.warn('[Artifacts] Pinokio app artifact stream closed before result delivery:', artifactErrorLogValue(err))
-      } else {
-        // `code` lets the panel's Builder Kit turn `app_offline` into a "Start with Pinokio" button.
-        await streamAdapter
-          .emitError({
-            error: finalError,
-            metadata: err instanceof PinokioAppRunError ? { code: err.code, ...err.details } : undefined
-          })
-          .catch((emitErr) => {
-            console.error('[Artifacts] Failed to emit Pinokio app artifact error event:', artifactErrorLogValue(emitErr))
-          })
-      }
-      await writer.close().catch(() => {})
-    } finally {
-      await finishArtifactRunLog({
-        userId,
-        artifactId,
-        runId,
-        status: finalStatus,
-        errorMessage: finalError,
-        error: finalException,
-        source: isArtifactStreamWriteError(finalException) ? 'client_disconnect' : 'pinokio_app'
-      }).catch((logErr) => console.error('[Artifacts] Failed to finish Pinokio app artifact run log:', logErr))
-    }
-  })().catch((taskErr) => {
-    console.error('[Artifacts] Pinokio app artifact background task failed after safeguards:', taskErr)
-  })
-
-  return new Response(input.stream.readable, {
-    status: 200,
-    headers: {
-      'Content-Type': 'application/x-ndjson',
-      'Cache-Control': 'no-store',
-      'X-Accel-Buffering': 'no'
-    }
-  })
-}
-
 export const POST: RequestHandler = async ({ request, locals, fetch }) => {
   const body = (await request.json()) as CompletionRequestBody
   const { artifactId, context = null, mode = 'complete', webhookUrl, sessionId: providedSessionId, model } = body
@@ -2053,23 +1955,18 @@ export const POST: RequestHandler = async ({ request, locals, fetch }) => {
   if (!userId) {
     return apiError('Unauthorized', 401)
   }
-  // BL-81 follow-up: no Subagent or Worker run completes an artifact on its own credential.
-  // Its allowed artifact tools (`use.artifact.*` on `/api/controls/use`) run through their
-  // handler, which calls this route with the instance token.
-  const delegatedRefusal = refuseDelegatedRunOutsideList(auth, null)
-  if (delegatedRefusal) {
-    return apiFailure(delegatedRefusal.message, 403, { code: delegatedRefusal.code })
-  }
 
   validatePayloadSize(body, { dataUrlFieldValues: true })
-  await enforceRateLimit(userId, artifactId)
 
   const artifact = await loadArtifact(artifactId)
   const brainType: 'built_in' | 'webhook' | 'n8n_workflow' | 'custom_webhook' | 'pinokio_app' | 'none' =
     artifact.brain_type ||
     (artifact.webhook_url ? 'webhook' : artifact.ai_enabled === false ? 'none' : 'built_in')
   const runsPinokioApp = brainType === PINOKIO_APP_BRAIN_TYPE
-  if (!runsPinokioApp) validatePayloadSize(body)
+  if (!runsPinokioApp) {
+    validatePayloadSize(body)
+    await enforceRateLimit(userId, artifactId)
+  }
   const configuredWebhookUrl = typeof artifact.webhook_url === 'string' ? artifact.webhook_url.trim() : ''
   const requestedWebhookUrl = typeof webhookUrl === 'string' ? webhookUrl.trim() : ''
 
@@ -2104,6 +2001,16 @@ export const POST: RequestHandler = async ({ request, locals, fetch }) => {
   }
 
   await ensureAccess(artifact, userId)
+
+  if (runsPinokioApp) {
+    // A Fabric run selected an ordinary HTTP transport from its saved snapshot. If that
+    // Artifact changed meanwhile, do not enter Pinokio without its in-process admission/Stop.
+    // This marker only narrows execution; it grants no authentication or Artifact access.
+    if (request.headers.get('x-batshit-artifact-http-only') === '1') {
+      throw error(409, 'The Artifact runtime changed while this run was being prepared. Run it again.')
+    }
+    return completePinokioAppArtifact({ artifact, userId, prompt, sessionId: providedSessionId ?? undefined, mode, fields, context, signal: request.signal })
+  }
 
   const sessionId = providedSessionId || `artifact:${artifactId}:${userId}`
   const messageId = (await generateMessageId(sessionId)) || crypto.randomUUID()
@@ -2156,11 +2063,6 @@ export const POST: RequestHandler = async ({ request, locals, fetch }) => {
   })
 
   streamAdapter.setMessageId(messageId)
-
-  // SA-072 P2: a Pinokio app artifact runs its app's own API through the saved recipe; no model.
-  if (runsPinokioApp) {
-    return streamViaPinokioApp({ artifact, artifactId, userId, runId, messageId, fields, context, streamAdapter, writer, stream })
-  }
 
   const systemPrompt = buildSystemPrompt(artifact, await redis.get('batshit:artifacts_system_prompt') as string | null)
   const modelConfig = normalizeArtifactModelConfig(artifact.model_config ?? null, artifact.model ?? null)
@@ -2281,6 +2183,9 @@ export const POST: RequestHandler = async ({ request, locals, fetch }) => {
     let finalException: unknown = null
     try {
       await streamAdapter.emitStart({ messageId, metadata: { transport: chosenTransport, runId } })
+      // SA-139 P4 (D11): no artifact mode (chat, agent, object, file, webhook) runs on the Claude
+      // plan; one readable refusal before any client, run or model call.
+      if (isClaudePlanSelection(resolvedConnection)) throw new ClaudePlanError('consumer_unsupported', ARTIFACTS_NOT_ON_CLAUDE_PLAN)
 
       if (chosenTransport === 'object') {
         // SA-011 Phase 4: Route to structured object streaming

@@ -13,11 +13,20 @@ Reach for a Project when you want to:
 - Have an agent understand or edit a local codebase.
 - Use file mentions like `@src/app.css`.
 - Give an agent a specific working path and optional Project rules.
-- Run CLI agents or Bash tools from the right folder.
+- Run Bash tools and saved CLI Tools from the right folder.
 
 Each Project has a file tree, a root path, optional rules, and exclusions. Exclusions keep noisy or sensitive folders out of the file tree — typically dependency folders, build output, logs, `.git`, `.env` files, and anything holding keys.
 
-The Project selected in the sidebar is the active working Project for the current chat. Batshit remembers the last Project you used with each agent, so switching agents can bring its previous Project back. If that Project is unavailable, or none is selected, the agent's default Project provides the fallback. Agent file tools, Bash/CLI tool paths, and n8n native-tool calls all receive the same resolved Project path.
+The Project selected in the sidebar is the active working Project for the current chat. Each agent opens on its own default Project, set under **Default Project** in Agent Settings. If you pick a different Project in the sidebar, Batshit remembers that pick for that agent, so switching agents brings each agent's own Project back. Saving a new default Project in Agent Settings replaces the pick right away: the next message uses the new default, with no reload. Agent file tools and Bash/CLI tool paths all receive the same resolved Project path.
+
+### The Default Project
+
+The **Default Project** is the folder set as the Default Project's Root Path in **Settings > Projects**. It is always the first entry under Saved Projects there, and once it has a Root Path it is listed first in the sidebar too. Every agent whose Default Project is **Use Global Default Project** uses it, and the sidebar shows it selected for those agents. Batshit never quietly switches such an agent to one of your saved Projects.
+
+- Change its folder by selecting **Default Project** in Settings > Projects and editing its Root Path. The new path is saved when you leave the field, press Enter, or close Settings.
+- Leave the Root Path blank to use the Batshit working directory instead. The sidebar then has no Default Project, and an agent on the default shows no selected Project.
+- If its Root Path is a whole disk or your home folder, Batshit lists its top level but does not index it for `@` mentions. Pick a folder inside it to use mentions.
+- It always excludes the same sensitive and noisy folders a new Project excludes by default. It has no rules, icon or depth settings of its own; create a saved Project when you need those.
 
 ## Mac app and Docker project paths
 

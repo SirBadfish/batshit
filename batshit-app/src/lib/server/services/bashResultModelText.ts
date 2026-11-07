@@ -51,10 +51,36 @@ export function formatBashResultForModel(output: BashResult): string {
 
   const patch = output.managedApplyPatch
   if (patch && typeof patch === 'object') {
-    const { operationsApplied, touchedPaths } = patch as { operationsApplied?: unknown; touchedPaths?: unknown }
-    const files = Array.isArray(touchedPaths) ? touchedPaths.filter((path) => typeof path === 'string') : []
-    const count = typeof operationsApplied === 'number' ? operationsApplied : files.length
-    lines.push(`apply_patch: ${count} operation${count === 1 ? '' : 's'}${files.length > 0 ? `; files: ${files.join(', ')}` : ''}`)
+    const { operationsApplied, touchedPaths, partial, changedPaths } = patch as {
+      operationsApplied?: unknown
+      touchedPaths?: unknown
+      partial?: unknown
+      changedPaths?: unknown
+    }
+    if (partial === true) {
+      // BL-1916: a write failed and Batshit could not put every path back; `reason` says which.
+      const changed = Array.isArray(changedPaths) ? changedPaths.filter((path) => typeof path === 'string') : []
+      lines.push(`apply_patch: partly written; left changed: ${changed.join(', ')}`)
+    } else {
+      const files = Array.isArray(touchedPaths) ? touchedPaths.filter((path) => typeof path === 'string') : []
+      const count = typeof operationsApplied === 'number' ? operationsApplied : files.length
+      lines.push(`apply_patch: ${count} operation${count === 1 ? '' : 's'}${files.length > 0 ? `; files: ${files.join(', ')}` : ''}`)
+      const { note, afterPatch, afterPatchStarted } = patch as { note?: unknown; afterPatch?: unknown; afterPatchStarted?: unknown }
+      if (text(note)) lines.push(`apply_patch note: ${text(note)}`)
+      // SA-126 item 2: the commands after the patch ran after it applied; the status above, the
+      // exit code and the output are theirs, and the patch stays applied whatever they did.
+      const tail = afterPatch && typeof afterPatch === 'object' ? text((afterPatch as { tail?: unknown }).tail) : ''
+      if (tail) {
+        const tailLines = tail.split('\n').map((line) => line.trim()).filter((line) => line && !line.startsWith('#'))
+        const shown = `${tailLines[0] ?? tail}${tailLines.length > 1 ? ` (+${tailLines.length - 1} more line${tailLines.length === 2 ? '' : 's'})` : ''}`
+        // BL-1978: a call still running when the Stop's wait ended returned no result at all.
+        lines.push(output.neverReturned === true
+          ? `then: ${shown} returned no result (the reply was stopped while it ran); the patch stays applied`
+          : afterPatchStarted === true
+            ? `then ran: ${shown}`
+            : `then not run: ${shown} (${output.stopped === true ? 'stopped before it started' : 'it could not start'}); the patch stays applied`)
+      }
+    }
   }
   if (output.agentBrowser && typeof output.agentBrowser === 'object') {
     lines.push(`agentBrowser: ${JSON.stringify(output.agentBrowser)}`)

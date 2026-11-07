@@ -247,7 +247,7 @@ export function resolveBusySendActions(input: {
 export type SteerSource = 'user' | 'dm'
 
 /** Which transport delivered a steer. Only `api` can deliver in P1. */
-export type SteerLane = 'api' | 'codex' | 'claude'
+export type SteerLane = 'api' | 'claude'
 
 /**
  * DL-119-05 — WHEN a held message is meant to reach the model.
@@ -404,9 +404,9 @@ function containDmSteerText(text: string): string {
  * spelling won because it is the one on three surfaces and in every stored turn.
  *
  * The guidance is not a copy of this text: `toolPromptInjection.ts` builds its sentence
- * from `STEER_WRAPPER_GUIDANCE_EXAMPLES`, which this function produces. The two packaged
- * `docs/batshit_System_Prompts/batshit_tool_prompt_zip_control_*.md` files are the same
- * words by hand, and `toolPromptInjection.test.ts` fails if any surface drifts.
+ * from `STEER_WRAPPER_GUIDANCE_EXAMPLES`, which this function produces. The packaged
+ * `docs/batshit_System_Prompts/batshit_tool_prompt_zips.md` ("Tool Prompt: Zips", BL-1777) is
+ * the placeholder that block fills, and `toolPromptInjection.test.ts` fails if any surface drifts.
  */
 export function formatSteerForModel(steer: SteerEntry): string {
   const text = steer.text.trim()
@@ -526,31 +526,14 @@ export function expandSteerPlaceholders(
  * client shows the same reason in the send button's tooltip. Restating the rule at either
  * call site is how the two would drift, so neither does.
  *
- * **P2 made this a real transport check.** The three delivery mechanisms are genuinely
- * different — the SDK's between-step hook for `api`, the app server's `turn/steer` for
- * managed Codex, a second line on the open stdin for managed Claude — so the rule needs to
- * know which transport a run will actually use, not only what type of agent it is. It is
- * given that as DATA (this module stays browser-safe); send-routed resolves it once, at the
- * same moment it registers the run, and the run registry carries the verdict from there.
+ * Only an `api` Primary takes a steer, through the SDK's between-step hook (SA-139 R4 removed
+ * the Claude Code CLI lane and its open-stdin delivery). send-routed resolves the verdict once,
+ * at the same moment it registers the run, and the run registry carries it from there; this
+ * module stays browser-safe.
  */
 export type SteerabilityVerdict =
   | { steerable: true; lane: SteerLane }
   | { steerable: false; reason: string }
-
-/**
- * What a `cli` primary is actually running, as plain data.
- *
- * `configScope` is `'managed'` for every live Batshit CLI agent today (both settings
- * builders hard-code it), but the type allows a user-owned profile, and DL-114-09 refuses
- * those: Batshit does not reach into a profile it does not own to change how its process is
- * driven. `codexTransport` is `resolveCodexTransportLane`'s answer — the `exec` lane writes
- * the prompt and closes stdin, so it has no channel left to steer through.
- */
-export interface SteerCliRuntime {
-  provider: 'codex' | 'claude' | null
-  configScope: string | null | undefined
-  codexTransport?: 'app-server' | 'exec' | null
-}
 
 /**
  * Why this reply cannot take a steer, in the user's words (F-P1-2, DL-119-07).
@@ -568,22 +551,14 @@ export const STEER_REFUSED_GROUP_SENTENCE =
   'Group chats cannot be steered — each agent speaks in turn, so your message queues and sends when the reply ends.'
 export const STEER_REFUSED_UNKNOWN_SENTENCE =
   'This agent cannot be steered mid-reply, so your message queues and sends when the reply ends.'
-export const STEER_REFUSED_CODEX_EXEC_SENTENCE =
-  'This Codex agent runs on the one-shot exec transport, which closes its input as soon as the prompt is sent, so your message queues and sends when the reply ends.'
-export const STEER_REFUSED_UNMANAGED_SENTENCE =
-  'This agent runs from your own CLI profile, which Batshit does not drive, so it cannot be steered mid-reply; your message queues and sends when the reply ends.'
 
 const NOT_STEERABLE_GROUP = STEER_REFUSED_GROUP_SENTENCE
 const NOT_STEERABLE_UNKNOWN = STEER_REFUSED_UNKNOWN_SENTENCE
-const NOT_STEERABLE_CODEX_EXEC = STEER_REFUSED_CODEX_EXEC_SENTENCE
-const NOT_STEERABLE_UNMANAGED = STEER_REFUSED_UNMANAGED_SENTENCE
 
 export function resolveSteerability(input: {
   /** Live primary agent type, already normalised by `normalizePrimaryAgentType`. */
   primaryAgentType: string | null | undefined
   isGroupSession: boolean
-  /** Set for `cli` primaries only; ignored for every other type. */
-  cli?: SteerCliRuntime | null
 }): SteerabilityVerdict {
   if (input.isGroupSession) {
     return { steerable: false, reason: NOT_STEERABLE_GROUP }
@@ -596,35 +571,15 @@ export function resolveSteerability(input: {
     return { steerable: true, lane: 'api' }
   }
 
-  if (type === 'cli') {
-    const cli = input.cli ?? null
-    // A `cli` primary whose runtime Batshit could not resolve is refused rather than
-    // guessed at: a wrong "yes" here sends the user's words into a transport that cannot
-    // carry them, and they would sit waiting for a boundary that never comes.
-    if (!cli || !cli.provider) {
-      return { steerable: false, reason: NOT_STEERABLE_UNKNOWN }
-    }
-    if (cli.configScope !== 'managed') {
-      return { steerable: false, reason: NOT_STEERABLE_UNMANAGED }
-    }
-    if (cli.provider === 'codex') {
-      if (cli.codexTransport !== 'app-server') {
-        return { steerable: false, reason: NOT_STEERABLE_CODEX_EXEC }
-      }
-      return { steerable: true, lane: 'codex' }
-    }
-    return { steerable: true, lane: 'claude' }
-  }
-
   return { steerable: false, reason: NOT_STEERABLE_UNKNOWN }
 }
 
 /**
  * The text a lane hands to the model for one delivery (DL-114-05, DL-118-07).
  *
- * All three transports send the same wrapper so an agent sees one shape whatever it is
- * running on: the API lane injects it as a user message, Codex sends it as a `turn/steer`
- * text item (P2), and Claude writes it as a second stream-json user line (P2). Since
+ * Both transports send the same wrapper so an agent sees one shape whatever it is running
+ * on: the API lane injects it as a user message, and Claude writes it as a second
+ * stream-json user line (P2). Since
  * SA-118 that wrapper is also the one the history replay uses and the one the guidance
  * teaches — `formatSteerForModel`, and nothing else.
  *
@@ -636,15 +591,14 @@ export function buildSteerInjectionText(steers: SteerEntry[]): string {
 }
 
 /**
- * One delivery, as the two managed CLI lanes need it (P2).
+ * One delivery, as the managed CLI lane needs it (P2).
  *
- * The API lane hands the SDK a message object, so it never needs this shape. Both CLI
- * lanes send TEXT over a wire and then have to recognise the transport's own echo of that
- * text coming back — Codex's `userMessage` item (AMD-114-02) and Claude's
- * `--replay-user-messages` line (AMD-114-01). Matching is by exact text, because both
- * transports also echo things Batshit did not steer: Codex emits a `userMessage` item for
- * the turn's ORIGINAL prompt, and Claude replays every user line. So the ids and the exact
- * bytes travel together, and the lane confirms one against the other.
+ * The API lane hands the SDK a message object, so it never needs this shape. The Claude lane
+ * sends TEXT over a wire and then has to recognise the transport's own echo of that text
+ * coming back — Claude's `--replay-user-messages` line (AMD-114-01). Matching is by exact
+ * text, because the transport also echoes things Batshit did not steer: Claude replays every
+ * user line. So the ids and the exact bytes travel together, and the lane confirms one
+ * against the other.
  */
 export interface SteerSendPayload {
   steerIds: string[]

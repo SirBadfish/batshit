@@ -1,10 +1,12 @@
 // @vitest-environment node
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { redis } from '$lib/server/redis'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { __resetStreamAbortRegistryForTests } from '$lib/server/services/streamAbortRegistry'
 import { __resetSteerInboxRegistryForTests } from '$lib/server/services/steerInboxRegistry'
+import { resolveApiReasoningRetention } from '$lib/utils/reasoningRetention'
 
 /**
  * The reply-end step (`finalizeReplyControl`) runs once per reply; a second finalize of the same
@@ -137,6 +139,7 @@ useRedisTestServer()
 
 let POST: (event: any) => Promise<Response>
 let SESSION = ''
+useSendHandlerFixture({ sessionIds: () => [SESSION], postStartupMcpUsers: () => [USER] })
 let count = 0
 
 /**
@@ -297,6 +300,13 @@ describe('send-routed: a second finalize of the same reply (BL-537, BL-542, the 
       const cardMetadata = {
         model: 'claude-sonnet-5',
         agentType: 'api',
+        // BL-1597: a real API approval pause retains this authoritative context. Without it
+        // the fail-closed resume guard refuses before this fixture can exercise finalization.
+        whiteboardContextSnapshot: {
+          schema_version: 1, userId: USER, sessionId: SESSION, agentId: AGENT, messageId: CARD,
+          settings: resolveApiReasoningRetention({ api_reasoning_retention: 'neither' }),
+          dcmLines: []
+        },
         memorySaves: [{ id: 'mem_pause', lane: 'ltm', gist: 'saved before the card' }],
         zipHolds: { held: [{ path: 'a.ts', zipId: 'zip_a' }] },
         zipControl: {
@@ -306,6 +316,7 @@ describe('send-routed: a second finalize of the same reply (BL-537, BL-542, the 
         controlErrors: [{ tag: 'batshit-tool-notes', error: 'You have no whole read of c.ts', at: '2026-09-27T01:00:04.000Z' }],
         replyControlFinalized: true,
         usage: null,
+        // An observed portion saved before Codex CLI retired (SA-139 R1): stored replies keep it.
         observedUsage: { completeness: 'partial', parts: [{
           source: 'codex-app-server-progress',
           counts: { inputTokens: 100, outputTokens: 10, totalTokens: 110, cachedInputTokens: 20, cacheCreationInputTokens: 30, reasoningTokens: 0 }

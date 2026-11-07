@@ -304,6 +304,31 @@ describe('createChatLoadQueue', () => {
     expect(firstDone).toBe(true)
   })
 
+  it('answers what the load that read the store last answered (BL-814)', async () => {
+    const outcomes = ['failed', 'loaded'] as const
+    const finishers: Array<() => void> = []
+    let index = 0
+    const queue = createChatLoadQueue<(typeof outcomes)[number]>(
+      () =>
+        new Promise((resolve) => {
+          const outcome = outcomes[index++]
+          finishers.push(() => resolve(outcome))
+        })
+    )
+
+    const first = queue.request('chat-a')
+    const second = queue.request('chat-a')
+    finishers.shift()?.()
+    for (let i = 0; i < 6; i += 1) await Promise.resolve()
+    finishers.shift()?.()
+    // The first load failed, but the follow-up read the store after it: both callers hear that one.
+    await expect(first).resolves.toBe('loaded')
+    await expect(second).resolves.toBe('loaded')
+
+    const alone = createChatLoadQueue(async () => 'failed' as const)
+    await expect(alone.request('chat-b')).resolves.toBe('failed')
+  })
+
   it('keeps chats apart', async () => {
     const { started, finishers, queue } = deferredLoads()
 

@@ -1,5 +1,5 @@
 import crypto from 'crypto'
-import { building } from '$app/environment'
+import { building } from '$app/env'
 import { env } from '$env/dynamic/private'
 import {
   CACHE_FORENSICS_SCHEMA_VERSION,

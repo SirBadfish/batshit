@@ -6,6 +6,8 @@ import * as agentStore from '$lib/stores/agents.svelte'
 import { buildPickedPresetModelFields } from '$lib/utils/modelPresetPick'
 import { chatBarWorkModeSave, presetModelSettings } from '$lib/utils/agentProviderSettings'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
+import { loadAgentRoute } from '$lib/test-utils/agentPutRoute'
+import { MODEL_SELECTION_REVISION_HEADER } from '$lib/appActions/settings/modelSelectionBaseline'
 
 /**
  * BL-514, the Agent Settings half. An agent's `provider_specific_settings` holds the picked
@@ -22,13 +24,10 @@ import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
  * changes go through the REAL agents store, the way `ModelSelector` and `ChatInput` send them.
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
-  syncAgentClaudeProfiles: vi.fn(async () => {}),
   deleteAgentClaudeConfig: vi.fn(async () => {}),
   agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
 }))
@@ -176,7 +175,7 @@ function installRoutes() {
       return jsonResponse({ keys: {} })
     }
     if (path === '/api/goons') {
-      return jsonResponse({ goons: [] })
+      return jsonResponse({ ownerId: 'josh', goons: [] })
     }
     if (path === '/api/icons/library') {
       return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
@@ -253,7 +252,8 @@ async function waitForPuts(count: number) {
 describe('Agent Settings keeps the agent\'s own provider settings (BL-514, panel half)', () => {
   const originalFetch = global.fetch
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    routeModule = await loadAgentRoute()
     ensureBrowserStubs()
     installRoutes()
     vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -264,6 +264,21 @@ describe('Agent Settings keeps the agent\'s own provider settings (BL-514, panel
     vi.restoreAllMocks()
     global.fetch = originalFetch
     agentStore.setAgents([])
+  })
+
+  it('the real Primary route keeps an ordinary API native DTO token-free and never stores a codex_settings or claude_settings block', async () => {
+    await redis.createAgent(agentWithPreset(PRESET_A, { nativeTools: WORK_MODE }) as any)
+    const response = await routeModule.PUT({ params: { id: AGENT }, locals: { user: { id: USER } },
+      request: new Request(`http://localhost/api/agents/${AGENT}`, { method: 'PUT', body: JSON.stringify({
+        codex_settings: { permissionMode: 'chat', model: 'custom-codex' }, claude_settings: { permissionMode: 'default', model: 'custom-claude' }
+      }) }) } as any)
+    expect(response.status).toBe(200)
+    const record = await stored()
+    expect(record).toMatchObject({ agentType: 'api' })
+    // SA-139 R1 and R4: the Codex CLI and Claude Code CLI Primary lanes were removed; a body's old
+    // CLI settings block is dropped, never stored.
+    expect(record).not.toHaveProperty('codex_settings')
+    expect(record).not.toHaveProperty('claude_settings')
   })
 
   it('(a) picking a model keeps the Work mode and never-allow list in the form: a later Work-mode edit keeps the list', async () => {
@@ -305,6 +320,7 @@ describe('Agent Settings keeps the agent\'s own provider settings (BL-514, panel
 
     // The chat-bar picker's save (ModelSelector), through the real store.
     await agentStore.updateAgentSettings(AGENT, {
+      expectedModelSelection: (await fetch(`/api/agents/${AGENT}`)).headers.get(MODEL_SELECTION_REVISION_HEADER)!,
       ...buildPickedPresetModelFields(PRESET_B as any),
       primary_model_connection: resolveSavedModelConnection(PRESET_B as any),
       provider_specific_settings: presetModelSettings(PRESET_B.settings),
@@ -403,6 +419,7 @@ describe('Agent Settings keeps the agent\'s own provider settings (BL-514, panel
     await openPanel()
 
     await agentStore.updateAgentSettings(AGENT, {
+      expectedModelSelection: (await fetch(`/api/agents/${AGENT}`)).headers.get(MODEL_SELECTION_REVISION_HEADER)!,
       ...buildPickedPresetModelFields(PRESET_B as any),
       primary_model_connection: resolveSavedModelConnection(PRESET_B as any),
       provider_specific_settings: presetModelSettings(PRESET_B.settings),

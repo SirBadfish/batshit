@@ -733,9 +733,9 @@ function extractCandidateRefs(value: unknown, seen = new WeakSet<object>()): str
   }
   if (refs.length > 0) return refs
   // F-P4-7: a record that names no ref may be a wrapper. Unwrap it the way the managed CLI
-  // helper bridge does (`normalizeArgs` in `scripts/mode4-controls-mcp.cjs`): a `value`
-  // object first, else a plain `arguments` object, as deep as it goes. The Codex event
-  // adapter stores every helper call as `{ arguments: <the model's call> }`. A record that
+  // helper bridge did (`normalizeArgs`, removed in SA-139 R5): a `value`
+  // object first, else a plain `arguments` object, as deep as it goes. Saved Codex
+  // steps store every helper call as `{ arguments: <the model's call> }`. A record that
   // names a ref is already the broker call, so its payload is never read as a wrapper —
   // API and Claude steps arrive with the tool input flattened beside `ref`.
   const unwrapped =
@@ -757,17 +757,26 @@ function extractCandidateRefs(value: unknown, seen = new WeakSet<object>()): str
  * authority, NOT the broker tool name. SA-104 P8 proved a name-only gate fails: n8n
  * steps arrive carrying the workflow's tool-node name (e.g. `Batshit_Tools`) instead of
  * the broker's, so memory search results were re-zipped there while API/CLI stayed
- * exempt. SA-106 retired the n8n PRIMARY lane but NOT that hazard — `n8n Workflow
- * Subagent` steps still reach the cool-tool adapter with workflow-authored names. Do
- * not relax this back to a name gate.
+ * exempt. SA-106 retired the n8n Primary lane and SA-139 R2 the n8n Workflow Subagent,
+ * the two lanes that carried workflow-authored names; the ref stays the authority so a
+ * name can never decide again. Do not relax this back to a name gate.
  * The ref may sit under the managed CLI helper's `arguments` / `value` wrapping (F-P4-7:
- * managed Codex steps and their SSE `tool-result` events carry `{ arguments: { ref } }`).
- * The unwrap follows the helper bridge's own and opens only a record that names no ref of
- * its own — never a deep search for any string.
+ * saved Codex steps, and the SSE `tool-result` events that carried them, hold
+ * `{ arguments: { ref } }`). The unwrap follows the helper bridge's own and opens only a record
+ * that names no ref of its own — never a deep search for any string.
  * Still strict: with no matching ref, the step is NOT a memory step and zips normally.
  */
 export function isMemoryControlToolStep(step: unknown): boolean {
   return memoryControlIdsOfToolStep(step).length > 0
+}
+
+/** Exact additional SA-133 exemption; other whiteboard-looking refs still zip normally. */
+export function isTransientContextControlToolStep(step: unknown): boolean {
+  if (isMemoryControlToolStep(step)) return true
+  if (!step || typeof step !== 'object') return false
+  const row = step as Record<string, any>
+  return [row.toolInput, row.toolArgs, row.args, row.input, row.action?.toolInput].some((candidate) =>
+    extractCandidateRefs(candidate).some((ref) => /^(?:fabric:)?sys\.whiteboard\.update$/i.test(ref.trim())))
 }
 
 /**

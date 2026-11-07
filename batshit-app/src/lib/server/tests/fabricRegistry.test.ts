@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  assertInitializedBuiltinPlugin,
+  initializedBuiltinPluginEntries
+} from '$lib/test-utils/initialized-builtin-plugin'
 
 const mockLoadToolsForUser = vi.fn()
 const mockShouldHideInternalMcpTool = vi.fn(() => false)
@@ -30,6 +34,13 @@ const mockCliToolService = {
   validateCliTool: vi.fn()
 }
 
+const mockSaveSlashCommandRecord = vi.fn()
+const mockCaptureSlashCommandWriteBasis = vi.fn()
+vi.mock('../services/slashCommandRevision', async importOriginal => ({
+  ...(await importOriginal<typeof import('../services/slashCommandRevision')>()),
+  saveSlashCommandRecord: (...args: any[]) => mockSaveSlashCommandRecord(...args),
+  captureSlashCommandWriteBasis: (...args: any[]) => mockCaptureSlashCommandWriteBasis(...args)
+}))
 const mockRedisJsonGet = vi.fn()
 const mockRedisJsonSet = vi.fn()
 const mockRedisGet = vi.fn()
@@ -45,6 +56,7 @@ const mockUpdateUserSettings = vi.fn()
 const mockGetAgents = vi.fn()
 const mockUpdateAgent = vi.fn()
 const mockGetVoiceProfiles = vi.fn()
+const mockRawProfileInventoryEval = vi.fn()
 const mockDeleteVoiceProfile = vi.fn()
 const mockCompleteLocalVoiceEngineSetup = vi.fn()
 const mockRuntimeAddons = {
@@ -59,8 +71,14 @@ const mockPinokio = {
   searchPinokioApps: vi.fn(),
   getPinokioAppStatus: vi.fn(),
   getPinokioAppLogs: vi.fn(),
-  startPinokioApp: vi.fn()
+  startPinokioApp: vi.fn(),
+  getPinokioTargetStatus: vi.fn(),
+  previewPinokioAppStart: vi.fn()
 }
+const remotePinokioId = '12345678-1234-4123-8123-123456789abc'
+const mockPinokioMachines = { list: vi.fn(), resolve: vi.fn(), resolveCurrent: vi.fn() }
+const mockPinokioCompletion = vi.fn()
+const mockNativeEffect = vi.fn()
 const mockFetchVercelModelCatalog = vi.fn()
 const mockApiKeyRetrieve = vi.fn()
 const mockPrivateEnv = vi.hoisted(() => ({
@@ -98,10 +116,12 @@ const mockRedisDel = vi.fn(async (key: string) => {
   return 1
 })
 const mockRedisExists = vi.fn(async () => 0)
+const mockRedisKeys = vi.fn()
 const mockRedisExecute = vi.fn(async (operation: any) =>
   operation({
     get: mockRedisGet,
     set: mockRedisSet,
+    eval: (script: string, args: unknown) => mockRawProfileInventoryEval(script, args),
     json: { get: mockRedisJsonGet, set: mockRedisJsonSet },
     expire: mockRedisExpire,
     lPush: mockRedisLPush,
@@ -109,7 +129,8 @@ const mockRedisExecute = vi.fn(async (operation: any) =>
     zAdd: mockRedisZAdd,
     zRange: mockRedisZRange,
     del: mockRedisDel,
-    exists: mockRedisExists
+    exists: mockRedisExists,
+    keys: mockRedisKeys
   })
 )
 
@@ -123,6 +144,13 @@ vi.mock('$lib/services/apiKey.server', () => ({
   }
 }))
 
+const mockImportSkillDefinition = vi.fn()
+const mockScreenImportedSkill = vi.fn()
+vi.mock('../services/skillImport', async original => ({ ...await original<typeof import('../services/skillImport')>(),
+  importSkillDefinition: (...args: any[]) => mockImportSkillDefinition(...args) }))
+vi.mock('../services/skillImportScreen', async original => ({ ...await original<typeof import('../services/skillImportScreen')>(),
+  screenImportedSkill: (...args: any[]) => mockScreenImportedSkill(...args) }))
+
 // BL-75: `sys.skill.save` tests never write a skill to disk (the real `upsertSkill` writes
 // under the home folder); every other skillRegistry export stays real.
 const mockUpsertSkill = vi.fn()
@@ -130,6 +158,34 @@ vi.mock('../services/skillRegistry', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../services/skillRegistry')>()),
   upsertSkill: (...args: any[]) => mockUpsertSkill(...args)
 }))
+
+async function initializeSkillSaveCatalog() {
+  // BL-2234: saves run after catalog startup. Use the same complete persisted fixture as
+  // other SA-138 consumers; migration and its physical writes belong to the Redis owner suite.
+  for (const [key, value] of initializedBuiltinPluginEntries('user-1')) {
+    await mockRedisJsonSet(key, '$', value)
+  }
+  await assertInitializedBuiltinPlugin('user-1', key => mockRedisJsonGet(key))
+  // The catalog read also initializes artifact manifests. Keep the service and JSON
+  // fixture on the same saved rows so later reads see that initialization, as production does.
+  const artifactIds: string[] = []
+  for (const artifact of await mockArtifactService.listByUser('user-1')) {
+    artifactIds.push(artifact.id)
+    await mockRedisJsonSet(`artifact:${artifact.id}`, '$', artifact)
+  }
+  mockArtifactService.listByUser.mockImplementation(async () =>
+    Promise.all(artifactIds.map(id => mockRedisJsonGet(`artifact:${id}`))))
+  const { listVisibleControls } = await import('../services/fabricRegistry')
+  await listVisibleControls({ userId: 'user-1', allowedControlIds: [] })
+}
+
+function ownedDiscoveryPrimary(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id, user_id: 'user-1', agentType: 'api',
+    provider_specific_settings: { nativeTools: { batshitToolsEnabled: true } },
+    ...overrides
+  }
+}
 
 vi.mock('$lib/server/redis', () => ({
   redis: {
@@ -145,7 +201,13 @@ vi.mock('$lib/server/redis', () => ({
     deleteVoiceProfile: (...args: any[]) => mockDeleteVoiceProfile(...args),
     get: (...args: any[]) => mockRedisGet(...args),
     json: {
-      get: (key: string) => mockRedisJsonGet(key),
+      // Same current root as decoded reads; actual raw precision/CAS is proved in DB15 owners.
+      getRaw: async (key: string, path: string) => {
+        if (path !== '$') throw new Error('The Fabric fixture only represents strict raw root reads.')
+        const value = await mockRedisJsonGet(key)
+        return value === null ? null : JSON.stringify([value])
+      },
+      get: (key: string, path?: string) => mockRedisJsonGet(key, path),
       set: (key: string, path: string, value: any) => mockRedisJsonSet(key, path, value)
     },
     expire: (...args: any[]) => mockRedisExpire(...args),
@@ -208,8 +270,12 @@ vi.mock('$lib/server/services/pinokioService', async (importOriginal) => ({
   searchPinokioApps: (...args: any[]) => mockPinokio.searchPinokioApps(...args),
   getPinokioAppStatus: (...args: any[]) => mockPinokio.getPinokioAppStatus(...args),
   getPinokioAppLogs: (...args: any[]) => mockPinokio.getPinokioAppLogs(...args),
-  startPinokioApp: (...args: any[]) => mockPinokio.startPinokioApp(...args)
+  startPinokioApp: (...args: any[]) => mockPinokio.startPinokioApp(...args),
+  getPinokioTargetStatus: (...args: any[]) => mockPinokio.getPinokioTargetStatus(...args),
+  previewPinokioAppStart: (...args: any[]) => mockPinokio.previewPinokioAppStart(...args)
 }))
+vi.mock('$lib/server/services/pinokioMachineService', async original => ({ ...await original<typeof import('$lib/server/services/pinokioMachineService')>(), pinokioMachineService: mockPinokioMachines }))
+vi.mock('$lib/server/artifacts/pinokioAppCompletion', () => ({ completePinokioAppArtifact: (...args: any[]) => mockPinokioCompletion(...args) }))
 
 // SA-113 F-SEC-1b: the gate dynamic-imports this to stamp the DM. Mocked so the test can
 // see the stamp without standing up the whole DM store, and so a stamp failure can never be
@@ -229,6 +295,28 @@ describe('controlRegistry artifact capability controls', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    mockImportSkillDefinition.mockReset()
+    mockScreenImportedSkill.mockReset().mockResolvedValue(null)
+    mockCaptureSlashCommandWriteBasis.mockImplementation(async () => Object.freeze({ basis: 'fixture' }))
+    // The physical nonce/CAS owner is qualified in its real Redis suite. This broker
+    // fixture returns the current access selected by that boundary, and asserts delegation.
+    mockSaveSlashCommandRecord.mockImplementation(async (userId, write) => {
+      const current = await mockRedisJsonGet(`slash_command:${userId}:${write.record.id}`)
+      const saved = { ...write.record }
+      for (const field of write.preserveAccess ?? []) {
+        if (current && Object.hasOwn(current, field)) saved[field] = current[field]
+        else delete saved[field]
+      }
+      await mockRedisJsonSet(`slash_command:${userId}:${saved.id}`, '$', saved)
+      return saved
+    })
+    const remote = { id: remotePinokioId, label: 'PC', revision: 1, kind: 'remote', bindingState: 'confirmed' }
+    mockPinokioMachines.list.mockResolvedValue([{ id: 'local', label: 'This computer', revision: 0, bindingState: 'confirmed' }, remote])
+    mockPinokioMachines.resolve.mockResolvedValue(remote)
+    mockPinokioMachines.resolveCurrent.mockResolvedValue(remote)
+    mockPinokioCompletion.mockReset()
+    mockPinokio.getPinokioTargetStatus.mockResolvedValue({ ok: true, value: { available: true, kind: 'remote', machineId: remotePinokioId, machineRevision: 1 } })
+    mockPinokio.previewPinokioAppStart.mockResolvedValue({ ok: true, value: { appId: 'comfy.git', alsoStarts: [], machineId: remotePinokioId, machineRevision: 1, launchFingerprint: 'a'.repeat(64) } })
     Object.assign(mockPrivateEnv.values, {
       BATSHIT_TOKEN: 'test-batshit-token',
       BATSHIT_FRONTEND_URL: 'http://localhost:5620',
@@ -253,7 +341,19 @@ describe('controlRegistry artifact capability controls', () => {
     let storedVoiceSettings: Record<string, any> | undefined
     const jsonStore = new Map<string, any>()
 
-    mockRedisJsonGet.mockImplementation(async (key: string) => jsonStore.get(key) ?? null)
+    mockRedisKeys.mockImplementation(async (pattern: string) => {
+      // Plugin ownership reads enumerate the records actually present, never an invented owner.
+      const escaped = pattern.split('*').map(part =>
+        part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      ).join('.*')
+      const matches = new RegExp(`^${escaped}$`)
+      return [...jsonStore.keys()].filter(key => matches.test(key))
+    })
+
+    mockRedisJsonGet.mockImplementation(async (key: string, path?: string) => {
+      const value = jsonStore.get(key) ?? null
+      return path === '$.id' ? value?.id ? [value.id] : [] : value
+    })
     // Path-aware, because SA-116's approval store writes `$.status` onto an EXISTING record
     // and a path write must NOT create the root. A path-blind fake would have made both the
     // "swept approval stays gone" rule and the whole-record-write bug it guards against
@@ -297,6 +397,11 @@ describe('controlRegistry artifact capability controls', () => {
     mockGetAgents.mockResolvedValue([])
     mockUpdateAgent.mockResolvedValue(undefined)
     mockGetVoiceProfiles.mockResolvedValue([])
+    mockRawProfileInventoryEval.mockReset().mockImplementation(async (script: string) => {
+      if (script.includes('VOICE_PROFILE_RAW_INVENTORY_IDS')) return ['OK']
+      if (script.includes('VOICE_PROFILE_RAW_INVENTORY_READ')) return ['OK', '0']
+      throw new Error('Unexpected raw profile query')
+    })
     mockDeleteVoiceProfile.mockResolvedValue(undefined)
 
     mockUpdateUserSettings.mockImplementation(async (_userId: string, updates: Record<string, any>) => {
@@ -594,6 +699,22 @@ describe('controlRegistry artifact capability controls', () => {
     })
   })
 
+  it('narrows utility namespaces before counting/limiting without broadening actor scope', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+    mockRedisGet.mockImplementation(async (key: string) => key === 'agent:agent-judge' ? ownedDiscoveryPrimary('agent-judge', { jev_juice_judge_tool: true }) : null)
+    const utilityIds = ['sys.judge.ask', 'sys.mcp.dynamic.find', 'sys.mcp.dynamic.use']
+    const utilities = await findControls({ userId: 'user-1', agentId: 'agent-judge', actorType: 'in-process', brokerFamilies: ['batshit'], limit: 1 })
+    expect(utilities.totalMatches).toBe(3)
+    expect(utilities.results).toHaveLength(1)
+    expect(utilityIds).toContain(utilities.results[0].controlId)
+    const fabric = await findControls({ userId: 'user-1', brokerFamilies: ['fabric'], limit: 50 })
+    expect(fabric.results.every((entry) => !utilityIds.includes(entry.controlId))).toBe(true)
+    expect((await findControls({ brokerFamilies: [] })).totalMatches).toBe(0)
+    expect((await findControls({ brokerFamilies: ['batshit'], allowedControlIds: ['sys.zip.fetch'] })).totalMatches).toBe(0)
+    expect((await findControls({ brokerFamilies: ['batshit'], delegatedRun: true, delegatedAllowedControlIds: ['sys.zip.fetch'] })).totalMatches).toBe(0)
+    await expect(findControls({ brokerFamilies: ['invalid'] as any })).rejects.toThrow('Invalid control brokerFamilies')
+  })
+
   it('publishes sys.artifact.* controls through findControls', async () => {
     const { findControls } = await import('../services/fabricRegistry')
 
@@ -628,6 +749,23 @@ describe('controlRegistry artifact capability controls', () => {
     ])
   })
 
+  it('keeps artifact version guards and Pinokio remote-start fields explicit in compact hints', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+    for (const controlId of ['sys.artifact.update', 'sys.artifact.add_version', 'sys.pinokio.run']) {
+      const found = await findControls({ query: controlId, allowedControlIds: [controlId], includeSchema: true })
+      const control = found.results.find(row => row.controlId === controlId)!
+      expect(control.schemaHint).toMatch(/^required: /)
+      for (const required of control.inputSchema?.required ?? []) expect(control.schemaHint).toContain(`\`${required}\``)
+      if (controlId.startsWith('sys.artifact.')) {
+        expect(control.schemaHint).toContain('`expectedVersion`')
+        expect(control.schemaHint).toContain('never apply_patch')
+      } else {
+        for (const field of ['machineId', 'revision', 'launchFingerprint', 'alsoStarts', 'waitSeconds']) expect(control.schemaHint).toContain(`\`${field}\``)
+        expect(control.schemaHint).toContain('remote run also needs')
+      }
+    }
+  })
+
   it('publishes the SA-104 P3 sys.memory.* control family through findControls', async () => {
     const { findControls } = await import('../services/fabricRegistry')
 
@@ -653,12 +791,11 @@ describe('controlRegistry artifact capability controls', () => {
       'sys.memory.search',
       'sys.memory.supersede',
       'sys.memory.unsupersede',
-      'sys.memory.update',
-      'sys.memory.whiteboard'
+      'sys.memory.update'
     ])
 
     const deleteControl = result.results.find((item) => item.controlId === 'sys.memory.delete')
-    expect(deleteControl?.riskLevel).toBe('confirm')
+    expect(deleteControl?.riskLevel).toBe('safe')
     const saveControl = result.results.find((item) => item.controlId === 'sys.memory.save')
     expect(saveControl?.riskLevel).toBe('safe')
     // SA-104 P5: episode boundary controls ride the same wildcard scope, risk safe.
@@ -666,11 +803,26 @@ describe('controlRegistry artifact capability controls', () => {
     expect(closeControl?.riskLevel).toBe('safe')
     const holdControl = result.results.find((item) => item.controlId === 'sys.memory.hold_episode')
     expect(holdControl?.riskLevel).toBe('safe')
-    // SA-104 P6: the whiteboard control joins the family, risk safe.
-    const whiteboardControl = result.results.find(
-      (item) => item.controlId === 'sys.memory.whiteboard'
-    )
-    expect(whiteboardControl?.riskLevel).toBe('safe')
+    expect(result.results.some(item => item.controlId === 'sys.memory.whiteboard')).toBe(false)
+  })
+
+  it.each([
+    ['sys.memory.search', { query: 'historical fact' }],
+    ['sys.memory.list', {}],
+    ['sys.memory.recall', { memoryIds: ['mem_history'] }]
+  ])('publishes and validates explicit expired lookup for %s', async (controlId, input) => {
+    const { findControls, useControl } = await import('../services/fabricRegistry')
+    const found = await findControls({ query: String(controlId), includeSchema: true, limit: 200 })
+    expect(found.results.find(row => row.controlId === controlId)?.inputSchema?.properties?.include_expired)
+      .toMatchObject({ type: 'boolean', default: false })
+    const context = { userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1', actorType: 'in-process' as const, controlId: String(controlId), dryRun: true }
+    for (const flag of [undefined, false, true]) {
+      const result = await useControl({ ...context, input: { ...input, ...(flag === undefined ? {} : { include_expired: flag }) } })
+      expect(result.success).toBe(true)
+    }
+    const invalid = await useControl({ ...context, input: { ...input, include_expired: 'true' } })
+    expect(invalid.success).toBe(false)
+    if (!invalid.success) expect(invalid.error.code).toBe('CONTROL_INPUT_INVALID')
   })
 
   it('excludes sys.memory.* from a broker allowlist without the memory scope', async () => {
@@ -692,13 +844,15 @@ describe('controlRegistry artifact capability controls', () => {
     })
     expect(
       withMemory.results.filter((item) => item.controlId.startsWith('sys.memory.')).length
-    ).toBe(12)
+    ).toBe(11)
   })
 
   it('publishes the SA-113 P2 sys.dm.* control family through findControls', async () => {
     const { findControls } = await import('../services/fabricRegistry')
+    mockRedisGet.mockImplementation(async (key: string) => key === 'agent:agent-dm' ? ownedDiscoveryPrimary('agent-dm', { dms_enabled: true }) : null)
 
     const result = await findControls({
+      userId: 'user-1', agentId: 'agent-dm', actorType: 'in-process',
       query: 'sys.dm.',
       includeDraft: true,
       limit: 200
@@ -728,8 +882,10 @@ describe('controlRegistry artifact capability controls', () => {
 
   it('excludes sys.dm.* from a broker allowlist without the DM scope', async () => {
     const { findControls } = await import('../services/fabricRegistry')
+    mockRedisGet.mockImplementation(async (key: string) => key === 'agent:agent-dm' ? ownedDiscoveryPrimary('agent-dm', { dms_enabled: true }) : null)
 
     const withoutDms = await findControls({
+      userId: 'user-1', agentId: 'agent-dm', actorType: 'in-process',
       query: 'dm',
       limit: 200,
       allowedControlIds: ['sys.artifact.*', 'sys.memory.*']
@@ -737,6 +893,7 @@ describe('controlRegistry artifact capability controls', () => {
     expect(withoutDms.results.some((item) => item.controlId.startsWith('sys.dm.'))).toBe(false)
 
     const withDms = await findControls({
+      userId: 'user-1', agentId: 'agent-dm', actorType: 'in-process',
       query: 'dm',
       limit: 200,
       allowedControlIds: ['sys.dm.*']
@@ -748,8 +905,10 @@ describe('controlRegistry artifact capability controls', () => {
 
   it('publishes the SA-115 P2 sys.schedule.* control family through findControls', async () => {
     const { findControls } = await import('../services/fabricRegistry')
+    mockRedisGet.mockImplementation(async (key: string) => key === 'agent:agent-dm' ? ownedDiscoveryPrimary('agent-dm', { dms_enabled: true }) : null)
 
     const result = await findControls({
+      userId: 'user-1', agentId: 'agent-dm', actorType: 'in-process',
       query: 'sys.schedule.',
       includeDraft: true,
       limit: 200
@@ -780,8 +939,10 @@ describe('controlRegistry artifact capability controls', () => {
 
   it('excludes sys.schedule.* from a broker allowlist without the schedule scope', async () => {
     const { findControls } = await import('../services/fabricRegistry')
+    mockRedisGet.mockImplementation(async (key: string) => key === 'agent:agent-dm' ? ownedDiscoveryPrimary('agent-dm', { dms_enabled: true }) : null)
 
     const without = await findControls({
+      userId: 'user-1', agentId: 'agent-dm', actorType: 'in-process',
       query: 'schedule',
       limit: 200,
       allowedControlIds: ['sys.artifact.*', 'sys.memory.*', 'sys.dm.*']
@@ -789,6 +950,7 @@ describe('controlRegistry artifact capability controls', () => {
     expect(without.results.some((item) => item.controlId.startsWith('sys.schedule.'))).toBe(false)
 
     const withSchedules = await findControls({
+      userId: 'user-1', agentId: 'agent-dm', actorType: 'in-process',
       query: 'schedule',
       limit: 200,
       allowedControlIds: ['sys.schedule.*']
@@ -800,8 +962,10 @@ describe('controlRegistry artifact capability controls', () => {
 
   it('SA-120 P2: publishes sys.judge.ask through findControls as a safe control that does not act as the agent', async () => {
     const { findControls, controlActsAsAgent } = await import('../services/fabricRegistry')
+    mockRedisGet.mockImplementation(async (key: string) => key === 'agent:agent-judge' ? ownedDiscoveryPrimary('agent-judge', { jev_juice_judge_tool: true }) : null)
 
     const result = await findControls({
+      userId: 'user-1', agentId: 'agent-judge', actorType: 'in-process',
       query: 'sys.judge.',
       includeDraft: true,
       limit: 200
@@ -809,6 +973,7 @@ describe('controlRegistry artifact capability controls', () => {
 
     const judgeControls = result.results.filter((item) => item.controlId.startsWith('sys.judge.'))
     expect(judgeControls.map((item) => item.controlId)).toEqual(['sys.judge.ask'])
+    expect(mockRedisGet).toHaveBeenCalledWith('agent:agent-judge', { throwOnError: true })
     // The control is the agent's own switch plus the instance master switch, never a
     // per-call prompt: Jev cannot act, so there is nothing to approve.
     expect(judgeControls[0].riskLevel).toBe('safe')
@@ -820,6 +985,7 @@ describe('controlRegistry artifact capability controls', () => {
 
   it('SA-120 P2: excludes sys.judge.* from a broker allowlist without the judge scope', async () => {
     const { findControls } = await import('../services/fabricRegistry')
+    mockRedisGet.mockImplementation(async (key: string) => key === 'agent:agent-judge' ? ownedDiscoveryPrimary('agent-judge', { jev_juice_judge_tool: true }) : null)
 
     const without = await findControls({
       query: 'judge',
@@ -829,11 +995,137 @@ describe('controlRegistry artifact capability controls', () => {
     expect(without.results.some((item) => item.controlId.startsWith('sys.judge.'))).toBe(false)
 
     const withJudge = await findControls({
+      userId: 'user-1', agentId: 'agent-judge', actorType: 'in-process',
       query: 'judge',
       limit: 200,
       allowedControlIds: ['sys.judge.*']
     })
     expect(withJudge.results.filter((item) => item.controlId.startsWith('sys.judge.')).length).toBe(1)
+    expect(mockRedisGet).toHaveBeenCalledWith('agent:agent-judge', { throwOnError: true })
+  })
+
+  describe('BL-2219: saved Primary permissions govern DM and schedule discovery', () => {
+    const agentId = 'agent-dm-discovery'
+    const agentKey = `agent:${agentId}`
+    const permittedFamilies = ['sys.dm.*', 'sys.schedule.*', 'sys.judge.ask']
+    type DiscoveryApi = 'findControls' | 'listVisibleControls'
+    type DiscoveryCaller = {
+      actorType?: 'agent' | 'in-process' | 'session' | 'service' | 'unknown' | 'portable-skill'
+      delegatedRun?: boolean
+      delegatedAllowedControlIds?: string[]
+      allowedControlIds?: string[]
+    }
+
+    async function discover(api: DiscoveryApi, caller: DiscoveryCaller = {}) {
+      const registry = await import('../services/fabricRegistry')
+      const options = {
+        userId: 'user-1', agentId, actorType: 'in-process' as const,
+        allowedControlIds: permittedFamilies, ...caller
+      }
+      return api === 'findControls'
+        ? (await registry.findControls({ ...options, limit: 200 })).results
+        : await registry.listVisibleControls(options)
+    }
+
+    const dmOrScheduleIds = (rows: Array<{ controlId: string }>) => rows
+      .map(row => row.controlId)
+      .filter(id => id.startsWith('sys.dm.') || id.startsWith('sys.schedule.'))
+
+    it.each(['findControls', 'listVisibleControls'] as const)('BL-2239: %s never promotes a supplied agent ID from an unverified discovery lane', async api => {
+      mockRedisGet.mockImplementation(async (key: string) => key === agentKey
+        ? ownedDiscoveryPrimary(agentId, { dms_enabled: true, jev_juice_judge_tool: true }) : null)
+      for (const actorType of ['service', 'unknown', undefined] as const) {
+        expect(await discover(api, { actorType })).toEqual([])
+      }
+      expect(mockRedisGet.mock.calls.filter(([key]) => key === agentKey)).toEqual([])
+    })
+
+    it.each(['findControls', 'listVisibleControls'] as const)('BL-2239: %s admits each verified Primary discovery lane without widening its caller list', async api => {
+      mockRedisGet.mockImplementation(async (key: string) => key === agentKey
+        ? ownedDiscoveryPrimary(agentId, { dms_enabled: true, jev_juice_judge_tool: true }) : null)
+      for (const actorType of ['in-process', 'session'] as const) {
+        for (const controlId of ['sys.dm.read', 'sys.schedule.update', 'sys.judge.ask']) {
+          mockRedisGet.mockClear()
+          const rows = await discover(api, { actorType, allowedControlIds: [controlId] })
+          expect(rows.map(row => row.controlId)).toEqual([controlId])
+          expect(mockRedisGet.mock.calls.filter(([key]) => key === agentKey)).toEqual([[agentKey, { throwOnError: true }]])
+        }
+      }
+    })
+
+    it.each(['findControls', 'listVisibleControls'] as const)('%s preserves an enabled family narrowed to one exact DM or schedule control', async api => {
+      mockRedisGet.mockImplementation(async (key: string) => key === agentKey
+        ? ownedDiscoveryPrimary(agentId, { dms_enabled: true }) : null)
+      for (const controlId of ['sys.dm.read', 'sys.schedule.update']) {
+        mockRedisGet.mockClear()
+        const rows = await discover(api, { allowedControlIds: [controlId] })
+        expect(rows.map(row => row.controlId)).toEqual([controlId])
+        expect(mockRedisGet.mock.calls.filter(([key]) => key === agentKey)).toEqual([[agentKey, { throwOnError: true }]])
+      }
+    })
+
+    it.each(['findControls', 'listVisibleControls'] as const)('%s reads one saved Primary for Judge and DM permissions, and an allowlist cannot turn DMs on', async api => {
+      let saved = ownedDiscoveryPrimary(agentId, { dms_enabled: false, jev_juice_judge_tool: true })
+      mockRedisGet.mockImplementation(async (key: string) => key === agentKey ? saved : null)
+
+      const off = await discover(api)
+      expect(dmOrScheduleIds(off)).toEqual([])
+      expect(off.some(row => row.controlId === 'sys.judge.ask')).toBe(true)
+      expect(mockRedisGet.mock.calls.filter(([key]) => key === agentKey)).toEqual([[agentKey, { throwOnError: true }]])
+
+      mockRedisGet.mockClear()
+      saved = { ...saved, dms_enabled: true }
+      const on = await discover(api)
+      expect(dmOrScheduleIds(on).sort()).toEqual([
+        'sys.dm.agents', 'sys.dm.blocked', 'sys.dm.claim', 'sys.dm.done', 'sys.dm.list',
+        'sys.dm.read', 'sys.dm.send', 'sys.schedule.create', 'sys.schedule.delete',
+        'sys.schedule.list', 'sys.schedule.update'
+      ])
+      expect(on.some(row => row.controlId === 'sys.judge.ask')).toBe(true)
+      expect(mockRedisGet.mock.calls.filter(([key]) => key === agentKey)).toEqual([[agentKey, { throwOnError: true }]])
+
+      mockRedisGet.mockClear()
+      saved = { ...saved, provider_specific_settings: { nativeTools: { batshitToolsEnabled: false } } }
+      const fabricOff = await discover(api)
+      expect(dmOrScheduleIds(fabricOff)).toEqual([])
+      expect(fabricOff.some(row => row.controlId === 'sys.judge.ask')).toBe(false)
+      expect(saved.dms_enabled).toBe(true)
+      expect(mockRedisGet.mock.calls.filter(([key]) => key === agentKey)).toEqual([[agentKey, { throwOnError: true }]])
+    })
+
+    it.each(['findControls', 'listVisibleControls'] as const)('%s denies portable and delegated callers even when their lists name every DM and schedule control', async api => {
+      mockRedisGet.mockImplementation(async (key: string) => key === agentKey ? ownedDiscoveryPrimary(agentId, { dms_enabled: true, jev_juice_judge_tool: true }) : null)
+      for (const caller of [
+        { actorType: 'portable-skill' as const },
+        { actorType: 'in-process' as const, delegatedRun: true, delegatedAllowedControlIds: permittedFamilies }
+      ]) {
+        const rows = await discover(api, caller)
+        expect(dmOrScheduleIds(rows)).toEqual([])
+        expect(rows.some(row => row.controlId === 'sys.judge.ask')).toBe(false)
+      }
+      expect(mockRedisGet.mock.calls.filter(([key]) => key === agentKey)).toEqual([])
+    })
+
+    it.each(['findControls', 'listVisibleControls'] as const)('%s requires a present owned live Primary before listing DMs or schedules', async api => {
+      for (const record of [
+        null,
+        ownedDiscoveryPrimary(agentId, { user_id: 'another-user', dms_enabled: true }),
+        ownedDiscoveryPrimary(agentId, { agentType: 'n8n', dms_enabled: true })
+      ]) {
+        mockRedisGet.mockImplementation(async (key: string) => key === agentKey ? record : null)
+        expect(dmOrScheduleIds(await discover(api))).toEqual([])
+      }
+    })
+
+    it.each(['findControls', 'listVisibleControls'] as const)('%s refuses an exact target-agent read failure instead of returning an empty permission set', async api => {
+      const failure = new Error('Exact Primary discovery read failed')
+      mockRedisGet.mockImplementation(async (key: string) => {
+        if (key === agentKey) throw failure
+        return null
+      })
+      await expect(discover(api)).rejects.toBe(failure)
+      expect(mockRedisGet.mock.calls.filter(([key]) => key === agentKey)).toEqual([[agentKey, { throwOnError: true }]])
+    })
   })
 
   it('matches multi-token artifact control queries in findControls', async () => {
@@ -922,6 +1214,227 @@ describe('controlRegistry artifact capability controls', () => {
   })
 
   describe('the Pinokio family (SA-072 P1, DL-08)', () => {
+    afterEach(async () => {
+      const registry = await import('../services/streamAbortRegistry')
+      registry.__resetStreamAbortRegistryForTests()
+      const { __resetPinokioAdmissionForTests } = await import('../services/pinokioAdmission')
+      __resetPinokioAdmissionForTests()
+    })
+    const remoteInput = () => ({ appId: 'comfy.git', machineId: remotePinokioId, revision: 1, launchFingerprint: 'a'.repeat(64), alsoStarts: [] })
+    async function remoteActor() {
+      const registry = await import('../services/streamAbortRegistry')
+      registry.__resetStreamAbortRegistryForTests()
+      const stop = new AbortController()
+      registry.registerStreamAbort('session-1', 'pinokio-reply', stop)
+      await mockRedisJsonSet('user:user-1:data', '$', { id: 'user-1' })
+      await mockRedisJsonSet('session:session-1', '$', { id: 'session-1', user_id: 'user-1', agent_id: 'agent-1' })
+      await mockRedisJsonSet('agent:agent-1', '$', { id: 'agent-1', user_id: 'user-1', provider_specific_settings: { nativeTools: { batshitToolsEnabled: true, artifactRuntimeEnabled: true } } })
+      mockPinokio.startPinokioApp.mockImplementation(async (input) => {
+        if (await input.admitStart() !== true) return { ok: false, kind: 'refused', message: 'Start admission was lost.' }
+        mockNativeEffect(input)
+        return { ok: true, value: { appId: 'comfy.git', machineId: remotePinokioId, machineRevision: 1, launchState: 'pending', ready: false } }
+      })
+      return { registry, stop, options: {
+        userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1', messageId: 'pinokio-reply',
+        actorType: 'in-process' as const, runtimeMode: 'mode3' as const, abortSignal: stop.signal, controlId: 'sys.pinokio.run', input: remoteInput()
+      } }
+    }
+
+    function remoteArtifact() {
+      return { id: 'pinokio_art', user_id: 'user-1', name: 'Remote tool', slug: 'remote-tool', mode: 'published', zone: 'panel', brain_type: 'pinokio_app',
+        agent_use_enabled: true, agent_access_scope: 'all', metadata: { runtime_manager: 'pinokio', source_type: 'custom', pinokio_app_id: 'app.git', pinokio_machine_id: remotePinokioId,
+          run_only: true, pinokio_runtime: { method: 'POST', path: '/run' } } }
+    }
+    async function delegatedArtifactActor(scopeId: string) {
+      const state = await remoteActor()
+      const agentId = `subagent_runtime_${scopeId}`
+      const artifact = remoteArtifact()
+      mockArtifactService.listByUser.mockResolvedValue([artifact])
+      mockArtifactService.getAccessible.mockResolvedValue(artifact)
+      mockPinokioCompletion.mockImplementation(async input => {
+        await input.admit()
+        mockNativeEffect()
+        return new Response('fixture complete boundary reached', { status: 400 })
+      })
+      return { ...state, options: { ...state.options, agentId, scopeAgentId: scopeId, delegatedRun: true,
+        delegatedAllowedControlIds: ['use.artifact.*'], controlId: 'use.artifact.remote-tool', input: { prompt: 'run' } } }
+    }
+    it.each([
+      { primary: true, subagent: false }, { primary: false, subagent: true }
+    ])('uses only the vouched delegated subject namespace for collided IDs %j', async ({ primary, subagent }) => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const state = await delegatedArtifactActor('same-id')
+      for (const [namespace, enabled] of [['agent', primary], ['subagent', subagent]] as const) {
+        await mockRedisJsonSet(`${namespace}:same-id`, '$', { id: 'same-id', user_id: 'user-1',
+          provider_specific_settings: { nativeTools: { artifactRuntimeEnabled: enabled } } })
+      }
+      await useControl(state.options)
+      expect(mockPinokioCompletion).toHaveBeenCalledOnce()
+      expect(mockNativeEffect).toHaveBeenCalledTimes(subagent ? 1 : 0)
+    })
+    it('refuses a missing ordinary delegated subject even if its same-ID Primary remains enabled', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const state = await delegatedArtifactActor('deleted-subagent')
+      await mockRedisJsonSet('agent:deleted-subagent', '$', { id: 'deleted-subagent', user_id: 'user-1',
+        provider_specific_settings: { nativeTools: { artifactRuntimeEnabled: true } } })
+      const result = await useControl(state.options)
+      expect(result.success).toBe(false)
+      expect(mockNativeEffect).not.toHaveBeenCalled()
+    })
+    it('rechecks a delegated subject deletion before a later remote computation request', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const state = await delegatedArtifactActor('deleted-subagent')
+      await mockRedisJsonSet('subagent:deleted-subagent', '$', { id: 'deleted-subagent', user_id: 'user-1',
+        provider_specific_settings: { nativeTools: { artifactRuntimeEnabled: true } } })
+      mockPinokioCompletion.mockImplementation(async input => {
+        await input.admit()
+        await mockRedisDel('subagent:deleted-subagent')
+        await input.admit()
+        mockNativeEffect()
+        return new Response('unreachable')
+      })
+      const result = await useControl(state.options)
+      expect(result.success).toBe(false)
+      expect(mockNativeEffect).not.toHaveBeenCalled()
+    })
+    it('retains the vouched unstored built-in Worker exception with its immutable control ceiling', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const state = await delegatedArtifactActor('worker_research')
+      await useControl(state.options)
+      expect(mockNativeEffect).toHaveBeenCalledOnce()
+      mockNativeEffect.mockClear()
+      const refused = await useControl({ ...state.options, delegatedAllowedControlIds: [] })
+      expect(refused.success).toBe(false)
+      expect(mockNativeEffect).not.toHaveBeenCalled()
+    })
+    it.each(['use.artifact.remote-tool', 'artifact.pinokio_art.action.run.run'])(
+      'calls the shared Pinokio completion owner in-process with original Stop and fresh Artifact scope: %s', async controlId => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const state = await remoteActor()
+      const artifact = remoteArtifact()
+      mockArtifactService.listByUser.mockResolvedValue([artifact])
+      mockArtifactService.getAccessible.mockResolvedValue(artifact)
+      mockPinokioCompletion.mockImplementation(async input => {
+        await input.admit()
+        mockNativeEffect()
+        return new Response('fixture complete boundary reached', { status: 400 })
+      })
+      const http = vi.fn(async () => { throw new Error('No internal HTTP fallback') })
+      vi.stubGlobal('fetch', http)
+      await useControl({ ...state.options, controlId, input: { prompt: 'run' } })
+      expect(mockNativeEffect).toHaveBeenCalledOnce()
+      expect(mockPinokioCompletion).toHaveBeenCalledWith(expect.objectContaining({ artifact, userId: 'user-1', prompt: 'run', signal: expect.any(AbortSignal), admit: expect.any(Function) }))
+      expect(http).not.toHaveBeenCalled()
+    })
+    it.each([
+      ['use.artifact.remote-tool', 'Stop'], ['artifact.pinokio_art.action.run.run', 'Stop'],
+      ['use.artifact.remote-tool', 'Artifact access'], ['artifact.pinokio_art.action.run.run', 'Artifact access'],
+      ['use.artifact.remote-tool', 'originating reply'], ['artifact.pinokio_art.action.run.run', 'originating reply']
+    ])('prevents a later remote computation request for %s after %s changes', async (controlId, reason) => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const state = await remoteActor()
+      const artifact = remoteArtifact()
+      mockArtifactService.listByUser.mockResolvedValue([artifact])
+      mockArtifactService.getAccessible.mockResolvedValue(artifact)
+      mockPinokioCompletion.mockImplementation(async input => {
+        await input.admit()
+        if (reason === 'Stop') { state.stop.abort(); expect(input.signal.aborted).toBe(true) }
+        else if (reason === 'Artifact access') artifact.agent_use_enabled = false
+        else state.registry.registerStreamAbort('session-1', 'newer-reply', new AbortController())
+        await input.admit()
+        mockNativeEffect()
+        return new Response('unreachable')
+      })
+      const result = await useControl({ ...state.options, controlId, input: { prompt: 'run' } })
+      expect(result.success).toBe(false)
+      expect(mockPinokioCompletion).toHaveBeenCalledOnce()
+      expect(mockNativeEffect).not.toHaveBeenCalled()
+    })
+    it('refuses a per-instance remote Artifact outside the delegated control ceiling', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const state = await delegatedArtifactActor('worker_research')
+      const result = await useControl({ ...state.options, controlId: 'artifact.pinokio_art.action.run.run' })
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error.code).toBe('CONTROL_NOT_ALLOWED')
+      expect(mockPinokioCompletion).not.toHaveBeenCalled()
+      expect(mockNativeEffect).not.toHaveBeenCalled()
+    })
+
+    it('exposes saved machine summaries without local availability and refuses registry failure as unknown', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockPinokio.detectPinokio.mockResolvedValue({ available: false, reason: 'not_installed' })
+      const status = await useControl({ userId: 'user-1', controlId: 'sys.pinokio.status', input: {} })
+      expect(status.success && status.result).toMatchObject({ machines: [{ id: 'local' }, { id: remotePinokioId }] })
+      mockPinokioMachines.list.mockRejectedValue(new Error('Unreadable registry'))
+      const unknown = await useControl({ userId: 'user-1', controlId: 'sys.pinokio.status', input: {} })
+      expect(unknown.success && unknown.result).toMatchObject({ machines: null, machinesError: { code: 'pinokio_machine_registry_unavailable' } })
+    })
+
+    it('routes remote status/search/logs and preview using context user rather than body identity', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockPinokio.searchPinokioApps.mockResolvedValue({ ok: true, value: { apps: [], skippedRemote: 0 } })
+      mockPinokio.getPinokioAppLogs.mockResolvedValue({ ok: true, value: { lines: [] } })
+      mockPinokio.getPinokioAppStatus.mockResolvedValue({ ok: true, value: { appId: 'comfy.git', machineId: remotePinokioId, machineRevision: 1 } })
+      for (const controlId of ['sys.pinokio.status', 'sys.pinokio.search', 'sys.pinokio.logs', 'sys.pinokio.app_status']) {
+        expect((await useControl({ userId: 'user-1', controlId, input: { ...remoteInput(), userId: 'other', previewStart: true } })).success).toBe(true)
+      }
+      expect(mockPinokio.getPinokioTargetStatus).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user-1', machineId: remotePinokioId, revision: 1 }))
+      expect(mockPinokio.searchPinokioApps).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user-1', machineId: remotePinokioId }))
+      expect(mockPinokio.getPinokioAppLogs).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user-1', machineId: remotePinokioId }))
+      expect(mockPinokio.previewPinokioAppStart).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user-1', machineId: remotePinokioId, revision: 1 }))
+    })
+
+    it('spends the exact approval then supplies original Stop and fresh actor admission on the API run', async () => {
+      const state = await remoteActor()
+      const approved = await useControlWithApproval(state.options)
+      expect(approved.success).toBe(true)
+      expect(mockNativeEffect).toHaveBeenCalledOnce()
+      expect(mockPinokio.startPinokioApp).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user-1', machineId: remotePinokioId, revision: 1, launchFingerprint: 'a'.repeat(64), signal: expect.any(AbortSignal), admitStart: expect.any(Function) }))
+    })
+
+    it.each(['scope', 'owner', 'reply', 'consent'])('fails fresh remote %s admission during awaited preparation without a native effect', async changed => {
+      const state = await remoteActor()
+      mockPinokio.startPinokioApp.mockImplementation(async input => {
+        await input.admitStart()
+        if (changed === 'scope') await mockRedisJsonSet('agent:agent-1', '$', { id: 'agent-1', user_id: 'user-1', provider_specific_settings: { nativeTools: { batshitToolsEnabled: false } } })
+        if (changed === 'owner') await mockRedisJsonSet('session:session-1', '$', { id: 'session-1', user_id: 'other' })
+        if (changed === 'reply') state.registry.registerStreamAbort('session-1', 'successor-reply', new AbortController())
+        if (changed === 'consent') {
+          const record = mockRedisJsonSet.mock.calls.find(([key, path, value]) => key.startsWith('control_approval:') && path === '$' && value?.controlId === 'sys.pinokio.run')
+          if (!record) throw new Error('Missing actual approval fixture')
+          await mockRedisDel(record[0])
+        }
+        if (await input.admitStart() !== true) return { ok: false, kind: 'refused', message: 'Start admission was lost.' }
+        mockNativeEffect()
+      })
+      const result = await useControlWithApproval(state.options)
+      expect(result.success).toBe(false)
+      expect(mockNativeEffect).not.toHaveBeenCalled()
+    })
+
+    it('refuses a retired managed reply before consuming its approved record or borrowing successor Stop', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const state = await remoteActor()
+      const paused = await useControl(state.options)
+      const approvalId = await approveThePause(paused)
+      state.registry.registerStreamAbort('session-1', 'successor-reply', new AbortController())
+      const retired = await useControl({ ...state.options, approval: { kind: 'sdk', approvalId } })
+      expect(retired.success).toBe(false)
+      if (!retired.success) expect(retired.error.code).toBe('CONTROL_CANCELLATION_REQUIRED')
+      expect((await mockRedisJsonGet(`control_approval:${approvalId}`))?.status).toBe('approved')
+      expect(mockNativeEffect).not.toHaveBeenCalled()
+    })
+
+    it('refuses missing remote preview fields or original Stop before raising a card', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const missing = await useControl({ userId: 'user-1', controlId: 'sys.pinokio.run', input: { appId: 'comfy.git', machineId: remotePinokioId } })
+      expect(!missing.success && missing.error.code).toBe('CONTROL_INPUT_INVALID')
+      const unbound = await useControl({ userId: 'user-1', controlId: 'sys.pinokio.run', input: remoteInput(), actorType: 'service' })
+      expect(!unbound.success && unbound.error.code).toBe('CONTROL_CANCELLATION_REQUIRED')
+      expect(mockRedisJsonSet.mock.calls.filter(([key]) => key.startsWith('control_approval:'))).toHaveLength(0)
+    })
+
     const NOT_RUNNING = {
       ok: false,
       kind: 'unavailable',
@@ -2091,7 +2604,8 @@ describe('controlRegistry artifact capability controls', () => {
     expect(serialized).toContain('FABRIC_RUNTIME_REQUIRED')
     expect(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).toContain('`native_skill` (skillId `artifact_creator`)')
     expect(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).toContain('Settings -> Agents -> Access')
-    expect(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).toContain('Settings -> Skills & Prompts')
+    expect(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).toContain('Settings -> Plugins & shit -> Plugins')
+    expect(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).toContain('turn on the Batshit plugin')
   })
 
   it('gives a field-name refusal its own next step: name the fields, nothing about the skill or the toggle (BL-89 review)', async () => {
@@ -2141,7 +2655,43 @@ describe('controlRegistry artifact capability controls', () => {
     expect(serialized).not.toContain('ARTIFACT_STRUCTURE_ENFORCED')
   })
 
+  it.each(['importer', 'screen'] as const)('keeps the original Fabric import epoch through a held %s before command save', async heldStage => {
+    const { withSettingsRestoreFence } = await import('../services/appActions/settings/lifecycle')
+    const actual = await vi.importActual<typeof import('../services/slashCommandRevision')>('../services/slashCommandRevision')
+    let entered!: () => void, release!: () => void
+    const arrived = new Promise<void>(resolve => { entered = resolve })
+    const held = new Promise<void>(resolve => { release = resolve })
+    let refusal: unknown
+    mockCaptureSlashCommandWriteBasis.mockImplementationOnce(async (...args: Parameters<typeof actual.captureSlashCommandWriteBasis>) => {
+      try { return await actual.captureSlashCommandWriteBasis(...args) }
+      catch (error) { refusal = error; throw error }
+    })
+    mockImportSkillDefinition.mockImplementationOnce(async () => {
+      if (heldStage === 'importer') { entered(); await held }
+      return { skill: { id: 'epoch_import', name: 'Epoch import', markdown: '# Imported', source: 'local' }, warnings: [] }
+    })
+    mockScreenImportedSkill.mockImplementationOnce(async () => {
+      if (heldStage === 'screen') { entered(); await held }
+      return null
+    })
+    const pending = useControlWithApproval({ userId: 'user-1', actorType: 'session', sessionId: 'session-1',
+      controlId: 'sys.skill.import', input: { sourceType: 'local', source: '/fixture/epoch-import' } })
+    try {
+      await arrived
+      await withSettingsRestoreFence(async () => undefined)
+    } finally { release() }
+    const result = await pending
+    expect(result.success).toBe(false)
+    expect(refusal).toMatchObject({ code: 'SLASH_COMMAND_CONFLICT', outcome: 'not_written' })
+    expect(mockImportSkillDefinition).toHaveBeenCalledOnce()
+    expect(mockScreenImportedSkill).toHaveBeenCalledOnce()
+    expect(mockUpsertSkill).not.toHaveBeenCalled()
+    expect(mockSaveSlashCommandRecord).not.toHaveBeenCalled()
+  })
+
   describe('sys.skill.save cannot widen skill access (BL-75)', () => {
+    beforeEach(initializeSkillSaveCatalog)
+
     function savedSkill(id: string) {
       return {
         id,
@@ -2158,7 +2708,7 @@ describe('controlRegistry artifact capability controls', () => {
 
     async function saveSkill(
       input: Record<string, unknown>,
-      caller: { agentId?: string; actorType?: any } = { agentId: 'agent_1', actorType: 'agent' }
+      caller: { agentId?: string; actorType?: any } = { agentId: 'agent_1', actorType: 'in-process' }
     ) {
       const { useControl } = await import('../services/fabricRegistry')
       return useControl({
@@ -2170,18 +2720,52 @@ describe('controlRegistry artifact capability controls', () => {
       })
     }
 
-    it('refuses a new command for a skill that already exists, a built-in one included', async () => {
-      await mockRedisJsonSet('skill:user-1:skill_creator', '$', { id: 'skill_creator', is_system: true })
+    it('refuses a new command for an independent skill that already exists', async () => {
+      await mockRedisJsonSet('skill:user-1:existing_skill', '$', {
+        ...savedSkill('existing_skill'), user_id: 'user-1'
+      })
 
       const result = await saveSkill({
         commandName: 'my-alias',
-        skill: { id: 'skill_creator', markdown: '# x', source: 'custom' }
+        skill: { id: 'existing_skill', markdown: '# x', source: 'custom' }
       })
 
       expect(result.success).toBe(false)
       expect(JSON.stringify(result)).toContain('already exists and belongs to another command')
       expect(mockUpsertSkill).not.toHaveBeenCalled()
+      expect(mockSaveSlashCommandRecord).not.toHaveBeenCalled()
       expect(await mockRedisJsonGet('slash_command:user-1:my_alias')).toBeNull()
+    })
+
+    it('refuses a built-in plugin skill alias before per-command access can be widened', async () => {
+      const preserved = initializedBuiltinPluginEntries('user-1')
+      const writesBefore = mockRedisJsonSet.mock.calls.length
+      const result = await saveSkill({
+        commandName: 'my-alias',
+        enabledForAllAgents: true,
+        enabledAgentIds: ['agent_1'],
+        skill: { id: 'skill_creator', markdown: '# x', source: 'custom' }
+      })
+
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error.code).toBe('CONTROL_EXECUTION_FAILED')
+      expect(result.error.message).toBe('Manage access for this skill through its plugin in Settings → Plugins & shit → Plugins.')
+      expect(mockUpsertSkill).not.toHaveBeenCalled()
+      expect(mockSaveSlashCommandRecord).not.toHaveBeenCalled()
+      // Every refusal is audited by useControl.finalize. Require that one audit write,
+      // with no post-setup writes to commands, skills, plugins, or any other saved owner.
+      const writesAfter = mockRedisJsonSet.mock.calls.slice(writesBefore)
+      expect(writesAfter.map(([key, path]) => [key, path])).toEqual([
+        [expect.stringMatching(/^control_audit:user-1:/), '$']
+      ])
+      expect(writesAfter[0][2]).toMatchObject({
+        userId: 'user-1', agentId: 'agent_1', actorType: 'in-process',
+        controlId: 'sys.skill.save', success: false,
+        errorCode: 'CONTROL_EXECUTION_FAILED', errorMessage: result.error.message
+      })
+      expect(await mockRedisJsonGet('slash_command:user-1:my_alias')).toBeNull()
+      for (const [key, original] of preserved) expect(await mockRedisJsonGet(key)).toEqual(original)
     })
 
     it('saves a new skill on for the saving agent only, and answers a wider request with accessNote', async () => {
@@ -2233,6 +2817,22 @@ describe('controlRegistry artifact capability controls', () => {
       })
       if (!result.success) return
       expect((result.result as any).accessNote).toContain('Access unchanged')
+    })
+
+    it('delegates access preservation at the physical owner after a concurrent user edit', async () => {
+      await mockRedisJsonSet('skill:user-1:my_skill', '$', { id: 'my_skill' })
+      await mockRedisJsonSet('slash_command:user-1:my_skill', '$', { id: 'my_skill', type: 'skill', skill_id: 'my_skill', enabled_agent_ids: ['agent_1'] })
+      mockUpsertSkill.mockImplementationOnce(async () => {
+        expect(mockCaptureSlashCommandWriteBasis).toHaveBeenCalledOnce()
+        await mockRedisJsonSet('slash_command:user-1:my_skill', '$', { id: 'my_skill', type: 'skill', skill_id: 'my_skill', enabled_agent_ids: ['agent_2'], is_active: false, can_be_invoked_in_chat: false })
+        return savedSkill('my_skill')
+      })
+      const result = await saveSkill({ commandName: 'my-skill', skill: { id: 'my_skill', markdown: '# Updated' } })
+      expect(result.success).toBe(true)
+      expect(mockSaveSlashCommandRecord).toHaveBeenCalledWith('user-1', expect.objectContaining({ mode: 'update',
+        preserveAccess: ['enabled_agent_ids', 'enabled_for_all_agents', 'is_active', 'can_be_invoked_in_chat'] }), expect.any(Object))
+      expect(await mockRedisJsonGet('slash_command:user-1:my_skill')).toMatchObject({ enabled_agent_ids: ['agent_2'], is_active: false, can_be_invoked_in_chat: false })
+      if (result.success) expect((result.result as any).command.enabledAgentIds).toEqual(['agent_2'])
     })
 
     it('keeps a switched-off command off for a caller with no agent (BL-80)', async () => {
@@ -2317,7 +2917,7 @@ describe('controlRegistry artifact capability controls', () => {
       expect(result.success).toBe(true)
       const stored = await mockRedisJsonGet('slash_command:user-1:legacy_skill')
       expect(Object.prototype.hasOwnProperty.call(stored, 'enabled_agent_ids')).toBe(false)
-      expect(stored?.enabled_for_all_agents).toBe(false)
+      expect(Object.prototype.hasOwnProperty.call(stored, 'enabled_for_all_agents')).toBe(false)
       if (!result.success) return
       expect((result.result as any).accessNote).toBeUndefined()
     })
@@ -2353,7 +2953,7 @@ describe('controlRegistry artifact capability controls', () => {
   })
 
   describe('a delegated run uses exactly what its DCM offers it (BL-81)', () => {
-    const RUNTIME = 'subagent_cli_research_bot'
+    const RUNTIME = 'parent-agent'
     const SCOPE = 'research_bot'
     const OFFERED = ['sys.zip.fetch', 'use.artifact.*']
     const delegated = {
@@ -2362,8 +2962,7 @@ describe('controlRegistry artifact capability controls', () => {
       scopeAgentId: SCOPE,
       delegatedRun: true,
       delegatedAllowedControlIds: OFFERED,
-      actorType: 'agent' as const,
-      credentialId: 'arc_delegated'
+      actorType: 'in-process' as const
     }
 
     /** A published, run-only artifact whose Agent Use list names `allowlist`. */
@@ -2577,10 +3176,11 @@ describe('controlRegistry artifact capability controls', () => {
     })
 
     it('leaves a primary, the service token, a portable-skill token and a signed-in session as they were', async () => {
+      await initializeSkillSaveCatalog()
       const { useControl, findControls } = await import('../services/fabricRegistry')
 
       const callers = [
-        { actorType: 'agent' as const, agentId: 'agent_1', credentialId: 'arc_primary' },
+        { actorType: 'in-process' as const, agentId: 'agent_1', credentialId: 'arc_primary' },
         { actorType: 'service' as const, agentId: 'agent_1' },
         { actorType: 'session' as const, agentId: 'agent_1' },
         { actorType: 'portable-skill' as const, allowRisky: true, allowedControlIds: ['sys.skill.save'] }
@@ -2626,10 +3226,10 @@ describe('controlRegistry artifact capability controls', () => {
       await useControl({ ...delegated, controlId: 'use.artifact.scoped-artifact', dryRun: true, input: {} })
 
       expect(auditEntriesWritten().at(-1)).toMatchObject({
-        actorType: 'agent',
+        actorType: 'in-process',
         agentId: RUNTIME,
         scopeAgentId: SCOPE,
-        credentialId: 'arc_delegated',
+        credentialId: null,
         controlId: 'use.artifact.scoped-artifact',
         success: true
       })
@@ -2743,14 +3343,31 @@ describe('controlRegistry artifact capability controls', () => {
   })
 
   describe('BL-829: artifact access belongs to the user', () => {
+    it.each(['unknown', 'saved'] as const)('BL-1635 preserves the recognized grant %s record/index custody at the Fabric boundary', async record => {
+      const { ArtifactGrantUnknownError } = await import('$lib/server/artifacts/artifactGrantLifecycle')
+      const { useControl } = await import('../services/fabricRegistry')
+      const failure = new ArtifactGrantUnknownError('artifact_123', record, record === 'saved' ? 'unknown' : 'not_started')
+      mockArtifactService.update.mockRejectedValueOnce(failure)
+      const result = await useControl({ userId: 'user-1', agentId: 'agent-1', actorType: 'session',
+        controlId: 'sys.artifact.update', input: { artifactId: 'artifact_123', agent_allowlist: ['agent-1'] } })
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error.details).toMatchObject({ success: false, status: 503, code: 'ARTIFACT_GRANT_UNCONFIRMED', outcome: 'unknown',
+        details: { artifactId: 'artifact_123', record, indexPublication: record === 'saved' ? 'unknown' : 'not_started', outcome: 'unknown' } })
+      expect(JSON.stringify(result)).not.toContain('stack')
+      expect(mockArtifactService.update).toHaveBeenCalledOnce()
+    })
     const accessRequests = [
       ['turn Agent Use off', { agent_use_enabled: false }],
       ['clear the selected agents', { agent_allowlist: [] }],
       ['clear the selected agents with null', { agent_allowlist: null }],
       ['open access to all agents', { agent_access_scope: 'all' }],
-      ['switch to selected agents', { agent_access_scope: 'selected' }]
+      ['switch to selected agents', { agent_access_scope: 'selected' }],
+      ...['agent_allowlist', 'agentAllowlist', 'assigned_agent_ids', 'assignedAgentIds'].flatMap((key) =>
+        [null, [], false].map((value) => [`set metadata.${key} to ${JSON.stringify(value)}`, { metadata: { [key]: value } }] as const)
+      )
     ] as const
-    const nonUserLanes = ['agent', 'in-process', 'n8n-callback', 'portable-skill', 'unknown'] as const
+    const nonUserLanes = ['in-process', 'portable-skill', 'unknown'] as const
 
     it.each(accessRequests)('refuses an agent request to %s without saving any content', async (_label, access) => {
       const { useControl } = await import('../services/fabricRegistry')
@@ -2761,7 +3378,7 @@ describe('controlRegistry artifact capability controls', () => {
           agentId: 'agent-1',
           actorType,
           controlId: 'sys.artifact.update',
-          input: { artifactId: 'artifact_123', content: '<div>unauthorized replacement</div>', ...access }
+          input: { artifactId: 'artifact_123', content: '<div>unauthorized replacement</div>', expectedVersion: 1, ...access }
         })
 
         expect(result.success, `${actorType}: ${_label}`).toBe(false)
@@ -2842,10 +3459,24 @@ describe('controlRegistry artifact capability controls', () => {
         { expectedVersion: 1 }
       )
     })
+
+    it('keeps unrelated Artifact metadata updates available to an agent', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const result = await useControl({
+        userId: 'user-1', agentId: 'agent-1', actorType: 'in-process',
+        controlId: 'sys.artifact.update',
+        input: { artifactId: 'artifact_123', metadata: { note: 'Keep this ordinary metadata.' } }
+      })
+
+      expect(result.success).toBe(true)
+      expect(mockArtifactService.update).toHaveBeenCalledWith('artifact_123', 'user-1', {
+        metadata: { note: 'Keep this ordinary metadata.' }
+      })
+    })
   })
 
   describe('BL-818: a whole-page write names the version it read', () => {
-    const everyLane = ['agent', 'in-process', 'n8n-callback', 'portable-skill', 'session', 'service'] as const
+    const everyLane = ['in-process', 'portable-skill', 'session', 'service'] as const
     const staleConflict = () =>
       Object.assign(
         new Error(
@@ -2927,7 +3558,7 @@ describe('controlRegistry artifact capability controls', () => {
       const result = await useControl({
         userId: 'user-1',
         agentId: 'agent-1',
-        actorType: 'agent',
+        actorType: 'in-process',
         controlId: 'sys.artifact.update',
         input: { artifactId: 'artifact_123', content: '<div>replacement</div>', agent_access_scope: 'all' }
       })
@@ -2947,7 +3578,7 @@ describe('controlRegistry artifact capability controls', () => {
       const result = await useControl({
         userId: 'user-1',
         agentId: 'agent-1',
-        actorType: 'agent',
+        actorType: 'in-process',
         controlId: 'sys.artifact.update',
         input: {
           artifactId: 'artifact_123',
@@ -3451,6 +4082,126 @@ describe('controlRegistry artifact capability controls', () => {
     expect((result.result as any).artifact.versions[0].content).toBe('<div>Old</div>')
   })
 
+  describe('BL-592 Artifact run deadline parity', () => {
+    const entryPoints = [
+      { name: 'per-instance', controlId: 'artifact.artifact_123.action.run.run', typed: false },
+      { name: 'typed', controlId: 'use.artifact.demo-artifact', typed: true }
+    ]
+    const savedArtifact = (brainType: string) => ({
+      id: 'artifact_123', user_id: 'user-1', name: 'Demo Artifact', slug: 'demo-artifact', type: 'html',
+      mode: 'published', zone: 'panel', brain_type: brainType, agent_use_enabled: true, agent_access_scope: 'all',
+      metadata: { run_only: true, ...(brainType === 'pinokio_app' ? {
+        runtime_manager: 'pinokio', source_type: 'custom', pinokio_app_id: 'app.git',
+        pinokio_runtime: { method: 'POST', path: '/run' }
+      } : {}) }, created_at: '2026-02-22T00:00:00.000Z', updated_at: '2026-02-22T00:00:00.000Z'
+    })
+    const done = () => new Response(`${JSON.stringify({ type: 'finish', content: 'done' })}\n`)
+
+    for (const entry of entryPoints) {
+      it(`uses the saved Pinokio budget for ${entry.name}, with no HTTP fallback`, async () => {
+        const artifact = savedArtifact('pinokio_app')
+        mockArtifactService.listByUser.mockResolvedValue([artifact])
+        mockArtifactService.getAccessible.mockResolvedValue(artifact)
+        mockPinokioCompletion.mockImplementation(async input => { await input.admit(); return done() })
+        const http = vi.fn().mockImplementation(async () => done())
+        vi.stubGlobal('fetch', http)
+        const deadline = new AbortController()
+        const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(deadline.signal)
+        try {
+          const { useControl } = await import('../services/fabricRegistry')
+          const result = await useControl({ userId: 'user-1', actorType: 'session', controlId: entry.controlId,
+            input: { prompt: 'run', brain_type: 'built_in', timeoutMs: 1 } })
+          expect(result.success).toBe(true)
+          expect(timeout.mock.calls).toEqual([[600_000]])
+          expect(mockArtifactService.getAccessible).toHaveBeenCalledWith('artifact_123', 'user-1')
+          expect(mockPinokioCompletion).toHaveBeenCalledOnce()
+          expect(mockPinokioCompletion).toHaveBeenCalledWith(expect.objectContaining({ artifact, signal: deadline.signal }))
+          expect(http).not.toHaveBeenCalled()
+        } finally { timeout.mockRestore() }
+      })
+
+      it(`keeps the ordinary budget and exact HTTP payload for ${entry.name} despite caller budget claims`, async () => {
+        const artifact = savedArtifact('built_in')
+        mockArtifactService.listByUser.mockResolvedValue([artifact])
+        mockArtifactService.getAccessible.mockResolvedValue(artifact)
+        const http = vi.fn().mockImplementation(async () => done())
+        vi.stubGlobal('fetch', http)
+        const deadline = new AbortController()
+        const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(deadline.signal)
+        try {
+          const { useControl } = await import('../services/fabricRegistry')
+          const result = await useControl({ userId: 'user-1', actorType: 'session', controlId: entry.controlId,
+            input: { prompt: 'run', brain_type: 'pinokio_app', timeoutMs: 3_600_000,
+              headers: { 'x-batshit-artifact-http-only': '0' } } })
+          expect(result.success).toBe(true)
+          expect(timeout.mock.calls).toEqual([[120_000]])
+          expect(mockPinokioCompletion).not.toHaveBeenCalled()
+          expect(http).toHaveBeenCalledOnce()
+          const [url, init] = http.mock.calls[0]
+          expect(url).toBe('http://localhost:5620/api/artifacts/complete')
+          expect(init).toMatchObject({ method: 'POST', signal: deadline.signal,
+            headers: { 'Content-Type': 'application/json', 'x-batshit-token': 'test-batshit-token', 'x-batshit-artifact-http-only': '1' } })
+          expect(JSON.parse(init.body)).toEqual({ artifactId: 'artifact_123', prompt: 'run', context: null,
+            mode: 'complete', sessionId: 'artifact:artifact_123:user-1', model: null, webhookUrl: null,
+            userId: 'user-1', ...(entry.typed ? { fields: {} } : {}) })
+        } finally { timeout.mockRestore() }
+      })
+
+      it(`refuses a missing accessible Artifact before ${entry.name} completion`, async () => {
+        mockArtifactService.listByUser.mockResolvedValue([savedArtifact('pinokio_app')])
+        mockArtifactService.getAccessible.mockResolvedValue(null)
+        const http = vi.fn().mockImplementation(async () => done())
+        vi.stubGlobal('fetch', http)
+        const { useControl } = await import('../services/fabricRegistry')
+        const result = await useControl({ userId: 'user-1', actorType: 'session', controlId: entry.controlId, input: { prompt: 'run' } })
+        expect(result.success).toBe(false)
+        if (result.success) return
+        expect(result.error.details).toMatchObject({ status: 404 })
+        expect(http).not.toHaveBeenCalled()
+        expect(mockPinokioCompletion).not.toHaveBeenCalled()
+      })
+
+      it.each(['deadline', 'original Stop'])(`keeps %s effective after the ${entry.name} Pinokio response starts`, async source => {
+        const artifact = savedArtifact('pinokio_app')
+        mockArtifactService.listByUser.mockResolvedValue([artifact])
+        mockArtifactService.getAccessible.mockResolvedValue(artifact)
+        const originalStop = new AbortController()
+        const deadline = new AbortController()
+        let observed: AbortSignal | undefined
+        mockPinokioCompletion.mockImplementation(async input => {
+          await input.admit()
+          observed = input.signal
+          return new Response(new ReadableStream({ start(controller) {
+            controller.enqueue(new TextEncoder().encode(`${JSON.stringify({ type: 'file', mediaType: 'image/png', base64: 'data:image/png;base64,AA==' })}\n`))
+            input.signal.addEventListener('abort', () => controller.error(input.signal.reason), { once: true })
+          } }))
+        })
+        const http = vi.fn().mockImplementation(async () => done())
+        vi.stubGlobal('fetch', http)
+        const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(deadline.signal)
+        try {
+          const { useControl } = await import('../services/fabricRegistry')
+          const pending = useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'sess_1', actorType: 'session', controlId: entry.controlId,
+            input: { prompt: 'run' }, abortSignal: originalStop.signal })
+          await vi.waitFor(() => expect(observed).toBeDefined())
+          expect(timeout.mock.calls).toEqual([[600_000]])
+          expect(observed!.aborted).toBe(false)
+          const reason = new Error(source === 'deadline' ? 'Artifact run time limit reached' : 'Original reply stopped')
+          const cancellation = source === 'deadline' ? deadline : originalStop
+          cancellation.abort(reason)
+          expect(observed!.aborted).toBe(true)
+          expect(observed!.reason).toBe(reason)
+          if (source === 'deadline') expect(originalStop.signal.aborted).toBe(false)
+          const result = await pending
+          expect(result.success).toBe(false)
+          if (result.success) return
+          expect(result.error.message).toContain(reason.message)
+          expect(http).not.toHaveBeenCalled() // A partial file never auto-shares after abort.
+        } finally { originalStop.abort(); timeout.mockRestore() }
+      })
+    }
+  })
+
   it('executes per-instance artifact run control without dynamic MCP tool lookup', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -3850,16 +4601,15 @@ describe('controlRegistry artifact capability controls', () => {
     )
   })
 
-  it('SA-117 DL-117-10: names the acting agent and the run credential on the agent lane', async () => {
+  it('records the in-process acting agent with no run credential', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
     await useControl({
       userId: 'user-1',
       controlId: 'sys.artifact.list',
-      actorType: 'agent',
+      actorType: 'in-process',
       agentId: 'agent-cooper',
-      sessionId: 'sess-1',
-      credentialId: 'arc_abc123'
+      sessionId: 'sess-1'
     })
 
     // "Which agent acted" has to be RECORDED to be true, and `credentialId` is what says the
@@ -3868,10 +4618,10 @@ describe('controlRegistry artifact capability controls', () => {
       expect.stringMatching(/^control_audit:user-1:/),
       '$',
       expect.objectContaining({
-        actorType: 'agent',
+        actorType: 'in-process',
         agentId: 'agent-cooper',
         sessionId: 'sess-1',
-        credentialId: 'arc_abc123'
+        credentialId: null
       })
     )
   })
@@ -3957,6 +4707,36 @@ describe('controlRegistry artifact capability controls', () => {
       true
     )
     expect(unassigned.results.some((entry) => entry.controlId.startsWith('artifact.artifact_123.'))).toBe(false)
+  })
+
+  it.each([
+    ['padded saved reference', [' agent-1 ']],
+    ['nonempty invalid saved references', [null, 7, '']]
+  ])('keeps %s restrictive without granting another identity', async (_label, agentAllowlist) => {
+    const { findControls } = await import('../services/fabricRegistry')
+    const [artifact] = await mockArtifactService.listByUser('user-1')
+    mockArtifactService.listByUser.mockResolvedValue([{ ...artifact, agent_allowlist: agentAllowlist }])
+
+    const result = await findControls({
+      userId: 'user-1', agentId: 'agent-1', query: 'artifact.artifact_123.',
+      sourceType: 'artifact', includeDraft: true, limit: 200
+    })
+
+    expect(result.results.some((entry) => entry.controlId.startsWith('artifact.artifact_123.'))).toBe(false)
+    expect(result.results.some((entry) => entry.controlId === 'use.artifact.demo-artifact')).toBe(false)
+  })
+
+  it('preserves a literal legacy saved Artifact access identity', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+    const [artifact] = await mockArtifactService.listByUser('user-1')
+    mockArtifactService.listByUser.mockResolvedValue([{ ...artifact, agent_allowlist: ['odd.id'] }])
+
+    const result = await findControls({
+      userId: 'user-1', agentId: 'odd.id', query: 'artifact.artifact_123.',
+      sourceType: 'artifact', includeDraft: true, limit: 200
+    })
+
+    expect(result.results.some((entry) => entry.controlId === 'artifact.artifact_123.field.details.get')).toBe(true)
   })
 
   it('hides dynamic artifact controls when agent_use_enabled is false', async () => {
@@ -4205,7 +4985,7 @@ describe('controlRegistry artifact capability controls', () => {
     const result = await findControls({ userId: 'user-1', agentId: 'agent-1', query: 'lighton ocr', sourceType: 'artifact', includeDraft: true, includeSchema: true, limit: 200 })
     const control = result.results.find((entry) => entry.controlId === 'use.artifact.lighton_ocr')
     expect(control?.schemaHint).toBe(
-      'image (a file: the Clip id from the Clips roster (clip_...), a public URL, or a data: URL), model (text)'
+      'optional: image:string, model:string, prompt:string · at least one field is required · file fields (image): a file: the Clip id from the Clips roster (clip_...), a public URL, or a data: URL'
     )
     expect((control?.inputSchema as any)?.properties?.image?.description).toBe(
       'Image: a file: the Clip id from the Clips roster (clip_...), a public URL, or a data: URL'
@@ -5321,6 +6101,34 @@ describe('controlRegistry artifact capability controls', () => {
     )
   })
 
+  it('refuses an incomplete profile preflight through Fabric before deleting the registry', async () => {
+    await useControlWithApproval({ userId: 'user-1', controlId: 'sys.voice.engine.register', input: {
+      engineId: 'parakeet', payload: { name: 'Parakeet Engine', baseUrl: 'http://localhost:9001' }
+    } })
+    mockRedisJsonSet.mockClear()
+    mockRawProfileInventoryEval.mockRejectedValueOnce(new Error('Required profile read failed'))
+    const failed = await useControlWithApproval({ userId: 'user-1', controlId: 'sys.voice.engine.delete', input: { engineId: 'parakeet' } })
+    expect(failed.success).toBe(false)
+    expect(failed).not.toHaveProperty('result.deleted')
+    expect(mockRedisJsonSet.mock.calls.filter(([key]) => key === 'voice_engine_registry:user-1')).toHaveLength(0)
+    expect(mockDeleteVoiceProfile).not.toHaveBeenCalled()
+  })
+
+  it.each(['changed', 'unknown'] as const)('does not project %s engine-delete failure as deleted:true', async kind => {
+    await useControlWithApproval({ userId: 'user-1', controlId: 'sys.voice.engine.register', input: {
+      engineId: 'parakeet', payload: { name: 'Parakeet Engine', baseUrl: 'http://localhost:9001' }
+    } })
+    mockGetUserSettings.mockResolvedValue({ id: 's', user_id: 'user-1',
+      voice_settings: { tts: { providerId: 'byo:parakeet' } } })
+    const { PresetReferenceWriteError } = await import('../services/modelPresetReferenceGuard')
+    mockUpdateUserSettings.mockRejectedValueOnce(new PresetReferenceWriteError(kind))
+    const failed = await useControlWithApproval({ userId: 'user-1', controlId: 'sys.voice.engine.delete',
+      input: { engineId: 'parakeet' } })
+    expect(failed.success).toBe(false)
+    expect(failed).not.toHaveProperty('result.deleted')
+    expect(JSON.stringify(failed)).toMatch(kind === 'unknown' ? /unconfirmed/ : /incomplete/)
+  })
+
   it('executes voice engine delete through control registry', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
@@ -5354,9 +6162,16 @@ describe('controlRegistry artifact capability controls', () => {
 })
 
 describe('sys.dm.send delivery modes (SA-114 DL-114-13)', () => {
+  beforeEach(() => {
+    mockRedisGet.mockImplementation(async (key: string) => key === 'agent:agent-dm-schema'
+      ? ownedDiscoveryPrimary('agent-dm-schema', { dms_enabled: true }) : null)
+  })
+  afterEach(() => mockRedisGet.mockReset().mockResolvedValue(null))
+
   it('offers steer and its fallback field in the schema the model reads', async () => {
     const { findControls } = await import('../services/fabricRegistry')
     const result = await findControls({
+      userId: 'user-1', agentId: 'agent-dm-schema', actorType: 'in-process',
       query: 'sys.dm.send',
       includeDraft: true,
       includeSchema: true,
@@ -5371,8 +6186,15 @@ describe('sys.dm.send delivery modes (SA-114 DL-114-13)', () => {
     expect(properties.deliver.enum).toEqual(['wait', 'wake', 'steer'])
     // And a mode offered without the field that governs its failure case is half an offer.
     expect(properties.steer_fallback.enum).toEqual(['wait', 'wake'])
-    expect(control!.schemaHint).toContain('wait | wake | steer')
+    expect(control!.schemaHint).toContain('`wait` | `wake` | `steer`')
+    expect(control!.schemaHint).toMatch(/an assignment also needs:.*`requested_outcome`.*`scope`.*`report_back_to`/)
+    expect(control!.schemaHint).toMatch(/a result also needs: `related_dm_id`/)
+    expect(properties.requested_outcome.description).toContain('Required for assignment')
+    expect(properties.scope.description).toContain('Required for assignment')
+    expect(properties.report_back_to.description).toContain('Required for assignment')
+    expect(properties.related_dm_id.description).toContain('Required for result')
     expect(control!.description).toContain('steer')
+    expect(mockRedisGet).toHaveBeenCalledWith('agent:agent-dm-schema', { throwOnError: true })
   })
 })
 
@@ -5387,6 +6209,15 @@ describe('sys.dm.send delivery modes (SA-114 DL-114-13)', () => {
  * -------------------------------------------------------------------------- */
 
 describe('SA-117 DL-117-05: identity-bearing controls', () => {
+  it('refuses an untyped retired actor before any registry read or effect', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    mockRedisJsonSet.mockClear()
+    const result = await useControl({ userId: 'user-1', agentId: 'claimed', actorType: 'agent' as never,
+      controlId: 'sys.memory.recall', input: { memoryIds: ['claimed'] } })
+    expect(result).toMatchObject({ success: false, error: { code: 'CONTROL_NOT_ALLOWED' } })
+    expect(mockRedisJsonSet).not.toHaveBeenCalled()
+  })
+
   const IDENTITY_BEARING = [
     'sys.dm.read',
     'sys.dm.list',
@@ -5428,7 +6259,7 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
   it('lets the credential lane, the in-process callers, and the user\'s own session through the same gate', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
-    for (const actorType of ['agent', 'in-process', 'n8n-callback', 'session'] as const) {
+    for (const actorType of ['in-process', 'session'] as const) {
       const result = await useControl({
         userId: 'user-1',
         controlId: 'sys.dm.list',
@@ -5503,7 +6334,7 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
       controlId: 'sys.dm.list',
       // `subagent_cli_<slug>` — the per-run runtime id, not one of the user's agents.
       agentId: 'subagent_cli_worker_agent_cooper_1',
-      actorType: 'agent',
+      actorType: 'in-process',
       delegatedRun: true,
       input: {}
     })
@@ -5540,7 +6371,7 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
    * — and this is the other half: the acting families are the test's EXPECTATION, so adding
    * a flag without a decision is as loud as losing one.
    */
-  const ACTING_AGENT_CONTROL_PREFIXES = ['sys.dm.', 'sys.memory.', 'sys.schedule.', 'sys.ui.'] as const
+  const ACTING_AGENT_CONTROL_PREFIXES = ['sys.dm.', 'sys.memory.', 'sys.schedule.', 'sys.ui.', 'sys.whiteboard.', 'sys.app_settings.native.'] as const
 
   it('discovers exactly five fixed-safe App Actions with bounded exact schemas', async () => {
     const { findControls } = await import('../services/fabricRegistry')
@@ -5563,7 +6394,7 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
 
   it('refuses service/unknown/delegated identities for remote App Actions before owner dispatch', async () => {
     const { useControl } = await import('../services/fabricRegistry')
-    for (const options of [{ actorType: 'service' as const }, { actorType: 'unknown' as const }, { actorType: 'agent' as const, delegatedRun: true }]) {
+    for (const options of [{ actorType: 'service' as const }, { actorType: 'unknown' as const }, { actorType: 'in-process' as const, delegatedRun: true }]) {
       const result = await useControl({ ...options, userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
         controlId: 'sys.ui.goon_show', input: { requestId: 'request', args: {} } })
       expect(result.success).toBe(false)
@@ -5615,6 +6446,137 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
     }
   })
 
+  it('I1 actual four-wrapper dispatch validates bounded MCP resources while discovery advertisement stays held', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    const actor = await import('../services/appActions/settings/managementActor')
+    const management = await import('../services/appActions/settings/managementRuntime')
+    const wire = await import('$lib/appActions/settings/managementInput')
+    const admit = vi.spyOn(actor, 'admitSettingsManagementActor').mockResolvedValue({} as any)
+    const prepare = vi.spyOn(management, 'prepareSettingsControl')
+    try {
+      // This test isolates the actual registered Zod gate; live authentication and consumed
+      // native/portable consent remain the real-route owners, never this injected admission.
+      const signal = new AbortController().signal, reportId = `asr_${'a'.repeat(24)}_mcp_${'b'.repeat(32)}`
+      const candidate = { domain: 'mcp-configuration', query: { kind: 'candidate', candidate: { kind: 'http', name: 'Source', url: 'https://source.example/mcp',
+        evidence: { kind: 'supplied', uri: 'https://source.example/docs' } } } }
+      const change = { op: 'change', requestId: `${'a'.repeat(24)}:i1`, reportId, semanticId: 'mcp.workflow.configure', changes: { source: { candidateId: `mcpc_${'c'.repeat(32)}` } } }
+      for (const lane of ['native', 'portable']) {
+        const common = { userId: 'user-1', agentId: lane === 'native' ? 'agent-1' : null, actorType: lane === 'native' ? 'in-process' as const : 'portable-skill' as const,
+          sessionId: 'session-1', abortSignal: signal, portableSettingsActor: lane === 'portable' ? { tokenId: 'fixture', authorityGeneration: 1 } : undefined, dryRun: true }
+        expect((await useControl({ ...common, controlId: `sys.app_settings.${lane}.report`, input: candidate })).success).toBe(true)
+        expect((await useControl({ ...common, controlId: `sys.app_settings.${lane}.change`, input: change })).success).toBe(true)
+        for (const [suffix, input] of [
+          ['report', { ...candidate, targets: { allAgents: true } }],
+          ['report', { ...candidate, query: { kind: 'candidate', candidate: { ...candidate.query.candidate, url: 'https://source.example/mcp?token=private' } } }],
+          ['change', { ...change, changes: { source: { candidateId: `mcpc_${'c'.repeat(32)}`, approved: true } } }]
+        ] as const) {
+          const rejected = await useControl({ ...common, controlId: `sys.app_settings.${lane}.${suffix}`, input })
+          expect(rejected.success).toBe(false)
+          if (!rejected.success) expect(rejected.error.code).toBe('CONTROL_INPUT_INVALID')
+        }
+      }
+      expect(prepare).not.toHaveBeenCalled() // Dry run stops above prepare/consent/effects.
+      expect(wire.MANAGED_SETTINGS_REPORT_SCHEMA.properties.domain.enum).not.toContain('mcp-configuration')
+      expect(wire.MANAGED_SETTINGS_CHANGE_SCHEMA.properties.semanticId.enum).not.toContain('mcp.workflow.configure')
+    } finally { prepare.mockRestore(); admit.mockRestore() }
+  })
+
+  it('projects only genuine original API discovery metadata before any setup, preserving base callers and refusing ended owners', async () => {
+    const { findControls, listVisibleControls } = await import('../services/fabricRegistry')
+    const management = await import('../services/appActions/settings/managementRuntime')
+    const owner = await import('../services/appActions/mcp/originalTask')
+    const turns = await import('../services/streamAbortRegistry')
+    const wire = await import('$lib/appActions/settings/managementInput')
+    // Isolate the existing grant visibility boundary; actual opaque originals
+    // below are genuine and no effect/ACK/consent result is substituted.
+    const visible = vi.spyOn(management, 'settingsControlsVisible').mockImplementation(async options => new Set(options.actorType === 'portable-skill'
+      ? ['sys.app_settings.portable.report', 'sys.app_settings.portable.change'] : ['sys.app_settings.native.report', 'sys.app_settings.native.change']))
+    const userId = 'user-1', agentId = 'agent-1', sessionId = 'metadata-original-api', replyId = 'metadata-first-reply', stop = new AbortController()
+    const turn = turns.registerSessionTurn(sessionId, 'single', replyId)
+    if (!turn.ok) throw new Error('The actual metadata fixture could not register its original turn.')
+    const identity = { userId, agentId, sessionId }
+    const lookup = owner.captureP5OriginalLookup({ ...identity, signal: stop.signal })
+    const session = { id: sessionId, user_id: userId, agent_id: agentId }, agent = { id: agentId, user_id: userId, agentType: 'api' }
+    const preparation = owner.prepareP5OriginalTask(lookup, { sessionId, session, agent, turn: turn.entry })
+    if (!preparation) throw new Error('The actual original API preparation is unavailable.')
+    owner.recordP5ResolvedApiScope(preparation, { gateways: [], tools: [], authority: { humanSelection: true } })
+    const part = owner.bindP5ApiReplyPart(preparation, { replyId, version: 0 })
+    const common = { userId, agentId, actorType: 'in-process' as const, runtimeMode: 'mode3' as const, domain: 'agent-settings' as const,
+      includeSchema: true, allowedControlIds: ['sys.app_settings.native.report', 'sys.app_settings.native.change'] }
+    try {
+      const base = await findControls({ ...common, query: '' }), baseBytes = JSON.stringify(base)
+      expect(base.results).toHaveLength(2)
+      expect(base.results.find(row => row.controlId.endsWith('.report'))?.inputSchema).toBe(wire.MANAGED_SETTINGS_REPORT_SCHEMA)
+      // DCM reaches this exact preparation BEFORE ApiRun association and before
+      // any approved source/verified C; a verified-C gate here would deadlock setup.
+      expect(owner.p5ApiHasVerifiedMcpSource(preparation)).toBe(false)
+      const ordinaryDcm = await listVisibleControls(common)
+      const dcm = await listVisibleControls({ ...common, p5McpOwner: preparation })
+      expect(dcm).toHaveLength(2)
+      expect(dcm.every(row => row.schemaHint.startsWith(ordinaryDcm.find(base => base.controlId === row.controlId)!.schemaHint) &&
+        row.schemaHint.includes('MCP'))).toBe(true)
+      const run = owner.associateP5ApiOriginalRun(preparation, part, { ...identity, replyId, signal: stop.signal })
+      if (!run) throw new Error('The genuine first API run is unavailable.')
+      const api = await findControls({ ...common, query: 'MCP', p5McpOwner: run })
+      expect(api.totalMatches).toBe(2); expect(api.results.map(row => row.controlId)).toEqual(base.results.map(row => row.controlId))
+      expect(api.results.find(row => row.controlId.endsWith('.report'))?.inputSchema).toBe(wire.API_MANAGED_SETTINGS_REPORT_SCHEMA)
+      expect(api.results.find(row => row.controlId.endsWith('.change'))?.inputSchema).toBe(wire.API_MANAGED_SETTINGS_CHANGE_SCHEMA)
+      expect(api.results.every(row => row.description.includes('custom HTTP') && row.tags.includes('MCP'))).toBe(true)
+      const fullReport = wire.API_MANAGED_SETTINGS_REPORT_SCHEMA.oneOf[1].properties.query.oneOf[2]
+      expect(fullReport.properties.candidate.properties.savedKeyRef.description).toContain('never its value')
+      expect(fullReport.properties.target.properties).not.toHaveProperty('gatewayId')
+      expect(JSON.stringify(wire.API_MANAGED_SETTINGS_REPORT_SCHEMA)).not.toContain('startupTimeoutMs')
+      expect(JSON.stringify(wire.API_MANAGED_SETTINGS_REPORT_SCHEMA)).not.toContain('authToken')
+      expect(wire.MANAGED_SETTINGS_REPORT_SCHEMA.properties.domain.enum).not.toContain('mcp-configuration')
+      expect(wire.MANAGED_SETTINGS_CHANGE_SCHEMA.properties.semanticId.enum).not.toContain('mcp.workflow.configure')
+      // Shared CLI/group/preview paths have no genuine API owner and keep the
+      // delivered bytes. A valid API handle still supplies no delegated metadata.
+      expect(JSON.stringify(await findControls({ ...common, query: '' }))).toBe(baseBytes)
+      expect(JSON.stringify(await findControls({ ...common, actorType: 'in-process', query: '' }))).toBe(baseBytes)
+      expect(JSON.stringify(await findControls({ ...common, query: '', p5McpOwner: run, delegatedRun: true,
+        delegatedAllowedControlIds: common.allowedControlIds }))).toBe(baseBytes)
+      const portable = await findControls({ ...common, actorType: 'portable-skill', agentId: undefined, query: '', allowedControlIds: ['sys.app_settings.portable.report', 'sys.app_settings.portable.change'] })
+      expect(portable.results).toHaveLength(2)
+      expect(portable.results.find(row => row.controlId.endsWith('.report'))?.inputSchema).toBe(wire.MANAGED_SETTINGS_REPORT_SCHEMA)
+      await expect(findControls({ ...common, p5McpOwner: Object.freeze({}) as never })).rejects.toThrow()
+      await expect(findControls({ ...common, userId: 'different-user', p5McpOwner: run })).rejects.toThrow('identity changed')
+      stop.abort(new Error('actual original ended before metadata handoff'))
+      await expect(findControls({ ...common, p5McpOwner: run })).rejects.toThrow()
+      await expect(listVisibleControls({ ...common, p5McpOwner: preparation })).rejects.toThrow()
+    } finally {
+      visible.mockRestore(); owner.retireP5OriginalPreparation(preparation)
+      turns.releaseSessionTurn(sessionId, turn.entry.turnId)
+    }
+  })
+
+  it('passes the in-process turn identity into internal Settings context', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    const registry = await import('../services/streamAbortRegistry')
+    const management = await import('../services/appActions/settings/managementRuntime')
+    const actor = await import('../services/appActions/settings/managementActor')
+    const admit = vi.spyOn(actor, 'admitSettingsManagementActor').mockResolvedValue({} as any)
+    const prepare = vi.spyOn(management, 'prepareSettingsControl').mockResolvedValue({ controlId: 'sys.app_settings.native.report', noEffect: true })
+    const handler = vi.spyOn(management, 'executeSettingsManagement').mockResolvedValue({ status: 'fixture_owner' } as any)
+    registry.__resetStreamAbortRegistryForTests()
+    try {
+      const stop = new AbortController()
+      registry.registerStreamAbort('session-1', 'reply-p5', stop)
+      for (const actorType of ['in-process'] as const) {
+        const result = await useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1', messageId: 'reply-p5',
+          actorType, abortSignal: stop.signal,
+          originatingReply: { sessionId: 'session-1', messageId: 'reply-p5' }, controlId: 'sys.app_settings.native.report',
+          input: { domain: 'runtime-inspection' } })
+        expect(result.success).toBe(true)
+        expect(prepare.mock.calls.at(-1)![0]).toMatchObject({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
+          messageId: 'reply-p5', actorType })
+        expect(handler.mock.calls.at(-1)![0]).toMatchObject({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
+          messageId: 'reply-p5', actorType })
+        expect(handler.mock.calls.at(-1)![1]).toBe('sys.app_settings.native.report')
+      }
+      expect(handler).toHaveBeenCalledTimes(1)
+    } finally { prepare.mockRestore(); handler.mockRestore(); admit.mockRestore(); registry.__resetStreamAbortRegistryForTests() }
+  })
+
   it('BL-1314: on a request lane a live chat Stop alone does not admit a Settings write; only the exact reply does', async () => {
     const { useControl } = await import('../services/fabricRegistry')
     const registry = await import('../services/streamAbortRegistry')
@@ -5628,13 +6590,13 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
     try {
       const live = new AbortController()
       registry.registerStreamAbort('session-1', 'reply-newer', live)
-      for (const actorType of ['agent', 'session', 'n8n-callback'] as const) {
+      for (const actorType of ['session'] as const) {
         for (const controlId of ['sys.ui.settings_agent_memory_update', identity]) {
-          // `abortSignal` is the chat's running reply (the dispatch route's session and n8n lanes
-          // pick that chat from the body). With no originating reply, an earlier reply's id, or
+          // `abortSignal` is the chat's running reply (the dispatch route's session lane
+          // picks that chat from the body). With no originating reply, an earlier reply's id, or
           // no reply id, the write is refused before the card and the owner.
           for (const originatingReply of [undefined, { sessionId: 'session-1', messageId: 'reply-earlier' },
-            { sessionId: 'session-1', messageId: null }]) {
+            { sessionId: 'session-1', messageId: null }, { sessionId: 'session-1', messageId: 'reply-newer' }]) {
             const label = `${actorType} ${controlId} ${JSON.stringify(originatingReply)}`
             const result = await useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1', actorType,
               controlId, abortSignal: live.signal, originatingReply, input: input(controlId) })
@@ -5646,7 +6608,7 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
       expect(handler).not.toHaveBeenCalled()
 
       // The exact live reply admits the safe identity write: the handler runs.
-      const exact = { userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1', actorType: 'agent' as const,
+      const exact = { userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1', actorType: 'in-process' as const,
         controlId: identity, abortSignal: live.signal, originatingReply: { sessionId: 'session-1', messageId: 'reply-newer' },
         input: input(identity) }
       expect(await useControl(exact)).toMatchObject({ success: true, result: { status: 'blocked', reason: 'fixture_owner' } })
@@ -5666,97 +6628,6 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
       handler.mockRestore()
       registry.__resetStreamAbortRegistryForTests()
     }
-  })
-
-  describe('BL-1322: a primary managed run whose own reply has stopped does nothing', () => {
-    // The routes hand a primary agent-lane call its own reply's Stop (BL-1321), already aborted
-    // once that reply has stopped, ended or been replaced. `useControl` then refuses the call
-    // after validation and the dry run, before the Settings choice and the risk gate.
-    const addon = { controlId: 'sys.runtime_addon.start', input: { addonId: 'fbx2vrma' } }
-    const stopped = () => { const controller = new AbortController(); controller.abort('retired_reply'); return controller.signal }
-
-    async function spies() {
-      const approvals = await import('../services/controlApprovals')
-      const runtime = await import('../services/appActions/runtime')
-      return {
-        // The gate is not under test: a reached gate answers a fixture group refusal.
-        gate: vi.spyOn(approvals, 'decideRiskGate').mockResolvedValue({ kind: 'refuse-group', message: 'fixture gate' }),
-        handler: vi.spyOn(runtime, 'executeAgentAppAction').mockResolvedValue({ status: 'fixture_handler' } as any)
-      }
-    }
-
-    it('refuses a confirm control before the risk gate: no approval record, no card', async () => {
-      const { useControl } = await import('../services/fabricRegistry')
-      const { gate, handler } = await spies()
-      try {
-        const result = await useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
-          actorType: 'agent', abortSignal: stopped(), ...addon })
-        expect(result.success).toBe(false)
-        if (!result.success) expect(result.error.code).toBe('CONTROL_CANCELLATION_REQUIRED')
-        expect(gate).not.toHaveBeenCalled()
-      } finally { gate.mockRestore(); handler.mockRestore() }
-    })
-
-    it('refuses a safe control too: no handler runs for a stopped run', async () => {
-      const { useControl } = await import('../services/fabricRegistry')
-      const { gate, handler } = await spies()
-      try {
-        const result = await useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
-          actorType: 'agent', abortSignal: stopped(), controlId: 'sys.ui.execution_open',
-          input: { requestId: 'request-bl1322', args: {} } })
-        expect(result.success).toBe(false)
-        if (!result.success) expect(result.error.code).toBe('CONTROL_CANCELLATION_REQUIRED')
-        expect(handler).not.toHaveBeenCalled()
-
-        // The same call with a live Stop reaches its handler.
-        const live = await useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
-          actorType: 'agent', abortSignal: new AbortController().signal, controlId: 'sys.ui.execution_open',
-          input: { requestId: 'request-bl1322-live', args: {} } })
-        expect(live).toMatchObject({ success: true, result: { status: 'fixture_handler' } })
-        expect(handler).toHaveBeenCalledTimes(1)
-      } finally { gate.mockRestore(); handler.mockRestore() }
-    })
-
-    it('keeps validation, authorization and the dry run ahead of it', async () => {
-      const { useControl } = await import('../services/fabricRegistry')
-      const { gate, handler } = await spies()
-      try {
-        const invalid = await useControl({ userId: 'user-1', agentId: 'agent-1', actorType: 'agent',
-          abortSignal: stopped(), controlId: 'sys.runtime_addon.start', input: { addonId: 'not-an-addon' } })
-        expect(invalid.success).toBe(false)
-        if (!invalid.success) expect(invalid.error.code).toBe('CONTROL_INPUT_INVALID')
-
-        const dryRun = await useControl({ userId: 'user-1', agentId: 'agent-1', actorType: 'agent',
-          abortSignal: stopped(), dryRun: true, ...addon })
-        expect(dryRun).toMatchObject({ success: true, dryRun: true })
-        expect(gate).not.toHaveBeenCalled()
-      } finally { gate.mockRestore(); handler.mockRestore() }
-    })
-
-    it('exempts, by name, every caller that is not a primary managed run', async () => {
-      const { useControl } = await import('../services/fabricRegistry')
-      const { gate, handler } = await spies()
-      try {
-        const callers = [
-          { label: 'Subagent or Worker run', actorType: 'agent' as const, delegatedRun: true, scopeAgentId: 'worker_1',
-            delegatedAllowedControlIds: ['sys.runtime_addon.start'] },
-          { label: 'API in-process broker', actorType: 'in-process' as const },
-          { label: 'session', actorType: 'session' as const },
-          { label: 'n8n callback', actorType: 'n8n-callback' as const },
-          { label: 'service token', actorType: 'service' as const },
-          { label: 'Portable Skill Token', actorType: 'portable-skill' as const, allowRisky: true }
-        ]
-        for (const caller of callers) {
-          gate.mockClear()
-          const { label, ...lane } = caller
-          const result = await useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
-            abortSignal: stopped(), ...addon, ...lane })
-          // The guard let it through: the call reached its normal risk gate.
-          expect(gate, label).toHaveBeenCalledTimes(1)
-          if (!result.success) expect(result.error.code, label).not.toBe('CONTROL_CANCELLATION_REQUIRED')
-        }
-      } finally { gate.mockRestore(); handler.mockRestore() }
-    })
   })
 
   it('flags exactly the admitted acting-agent families across every code-defined control', async () => {

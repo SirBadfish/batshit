@@ -1,3 +1,4 @@
+import { readP5McpHttpAdmission, requireP5McpToolUse, revalidateP5McpHttpAdmission, validateP5McpHttpTool, notifyP5McpClientSettlement, settleBeforeAbort, type P5McpClientAdmission } from './mcpGatewayAdmission'
 /**
  * n8n MCP Gateway Client
  *
@@ -26,7 +27,149 @@ export interface N8nMCPGatewayHealth {
   toolCount?: number
 }
 
+type HeldHttpState = {
+  creation?: Promise<MCPClient>; client?: MCPClient; transport?: StreamableHTTPClientTransport;
+  initialize: 'pending' | 'known' | 'unknown'; constructor: 'started'; requests: Set<Promise<Response>>; requestIssued: boolean; requestUnknown: boolean; list: 'not_started' | 'pending' | 'known' | 'unknown';
+  execute: 'not_started' | 'pending' | 'known' | 'unknown'; close: 'not_started' | 'pending' | 'known' | 'unknown';
+  closing?: Promise<void>; closeRequested: boolean; removeAbort?: () => void; tools?: Record<string, Tool>
+}
+
 export class N8nMCPGatewayClient {
+  private readonly heldHttp = new WeakMap<object, HeldHttpState>()
+
+  /** One constructor implementation for ordinary and fixed original-owned HTTP calls. */
+  private createHttpClient(url: URL, requestInit?: RequestInit, admission?: P5McpClientAdmission) {
+    if (admission) readP5McpHttpAdmission(admission) // last synchronous issue fence
+    const actualFetch = globalThis.fetch
+    const heldFetch: typeof fetch | undefined = admission ? async (input, init) => {
+      const state = this.heldHttp.get(admission)!
+      const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase()
+      if (method === 'POST') {
+        if (state.closeRequested) throw new Error('The actual held MCP client has closed issuance.')
+        // The actual SDK has already awaited transport/header work. No awaited
+        // authority read follows this joined cut before the SAME outbound call.
+        await revalidateP5McpHttpAdmission(admission)
+        readP5McpHttpAdmission(admission)
+        if (state.closeRequested) throw new Error('The actual held MCP client has closed issuance.')
+      }
+      // GET/resumption already belongs to the actual transport's result drain;
+      // ended positive authority cannot suppress its observation/close.
+      state.requestIssued = true
+      let physical: Promise<Response>
+      try { physical = actualFetch(input, init) }
+      catch (error) { state.requestUnknown = true; notifyP5McpClientSettlement(admission); throw error }
+      state.requests.add(physical)
+      try { return await physical }
+      catch (error) { state.requestUnknown = true; throw error }
+      finally { state.requests.delete(physical); notifyP5McpClientSettlement(admission) }
+    } : undefined
+    const transport = new StreamableHTTPClientTransport(url, { requestInit, ...(heldFetch ? { fetch: heldFetch } : {}) })
+    if (admission) this.heldHttp.get(admission)!.transport = transport
+    const creation = createMCPClient({ transport })
+    return { transport, creation }
+  }
+
+  private async openForHeldApi(admission: P5McpClientAdmission): Promise<MCPClient> {
+    let state = this.heldHttp.get(admission)
+    if (!state) {
+      // Refusal here is genuinely before constructor/physical initialization.
+      await revalidateP5McpHttpAdmission(admission)
+      const held = readP5McpHttpAdmission(admission)
+      state = { initialize: 'pending', constructor: 'started', requests: new Set(), requestIssued: false, requestUnknown: false, list: 'not_started', execute: 'not_started', close: 'not_started', closeRequested: false }
+      this.heldHttp.set(admission, state)
+      const actual = state
+      const abort = () => { void this.closeForHeldApi(admission) }
+      held.signal.addEventListener('abort', abort, { once: true })
+      actual.removeAbort = () => held.signal.removeEventListener('abort', abort)
+      try {
+        const created = this.createHttpClient(new URL(held.url), { headers: held.headers, signal: held.signal }, admission)
+        actual.creation = created.creation.then(client => {
+          actual.client = client; actual.initialize = 'known'; notifyP5McpClientSettlement(admission)
+          // Late initialization is a physical fact, never a new effect grant.
+          if (actual.closeRequested) void this.closeForHeldApi(admission)
+          return client
+        }, error => { actual.initialize = 'unknown'; notifyP5McpClientSettlement(admission); void this.closeForHeldApi(admission); throw error })
+      } catch (error) { actual.initialize = 'unknown'; notifyP5McpClientSettlement(admission); void this.closeForHeldApi(admission); throw error }
+    }
+    const held = readP5McpHttpAdmission(admission)
+    held.signal.throwIfAborted()
+    if (!state.creation || state.closeRequested) throw new Error('The actual MCP initialization has ended; no new client was created.')
+    const client = await settleBeforeAbort(state.creation, held.signal, () => { void this.closeForHeldApi(admission) })
+    readP5McpHttpAdmission(admission)
+    return client
+  }
+
+  /** Actual initialize/list for a held source. Setup uses its separate admission factory. */
+  async listForHeldApi(admission: P5McpClientAdmission): Promise<Record<string, Tool>> {
+    const client = await this.openForHeldApi(admission)
+    await revalidateP5McpHttpAdmission(admission)
+    readP5McpHttpAdmission(admission)
+    const state = this.heldHttp.get(admission)!
+    state.list = 'pending'
+    const held = readP5McpHttpAdmission(admission)
+    let issued: ReturnType<MCPClient['tools']>
+    try { issued = client.tools() }
+    catch (error) { state.list = 'unknown'; notifyP5McpClientSettlement(admission); throw error }
+    const physical = issued.then(tools => {
+      state.list = 'known'; state.tools = tools; notifyP5McpClientSettlement(admission); return tools
+    }, error => { state.list = 'unknown'; notifyP5McpClientSettlement(admission); throw error })
+    return settleBeforeAbort(physical, held.signal, () => { void this.closeForHeldApi(admission) })
+  }
+
+  async executeForHeldApi(admission: P5McpClientAdmission): Promise<unknown> {
+    requireP5McpToolUse(admission)
+    try {
+      const tools = await this.listForHeldApi(admission)
+      const held = readP5McpHttpAdmission(admission)
+      if (!held.toolName) throw new Error('The actual tool identity is unavailable.')
+      const target = tools[held.toolName]
+      if (!target || typeof target.execute !== 'function') throw new Error('The held MCP tool is unavailable in the actual client.')
+      const args = await validateP5McpHttpTool(admission, held.toolName, target)
+      readP5McpHttpAdmission(admission)
+      const state = this.heldHttp.get(admission)!
+      state.execute = 'pending'
+      // Only the actual promise may settle this physical fact; logical Stop is separate.
+      let issued: unknown
+      try { issued = Reflect.apply(target.execute, target, [args, { abortSignal: held.signal }]) }
+      catch (error) { state.execute = 'unknown'; notifyP5McpClientSettlement(admission); throw error }
+      const physical = Promise.resolve(issued).then(result => {
+        state.execute = 'known'; notifyP5McpClientSettlement(admission); return result
+      }, error => { state.execute = 'unknown'; notifyP5McpClientSettlement(admission); throw error })
+      return await settleBeforeAbort(physical, held.signal, () => { void this.closeForHeldApi(admission) })
+    } finally { void this.closeForHeldApi(admission) }
+  }
+
+  /** SAME actual close flight; no authority check may suppress late cleanup. */
+  closeForHeldApi(admission: P5McpClientAdmission): Promise<void> {
+    const state = this.heldHttp.get(admission)
+    if (!state) { notifyP5McpClientSettlement(admission); return Promise.resolve() } // no physical issue was observed
+    state.closeRequested = true
+    state.closing ??= (async () => {
+      state.close = 'pending'
+      try {
+        // Close an initializing transport now, then settle/close its late client.
+        // This does not make initialization/list/effect uncertainty known.
+        if (!state.client) await state.transport?.close()
+        const client = state.client ?? await state.creation?.catch(() => undefined)
+        if (client) await client.close()
+        state.close = 'known'
+        const unissued = !state.requestIssued && state.requests.size === 0
+        const settled = state.requests.size === 0 && !state.requestUnknown && state.initialize === 'known' &&
+          !['pending','unknown'].includes(state.list) && !['pending','unknown'].includes(state.execute)
+        if (unissued || settled) { state.client = undefined; state.transport = undefined; state.creation = undefined; state.tools = undefined }
+      } catch (error) { state.close = 'unknown'; logger.error('[MCP Gateway] Held original client close is unconfirmed') }
+      finally { state.removeAbort?.(); notifyP5McpClientSettlement(admission) }
+    })()
+    return state.closing
+  }
+
+  /** Read only THIS actual owner facts, including after Stop. No mark-ready API. */
+  readHeldApiSettlement(admission: P5McpClientAdmission) {
+    const state = this.heldHttp.get(admission)
+    if (!state) return Object.freeze({ constructor: 'not_started' as const, requests: 'not_started' as const, initialize: 'not_started' as const, list: 'not_started' as const, execute: 'not_started' as const, close: 'not_started' as const })
+    return Object.freeze({ constructor: state.constructor, requests: state.requests.size ? 'pending' as const : state.requestUnknown ? 'unknown' as const : state.requestIssued ? 'known' as const : 'not_started' as const, initialize: state.initialize, list: state.list, execute: state.execute, close: state.close })
+  }
+
   /**
    * Discover tools from n8n MCP Trigger gateway
    *
@@ -72,13 +215,10 @@ export class N8nMCPGatewayClient {
 
       // Create HTTP Streamable transport (production-ready)
       // Note: Don't specify sessionId - let the transport handle session management.
-      const transport = new StreamableHTTPClientTransport(url, {
-        requestInit
-      })
+      const { creation } = this.createHttpClient(url, requestInit)
 
-      // Create fresh MCP client for this discovery
-      // ⚠️ CRITICAL: Create new client each time - NO caching!
-      mcpClient = (await Promise.race([createMCPClient({ transport }), timeoutPromise])) as MCPClient
+      // Create fresh MCP client for this discovery; ordinary timeout/output unchanged.
+      mcpClient = (await Promise.race([creation, timeoutPromise])) as MCPClient
 
       // Discover tools from the n8n MCP workflow
       const tools = await Promise.race([mcpClient.tools(), timeoutPromise])
@@ -148,13 +288,11 @@ export class N8nMCPGatewayClient {
 
         // Create transport with timeout
         // Note: Don't specify sessionId - let the transport handle session management.
-        const transport = new StreamableHTTPClientTransport(url, {
-          requestInit
-        })
+        const { creation } = this.createHttpClient(url, requestInit)
 
-        // Fresh client for health check
+        // Fresh client for health check; ordinary timeout/output unchanged.
         mcpClient = (await Promise.race([
-          createMCPClient({ transport }),
+          creation,
           timeoutPromise
         ])) as MCPClient
 

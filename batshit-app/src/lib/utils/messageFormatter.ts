@@ -9,10 +9,11 @@ import {
   isTrustedClipReferenceId,
   neutralizeAllZipReferenceSyntax,
   neutralizeUntrustedClipReferenceSyntax,
+  scanClipReferences,
+  scanZipReferences,
   stripTrustedClipReferenceSyntax
 } from '$lib/utils/zipReferenceSafety'
 import { decodeStructuredTextContent } from './htmlEntities'
-import { scanMessageZipReferences, scanMessageClipReferences } from './markdownReferenceScan'
 import { STRUCTURED_TAG_PRESENT, findStructuredElements, type StructuredElement } from './structuredTagScan'
 import { projectRemovedTextRanges, type TextRange } from './hydratedTextRanges'
 
@@ -66,7 +67,7 @@ function parseEmbeddedZipRefs(text: string, isValidZipId?: (zipId: string) => bo
   const segments: MessageSegment[] = []
   let lastIndex = 0
 
-  for (const zipMatch of scanMessageZipReferences(text)) {
+  for (const zipMatch of scanZipReferences(text)) {
     if (zipMatch.start > lastIndex) {
       const textBefore = text.substring(lastIndex, zipMatch.start).trim()
       if (textBefore) {
@@ -514,15 +515,32 @@ function toMessageSegment(xmlSegment: XmlSegment): MessageSegment | null {
   return null
 }
 
+/**
+ * An Error card's tag as Cheerio should read it. Its words may hold a `</error>` inside their own
+ * fence (BL-779 d: the block does not end there), which Cheerio would read as the end of the
+ * element, cutting the card and losing the words after it; so those are given to Cheerio escaped,
+ * and it hands them back as written.
+ */
+function errorElementSource(content: string, element: StructuredElement & { openEnd: number }): string {
+  const closeStart = element.end - '</error>'.length
+  const words = content.substring(element.openEnd, closeStart).replace(/<\/error>/gi, (tag) => `&lt;${tag.slice(1)}`)
+  return content.substring(element.start, element.openEnd) + words + content.substring(closeStart, element.end)
+}
+
 /** The card for one structured tag of `content`, read by Cheerio from that tag's own text alone. */
 function readStructuredElement(content: string, element: StructuredElement): MessageSegment | null {
   const source =
     element.srcFromNextLine !== undefined && element.openEnd !== undefined
-      ? `${content.substring(element.start, element.openEnd - 1)} src="${element.srcFromNextLine}">`
-      : content.substring(element.start, element.end)
+      ? content.substring(element.start, element.openEnd)
+      : element.name === 'error' && element.openEnd !== undefined
+        ? errorElementSource(content, { ...element, openEnd: element.openEnd })
+        : content.substring(element.start, element.end)
   const $ = cheerio.load(`<root>${source}</root>`, CHEERIO_OPTIONS)
   const elem = $('root').find(element.name).first()
   if (elem.length === 0) return null
+  if (element.srcFromNextLine !== undefined && element.openEnd !== undefined) {
+    elem.attr('src', element.srcFromNextLine)
+  }
   const xmlSegment = readXmlElement($, elem.get(0), element.name)
   return xmlSegment ? toMessageSegment(xmlSegment) : null
 }
@@ -550,7 +568,17 @@ export function parseMessageContent(
     content?: string
   }>,
   validZipIds?: Set<string> | string[],
-  hydratedRanges: readonly TextRange[] = []
+  hydratedRanges: readonly TextRange[] = [],
+  options: {
+    /**
+     * The caller already hid every control block (a streaming reply's live view,
+     * `hideStreamingHiddenControlBlocks`), so the strip below would read the text for nothing
+     * (BL-696). The caller then passes no `originalContent` either.
+     */
+    controlBlocksHidden?: boolean
+    /** The reply is still streaming: an opening tag still arriving over several lines is hidden (BL-780). */
+    streaming?: boolean
+  } = {}
 ): MessageSegment[] {
   // Handle undefined or null content
   if (!content) {
@@ -570,9 +598,11 @@ export function parseMessageContent(
     ? (zipId: string) => trustedZipIds.has(normalizeId(zipId))
     : undefined
 
-  const unstripped = content
-  content = stripZipControlBlocks(content)
-  hydratedRanges = projectRemovedTextRanges(unstripped, content, hydratedRanges)
+  if (!options.controlBlocksHidden) {
+    const unstripped = content
+    content = stripZipControlBlocks(content)
+    hydratedRanges = projectRemovedTextRanges(unstripped, content, hydratedRanges)
+  }
   if (originalContent) {
     originalContent = stripZipControlBlocks(originalContent)
   }
@@ -580,7 +610,7 @@ export function parseMessageContent(
   // For AI responses, the structured tags outside code become their cards, in the order they
   // appear. Everything else is the reply's own text, sliced as written (BL-475).
   if (role === 'assistant' && STRUCTURED_TAG_PRESENT.test(content)) {
-    const elements = findStructuredElements(content, isValidZipId)
+    const elements = findStructuredElements(content, isValidZipId, { streaming: options.streaming === true })
     if (elements.length > 0) {
       const segments: MessageSegment[] = []
       const pushText = (from: number, to: number) => {
@@ -617,7 +647,7 @@ export function parseMessageContent(
     }> = []
     let lastIndex = 0
     
-    for (const zipMatch of scanMessageZipReferences(content)) {
+    for (const zipMatch of scanZipReferences(content)) {
       // Add text before zip
       if (zipMatch.start > lastIndex) {
         const textBefore = content.substring(lastIndex, zipMatch.start).trim()
@@ -692,7 +722,7 @@ export function parseMessageContent(
         .map((clip) => normalizeId(clip?.clipId))
         .filter(Boolean)
     )
-    for (const clipMatch of scanMessageClipReferences(clipSource)) {
+    for (const clipMatch of scanClipReferences(clipSource)) {
       // Parse new clip format: {{batshit-clip:id}} or {{batshit-clip:id:::description}}
       const clipId = clipMatch.id
       if (!isTrustedClipReferenceId(clipId, trustedClipIds)) {

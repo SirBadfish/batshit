@@ -1,14 +1,25 @@
 import { realpath } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { z } from 'zod'
 
 import { cloneIconRef, isIconRef, type IconRef } from '$lib/icons/iconTypes'
 import { redis } from '$lib/server/redis'
 import {
+  ConfiguredTtsBaseRequiredError,
+  ConfiguredTtsConflictError,
+  ConfiguredTtsModelLockedError,
+  ConfiguredTtsSaveUnconfirmedError,
+  readVoiceEngineClearRecord
+} from '$lib/server/configuredTtsGuard'
+import { SettingsLifecycleRefusal } from './appActions/settings/lifecycle'
+import { PresetReferenceWriteError } from './modelPresetReferenceGuard'
+import { VOICE_ENGINE_DELETE_OUTCOME_CONTRACT } from '$lib/types/voice'
+import {
   resolveLocalVoiceRuntimeStateDir,
   resolveManagedInstallsRoot
 } from '$lib/server/services/voiceLocalRuntimePaths'
-import { deleteVoiceProfilesForProvider } from '$lib/server/services/voiceProfileRecords'
+import { prepareVoiceProfileCleanup, deletePreparedVoiceProfiles } from '$lib/server/services/voiceProfileRecords'
 import {
   isUserFacingApiKeyService,
   normalizeApiKeyServiceName
@@ -35,6 +46,7 @@ import type {
   LocalVoiceEngineInstallOwnership,
   VoiceByoAuthMode,
   VoiceEngineClientSummary,
+  VoiceEngineDeleteOutcomeReceipt,
   VoiceEngineExpressionContract,
   VoiceEngineLaunchConfig,
   VoiceEngineLocalRuntimeConfig,
@@ -56,8 +68,7 @@ import type {
   VoiceProviderOptionBlock,
   VoiceProviderOptionValue,
   VoiceProviderId,
-  VoiceSettings,
-  AgentVoiceProfile
+  VoiceSettings
 } from '$lib/types/voice'
 
 export const VOICE_ENGINE_REGISTRY_SCHEMA_VERSION = 1 as const
@@ -1046,6 +1057,53 @@ class VoiceEngineRegistryUnreadableError extends Error {
   }
 }
 
+type VoiceEngineDeletePreparation = Readonly<{ engineId: string }>
+
+/** Only the exact parser before this call's migration may mint this refusal. */
+class VoiceEngineDeletePreflightRefusal extends Error {
+  constructor(readonly preparation: VoiceEngineDeletePreparation, cause: Error) {
+    super(cause.message, { cause })
+  }
+}
+
+class VoiceEngineDeleteAckUnconfirmedError extends Error {
+  constructor() {
+    super('The voice engine registry write did not return its expected acknowledgement.')
+  }
+}
+
+/** Sanitized response-only fact; no lower writer custody is released by constructing it. */
+export class VoiceEngineDeleteError extends Error {
+  readonly deleteOutcome: Readonly<VoiceEngineDeleteOutcomeReceipt>
+  readonly status: number
+  readonly code: string
+
+  constructor(engineId: string, configurationOutcome: VoiceEngineDeleteOutcomeReceipt['configurationOutcome'], cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : 'Failed to delete voice engine.'
+    const summary = configurationOutcome === 'known_no_change'
+      ? 'The engine was not deleted and no configuration was changed.'
+      : configurationOutcome === 'known_settled_partial'
+        ? 'Engine deletion stopped after earlier configuration changes were saved. Configuration cleanup is incomplete.'
+        : 'The engine delete outcome is unconfirmed. Do not automatically repeat it.'
+    super(`${summary} ${detail}`, { cause })
+    this.name = 'VoiceEngineDeleteError'
+    this.deleteOutcome = Object.freeze({ contract: VOICE_ENGINE_DELETE_OUTCOME_CONTRACT, engineId, configurationOutcome })
+    // Status/code preserve recognized causes; they never certify the outcome enum.
+    if (cause instanceof PresetReferenceWriteError || cause instanceof SettingsLifecycleRefusal ||
+        cause instanceof ConfiguredTtsBaseRequiredError || cause instanceof ConfiguredTtsConflictError ||
+        cause instanceof ConfiguredTtsModelLockedError || cause instanceof ConfiguredTtsSaveUnconfirmedError) {
+      this.status = cause.status
+      this.code = cause.code
+    } else if (cause instanceof VoiceEngineDeletePreflightRefusal) {
+      this.status = 409
+      this.code = 'VOICE_ENGINE_REGISTRY_UNREADABLE'
+    } else {
+      this.status = cause instanceof VoiceEngineDeleteAckUnconfirmedError ? 503 : 500
+      this.code = 'VOICE_ENGINE_DELETE_UNCONFIRMED'
+    }
+  }
+}
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -1154,7 +1212,8 @@ function assertVoiceEngineRecordReadable(registry: LoadedVoiceEngineRegistry, en
 
 async function writeVoiceEngineRegistryStore(
   userId: string,
-  registry: Pick<LoadedVoiceEngineRegistry, 'records' | 'unreadable'>
+  registry: Pick<LoadedVoiceEngineRegistry, 'records' | 'unreadable'>,
+  deletePreparation?: VoiceEngineDeletePreparation
 ): Promise<void> {
   const key = buildVoiceEngineRegistryKey(userId)
   const store = {
@@ -1163,7 +1222,8 @@ async function writeVoiceEngineRegistryStore(
     records: [...registry.records, ...registry.unreadable.map((entry) => entry.raw)]
   }
   await redis.execute(async (client) => {
-    await client.json.set(key, '$', store as any)
+    const answer = await client.json.set(key, '$', store as any)
+    if (deletePreparation && answer !== 'OK') throw new VoiceEngineDeleteAckUnconfirmedError()
   })
   // The engine list just changed (a delete, a base URL or recipe change, from any writer), so
   // bring this registry's launch records in line: an attach record must never outlive its
@@ -1666,7 +1726,8 @@ function sanitizeVoiceEngineForClient(
 
 async function migrateLegacyVoiceSettings(
   userId: string,
-  registry: LoadedVoiceEngineRegistry
+  registry: LoadedVoiceEngineRegistry,
+  deletePreparation?: VoiceEngineDeletePreparation
 ): Promise<LoadedVoiceEngineRegistry> {
   const settings = await redis.getUserSettings(userId)
   const normalizedVoiceSettings = normalizeVoiceSettings(settings?.voice_settings)
@@ -1706,7 +1767,7 @@ async function migrateLegacyVoiceSettings(
   }
 
   if (changed) {
-    await writeVoiceEngineRegistryStore(userId, next)
+    await writeVoiceEngineRegistryStore(userId, next, deletePreparation)
   }
 
   if (keptInSettings.length > 0) {
@@ -1732,19 +1793,22 @@ async function migrateLegacyVoiceSettings(
  * `write`, a registry this Batshit cannot read as a whole throws too, so nothing is written over
  * it; a `read` (display, and engines at run time) then sees no engines and the reason.
  */
-async function loadRegistry(userId: string, use: 'read' | 'write'): Promise<LoadedVoiceEngineRegistry> {
+async function loadRegistry(userId: string, use: 'read' | 'write', deletePreparation?: VoiceEngineDeletePreparation): Promise<LoadedVoiceEngineRegistry> {
   const { key, raw } = await readVoiceEngineRegistryRaw(userId)
   let parsed: Pick<LoadedVoiceEngineRegistry, 'records' | 'unreadable'>
   try {
     parsed = parseVoiceEngineRegistryStore(key, raw)
   } catch (error) {
+    if (deletePreparation && error instanceof VoiceEngineRegistryUnreadableError) {
+      throw new VoiceEngineDeletePreflightRefusal(deletePreparation, error)
+    }
     if (use === 'write' || !(error instanceof VoiceEngineRegistryUnreadableError)) throw error
     reportRegistryProblem(key, `the saved engine list cannot be read and is kept unchanged: ${error.why}`)
     // No migration either: it would write over the registry.
     return { records: [], unreadable: [], storeProblem: error.why }
   }
   reportUnreadableRecords(key, parsed.unreadable)
-  return migrateLegacyVoiceSettings(userId, { ...parsed, storeProblem: null })
+  return migrateLegacyVoiceSettings(userId, { ...parsed, storeProblem: null }, deletePreparation)
 }
 
 function sortVoiceEngineRecords(records: VoiceEngineRecord[]): VoiceEngineRecord[] {
@@ -1767,8 +1831,52 @@ function unreadableVoiceEngineNotices(registry: LoadedVoiceEngineRegistry): Unre
   ]
 }
 
+/** Existing engine-delete cleanup, using only a corresponding current raw voice/base.
+ * A concurrent unrelated voice edit conflicts at the physical whole-voice fingerprint guard. */
+export async function clearDeletedVoiceEngineAgentProfiles(userId: string, deletedProviderIds: readonly string[]) {
+  const deleted = new Set(deletedProviderIds), clearedAgentIds: string[] = []
+  for (const agent of await redis.getAgents(userId)) {
+    const current = await redis.execute(client => readVoiceEngineClearRecord(client, userId, agent.id))
+    const normalized = normalizeAgentVoiceProfile(current.voiceProfile)
+    if (!normalized || !current.voiceProfile || typeof current.voiceProfile !== 'object' || Array.isArray(current.voiceProfile)) continue
+    const next = { ...current.voiceProfile } as Record<string, unknown>, cleared = new Set<string>()
+    for (const field of ['tts', 'stt', 'realtimeStt'] as const) {
+      const provider = normalized[field]?.providerId
+      if (provider && deleted.has(provider)) { next[field] = {}; cleared.add(field) }
+    }
+    if (!cleared.size) continue
+    const remaining = Object.entries(next).some(([field, value]) => field !== 'schemaVersion' &&
+      !(cleared.has(field) && value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0))
+    await redis.updateAgent(agent.id, { voice_profile: remaining ? next : null } as never,
+      { expectedTtsSelection: current.basis.target.revision, voiceEngineClearBasis: current.basis })
+    clearedAgentIds.push(agent.id)
+  }
+  return clearedAgentIds
+}
+
 export async function listVoiceEngineRecords(userId: string): Promise<VoiceEngineRecord[]> {
   return sortVoiceEngineRecords((await loadRegistry(userId, 'read')).records)
+}
+
+/** A10 configuration snapshot: deliberately bypasses migration, keys, endpoint/status and runtime owners.
+ * `guard` is server-private and must never enter the source DTO or an operation response. */
+export async function readConfiguredVoiceEngineSelectionSource(userId: string) {
+  const key = buildVoiceEngineRegistryKey(userId)
+  const answer = await redis.execute(client => client.eval(`local raw = redis.call('JSON.GET', KEYS[1], '$') or '[]'; if string.len(raw) > 262144 then return {'LIMIT'} end; return {'OK', raw}`, { keys: [key], arguments: [] }))
+  if (!Array.isArray(answer) || answer[0] !== 'OK' || typeof answer[1] !== 'string') throw new Error('voice_engine_source_unavailable')
+  const raw = answer[1] as string
+  const envelope: unknown = JSON.parse(raw)
+  if (!Array.isArray(envelope) || envelope.length > 1) throw new Error('voice_engine_source_unavailable')
+  const parsed = parseVoiceEngineRegistryStore(key, envelope[0])
+  return {
+    guard: { key, path: '$', fingerprint: createHash('sha1').update(raw).digest('hex'), byteLimit: 262144 },
+    complete: parsed.unreadable.length === 0,
+    engines: parsed.records.filter((record, index, records) => !isVoiceEngineHidden(record) && !parsed.unreadable.some(item => item.id === record.id) && records.findIndex(item => item.id === record.id) === index).map(record => ({
+      id: `byo:${record.id}`, label: record.name, enabled: record.enabled !== false, supportsTts: record.supportsTts !== false,
+      model: record.ttsDefaults?.modelId ?? (typeof record.ttsDefaults?.providerOptions?.model === 'string' ? record.ttsDefaults.providerOptions.model : null), voice: record.ttsDefaults?.voiceId ?? null,
+      voices: [...(record.voiceSurface?.voices ?? [])]
+    }))
+  }
 }
 
 /**
@@ -2118,167 +2226,147 @@ export async function deleteVoiceEngineRecord(
   localFiles: VoiceEngineLocalFileCleanupResult
 }> {
   const normalizedId = normalizeVoiceEngineId(engineId)
-  const providerId = `byo:${normalizedId}` as const
-  const registry = await loadRegistry(userId, 'write')
-  assertVoiceEngineRecordReadable(registry, normalizedId)
-  const targetRecord = registry.records.find((record) => record.id === normalizedId)
-  const deleteIds = new Set<string>([normalizedId])
+  const preparation = Object.freeze({ engineId: normalizedId })
+  let configurationOutcome: VoiceEngineDeleteOutcomeReceipt['configurationOutcome'] = 'unknown'
+  try {
+    const providerId = `byo:${normalizedId}` as const
+    const registry = await loadRegistry(userId, 'write', preparation)
+    assertVoiceEngineRecordReadable(registry, normalizedId)
+    const targetRecord = registry.records.find((record) => record.id === normalizedId)
+    const deleteIds = new Set<string>([normalizedId])
 
-  if (targetRecord && !isVoiceEngineHidden(targetRecord)) {
-    const suiteId = getVoiceEngineSuiteId(targetRecord)
-    for (const record of registry.records) {
-      if (record.id === normalizedId) continue
-      if (getVoiceEngineSuiteId(record) !== suiteId) continue
-      if (!isVoiceEngineHidden(record)) continue
-      deleteIds.add(record.id)
-    }
-  }
-
-  const recordsToDelete = registry.records.filter((record) => deleteIds.has(record.id))
-  const deletedProviderIds = Array.from(deleteIds).map((id) => `byo:${id}` as const)
-  const deletedProviderIdSet = new Set<string>(deletedProviderIds)
-  const nextRecords = registry.records.filter((record) => !deleteIds.has(record.id))
-  if (nextRecords.length === registry.records.length) {
-    throw new Error(`Voice engine "${normalizedId}" is not registered.`)
-  }
-
-  await writeVoiceEngineRegistryStore(userId, { records: nextRecords, unreadable: registry.unreadable })
-
-  const settings = await redis.getUserSettings(userId)
-  const normalizedSettings = sanitizeVoiceSettingsForStorage(settings?.voice_settings)
-  let clearedUserDefaults = false
-  const nextSettings: VoiceSettings = {
-    ...normalizedSettings
-  }
-
-  if (nextSettings.tts?.providerId && deletedProviderIdSet.has(nextSettings.tts.providerId)) {
-    nextSettings.tts = {
-      providerId: 'browser'
-    }
-    clearedUserDefaults = true
-  }
-  if (nextSettings.stt?.providerId && deletedProviderIdSet.has(nextSettings.stt.providerId)) {
-    nextSettings.stt = {
-      providerId: 'browser'
-    }
-    clearedUserDefaults = true
-  }
-  if (nextSettings.realtimeStt?.providerId && deletedProviderIdSet.has(nextSettings.realtimeStt.providerId)) {
-    nextSettings.realtimeStt = {
-      providerId: 'browser'
-    }
-    clearedUserDefaults = true
-  }
-  if (nextSettings.ttsEnginePrompts) {
-    const nextPrompts = { ...nextSettings.ttsEnginePrompts }
-    let removedPrompt = false
-    for (const deletedProviderId of deletedProviderIds) {
-      if (deletedProviderId in nextPrompts) {
-        delete nextPrompts[deletedProviderId]
-        removedPrompt = true
+    if (targetRecord && !isVoiceEngineHidden(targetRecord)) {
+      const suiteId = getVoiceEngineSuiteId(targetRecord)
+      for (const record of registry.records) {
+        if (record.id === normalizedId) continue
+        if (getVoiceEngineSuiteId(record) !== suiteId) continue
+        if (!isVoiceEngineHidden(record)) continue
+        deleteIds.add(record.id)
       }
     }
-    if (removedPrompt) {
-      nextSettings.ttsEnginePrompts =
-        Object.keys(nextPrompts).length > 0 ? nextPrompts : undefined
+
+    const recordsToDelete = registry.records.filter((record) => deleteIds.has(record.id))
+    const deletedProviderIds = Array.from(deleteIds).map((id) => `byo:${id}` as const)
+    const deletedProviderIdSet = new Set<string>(deletedProviderIds)
+    const nextRecords = registry.records.filter((record) => !deleteIds.has(record.id))
+    if (nextRecords.length === registry.records.length) {
+      throw new Error(`Voice engine "${normalizedId}" is not registered.`)
+    }
+
+    // Read the complete indexed cohort once, before registry removal. Earlier legacy
+    // migration may already have written, so a refusal still keeps the existing unknown outcome.
+    const profileCleanup = await prepareVoiceProfileCleanup(userId, deletedProviderIds)
+    await writeVoiceEngineRegistryStore(userId, { records: nextRecords, unreadable: registry.unreadable }, preparation)
+
+    const settings = await redis.getUserSettings(userId)
+    const normalizedSettings = sanitizeVoiceSettingsForStorage(settings?.voice_settings)
+    let clearedUserDefaults = false
+    const nextSettings: VoiceSettings = {
+      ...normalizedSettings
+    }
+
+    if (nextSettings.tts?.providerId && deletedProviderIdSet.has(nextSettings.tts.providerId)) {
+      nextSettings.tts = {
+        providerId: 'browser'
+      }
       clearedUserDefaults = true
     }
-  }
-  if (nextSettings.ttsEngineSettings) {
-    const nextTtsEngineSettings = { ...nextSettings.ttsEngineSettings }
-    let removedTtsEngineSettings = false
-    for (const deletedProviderId of deletedProviderIds) {
-      if (deletedProviderId in nextTtsEngineSettings) {
-        delete nextTtsEngineSettings[deletedProviderId]
-        removedTtsEngineSettings = true
+    if (nextSettings.stt?.providerId && deletedProviderIdSet.has(nextSettings.stt.providerId)) {
+      nextSettings.stt = {
+        providerId: 'browser'
+      }
+      clearedUserDefaults = true
+    }
+    if (nextSettings.realtimeStt?.providerId && deletedProviderIdSet.has(nextSettings.realtimeStt.providerId)) {
+      nextSettings.realtimeStt = {
+        providerId: 'browser'
+      }
+      clearedUserDefaults = true
+    }
+    if (nextSettings.ttsEnginePrompts) {
+      const nextPrompts = { ...nextSettings.ttsEnginePrompts }
+      let removedPrompt = false
+      for (const deletedProviderId of deletedProviderIds) {
+        if (deletedProviderId in nextPrompts) {
+          delete nextPrompts[deletedProviderId]
+          removedPrompt = true
+        }
+      }
+      if (removedPrompt) {
+        nextSettings.ttsEnginePrompts =
+          Object.keys(nextPrompts).length > 0 ? nextPrompts : undefined
+        clearedUserDefaults = true
       }
     }
-    if (removedTtsEngineSettings) {
-      nextSettings.ttsEngineSettings =
-        Object.keys(nextTtsEngineSettings).length > 0 ? nextTtsEngineSettings : undefined
-      clearedUserDefaults = true
-    }
-  }
-  if (nextSettings.sttEngineSettings) {
-    const nextSttEngineSettings = { ...nextSettings.sttEngineSettings }
-    let removedSttEngineSettings = false
-    for (const deletedProviderId of deletedProviderIds) {
-      if (deletedProviderId in nextSttEngineSettings) {
-        delete nextSttEngineSettings[deletedProviderId]
-        removedSttEngineSettings = true
+    if (nextSettings.ttsEngineSettings) {
+      const nextTtsEngineSettings = { ...nextSettings.ttsEngineSettings }
+      let removedTtsEngineSettings = false
+      for (const deletedProviderId of deletedProviderIds) {
+        if (deletedProviderId in nextTtsEngineSettings) {
+          delete nextTtsEngineSettings[deletedProviderId]
+          removedTtsEngineSettings = true
+        }
+      }
+      if (removedTtsEngineSettings) {
+        nextSettings.ttsEngineSettings =
+          Object.keys(nextTtsEngineSettings).length > 0 ? nextTtsEngineSettings : undefined
+        clearedUserDefaults = true
       }
     }
-    if (removedSttEngineSettings) {
-      nextSettings.sttEngineSettings =
-        Object.keys(nextSttEngineSettings).length > 0 ? nextSttEngineSettings : undefined
-      clearedUserDefaults = true
+    if (nextSettings.sttEngineSettings) {
+      const nextSttEngineSettings = { ...nextSettings.sttEngineSettings }
+      let removedSttEngineSettings = false
+      for (const deletedProviderId of deletedProviderIds) {
+        if (deletedProviderId in nextSttEngineSettings) {
+          delete nextSttEngineSettings[deletedProviderId]
+          removedSttEngineSettings = true
+        }
+      }
+      if (removedSttEngineSettings) {
+        nextSettings.sttEngineSettings =
+          Object.keys(nextSttEngineSettings).length > 0 ? nextSttEngineSettings : undefined
+        clearedUserDefaults = true
+      }
     }
-  }
 
-  if (clearedUserDefaults) {
-    await redis.updateUserSettings(userId, {
-      voice_settings: nextSettings
-    })
-  }
-
-  const clearedAgentIds: string[] = []
-  const agents = await redis.getAgents(userId)
-  for (const agent of agents) {
-    const voiceProfile = normalizeAgentVoiceProfile(agent.voice_profile)
-    if (!voiceProfile) {
-      continue
+    if (clearedUserDefaults) {
+      try {
+        await redis.updateUserSettings(userId, {
+          voice_settings: nextSettings
+        })
+      } catch (error) {
+        // This exact writer's known refusal is safe only after acknowledged preparation/removal,
+        // before entering the migration-capable agent list or any later cleanup helper.
+        if (error instanceof PresetReferenceWriteError && error.outcome === 'not_written') {
+          configurationOutcome = 'known_settled_partial'
+        }
+        throw error
+      }
     }
-    const nextProfile: AgentVoiceProfile = { ...voiceProfile }
-    let clearedAgentVoice = false
-    if (nextProfile.tts?.providerId && deletedProviderIdSet.has(nextProfile.tts.providerId)) {
-      delete nextProfile.tts
-      clearedAgentVoice = true
+
+    const clearedAgentIds = await clearDeletedVoiceEngineAgentProfiles(userId, deletedProviderIds)
+
+    const { deletedProfileIds: deletedVoiceProfileIds } = await deletePreparedVoiceProfiles(profileCleanup)
+
+    const localFiles = await deleteManagedLocalVoiceEngineFiles(
+      recordsToDelete,
+      options.deleteLocalFiles === true
+    )
+
+    return {
+      deletedEngineId: normalizedId,
+      deletedProviderId: providerId,
+      deletedProviderIds,
+      clearedUserDefaults,
+      clearedAgentIds,
+      deletedVoiceProfileIds,
+      localFiles
     }
-    if (nextProfile.stt?.providerId && deletedProviderIdSet.has(nextProfile.stt.providerId)) {
-      delete nextProfile.stt
-      clearedAgentVoice = true
+  } catch (error) {
+    if (error instanceof VoiceEngineDeletePreflightRefusal && error.preparation === preparation) {
+      configurationOutcome = 'known_no_change'
     }
-    if (
-      nextProfile.realtimeStt?.providerId &&
-      deletedProviderIdSet.has(nextProfile.realtimeStt.providerId)
-    ) {
-      delete nextProfile.realtimeStt
-      clearedAgentVoice = true
-    }
-    if (!clearedAgentVoice) continue
-
-    const hasRemainingProfile =
-      Boolean(nextProfile.tts) ||
-      Boolean(nextProfile.stt) ||
-      Boolean(nextProfile.realtimeStt) ||
-      Boolean(nextProfile.voiceModeInputMode) ||
-      Boolean(nextProfile.voiceSessionRuntime)
-
-    await redis.updateAgent(agent.id, {
-      voice_profile: hasRemainingProfile ? nextProfile : null as any
-    })
-    clearedAgentIds.push(agent.id)
-  }
-
-  const deletedVoiceProfileIds: string[] = []
-  for (const deletedProviderId of deletedProviderIds) {
-    const deletedProfiles = await deleteVoiceProfilesForProvider(userId, deletedProviderId)
-    deletedVoiceProfileIds.push(...deletedProfiles.deletedProfileIds)
-  }
-
-  const localFiles = await deleteManagedLocalVoiceEngineFiles(
-    recordsToDelete,
-    options.deleteLocalFiles === true
-  )
-
-  return {
-    deletedEngineId: normalizedId,
-    deletedProviderId: providerId,
-    deletedProviderIds,
-    clearedUserDefaults,
-    clearedAgentIds,
-    deletedVoiceProfileIds,
-    localFiles
+    throw new VoiceEngineDeleteError(normalizedId, configurationOutcome, error)
   }
 }
 

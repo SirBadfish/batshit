@@ -20,6 +20,10 @@
    * OFF, because DMs create sessions and spend tokens outside the user's view. **May Be
    * Woken** is separate and defaults ON, because it is inert until a sender or a wake-up
    * webhook exists — and a webhook can wake an agent that never sends or receives a DM.
+   *
+   * The DM and schedule tools are Fabric controls, so Agent DMs need the agent's Fabric &
+   * Utilities switch (Josh, 2026-10-24). While it is off the switch is shown as saved but
+   * cannot be changed, and a short note says why; the saved choice is never rewritten.
    */
   interface SenderCandidate {
     id: string
@@ -36,6 +40,8 @@
     wakeEnabled: boolean
     wakeTimeoutMinutes: number | null
     wakeTarget: WakeTarget
+    /** The agent's Fabric & Utilities switch, as the form holds it right now. */
+    fabricUtilitiesEnabled?: boolean
     disabled?: boolean
     onDmsEnabledChange: (enabled: boolean) => void
     onDmSenderScopeChange: (scope: DmSenderScope) => void
@@ -53,6 +59,7 @@
     wakeEnabled,
     wakeTimeoutMinutes,
     wakeTarget,
+    fabricUtilitiesEnabled = true,
     disabled = false,
     onDmsEnabledChange,
     onDmSenderScopeChange,
@@ -61,6 +68,8 @@
     onWakeTimeoutMinutesChange,
     onWakeTargetChange
   }: Props = $props()
+
+  const dmsLocked = $derived(disabled || !fabricUtilitiesEnabled)
 
   const senderScopeLabel = $derived(
     dmSenderScope === 'selected' ? 'Only chosen agents' : 'Any agent'
@@ -119,15 +128,23 @@
         Off by default. An agent with DMs off has no inbox, no DM tools, and no DM instructions in
         its prompt, so turning this on for nobody costs nothing.
       </p>
+      <p>Needs Fabric &amp; Utilities on for this agent, because the DM tools are part of it.</p>
     </SettingsInfoMenu>
   </div>
   <Switch.Root
     checked={dmsEnabled}
-    disabled={disabled}
+    disabled={dmsLocked}
     onCheckedChange={(checked) => onDmsEnabledChange(checked === true)}
     data-testid="agent-dms-enabled-toggle"
   />
 </div>
+
+{#if !fabricUtilitiesEnabled}
+  <p class="batshit-settings-form-help" data-testid="agent-dms-needs-fabric">
+    Needs Fabric &amp; Utilities, which is off for this agent. Your choice is kept and works again
+    when it is back on.
+  </p>
+{/if}
 
 {#if dmsEnabled}
   <div class="batshit-settings-form-row is-child">
@@ -149,7 +166,7 @@
       <Select.Root
         type="single"
         value={dmSenderScope}
-        disabled={disabled}
+        disabled={dmsLocked}
         onValueChange={(value) =>
           onDmSenderScopeChange(
             ((Array.isArray(value) ? value[0] : value) ?? 'all') as DmSenderScope
@@ -182,7 +199,7 @@
           </div>
           <Switch.Root
             checked={dmSenderAgentIds.includes(candidate.id)}
-            disabled={disabled}
+            disabled={dmsLocked}
             onCheckedChange={() => toggleSender(candidate.id)}
             data-testid={`agent-dm-sender-${candidate.id}`}
           />

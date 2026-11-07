@@ -12,6 +12,7 @@
     MemoryEmbeddingDraft,
     MemoryPresetOption
   } from '$lib/components/settings/memory/memoryPanelTypes'
+  import DeletedMemoriesCard from '$lib/components/settings/memory/DeletedMemoriesCard.svelte'
   import MemoryRecordDetail from '$lib/components/settings/memory/MemoryRecordDetail.svelte'
   import MemoryDreamingCard from '$lib/components/settings/memory/MemoryDreamingCard.svelte'
   import EntityAvatar from '$lib/components/avatar/EntityAvatar.svelte'
@@ -47,8 +48,10 @@
   let builtinModels = $state<Array<{ id: string; dims: number }>>([])
   let apiProviders = $state<string[]>(['openai'])
   let presetOptions = $state<MemoryPresetOption[]>([])
+  let presetsState = $state<'loading' | 'ready' | 'unavailable'>('loading')
   let indexMeta = $state<Record<string, any> | null>(null)
   let indexMismatch = $state(false)
+  let indexStatusCurrent = $state(false)
   let configSaving = $state(false)
   let reindexing = $state(false)
   let configError = $state<string | null>(null)
@@ -69,6 +72,10 @@
   let listError = $state<string | null>(null)
   let searchQuery = $state('')
   let includeSuperseded = $state(true)
+  let includeExpired = $state(false)
+  let browseGeneration = 0
+  let awarenessGeneration = 0
+  let detailGeneration = 0
   let selectedMemoryId = $state<string | null>(null)
   let detail = $state<Record<string, any> | null>(null)
   let detailLoading = $state(false)
@@ -132,13 +139,17 @@
   )
 
   async function loadPresetOptions() {
+    presetsState = 'loading'
     try {
       const response = await fetch('/api/user/saved-models')
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const payload = await response.json()
       const rows: Array<Record<string, any>> = Array.isArray(payload)
         ? payload
-        : (payload?.models ?? [])
+        : payload?.models
+      if (!Array.isArray(rows) || rows.some((row) => !row || typeof row !== 'object' || Array.isArray(row) || typeof row.id !== 'string' || !row.id.trim())) {
+        throw new Error('The model preset list could not be read.')
+      }
       presetOptions = rows.map((row) => ({
         id: String(row.id ?? ''),
         modelId: String(row.modelId ?? ''),
@@ -146,9 +157,10 @@
         provider: String(row.provider ?? ''),
         purpose: typeof row.purpose === 'string' ? row.purpose : undefined
       }))
+      presetsState = 'ready'
     } catch (error) {
       console.error('[MemoryPanel] Failed to load model presets:', error)
-      presetOptions = []
+      presetsState = 'unavailable'
     }
   }
 
@@ -176,6 +188,7 @@
 
   async function loadConfig() {
     configLoadBusy = true
+    indexStatusCurrent = false
     try {
       const response = await fetch('/api/memory/config')
       if (!response.ok) throw new Error(`Failed to load memory config (HTTP ${response.status}).`)
@@ -185,6 +198,13 @@
       if (!payload?.embedding) {
         throw new Error('The memory config answer carried no embedding settings.')
       }
+      const meta = payload.indexMeta
+      if (typeof payload.indexMismatch !== 'boolean' || !(meta === null ||
+        meta && typeof meta === 'object' && !Array.isArray(meta) &&
+        typeof meta.embedding_model === 'string' && typeof meta.dims === 'number' &&
+        typeof meta.last_rebuilt_at === 'string')) {
+        throw new Error('The memory config answer carried no readable index status.')
+      }
       hydrateEmbeddingDraft(payload.embedding)
       builtinModels = Array.isArray(payload?.builtinModels) ? payload.builtinModels : []
       apiProviders = Array.isArray(payload?.apiProviders) ? payload.apiProviders : ['openai']
@@ -192,9 +212,12 @@
       indexMismatch = Boolean(payload?.indexMismatch)
       configError = null
       configLoaded = true
+      indexStatusCurrent = true
+      return true
     } catch (error) {
       console.error('[MemoryPanel] Failed to load memory config:', error)
       configError = error instanceof Error ? error.message : 'Failed to load memory config.'
+      return false
     } finally {
       configLoadBusy = false
     }
@@ -291,8 +314,8 @@
       const payload = await response.json().catch(() => null)
       if (!response.ok) throw new Error(payload?.error || `Save failed (HTTP ${response.status}).`)
       toast.success('Memory system configuration saved.')
-      await loadConfig()
-      if (indexMismatch) {
+      const refreshed = await loadConfig()
+      if (refreshed && indexMismatch) {
         toast.info('The embedding model changed. Run Re-Index Memories to finish the switch.')
       }
     } catch (error) {
@@ -326,12 +349,14 @@
   }
 
   async function refreshBrowse() {
+    const generation = ++browseGeneration
     const agentId = selectedAgentId
     if (!agentId) return
     listLoading = true
     listError = null
     try {
       const params = new URLSearchParams({ agentId })
+      params.set('includeExpired', includeExpired ? 'true' : 'false')
       params.set('includeSuperseded', includeSuperseded ? 'true' : 'false')
       const query = searchQuery.trim()
       let rows: Array<Record<string, any>> = []
@@ -340,14 +365,18 @@
         const response = await fetch(`/api/memory/manage/search?${params.toString()}`)
         const payload = await response.json().catch(() => null)
         if (!response.ok) throw new Error(payload?.error || `Search failed (HTTP ${response.status}).`)
-        rows = payload?.results ?? []
+        if (agentId !== selectedAgentId || generation !== browseGeneration) return
+        if (!Array.isArray(payload?.results)) throw new Error('Memory search returned an unreadable list.')
+        rows = payload.results
         listTotal = rows.length
       } else {
         const response = await fetch(`/api/memory/manage/list?${params.toString()}`)
         const payload = await response.json().catch(() => null)
         if (!response.ok) throw new Error(payload?.error || `List failed (HTTP ${response.status}).`)
-        rows = payload?.results ?? []
-        listTotal = payload?.total ?? rows.length
+        if (agentId !== selectedAgentId || generation !== browseGeneration) return
+        if (!Array.isArray(payload?.results) || !Number.isSafeInteger(payload?.total)) throw new Error('Memory browse returned an unreadable list.')
+        rows = payload.results
+        listTotal = payload.total
       }
       listResults = rows
       if (selectedMemoryId && !rows.some((row) => row.id === selectedMemoryId)) {
@@ -355,14 +384,15 @@
         detail = null
       }
     } catch (error) {
+      if (agentId !== selectedAgentId || generation !== browseGeneration) return
       listError = error instanceof Error ? error.message : 'Failed to load memories.'
-      listResults = []
     } finally {
-      listLoading = false
+      if (agentId === selectedAgentId && generation === browseGeneration) listLoading = false
     }
   }
 
   async function refreshAwareness() {
+    const generation = ++awarenessGeneration
     const agentId = selectedAgentId
     if (!agentId) return
     try {
@@ -371,10 +401,13 @@
       )
       const payload = await response.json().catch(() => null)
       if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`)
-      awarenessEntries = payload?.entries ?? []
+      if (agentId !== selectedAgentId || generation !== awarenessGeneration) return
+      if (!Array.isArray(payload?.entries)) throw new Error('Awareness returned an unreadable list.')
+      awarenessEntries = payload.entries
     } catch (error) {
+      if (agentId !== selectedAgentId || generation !== awarenessGeneration) return
       console.error('[MemoryPanel] Failed to load Awareness entries:', error)
-      awarenessEntries = []
+      listError = 'Awareness could not be read. Read the current list before another action.'
     }
   }
 
@@ -401,6 +434,7 @@
   }
 
   async function openDetail(memoryId: string) {
+    const generation = ++detailGeneration
     const agentId = selectedAgentId
     if (!agentId) return
     selectedMemoryId = memoryId
@@ -411,22 +445,26 @@
       )
       const payload = await response.json().catch(() => null)
       if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`)
+      if (agentId !== selectedAgentId || generation !== detailGeneration || selectedMemoryId !== memoryId) return
       detail = payload
     } catch (error) {
+      if (agentId !== selectedAgentId || generation !== detailGeneration) return
       toast.error(error instanceof Error ? error.message : 'Failed to load memory details.')
       detail = null
       selectedMemoryId = null
     } finally {
-      detailLoading = false
+      if (agentId === selectedAgentId && generation === detailGeneration) detailLoading = false
     }
   }
 
-  async function handleDetailChanged() {
+  async function handleDetailChanged(owner?: string, memoryId?: string) {
+    if (owner && (owner !== selectedAgentId || memoryId && memoryId !== selectedMemoryId)) return
     await Promise.all([refreshBrowse(), refreshAwareness()])
     if (selectedMemoryId) await openDetail(selectedMemoryId)
   }
 
-  async function handleDetailDeleted() {
+  async function handleDetailDeleted(owner?: string, memoryId?: string) {
+    if (owner && (owner !== selectedAgentId || memoryId && memoryId !== selectedMemoryId)) return
     selectedMemoryId = null
     detail = null
     await Promise.all([refreshBrowse(), refreshAwareness()])
@@ -520,6 +558,7 @@
           <span class="batshit-settings-form-meta">+{row.trigger_terms.length - 6} more</span>
         {/if}
       {/if}
+      {#if row.expired}<span class="batshit-settings-status-badge">Expired</span>{/if}
       {#if row.superseded}
         <Badge variant="outline" class="batshit-settings-spine-badge">superseded</Badge>
       {/if}
@@ -570,10 +609,13 @@
           {builtinModels}
           {apiProviders}
           presets={presetOptions}
+          {presetsState}
           saving={configSaving}
           {reindexing}
           errorText={configError}
           {indexMismatch}
+          {indexStatusCurrent}
+          statusLoading={configLoadBusy}
           onDraftChange={(next) => (embeddingDraft = next)}
           onSave={handleConfigSave}
           onReindex={handleReindex}
@@ -683,6 +725,10 @@
               }}
             />
             <span class="batshit-settings-form-meta">Show superseded</span>
+          </label>
+          <label class="memory-superseded-toggle">
+            <Switch.Root checked={includeExpired} onCheckedChange={(checked) => { includeExpired = Boolean(checked); void refreshBrowse() }} />
+            <span class="batshit-settings-form-meta">Show expired</span>
           </label>
           <Button size="sm" variant="outline" onclick={() => refreshBrowse()} disabled={listLoading}>
             {searchActive ? 'Search' : 'Apply'}
@@ -832,17 +878,23 @@
             {#if detailLoading}
               <p class="batshit-settings-form-meta">Loading details...</p>
             {:else if detail && selectedMemoryId}
+              {#key `${selectedAgentId}:${selectedMemoryId}`}
               <MemoryRecordDetail
                 agentId={selectedAgentId}
                 detail={detail as never}
                 onChanged={handleDetailChanged}
                 onDeleted={handleDetailDeleted}
               />
+              {/key}
             {:else}
               <p class="batshit-settings-form-meta">Select a memory to view and edit it.</p>
             {/if}
           </div>
         </div>
+
+        {#key selectedAgentId}
+          <DeletedMemoriesCard agentId={selectedAgentId} onChanged={() => { void refreshBrowse(); void refreshAwareness() }} />
+        {/key}
 
         <SettingsAccordionCard name="memory-graduated-history" title="Graduated History" icon={History}>
           {#snippet info()}

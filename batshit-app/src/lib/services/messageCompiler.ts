@@ -3,8 +3,10 @@ import { projectRemovedTextRanges, replaceTextRanges, type TextRange } from '$li
 import { replaceAddressSourceRanges, type PositionedAddressSource } from '$lib/utils/addressSourceRanges'
 import { calculateZipActivation, describeReadCompressHint } from '$lib/utils/zipActivation'
 import { classifyToolResultSize, resolveToolResultPromptTokens, TOOL_RESULT_SIZE_REASON_TEXT, type ToolResultSizeGuard } from '$lib/utils/toolResultSizeGuard'
-import { describeHeldReadHint } from '$lib/utils/zipHoldWords'
-import { DEAD_COPY_REASON_TEXT, type DeadCopyReason, type DeadCopyToolResult } from '$lib/utils/zipDeadCopies'
+import { describeHeldReadHint, SKILL_OPEN_HINT } from '$lib/utils/zipHoldWords'
+import { resolveZipToolNotesEnabled } from '$lib/utils/replyControl'
+import type { DeadCopyReason, DeadCopyToolResult } from '$lib/utils/zipDeadCopies'
+import { readFileReadSource, type FileReadSource } from '$lib/utils/fileReadSource'
 import { canonicalToolName } from '$lib/utils/toolRenderMap'
 import {
   extractAllReferences,
@@ -34,6 +36,7 @@ import {
   escapeStructuredTextContent
 } from '$lib/utils/htmlEntities'
 import { logger } from '$lib/utils/logger'
+import { resolvePreserveReasoning } from '$lib/utils/reasoningRetention'
 import type { ZipStateView } from './zipping'
 import type { AddressSourcePiece } from '$lib/utils/imageAddressOrigin'
 
@@ -111,7 +114,20 @@ export interface ZipCompression {
    * reopened by an `inferred` (Judge Juice) unzip, so the smart-zip lane never offers it.
    */
   deadCopy: DeadCopyReason | null
+  /**
+   * BL-1541: the dead-copy rule is what compressed it (the copy was still open by the automatic
+   * rules when it died), so the Zip Index names it on the turn it died.
+   */
+  deadCopyNamed: boolean
   messagesFromEnd: number
+  /**
+   * SA-137 Round 2: why Refreshed File Reads zipped this Read File copy this turn, for its one
+   * Zipped this turn line: its refreshed body crossed the size guard (`grew`, at that size), or it
+   * could not be refreshed and strict freshness kept it zipped (`not-refreshed`, with the reason).
+   */
+  liveRead?: { kind: 'grew'; tokens: number } | { kind: 'not-refreshed'; reason: string }
+  /** With `liveRead`: the agent whose read it is, when another member's (null for the compiling agent's). */
+  readerAgentId?: string | null
 }
 
 /**
@@ -157,7 +173,7 @@ function resolveMessageAgentId(message?: any): string | null {
  * is only the model-context gate for the agent that authored the response.
  */
 export function buildPreservedReasoningHistory(agent: any, message?: any): string {
-  if (agent?.preserve_reasoning !== true) return ''
+  if (!resolvePreserveReasoning(agent)) return ''
 
   const currentAgentId =
     typeof agent?.id === 'string' && agent.id.trim().length > 0 ? agent.id.trim() : null
@@ -401,11 +417,162 @@ export async function collectDeadCopyToolResults(
         authorId,
         messageIndex: index,
         operationKind: typeof zipData.metadata?.operationKind === 'string' ? zipData.metadata.operationKind : null,
-        payload: parseCoolToolPayload(zipData.content)
+        payload: parseCoolToolPayload(zipData.content),
+        // SA-136: a typed read's verified provenance tells the ledger whether it was whole.
+        fileReadSource: readFileReadSource(zipData.metadata?.fileReadSource)
       })
     }
   }
   return { results, messageIndexByZip }
+}
+
+/**
+ * SA-137 (live file reads): one compile's frozen refresh outcomes by zip state id
+ * (`LiveFileReadTurn`, server). A `refreshed` copy shows `text` (today's file, in the read's own
+ * form, labelled) and is sized by `promptTokens`; any other copy compiles exactly as today.
+ */
+export interface CompileLiveReads {
+  copies: ReadonlyMap<string, { status: 'refreshed'; text: string; parts: AddressSourcePiece[]; promptTokens: number } | { status: 'static'; reason: string }>
+  /**
+   * SA-137 Round 2 (strict freshness, Josh 2026-10-22): a Read File copy of any message but
+   * `replyMessageId` is shown only when refreshed; any other stays zipped this turn, whatever its
+   * Zip Buffer, Zip Hold, Off or an unzip says. Nothing stored changes.
+   */
+  strict?: boolean
+  replyMessageId?: string
+  /**
+   * Every part of the turn's reply (review M1: a context continuation is the same reply under a new
+   * id). When given, it replaces `replyMessageId`.
+   */
+  replyMessageIds?: ReadonlySet<string>
+  /** The reason a copy this snapshot does not name stays zipped (`not-in-replay` on a resume). */
+  missingReason?: string
+}
+
+/** A stored Read File the compile could show this turn (`collectLiveReadCandidates`). */
+export interface CompileLiveReadCandidate {
+  rawZipId: string
+  zipId: string
+  /** Its proven file and form, or null when there is none (it cannot refresh). */
+  source: FileReadSource | null
+  payload: Record<string, any>
+  metadata: Record<string, any>
+  /** The names group sharing tests for this zip, as `compileForAI` tests them. */
+  toolCandidates: Array<string | undefined>
+}
+
+/**
+ * SA-137 Round 2: the one test of a stored Read File copy, for both the candidates and strict
+ * freshness (security review N1): the zip's own `operationKind`, else its payload's (zips older
+ * than the metadata field).
+ */
+export function isStoredReadFileZip(zipData: ZipData | null | undefined, payload?: Record<string, any> | null): boolean {
+  if (!zipData || zipData.type !== 'cool_tool') return false
+  const kind = zipData.metadata?.operationKind
+  if (typeof kind === 'string' && kind) return kind === 'read_file'
+  return (payload ?? parseCoolToolPayload(zipData.content))?.operationKind === 'read_file'
+}
+
+/** The names group sharing tests for a zip (`isToolSharedForGroup`), one list for every reader. */
+function groupShareCandidatesOf(zipData: ZipData): Array<string | undefined> {
+  return [zipData.metadata?.toolName, zipData.metadata?.operationKind, zipData.name]
+    .map((value) => (typeof value === 'string' ? value : undefined))
+}
+
+/**
+ * SA-137 (D6) and Round 2: the provisional candidates of one history pass: every stored Read File
+ * copy of an earlier message that this agent can see (its own, and another member's that group
+ * sharing shows it) and that today's rules would leave open whatever its size (the size guard is
+ * decided again on the refreshed body). The dead-copy rules apply as with the feature off (Josh,
+ * 2026-11-04; D3 amended): a stale or superseded copy is a candidate only where the feature-off
+ * compile keeps it open too (a user Hold, an `Off` row). A copy
+ * with a valid `fileReadSource` of its own message can refresh; one without is listed with a null
+ * source, so strict freshness knows why it stays zipped. Over-including only reads a file that then
+ * stays compressed. Pure apart from the pass's own zip reads.
+ */
+export async function collectLiveReadCandidates(input: {
+  messages: any[]
+  agent: any
+  globalZipSettings?: Record<string, any>
+  zipState: ZipStateView
+  zipResolver: (zipId: string) => Promise<ZipData | null>
+  agentMessagesFromEndByIndex: number[]
+  recoveryHoldByIndex: boolean[]
+  /** The pass's dead copies, exactly as the feature-off compile finds them (Josh, 2026-11-04). */
+  deadCopies: () => Promise<ReadonlyMap<string, CompileDeadCopy>>
+  groupToolSharing?: { currentAgentId?: string | null; sharedTools?: string[] }
+  /** The turn's own reply: its results are never candidates (nothing zips while the agent works). */
+  replyMessageId?: string | null
+  /** Every part of that reply (a context continuation's earlier parts); replaces `replyMessageId`. */
+  replyMessageIds?: ReadonlySet<string> | null
+}): Promise<CompileLiveReadCandidate[]> {
+  const compilingAgentId =
+    input.groupToolSharing?.currentAgentId ?? (typeof input.agent?.id === 'string' ? input.agent.id : null)
+  const sharedTools = Array.isArray(input.groupToolSharing?.sharedTools) ? input.groupToolSharing!.sharedTools : []
+  const described: Array<{ index: number; zip: ExtractedZip; zipId: string; zipData: ZipData; source: FileReadSource | null; payload: Record<string, any> }> = []
+  const seen = new Set<string>()
+  for (let index = 0; index < input.messages.length; index += 1) {
+    const message = input.messages[index]
+    if (message?.role !== 'assistant' || typeof message.content !== 'string' || !message.content) continue
+    if (input.replyMessageIds ? input.replyMessageIds.has(message.id) : input.replyMessageId && message.id === input.replyMessageId) continue
+    const authorId = resolveMessageAgentId(message)
+    for (const zip of listCompilableZips(message.content, message)) {
+      const zipId = normalizeId(zip.id)
+      if (seen.has(zipId)) continue
+      seen.add(zipId)
+      let zipData: ZipData | null = null
+      try {
+        zipData = await input.zipResolver(zip.id)
+      } catch {
+        zipData = null
+      }
+      if (!zipData || zipData.type !== 'cool_tool') continue
+      const payload = parseCoolToolPayload(zipData.content)
+      if (!payload || !isStoredReadFileZip(zipData, payload)) continue
+      // Another member's result reaches this agent only through group sharing (the same rule
+      // `compileForAI` applies); one it cannot see is never a candidate.
+      if (input.groupToolSharing && compilingAgentId && authorId && authorId !== compilingAgentId) {
+        if (!isToolSharedForGroup({ zipType: zipData.type, toolCandidates: groupShareCandidatesOf(zipData) }, sharedTools)) continue
+      }
+      // A descriptor describes only its own reader's read, in the message that stored it.
+      const stored = readFileReadSource(zipData.metadata?.fileReadSource)
+      const source = stored && authorId && stored.owner.agentId === authorId && stored.owner.messageId === message.id ? stored : null
+      described.push({ index, zip, zipId, zipData, source, payload })
+    }
+  }
+  if (described.length === 0) return []
+
+  // A dead copy (superseded, or stale after an edit) closes as it would with the feature off: it is a
+  // candidate only where the feature-off compile keeps it open too (a user Hold, an `Off` row), because
+  // refreshing changes what an open copy says, never what stays open. Never filter by `deadCopies.has`.
+  const deadCopies = await input.deadCopies()
+  const candidates: CompileLiveReadCandidate[] = []
+  for (const { index, zip, zipId, zipData, source, payload } of described) {
+    const toolNameForZip = zipData.metadata?.operationKind || zipData.metadata?.toolName || zipData.name
+    const isUnzipped = input.zipState.isUnzipped(zipId)
+    const unzippedSource = isUnzipped ? input.zipState.getUnzippedInfo(zipId)?.source : undefined
+    // The old stored size decides nothing here (D6): the size guard and the buffer's threshold are
+    // decided on the refreshed body, so a file that shrank can reopen under its original age.
+    const provisionalTokens = 0
+    const activation = calculateZipActivation({
+      zipType: zipData.type,
+      messagesFromEnd: input.agentMessagesFromEndByIndex[index] ?? 0,
+      zipData: { ...zipData, tokens: provisionalTokens, metadata: { ...(zipData.metadata || {}), promptTokens: provisionalTokens, aiTokens: provisionalTokens, tokens: provisionalTokens } },
+      agentSettings: input.agent,
+      globalSettings: input.globalZipSettings,
+      toolName: toolNameForZip,
+      fallbackTokens: provisionalTokens,
+      isUnzipped,
+      isInferredUnzipped: unzippedSource === 'inferred',
+      isRezipped: input.zipState.isRezipped(zipId),
+      recoveryHold: input.recoveryHoldByIndex[index] === true,
+      deadCopy: deadCopies.get(zipId) ?? null,
+      isUserUnzipped: isUnzipped && unzippedSource !== 'agent' && unzippedSource !== 'inferred'
+    })
+    if (activation.shouldCompress) continue
+    candidates.push({ rawZipId: zip.id, zipId, source, payload, metadata: zipData.metadata || {}, toolCandidates: groupShareCandidatesOf(zipData) })
+  }
+  return candidates
 }
 
 /** SA-129 P1: one dead copy as a compile sees it (`findDeadCopies` plus its author's reply count). */
@@ -465,6 +632,12 @@ export async function compileForAI(
      * ignored. A tool result in the appended view is told by the zip index that holds it.
      */
     onDeliveredSource?: (piece: PositionedAddressSource) => void
+    /**
+     * SA-137: this compile's frozen live-read outcomes. A refreshed Read File shows today's file
+     * and is sized by its refreshed transcript; its reference keeps the original size reason (D9).
+     * Absent (the setting off, a preview, a CLI lane), every zip compiles exactly as before.
+     */
+    liveReads?: CompileLiveReads
   }
 ): Promise<string> {
   const zipState: ZipStateView =
@@ -490,6 +663,9 @@ export async function compileForAI(
   // SA-129 P1 (DL-03): the compression hint speaks to the agent this compile is for, so a group
   // compile gives none to another agent's results (they age by that agent's replies).
   const compressHintsForThisAgent = !shouldLimitSharedTools
+  // BL-1785: the last-reply line names Tool Notes only for an agent that has them (one rule with
+  // the reply end, `resolveZipToolNotesEnabled`).
+  const toolNotesEnabled = resolveZipToolNotesEnabled(agent, globalZipSettings)
   // SA-129 P2: the agent this compile is for, which "Held by you" means.
   const compilingAgentId = currentAgentId ?? (typeof agent?.id === 'string' ? agent.id : null)
   const reportDelivered = (piece: PositionedAddressSource) => {
@@ -517,15 +693,25 @@ export async function compileForAI(
       if (!resolvedZipData) {
         continue
       }
-      const zipData = await ensureCoolToolPromptTokens(
+      const storedZipData = await ensureCoolToolPromptTokens(
         zip,
         resolvedZipData,
         fetchImpl,
         options?.zipResolver
       )
-      
+
       // Check if this zip is unzipped by the user
       const checkZipId = normalizeId(zip.id)
+      // SA-137: a refreshed copy is sized by today's transcript for every rule (D6); nothing is stored.
+      const liveCopy = storedZipData.type === 'cool_tool' ? options?.liveReads?.copies.get(checkZipId) : undefined
+      const refreshed = liveCopy?.status === 'refreshed' ? liveCopy : null
+      const zipData: ZipData = refreshed
+        ? {
+            ...storedZipData,
+            tokens: refreshed.promptTokens,
+            metadata: { ...(storedZipData.metadata || {}), tokens: refreshed.promptTokens, promptTokens: refreshed.promptTokens, aiTokens: refreshed.promptTokens }
+          }
+        : storedZipData
       const isUnzipped = zipState.isUnzipped(checkZipId)
       const isRezipped = zipState.isRezipped(checkZipId)
       const messagesFromEnd =
@@ -572,7 +758,28 @@ export async function compileForAI(
           sharedTools
         ) === false
 
-      const shouldCompress = shouldForceCompress ? true : activation.shouldCompress
+      // SA-137 Round 2 (strict freshness): with Refreshed File Reads on, a Read File copy of an
+      // earlier message is shown only when this turn refreshed it; otherwise it stays zipped this
+      // turn whatever its Zip Buffer, Zip Hold, Off or an unzip says. Its zip state is untouched,
+      // so a later turn tries again; the turn's own reply is never touched.
+      const notRefreshedReason =
+        options?.liveReads?.strict === true &&
+        isStoredReadFileZip(zipData) &&
+        !refreshed &&
+        !shouldForceCompress &&
+        !activation.shouldCompress &&
+        !(options.liveReads.replyMessageIds
+          ? options.liveReads.replyMessageIds.has(_message?.id)
+          : options.liveReads.replyMessageId && _message?.id === options.liveReads.replyMessageId)
+          ? liveCopy?.status === 'static' ? liveCopy.reason : options.liveReads.missingReason ?? 'not-refreshable'
+          : null
+      const shouldCompress = shouldForceCompress ? true : activation.shouldCompress || notRefreshedReason !== null
+      // Review S2: "it grew" only for a real transition: the copy as stored was under the size guard
+      // and its refreshed body is not (one already large when read gets no such line).
+      const grewPastGuard = Boolean(
+        refreshed && activation.sizeGuard && !shouldForceCompress &&
+        classifyToolResultSize(resolveToolResultPromptTokens(storedZipData) ?? storedZipData.tokens ?? 0) === null
+      )
       const shouldExpose = !shouldCompress
       const shouldAppend = zipViewMode === 'appended'
 
@@ -581,7 +788,20 @@ export async function compileForAI(
         let expandedContentParts: AddressSourcePiece[] | undefined
 
         // For Cool Tools, we need to handle them specially
-        if (zipData.type === 'cool_tool') {
+        if (zipData.type === 'cool_tool' && refreshed) {
+          // SA-137: the refreshed transcript, frozen for this compile, then the same compression hint.
+          expandedContent = refreshed.text
+          expandedContentParts = [...refreshed.parts]
+          const compressHint = compressHintsForThisAgent
+            ? isUnzipped
+              ? describeHeldReadHint(zipState.getUnzippedInfo(checkZipId), compilingAgentId)
+              : describeReadCompressHint(activation, { isUnzipped, toolNotesEnabled })
+            : null
+          if (compressHint) {
+            expandedContent += `\n${compressHint}`
+            expandedContentParts = [...expandedContentParts, { source: 'agent_words', text: `\n${compressHint}` }]
+          }
+        } else if (zipData.type === 'cool_tool') {
           const parsedPayload = parseCoolToolPayload(zipData.content)
           const rawSidecarZipId = getCoolToolRawSidecarZipId(zipData, parsedPayload)
           const rawSidecarZip =
@@ -602,9 +822,11 @@ export async function compileForAI(
             // since) is never expanded, so it never reaches here.
             const compressHint =
               compressHintsForThisAgent && isReadTranscriptLane(zipData)
-                ? isUnzipped
+                ? zipState.getUnzippedInfo(checkZipId)?.skillSession
+                  ? SKILL_OPEN_HINT
+                  : isUnzipped
                   ? describeHeldReadHint(zipState.getUnzippedInfo(checkZipId), compilingAgentId)
-                  : describeReadCompressHint(activation, { isUnzipped })
+                  : describeReadCompressHint(activation, { isUnzipped, toolNotesEnabled })
                 : null
             if (compressHint) {
               expandedContent += `\n${compressHint}`
@@ -672,23 +894,22 @@ export async function compileForAI(
 
       if (shouldCompress || (shouldAppend && shouldExpose)) {
         const optionalContent = zip.optionalContent || zip.description
-        // SA-129 P1: a copy the dead-copy rule compressed says why after its description.
-        const deadCopyText =
-          shouldCompress && !shouldForceCompress && activation.deadCopy && activation.deadCopyNamed
-            ? DEAD_COPY_REASON_TEXT[activation.deadCopy]
-            : ''
-        // A large result already carried this reference before a later read made it
-        // a dead copy. Keep its size reason stable; activation still reports the
-        // winning rule separately for Holds, UI and Judge Juice.
-        const referenceSize = zipData.type === 'cool_tool' ? classifyToolResultSize(activation.tokens) : null
-        const sizeGuardText = shouldCompress && !shouldForceCompress && referenceSize
+        // BL-1541: history is frozen once written, so a dead copy keeps its plain reference
+        // (the Zip Index says why, on the turn it compresses). A large result carries
+        // its size reason from its first compile; activation still reports the winning rule
+        // separately for Holds, UI and Judge Juice.
+        // SA-137 (D9): a refreshed copy's reference keeps the size reason of the copy as stored.
+        const referenceTokens = refreshed ? (resolveToolResultPromptTokens(storedZipData) ?? storedZipData.tokens ?? 0) : activation.tokens
+        const referenceSize = zipData.type === 'cool_tool' ? classifyToolResultSize(referenceTokens) : null
+        // SA-137 Round 2 (review S1): a copy only strict freshness zipped keeps its plain reference:
+        // its size was not why, and the frozen history must not change with each refresh's outcome.
+        const sizeGuardText = shouldCompress && !shouldForceCompress && notRefreshedReason === null && referenceSize
           ? TOOL_RESULT_SIZE_REASON_TEXT[referenceSize]
           : ''
-        const reasonText = sizeGuardText || deadCopyText
-        const referenceText = reasonText
+        const referenceText = sizeGuardText
           ? optionalContent
-            ? `${optionalContent} - ${reasonText}`
-            : reasonText
+            ? `${optionalContent} - ${sizeGuardText}`
+            : sizeGuardText
           : optionalContent
         const compressedZip = createReference('zip', zip.id, referenceText)
         delivered = replaceAddressSourceRanges(delivered,start,start+zip.length,compressedZip)
@@ -723,7 +944,16 @@ export async function compileForAI(
               rezippedBy: isRezipped ? (zipState.getRezippedSource(checkZipId) ?? 'user') : null,
               groupUnshared: shouldForceCompress,
               deadCopy: activation.deadCopy,
-              messagesFromEnd: activation.messagesFromEnd
+              deadCopyNamed: Boolean(activation.deadCopy && activation.deadCopyNamed && !shouldForceCompress),
+              messagesFromEnd: activation.messagesFromEnd,
+              ...(notRefreshedReason !== null
+                ? { liveRead: { kind: 'not-refreshed' as const, reason: notRefreshedReason } }
+                : grewPastGuard
+                  ? { liveRead: { kind: 'grew' as const, tokens: activation.tokens } }
+                  : {}),
+              ...(notRefreshedReason !== null || grewPastGuard
+                ? { readerAgentId: messageAgentId && messageAgentId !== compilingAgentId ? messageAgentId : null }
+                : {})
             })
           } catch (error) {
             console.error('[compileForAI] onZipCompressed observer threw; ignored:', error)

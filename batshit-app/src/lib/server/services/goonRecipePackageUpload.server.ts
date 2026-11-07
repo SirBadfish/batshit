@@ -17,6 +17,12 @@ const UPLOAD_ATTEMPTS = 2
 type UploadFile = { url: string; filename: string; size?: number }
 type UploadFiles = { package: UploadFile; model: UploadFile; manifest: UploadFile }
 
+export type RecipeArchiveInspection = {
+  contract: 'recipe-archive-inspection/v1'
+  archive: { sha256: string; bytes: number }
+  members: Array<{ role: 'model' | 'manifest'; sha256: string; bytes: number }>
+}
+
 class PermanentUploadError extends Error {}
 
 function record(value: unknown, context: string): Record<string, unknown> {
@@ -24,6 +30,39 @@ function record(value: unknown, context: string): Record<string, unknown> {
     throw new Error(`${context} is missing or malformed.`)
   }
   return value as Record<string, unknown>
+}
+
+/** Ask the authenticated file owner to inspect the actual stored archive. */
+export async function inspectStoredRecipeArchive(filename: string): Promise<RecipeArchiveInspection> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.bgoon$/.test(filename) || filename.includes('..')) {
+    throw new Error('The current Recipe package filename is invalid.')
+  }
+  const response = await fetch(`${getInternalBatshitServerUrl()}/api/upload/goon-custom-package/inspect`, {
+    method: 'POST',
+    headers: { ...getInternalBatshitServerAuthHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename }),
+    signal: AbortSignal.timeout(120_000)
+  })
+  if (!response.ok) throw new Error(`The stored Recipe package could not be inspected (${response.status}).`)
+  const value = record(await response.json(), 'Recipe archive inspection')
+  const archive = record(value.archive, 'Recipe archive inspection archive')
+  const validContent = (row: Record<string, unknown>) =>
+    typeof row.sha256 === 'string' && /^[a-f0-9]{64}$/.test(row.sha256) &&
+    typeof row.bytes === 'number' && Number.isSafeInteger(row.bytes) && row.bytes > 0
+  if (value.contract !== 'recipe-archive-inspection/v1' || !validContent(archive) ||
+      !Array.isArray(value.members) || value.members.length !== 2) {
+    throw new Error('The stored Recipe package inspection is malformed.')
+  }
+  const members = value.members.map((member) => record(member, 'Recipe archive inspection member'))
+  if (members.some((member) => !validContent(member) ||
+      (member.role !== 'model' && member.role !== 'manifest')) ||
+      new Set(members.map((member) => member.role)).size !== 2) {
+    throw new Error('The stored Recipe package inspection members are malformed.')
+  }
+  return { contract: 'recipe-archive-inspection/v1',
+    archive: { sha256: archive.sha256 as string, bytes: archive.bytes as number },
+    members: members.map((member) => ({ role: member.role as 'model' | 'manifest',
+      sha256: member.sha256 as string, bytes: member.bytes as number })) }
 }
 
 function uploadFiles(value: unknown): UploadFiles {

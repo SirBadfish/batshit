@@ -9,7 +9,12 @@
  * - Zips: sessionId-messageId-type-0 → sessionId-messageId-type
  * - Cool Tools: id-cool_tool-0 → id-cool_tool
  * - Clips: clip_timestamp_hash_0 → clip_timestamp_hash
+ *
+ * An id that ends in a whole UUID (`clip_<uuid>`) has no index suffix: its last group is part of
+ * the UUID even when it is all digits (BL-780).
  */
+
+const ENDS_WITH_UUID = /(?:^|[^0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Normalize any Batshit ID by removing index suffixes
@@ -17,12 +22,14 @@
  */
 export function normalizeId(id: string): string {
   if (!id) return id;
-  
+
   // Handle Cool Tools special case (always normalize to -0)
   if (id.includes('-cool_tool-')) {
     return id.replace(/-cool_tool-\d+$/, '-cool_tool-0');
   }
-  
+
+  if (ENDS_WITH_UUID.test(id)) return id;
+
   // Handle regular zips (remove -index at the end)
   // Pattern: anything-number at the end where number is 0-9
   if (id.match(/-\d+$/)) {
@@ -114,7 +121,8 @@ export function parseIdParts(id: string): { baseId: string; index: number } {
   
   // Try to extract index from original ID
   let index = 0;
-  
+  if (ENDS_WITH_UUID.test(id)) return { baseId: normalizedId, index };
+
   // Check for -number pattern
   const dashMatch = id.match(/-(\d+)$/);
   if (dashMatch) {

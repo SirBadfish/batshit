@@ -66,7 +66,7 @@ function launchReason(mode: N8nRuntimeMode) {
   if (mode === 'docker') {
     return 'Docker n8n is opt-in through the n8n Compose profile; the app does not start extra n8n containers from inside Batshit.'
   }
-  return 'Source-checkout n8n startup is owned by the launcher before the app boots, so Admin cannot safely change it after startup.'
+  return 'Start and stop n8n with its launcher or app; this Admin panel only checks the connection.'
 }
 
 export async function getN8nRuntimeStatus(

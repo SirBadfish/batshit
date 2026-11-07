@@ -13,7 +13,7 @@ describe('SA-122 originating API reply signal at the brain/native-tools owner bo
   it('forwards the same server-owned signal when Workers are disabled and keeps its retirement', async () => {
     const controller = new AbortController()
     const brain = new VercelAIBrain() as any
-    await brain.buildToolsForMode3(undefined, undefined, 'sa122_session', 'sa122_user', [], undefined,
+    await brain.buildToolsForMode3('sa122_session', 'sa122_user', [], undefined,
       'sa122_primary', { assignedSubagents: [] }, null, null, 'off', {
         providerSettings: { nativeTools: { fabricEnabled: true, batshitToolsEnabled: true } },
         allowFabricControlTools: true, workersEnabled: false, abortSignal: controller.signal

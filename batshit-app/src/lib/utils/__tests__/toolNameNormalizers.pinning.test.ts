@@ -19,7 +19,6 @@
  *
  * Server-side adapters:
  *   - claudeEventAdapter.ts subagent detection is pinned in claudeEventAdapter.test.ts.
- *   - codexEventAdapter.ts subagent and Dynamic MCP checks are pinned in codexEventAdapter.test.ts.
  *
  * Key asymmetries these pins protect (a naive cleanup would flatten them):
  *   - miss-fallthrough: canonicalToolName returns the ORIGINAL string (case preserved);

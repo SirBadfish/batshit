@@ -8,10 +8,10 @@ Use it when you have a local command you want Batshit agents to call safely and 
 
 - Batshit running locally.
 - A Portable Skill Token with the `CLI Tools` scope.
-- The downloaded `cli-tool-creator` Portable Skill bundle.
+- The `cli-tool-creator` skill from the current complete Batshit plugin.
 - The command, script, or program you want registered.
 
-Download links are listed in [Portable Skill downloads](../reference/portable-skills.md).
+Download the current package from **Settings → Plugins & shit → Plugins → Batshit → Download Plugin**; see [outside-agent setup](portable-skills.md).
 
 ## What the skill is allowed to do
 

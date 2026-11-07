@@ -3,8 +3,6 @@ import type { RequestHandler } from './$types';
 import { env } from '$env/dynamic/private';
 import { apiKeyService } from '$lib/services/apiKey.server';
 import { deleteN8nInstanceToken, N8N_INSTANCE_TOKEN_SERVICE } from '$lib/server/services/n8nInstanceCredential';
-import { syncAgentCodexProfiles } from '$lib/server/services/codexProfileManager';
-import { syncAgentClaudeProfiles } from '$lib/server/services/claudeProfileManager';
 import { pausedPlanAddRefusal, pausedPlanStatuses } from '$lib/server/services/pausedPlans';
 
 function isContainerizedRuntime() {
@@ -249,10 +247,6 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     // Store the API key
     await apiKeyService.store(service, apiKey, userId);
-    if (service === 'n8n_instance_mcp_token') {
-      await syncAgentCodexProfiles(userId);
-      await syncAgentClaudeProfiles(userId);
-    }
 
     // Return masked version
     const masked = await apiKeyService.getMasked(service, userId);
@@ -315,13 +309,6 @@ export const DELETE: RequestHandler = async ({ request, locals }) => {
           success: false,
           error: 'The n8n Instance MCP token was not deleted. Some old copies inside n8n gateways may already be removed. Delete it again.'
         }, { status: 500 });
-      }
-      // The delete is done; a profile sync failure after it must not answer "failed to delete".
-      try {
-        await syncAgentCodexProfiles(userId);
-        await syncAgentClaudeProfiles(userId);
-      } catch (error) {
-        console.error('The n8n Instance MCP token was deleted, but the profile sync after it failed:', error);
       }
       return json({ success: true, service });
     }

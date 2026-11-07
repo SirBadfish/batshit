@@ -15,6 +15,8 @@
     open: boolean
     title: string
     value: string
+    /** Opaque owner snapshot captured with this draft, never refreshed at Save. */
+    baseline?: unknown
     description?: string
     warning?: string
     placeholder?: string
@@ -22,7 +24,7 @@
     readOnly?: boolean
     width?: 'default' | 'medium' | 'large' | 'full'
     saveLabel?: string
-    onSave?: (value: string) => void | Promise<void>
+    onSave?: (value: string, baseline?: unknown) => void | Promise<void>
     onCancel?: () => void
   }
 
@@ -30,6 +32,7 @@
     open = $bindable(),
     title,
     value,
+    baseline,
     description,
     warning,
     placeholder = 'Enter text...',
@@ -48,6 +51,7 @@
   // followed. `null` while the editor is closed. It is what tells an untouched draft (follow a new
   // saved value) from an edited one (keep it, and say the saved value changed).
   let draftBase = $state<string | null>(null)
+  let draftBaseline = $state.raw<unknown>(undefined)
 
   const hasChanges = $derived(editedValue !== value)
   // P1 reads the real editor draft. It never saves, discards or closes this editor.
@@ -55,7 +59,7 @@
   onMount(() => appActionsSettingsScope ? registerAppActionDraft(() => open && (hasChanges || isSaving)) : undefined)
   // Not while this editor's own save is in flight: the panel updates the saved value as part of it.
   const savedValueChangedWhileEditing = $derived(
-    draftBase !== null && !isSaving && value !== draftBase && editedValue !== value
+    draftBase !== null && !isSaving && (value !== draftBase || baseline !== undefined && baseline !== draftBaseline) && editedValue !== value
   )
 
   // BL-816: the draft is taken when the editor OPENS, never on every `value` change. The only
@@ -64,26 +68,31 @@
   $effect(() => {
     const isOpen = open
     const saved = value
+    const savedBaseline = baseline
     untrack(() => {
       if (!isOpen) {
         draftBase = null
+        draftBaseline = undefined
         return
       }
       if (draftBase === null) {
         editedValue = saved
         draftBase = saved
+        draftBaseline = savedBaseline
         saveError = null
         isSaving = false
         return
       }
-      if (saved !== draftBase && editedValue === draftBase) {
+      if (!isSaving && editedValue === draftBase) {
         editedValue = saved
         draftBase = saved
+        draftBaseline = savedBaseline
       }
     })
   })
 
   async function handleSave() {
+    if (isSaving) return
     if (readOnly || !hasChanges || !onSave) {
       open = false
       return
@@ -93,7 +102,9 @@
     isSaving = true
 
     try {
-      await onSave(editedValue)
+      // Preserve the old single-argument contract for editors without a baseline.
+      if (draftBaseline === undefined) await onSave(editedValue)
+      else await onSave(editedValue, draftBaseline)
       open = false
     } catch (error) {
       saveError = error instanceof Error ? error.message : 'Failed to save changes'
@@ -158,8 +169,14 @@
           <div>
             <h5 class="batshit-settings-form-label is-warning">Saved value changed</h5>
             <p class="batshit-settings-caption mt-1">
-              The saved value changed while you were editing. Your text is kept, and saving replaces the
-              saved value with it. Cancel discards your text.
+              {#if baseline !== undefined}
+                The saved value changed while you were editing. Your text is kept. Saving checks the
+                version you opened; read the current instructions and make a new choice if it changed.
+                Cancel discards your text.
+              {:else}
+                The saved value changed while you were editing. Your text is kept, and saving replaces the
+                saved value with it. Cancel discards your text.
+              {/if}
             </p>
           </div>
         </div>

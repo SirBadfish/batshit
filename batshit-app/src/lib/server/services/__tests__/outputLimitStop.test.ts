@@ -32,12 +32,23 @@ describe('outputLimitStop', () => {
     )
   })
 
+  it('a Claude plan reply is told to lower the effort, not to raise a Max Tokens it does not have (SA-139 D7)', () => {
+    expect(describeOutputLimitStop({ outputTokens: 32000, wroteReply: true, claudePlan: true })).toBe(
+      'The model reached its output limit of 32,000 tokens before this reply was finished. Ask the agent to continue, or lower the effort in its model settings, so less of the limit goes to thinking.'
+    )
+    expect(describeOutputLimitStop({ outputTokens: null, wroteReply: false, claudePlan: true })).toBe(
+      'The model reached its output limit before it wrote a reply (its thinking counts toward the limit). Ask again, or lower the effort in its model settings, so less of the limit goes to thinking.'
+    )
+  })
+
   // A wording that the context-exhaustion classifier matched would auto-continue a stop that a
   // fresh run meets again (send-routed re-runs context exhaustion up to three times).
   it('is never read as context exhaustion', () => {
     for (const wroteReply of [true, false]) {
       for (const outputTokens of [65536, null]) {
-        expect(isContextExhaustionError(describeOutputLimitStop({ outputTokens, wroteReply }))).toBe(false)
+        for (const claudePlan of [false, true]) {
+          expect(isContextExhaustionError(describeOutputLimitStop({ outputTokens, wroteReply, claudePlan }))).toBe(false)
+        }
       }
     }
   })

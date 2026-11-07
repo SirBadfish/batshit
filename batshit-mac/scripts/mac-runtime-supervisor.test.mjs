@@ -10,6 +10,8 @@ import test from 'node:test';
 import {
   runtimeFingerprintFiles,
   auditAnchoredProjectReader,
+  auditPackagedSystemBundles,
+  requiredSystemBundleFiles,
   attemptSafeRedisShutdown,
   auditManagedNodeRuntime,
   auditElectronPackage,
@@ -32,6 +34,48 @@ import {
   testPackageFolderRefusal
 } from './mac-runtime-supervisor.mjs';
 import { macPackageIdentity } from './package-mac-app.mjs';
+
+test('the package audit requires all shipped skill entrypoints and core prompt defaults (BL-2060)', async () => {
+  const repo = fileURLToPath(new URL('../../', import.meta.url));
+  const skills = await readdir(join(repo, 'batshit-app/src/lib/server/system-plugins/batshit/skills'), { withFileTypes: true });
+  const prompts = await readdir(join(repo, 'docs/batshit_System_Prompts'), { withFileTypes: true });
+  const laneFiles = [];
+  for (const skill of skills.filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))) {
+    const references = await readdir(join(repo, 'batshit-app/src/lib/server/system-plugins/batshit/skills', skill.name, 'references'));
+    for (const file of references.filter(name => ['native.md', 'outside.md', 'guide-index.md', 'reference-paths.md', 'goon-guide.md'].includes(name))) {
+      laneFiles.push(`batshit-app/build/server/system-plugins/batshit/skills/${skill.name}/references/${file}`);
+    }
+  }
+  const expected = [
+    ...['plugin.json', '.claude-plugin/plugin.json']
+      .map(name => `batshit-app/build/server/system-plugins/batshit/${name}`),
+    ...skills.filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
+      .map(entry => `batshit-app/build/server/system-plugins/batshit/skills/${entry.name}/SKILL.md`),
+    ...laneFiles,
+    ...prompts.filter(entry => entry.isFile() && !entry.name.startsWith('.'))
+      .map(entry => `batshit-app/build/server/docs/batshit_System_Prompts/${entry.name}`)
+  ];
+  assert.deepEqual([...requiredSystemBundleFiles].sort(), expected.sort());
+  const root = await mkdtemp(join(tmpdir(), 'batshit-system-bundle-audit-'));
+  try {
+    assert.equal((await auditPackagedSystemBundles(root)).length, expected.length);
+    for (const file of expected) {
+      await mkdir(dirname(join(root, file)), { recursive: true });
+      await writeFile(join(root, file), 'required bundle content');
+    }
+    assert.deepEqual(await auditPackagedSystemBundles(root), []);
+    const guide = 'batshit-app/build/server/system-plugins/batshit/skills/batshit-guide/SKILL.md';
+    await rm(join(root, guide));
+    assert.deepEqual(await auditPackagedSystemBundles(root), [
+      `Required built-in bundle file is missing, empty, or not a regular file: ${guide}`
+    ]);
+    await writeFile(join(root, guide), '');
+    assert.equal((await auditPackagedSystemBundles(root)).length, 1);
+    await rm(join(root, guide));
+    await mkdir(join(root, guide));
+    assert.equal((await auditPackagedSystemBundles(root)).length, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test('anchored reader package audit pins source content and an executable artifact', async () => {
   const root = await mkdtemp(join(tmpdir(), 'batshit-anchored-reader-audit-'));

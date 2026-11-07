@@ -87,11 +87,28 @@ function ensureBrowserStubs() {
 function installSlashCommandRoutes(initial: StoredCommand) {
   const records = new Map<string, StoredCommand>([[initial.id, initial]])
   const puts: Array<Record<string, any>> = []
+  const pluginPuts: Array<Record<string, any>> = []
+  const plugin = initial.plugin_id ? {
+    id: initial.plugin_id, name: 'Batshit', description: 'Protected built-in skills', version: '1.1.0',
+    revision: 'plugin-probe', builtIn: true, enabled_for_all_agents: false,
+    enabled_agent_ids: [...initial.enabled_agent_ids],
+    skills: [{ commandId: initial.id, skillId: initial.skill_id, name: initial.displayName, invocation: '/batshit:ssacc-notes' }]
+  } : null
 
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
     const method = (init.method ?? 'GET').toUpperCase()
 
+    if (url === '/api/plugins' && method === 'GET') {
+      return jsonResponse({ plugins: plugin ? [structuredClone(plugin)] : [] })
+    }
+    if (plugin && url === `/api/plugins/${plugin.id}` && method === 'PUT') {
+      const body = JSON.parse(String(init.body))
+      pluginPuts.push(body)
+      expect(Object.keys(body)).toEqual(['enabled_for_all_agents'])
+      plugin.enabled_for_all_agents = body.enabled_for_all_agents
+      return jsonResponse({ plugin: structuredClone(plugin) })
+    }
     if (url === '/api/slash-commands' && method === 'GET') {
       return jsonResponse({ slashCommands: [...records.values()].map((record) => structuredClone(record)) })
     }
@@ -108,6 +125,7 @@ function installSlashCommandRoutes(initial: StoredCommand) {
         typeof body.enabled_for_all_agents === 'boolean' ? body.enabled_for_all_agents : record.enabled_for_all_agents
       const next = {
         ...record,
+        ...(typeof body.displayName === 'string' ? { displayName: body.displayName } : {}),
         ...(typeof body.is_active === 'boolean' ? { is_active: body.is_active } : {}),
         ...(body.skill?.trustLevel ? { trust_level: body.skill.trustLevel } : {}),
         enabled_agent_ids: enabledAgentIds,
@@ -119,7 +137,6 @@ function installSlashCommandRoutes(initial: StoredCommand) {
       return jsonResponse({ slashCommand: structuredClone(next) })
     }
     if (url === '/api/agents') return jsonResponse({ agents: [] })
-    if (url.startsWith('/api/slash-commands/cli')) return jsonResponse({ commands: [] })
     if (url.startsWith('/api/skill-sources')) return jsonResponse({ sources: [] })
     if (url.startsWith('/api/icons/library')) return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
     if (method === 'GET') return jsonResponse({})
@@ -128,12 +145,15 @@ function installSlashCommandRoutes(initial: StoredCommand) {
 
   // @ts-expect-error test override
   global.fetch = fetchMock
-  return { records, puts }
+  return { records, puts, plugin, pluginPuts }
 }
 
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function openSkill() {
+  const tab = screen.getByRole('tab', { name: 'Skills', exact: true })
+  await fireEvent.mouseDown(tab)
+  await fireEvent.click(tab)
   const title = await screen.findByText('Ssacc Notes', { selector: '.settings-sidebar-item-title' })
   await fireEvent.click(title.closest('button') as HTMLElement)
   await screen.findByText('Active')
@@ -192,23 +212,68 @@ describe('Skills & Prompts never sends back the per-agent access list it loaded 
     expect(routes.records.get(SKILL_ID)?.enabled_agent_ids).toEqual(['ssacc_new'])
   })
 
-  it('a built-in skill sends only the switch the user changed, never the list or the all-agents flag', async () => {
+  it('a built-in plugin changes package access only, without a legacy member write or a stale named list', async () => {
     const routes = installSlashCommandRoutes(
-      storedSkill({ is_system: true, skill_source: 'system', enabled_agent_ids: ['ssacc_old'] })
+      storedSkill({ is_system: true, skill_source: 'system', plugin_id: 'batshit', enabled_agent_ids: ['ssacc_old'] })
     )
     render(SlashCommandSettingsPanel, { props: { data: { user: { id: USER_ID } } } as any })
-    await openSkill()
+    const enable = await screen.findByRole('switch', { name: 'Enable Batshit for all agents', exact: true })
 
-    // Access took the skill away from ssacc_old after the panel loaded it.
-    const stored = routes.records.get(SKILL_ID) as StoredCommand
-    routes.records.set(SKILL_ID, { ...stored, enabled_agent_ids: [] })
+    // Access changed the package's named list after this view loaded it.
+    routes.plugin!.enabled_agent_ids = []
 
-    await fireEvent.click(statusSwitch())
-    await waitFor(() => expect(routes.puts).toHaveLength(1), { timeout: 3000 })
-    // Longer than the autosave debounce: the save that landed is the only one.
+    await fireEvent.click(enable)
+    await waitFor(() => expect(routes.pluginPuts).toHaveLength(1), { timeout: 3000 })
     await pause(900)
 
-    expect(routes.puts).toEqual([{ is_active: false }])
-    expect(routes.records.get(SKILL_ID)?.enabled_agent_ids).toEqual([])
+    expect(routes.pluginPuts).toEqual([{ enabled_for_all_agents: true }])
+    expect(routes.plugin?.enabled_agent_ids).toEqual([])
+    expect(routes.puts).toEqual([])
+    expect(routes.records.get(SKILL_ID)?.is_active).toBe(true)
+    expect(routes.records.get(SKILL_ID)?.enabled_agent_ids).toEqual(['ssacc_old'])
+  })
+
+  it('a clean mounted editor refreshes external access without autosaving hydration', async () => {
+    const routes = installSlashCommandRoutes(storedSkill())
+    render(SlashCommandSettingsPanel, { props: { data: { user: { id: USER_ID } } } as any })
+    await openSkill()
+    routes.records.set(SKILL_ID, { ...routes.records.get(SKILL_ID)!, enabled_for_all_agents: true })
+    window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated', { detail: { source: 'unknown' } }))
+    const row = screen.getByText('Enable For All Agents', { selector: 'p' }).closest('.batshit-settings-toggle-row') as HTMLElement
+    await waitFor(() => expect(row.querySelector('[role="switch"]')?.getAttribute('aria-checked')).toBe('true'))
+    await pause(750)
+    expect(routes.puts).toEqual([])
+  })
+
+  it('preserves a dirty save flight across external refresh and saves only the actual draft field', async () => {
+    const routes = installSlashCommandRoutes(storedSkill())
+    const baseFetch = global.fetch
+    let release!: () => void
+    const hold = new Promise<void>(resolve => { release = resolve })
+    let writeStarted = false
+    let writeRequests = 0
+    let reads = 0
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/slash-commands') reads += 1
+      if (init?.method === 'PUT') { writeStarted = true; writeRequests += 1; await hold }
+      return baseFetch(input, init)
+    })
+    render(SlashCommandSettingsPanel, { props: { data: { user: { id: USER_ID } } } as any })
+    await openSkill()
+    await fireEvent.input(screen.getByLabelText('Display Name'), { target: { value: 'Local draft' } })
+    await waitFor(() => expect(writeStarted).toBe(true), { timeout: 3000 })
+    const before = reads
+    routes.records.set(SKILL_ID, { ...routes.records.get(SKILL_ID)!, enabled_for_all_agents: true })
+    try {
+      window.dispatchEvent(new CustomEvent('batshit:slash-commands-updated', { detail: { source: 'unknown' } }))
+      await waitFor(() => expect(reads).toBeGreaterThan(before))
+      expect((screen.getByLabelText('Display Name') as HTMLInputElement).value).toBe('Local draft')
+      expect(routes.puts).toEqual([])
+      await pause(750)
+      expect(writeRequests).toBe(1)
+    } finally { release() }
+    await waitFor(() => expect(routes.puts).toEqual([{ displayName: 'Local draft' }]), { timeout: 3000 })
+    await waitFor(() => expect((screen.getByLabelText('Display Name') as HTMLInputElement).value).toBe('Local draft'))
+    expect(routes.records.get(SKILL_ID)?.enabled_for_all_agents).toBe(true)
   })
 })

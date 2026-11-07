@@ -82,27 +82,9 @@ function remapLegacyPath(value) {
   return value
 }
 
-function findCodexExecutable(versionRoot) {
-  const vendorRoot = path.join(versionRoot, 'package', 'vendor')
-  try {
-    for (const entry of fs.readdirSync(vendorRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue
-      const candidate = path.join(vendorRoot, entry.name, 'bin', 'codex')
-      if (exists(candidate)) return candidate
-    }
-  } catch {
-    return null
-  }
-  return null
-}
-
 function findExecutable(runtime, versionRoot, manifest) {
   const candidates = []
   if (runtime === 'claude') candidates.push(path.join(versionRoot, 'package', 'claude'))
-  if (runtime === 'codex') {
-    const codexCandidate = findCodexExecutable(versionRoot)
-    if (codexCandidate) candidates.push(codexCandidate)
-  }
   const remappedManifestPath = remapLegacyPath(manifest?.executablePath)
   if (remappedManifestPath) candidates.push(remappedManifestPath)
 
@@ -117,7 +99,7 @@ function removeShim(shimPath) {
   }
 }
 
-for (const runtime of ['codex', 'claude']) {
+for (const runtime of ['claude']) {
   const runtimeRoot = path.join(cliRoot, runtime)
   if (!fs.existsSync(runtimeRoot)) continue
 

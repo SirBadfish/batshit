@@ -108,7 +108,7 @@ export interface MeasuredStreamTimingInput {
 
 /**
  * SA-093 P7 (DL-093-14): Batshit-measured stream performance for lanes whose
- * runtime does not measure itself — the managed Codex/Claude CLI bridges.
+ * runtime does not measure itself — the managed Claude CLI bridge.
  *
  * Every number is a real wall-clock measurement combined with runtime-reported
  * token counts; nothing here estimates cache behavior from latency. TTFT is

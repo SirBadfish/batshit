@@ -20,7 +20,7 @@
 		name: string
 		role: string | null
 		base: string | null
-		status: 'completed' | 'failed' | 'timed_out'
+		status: 'completed' | 'failed' | 'timed_out' | 'partial'
 		output: string
 		durationMs: number
 		totalTokens: number | null
@@ -54,7 +54,9 @@
 	}
 
 	function readStatus(value: unknown): WorkerRow['status'] {
-		return value === 'completed' || value === 'failed' || value === 'timed_out' ? value : 'failed'
+		return value === 'completed' || value === 'failed' || value === 'timed_out' || value === 'partial'
+			? value
+			: 'failed'
 	}
 
 	const workers = $derived.by<WorkerRow[]>(() => {
@@ -109,6 +111,9 @@
 	function statusLabel(status: WorkerRow['status']): string {
 		if (status === 'completed') return 'Completed'
 		if (status === 'timed_out') return 'Timed out'
+		// Its Subagent's tool-step limit (2026-10-24) or its model's output limit (BL-2356) stopped it;
+		// the result's own note says which.
+		if (status === 'partial') return 'Partial'
 		return 'Failed'
 	}
 </script>
@@ -194,6 +199,10 @@
 	.worker-status[data-status='failed'],
 	.worker-status[data-status='timed_out'] {
 		color: var(--bs-settings-danger, var(--destructive));
+	}
+
+	.worker-status[data-status='partial'] {
+		color: var(--bs-settings-warning, var(--muted-foreground));
 	}
 
 	.worker-output {

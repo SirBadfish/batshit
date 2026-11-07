@@ -51,6 +51,21 @@ export async function upstashKvGet<T>(
   key: string,
   options: UpstashReadOptions = {}
 ): Promise<T | null> {
+  const value = await readUpstashValue(key, options)
+  if (value === null) return null
+  const parsed = maybeParseJson<T>(value)
+  if (parsed === null) throw new Error('Upstash read failed: stored value resolved to null')
+  return parsed
+}
+
+/** Exact stored STRING bytes for catalog publication CAS; no parse/re-serialization. */
+export async function upstashKvGetRaw(key: string, options: UpstashReadOptions = {}): Promise<string | null> {
+  const value = await readUpstashValue(key, options)
+  if (value !== null && typeof value !== 'string') throw new Error('Upstash raw read failed: stored value is not text')
+  return value
+}
+
+async function readUpstashValue(key: string, options: UpstashReadOptions): Promise<unknown> {
   const required = options.required !== false
   const [baseUrl, token] = await Promise.all([
     getBaseUrl(required),
@@ -86,12 +101,29 @@ export async function upstashKvGet<T>(
   if (value === undefined) {
     throw new Error('Upstash read failed: missing result value')
   }
-  if (value === null) return null
-  const parsed = maybeParseJson<T>(value)
-  if (parsed === null) {
-    throw new Error('Upstash read failed: stored value resolved to null')
-  }
-  return parsed
+  return value
+}
+
+/** The published catalog stays untouched if another publisher changed its actual raw snapshot. */
+export const UPSTASH_COMPARE_AND_SET_SCRIPT = `
+local current = redis.call('GET', KEYS[1])
+if ARGV[1] == 'absent' then
+  if current then return 'CHANGED' end
+elseif current ~= ARGV[2] then return 'CHANGED' end
+local written = redis.call('SET', KEYS[1], ARGV[3])
+if type(written) == 'table' and written.ok == 'OK' then return 'OK' end
+return 'UNWRITTEN'
+`
+
+export async function upstashKvSetIfUnchanged(key: string, expectedRaw: string | null, value: unknown,
+  options: UpstashWriteOptions = {}): Promise<boolean> {
+  const serialized = JSON.stringify(value)
+  if (typeof serialized !== 'string') throw new Error('Upstash compare-and-set value has no JSON text')
+  const answer = await upstashKvCommand(['EVAL', UPSTASH_COMPARE_AND_SET_SCRIPT, 1, key,
+    expectedRaw === null ? 'absent' : 'present', expectedRaw ?? '', serialized], options)
+  if (answer === 'OK') return true
+  if (answer === 'CHANGED') return false
+  throw new Error('Upstash compare-and-set did not confirm a catalog write')
 }
 
 export async function upstashKvSet(

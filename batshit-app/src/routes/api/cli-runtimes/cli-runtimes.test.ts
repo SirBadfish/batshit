@@ -1,10 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   getStatus: vi.fn(),
   install: vi.fn(),
   uninstall: vi.fn(),
-  resolveCodex: vi.fn(),
   resolveClaude: vi.fn(),
   incr: vi.fn(),
   expire: vi.fn(),
@@ -19,18 +18,15 @@ vi.mock('$lib/server/services/managedCliInstaller', () => {
     }
   }
   return {
-    MANAGED_CLI_RUNTIME_IDS: ['codex', 'claude'],
+    MANAGED_CLI_RUNTIME_IDS: ['claude'],
     ManagedCliOperationInProgressError,
     getManagedCliInstallStatus: mocks.getStatus,
     installManagedCli: mocks.install,
     uninstallManagedCli: mocks.uninstall,
-    isManagedCliRuntimeId: (value: unknown) => value === 'codex' || value === 'claude',
+    isManagedCliRuntimeId: (value: unknown) => value === 'claude',
   }
 })
 
-vi.mock('$lib/server/services/codexCliStatus', () => ({
-  resolveCodexCliExecutableDetailed: mocks.resolveCodex,
-}))
 vi.mock('$lib/server/services/claudeCliStatus', () => ({
   resolveClaudeCliExecutableDetailed: mocks.resolveClaude,
 }))
@@ -40,6 +36,7 @@ vi.mock('$lib/server/redis', () => ({
 
 import { GET, POST } from './+server'
 import { ManagedCliOperationInProgressError } from '$lib/server/services/managedCliInstaller'
+import { claudeCodeChangeCount } from '$lib/server/services/claudeCodeChanges'
 
 const status = {
   installed: false,
@@ -67,12 +64,12 @@ function request(body: string, contentType = 'application/json', extraHeaders: H
 beforeEach(() => {
   vi.clearAllMocks()
   mocks.getStatus.mockResolvedValue(status)
-  mocks.resolveCodex.mockReturnValue({ executable: '', source: 'not-found' })
   mocks.resolveClaude.mockReturnValue({ executable: '', source: 'not-found' })
   mocks.incr.mockResolvedValue(1)
   mocks.expire.mockResolvedValue(true)
   mocks.ttl.mockResolvedValue(600)
 })
+afterEach(() => { vi.unstubAllEnvs() })
 
 describe('/api/cli-runtimes', () => {
   it('keeps status readable by authenticated users and exposes admin capability', async () => {
@@ -87,13 +84,13 @@ describe('/api/cli-runtimes', () => {
   it('rejects unauthenticated and non-admin mutations before invoking the installer', async () => {
     const unauthenticated = await POST({
       locals: locals(null),
-      request: request('{"runtime":"codex","operation":"install"}'),
+      request: request('{"runtime":"claude","operation":"install"}'),
     } as any)
     expect(unauthenticated.status).toBe(401)
 
     const forbidden = await POST({
       locals: locals(false),
-      request: request('{"runtime":"codex","operation":"install"}'),
+      request: request('{"runtime":"claude","operation":"install"}'),
     } as any)
     expect(forbidden.status).toBe(403)
     expect(mocks.install).not.toHaveBeenCalled()
@@ -121,19 +118,20 @@ describe('/api/cli-runtimes', () => {
   })
 
   it('makes install idempotent, keeps reinstall explicit, and rate-limits mutations', async () => {
+    const changesAtStart = claudeCodeChangeCount()
     const installResponse = await POST({
       locals: locals(true),
-      request: request('{"runtime":"codex","operation":"install"}'),
+      request: request('{"runtime":"claude","operation":"install"}'),
     } as any)
     expect(installResponse.status).toBe(200)
-    expect(mocks.install).toHaveBeenCalledWith('codex', { force: false })
+    expect(mocks.install).toHaveBeenCalledWith('claude', { force: false })
 
     const reinstallResponse = await POST({
       locals: locals(true),
-      request: request('{"runtime":"codex","operation":"reinstall"}'),
+      request: request('{"runtime":"claude","operation":"reinstall"}'),
     } as any)
     expect(reinstallResponse.status).toBe(200)
-    expect(mocks.install).toHaveBeenLastCalledWith('codex', { force: true })
+    expect(mocks.install).toHaveBeenLastCalledWith('claude', { force: true })
 
     mocks.incr.mockResolvedValueOnce(7)
     const limited = await POST({
@@ -143,12 +141,39 @@ describe('/api/cli-runtimes', () => {
     expect(limited.status).toBe(429)
     expect(limited.headers.get('retry-after')).toBe('600')
     expect(mocks.uninstall).not.toHaveBeenCalled()
+
+    // SA-139: only a Claude Code change, even a failed one, makes the Claude plan's shared status read look again:
+    // the install and the reinstall above counted; the rate-limited request did not run, so it did not.
+    const before = claudeCodeChangeCount()
+    expect(before).toBe(changesAtStart + 2)
+    expect((await POST({ locals: locals(true), request: request('{"runtime":"claude","operation":"install"}') } as any)).status).toBe(200)
+    expect(claudeCodeChangeCount()).toBe(before + 1)
+    mocks.uninstall.mockRejectedValueOnce(new Error('uninstall failed'))
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    expect((await POST({ locals: locals(true), request: request('{"runtime":"claude","operation":"uninstall"}') } as any)).status).toBe(500)
+    expect(claudeCodeChangeCount()).toBe(before + 2)
+  })
+
+  // SA-139 R1: Codex CLI was removed; no install, reinstall or uninstall of it runs.
+  it.each(['install', 'reinstall', 'uninstall'])('refuses a Codex CLI %s with 409 codex_cli_retired and runs nothing', async operation => {
+    const changesAtStart = claudeCodeChangeCount()
+    const response = await POST({
+      locals: locals(true),
+      request: request(JSON.stringify({ runtime: 'codex', operation })),
+    } as any)
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toMatchObject({ code: 'codex_cli_retired', error: 'Codex CLI agents were removed from Batshit.' })
+    expect(mocks.install).not.toHaveBeenCalled()
+    expect(mocks.uninstall).not.toHaveBeenCalled()
+    expect(mocks.incr).not.toHaveBeenCalled()
+    // Not a Claude Code change: the Claude plan's shared status read does not look again.
+    expect(claudeCodeChangeCount()).toBe(changesAtStart)
   })
 
   it('returns deterministic 409 operation state for a cross-request conflict', async () => {
     mocks.install.mockRejectedValueOnce(
       new ManagedCliOperationInProgressError({
-        runtime: 'codex',
+        runtime: 'claude',
         operation: 'reinstall',
         phase: 'downloading',
         startedAt: '2026-08-28T00:00:00.000Z',
@@ -156,7 +181,7 @@ describe('/api/cli-runtimes', () => {
     )
     const response = await POST({
       locals: locals(true),
-      request: request('{"runtime":"codex","operation":"install"}'),
+      request: request('{"runtime":"claude","operation":"install"}'),
     } as any)
     expect(response.status).toBe(409)
     await expect(response.json()).resolves.toMatchObject({
@@ -173,28 +198,25 @@ describe('/api/cli-runtimes', () => {
     const path = await import('node:path')
     const dir = await mkdtemp(path.join(os.tmpdir(), 'zccli-bl268-'))
     try {
-      const oldCodex = path.join(dir, 'codex')
-      await writeFile(oldCodex, '#!/bin/sh\necho "codex-cli 0.139.0"\n')
-      await chmod(oldCodex, 0o755)
-      const newClaude = path.join(dir, 'claude')
-      await writeFile(newClaude, '#!/bin/sh\necho "2.1.280 (Claude Code)"\n')
-      await chmod(newClaude, 0o755)
-      mocks.getStatus.mockImplementation(async (runtime: string) => ({
-        ...status,
-        pinnedVersion: runtime === 'codex' ? '0.155.1' : '2.1.185'
-      }))
-      mocks.resolveCodex.mockReturnValue({ executable: oldCodex, source: 'path' })
-      mocks.resolveClaude.mockReturnValue({ executable: newClaude, source: 'well-known' })
+      const claude = path.join(dir, 'claude')
+      await writeFile(claude, '#!/bin/sh\necho "2.1.280 (Claude Code)"\n')
+      await chmod(claude, 0o755)
+      mocks.resolveClaude.mockReturnValue({ executable: claude, source: 'well-known' })
 
-      const response = await GET({ locals: locals(false) } as any)
-      const body = await response.json()
-      expect(body.runtimes.codex.resolution).toMatchObject({
-        version: 'codex-cli 0.139.0',
-        olderThanPinned: true
-      })
-      expect(body.runtimes.claude.resolution).toMatchObject({
+      mocks.getStatus.mockResolvedValue({ ...status, pinnedVersion: '2.1.185' })
+      const current = await (await GET({ locals: locals(false) } as any)).json()
+      // Only the Claude CLI is listed: Codex CLI was removed (SA-139 R1).
+      expect(Object.keys(current.runtimes)).toEqual(['claude'])
+      expect(current.runtimes.claude.resolution).toMatchObject({
         version: '2.1.280 (Claude Code)',
         olderThanPinned: false
+      })
+
+      mocks.getStatus.mockResolvedValue({ ...status, pinnedVersion: '2.1.300' })
+      const older = await (await GET({ locals: locals(false) } as any)).json()
+      expect(older.runtimes.claude.resolution).toMatchObject({
+        version: '2.1.280 (Claude Code)',
+        olderThanPinned: true
       })
     } finally {
       await rm(dir, { recursive: true, force: true })

@@ -18,11 +18,19 @@ import {
   type LiveKitSpeechToSpeechProviderId
 } from '$lib/server/services/liveKitSpeechToSpeechProviders'
 import { resolveUploadUrlForBrowser } from '$lib/server/services/batshitServerUrls'
+import { normalizePrimaryAgentType, retiredPrimaryAgentRefusal, PRIMARY_AGENT_TYPE_RETIRED_CODE } from '$lib/utils/primaryAgentType'
+import { isSubagentCompatibleWithPrimaryAgent } from '$lib/utils/subagentType'
 
 const DEFAULT_TOKEN_TTL_SEC = 10 * 60
 const MIN_TOKEN_TTL_SEC = 60
 const MAX_TOKEN_TTL_SEC = 60 * 60
 const DEFAULT_ROOM_PREFIX = 'batshit-voice'
+
+/** SA-139 R4 (D14): the selected agent is of a removed Primary type; the session route answers 409. */
+export class LiveKitRetiredAgentError extends Error {
+  readonly code = PRIMARY_AGENT_TYPE_RETIRED_CODE
+}
+
 export const DEFAULT_LIVEKIT_AGENT_NAME = 'batshit-livekit-agent'
 const MAX_SPEECH_TO_SPEECH_INSTRUCTIONS_LENGTH = 48_000
 const RESERVED_METADATA_KEYS = new Set([
@@ -419,13 +427,17 @@ async function loadAssignedSubagentsForPrompt(userId: string, agent: AgentRow): 
   const ids = getAssignedSubagentIds(agent)
   if (!ids.length) return []
 
-  const subagents = await Promise.all(
+  const subagents: any[] = await Promise.all(
     ids.map(async (id) => {
       const value = await redis.json.get(`subagent:${id}`).catch(() => null)
       return normalizeAssignedSubagentRecord(value, id)
     })
   )
-  return subagents.filter((subagent): subagent is any => subagent !== null)
+  // Like send-routed's `loadAssignedSubagents`: only Subagents this Primary can use (a stored
+  // assignment of a removed n8n Subagent type is never cleaned, SA-139 R2).
+  const primaryAgentType = normalizePrimaryAgentType(agent)
+  return subagents.filter((subagent) =>
+    subagent !== null && isSubagentCompatibleWithPrimaryAgent(primaryAgentType, subagent))
 }
 
 /**
@@ -456,7 +468,6 @@ async function compileSpeechToSpeechPrimaryInstructions(
     assignedSubagents,
     userId,
     {
-      runtimeFlavor: 'vercel',
       voiceState: {
         stt: true,
         tts: true,
@@ -636,6 +647,12 @@ async function resolveSpeechToSpeechInstructions(
     throw new Error(
       'LiveKit speech-to-speech session could not start because Batshit could not load the selected agent prompt.'
     )
+  }
+  // SA-139 R4 (D14): a retired Primary type never runs, so its session is refused before the
+  // compile, never compiled as an API agent.
+  const retired = retiredPrimaryAgentRefusal(agent)
+  if (retired) {
+    throw new LiveKitRetiredAgentError(`LiveKit speech-to-speech session could not start. ${retired.error} ${retired.details}`)
   }
 
   // Fixed, never trimmed: computed BEFORE compiling so the compile's own budget can reserve

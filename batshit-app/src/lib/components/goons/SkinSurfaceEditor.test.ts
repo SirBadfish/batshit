@@ -144,4 +144,26 @@ describe('SkinSurfaceEditor', () => {
       })
     )
   })
+
+  it('offers the 4096 master for a 2048 canvas and accepts the prepared Base Color', async () => {
+    const base = definition()
+    const contract = { ...base, canvas: { ...base.canvas, width: 2048, height: 2048 } }
+    const upload: SkinSurfaceUploadV1 = {
+      ...normalUpload(contract.definitionSha256), map: 'baseColor',
+      canvas: { width: 2048, height: 2048, colorSpace: 'srgb', flipY: false, encoding: 'rgba8' }
+    }
+    const onChange = vi.fn(), onUpload = vi.fn().mockResolvedValue(upload)
+    render(SkinSurfaceEditor, {
+      definition: contract, valueState: createDefaultSkinAppearanceState(contract), ownerDisplayName: 'Josh',
+      creditDraft: { sourceKind: 'user-authored', externalAuthor: '', externalLicense: '', externalRightsConfirmed: false },
+      onCreditDraftChange: vi.fn(), onChange, onUpload
+    })
+    expect(screen.getByText('2048 × 2048 or 4096 × 4096 · sRGB PNG')).toBeInTheDocument()
+    const file = new File(['master'], 'master.png', { type: 'image/png' })
+    await fireEvent.change(screen.getByLabelText('Choose Base Color Artwork PNG'), { target: { files: [file] } })
+    await waitFor(() => expect(onUpload).toHaveBeenCalledWith('baseColor', file, upload.provenance))
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ surface: expect.objectContaining({
+      baseColor: expect.objectContaining({ mode: 'custom', custom: upload })
+    }) }))
+  })
 })

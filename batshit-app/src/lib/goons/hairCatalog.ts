@@ -1,5 +1,7 @@
 import {
   createHairState,
+  hairAssetMatchesRecipeFit,
+  hairAssetStyleFitKey,
   parseHairRefitSource,
   parseHairState,
   verifyHairAsset,
@@ -18,6 +20,7 @@ export type HairAssetAvailability =
         | 'incompatible-base'
         | 'incompatible-fit'
         | 'stale-fit'
+        | 'ambiguous-fit'
         | 'material-pending'
         | 'motion-upgrade-required'
       selectable: false
@@ -34,6 +37,7 @@ export type HairSelectionCatalogStatus =
 
 export type HairAssetCatalog = {
   assets: HairAssetV1[]
+  retainedBuiltinAssets: HairAssetV1[]
   refitSources: HairRefitSourceV1[]
 }
 
@@ -58,18 +62,45 @@ export async function loadHairAssetCatalog(
     !payload ||
     typeof payload !== 'object' ||
     !Array.isArray((payload as { assets?: unknown }).assets) ||
+    !Array.isArray((payload as { retainedBuiltinAssets?: unknown }).retainedBuiltinAssets) ||
     !Array.isArray((payload as { refitSources?: unknown }).refitSources)
   ) {
     throw new Error('Hair catalog response is invalid.')
   }
-  const responsePayload = payload as { assets: unknown[]; refitSources: unknown[] }
-  const assets = await Promise.all(responsePayload.assets.map((asset) => verifyHairAsset(asset)))
+  const responsePayload = payload as {
+    assets: unknown[]
+    retainedBuiltinAssets: unknown[]
+    refitSources: unknown[]
+  }
+  const [assets, retainedBuiltinAssets] = await Promise.all([
+    Promise.all(responsePayload.assets.map((asset) => verifyHairAsset(asset))),
+    Promise.all(responsePayload.retainedBuiltinAssets.map((asset) => verifyHairAsset(asset)))
+  ])
   const refitSources = responsePayload.refitSources.map((source) => parseHairRefitSource(source))
-  const identities = new Set(assets.map((asset) => `${asset.assetId}@${asset.revisionId}`))
-  if (refitSources.some((source) => !identities.has(`${source.assetId}@${source.revisionId}`))) {
+  const identities = new Set<string>()
+  const builtinCurrentFits = new Set<string>()
+  const builtinStyles = new Set(assets.filter((asset) => asset.sourceClass === 'builtin').map((asset) => asset.assetId))
+  for (const asset of assets.filter((entry) => entry.sourceClass === 'builtin')) {
+    const key = hairAssetStyleFitKey(asset)
+    if (builtinCurrentFits.has(key)) throw new Error('Hair catalog contains ambiguous current fits for one style.')
+    builtinCurrentFits.add(key)
+  }
+  for (const asset of [...assets, ...retainedBuiltinAssets]) {
+    const identity = `${asset.assetId}@${asset.revisionId}`
+    if (identities.has(identity)) throw new Error('Hair catalog contains an ambiguous revision identity.')
+    identities.add(identity)
+    if (asset.sourceClass === 'user' && builtinStyles.has(asset.assetId)) {
+      throw new Error('Hair catalog contains a user style that conflicts with a built-in style.')
+    }
+  }
+  if (retainedBuiltinAssets.some((asset) => asset.sourceClass !== 'builtin' || !builtinStyles.has(asset.assetId))) {
+    throw new Error('Hair catalog contains invalid retained built-in history.')
+  }
+  const selectableIdentities = new Set(assets.map((asset) => `${asset.assetId}@${asset.revisionId}`))
+  if (refitSources.some((source) => !selectableIdentities.has(`${source.assetId}@${source.revisionId}`))) {
     throw new Error('Hair catalog contains an orphaned refit source.')
   }
-  return { assets, refitSources }
+  return { assets, retainedBuiltinAssets, refitSources }
 }
 
 export function resolveHairAssetBrowserUrl(ref: string, batshitServerUrl: string): string {
@@ -125,13 +156,7 @@ export function classifyHairAssetAvailability(
       message: 'This style needs a new fit for this Goon family.'
     }
   }
-  const fit = asset.attachment.fitReceipt
-  if (
-    fit.appearanceDefinitionSha256 !== source.definitionSha256 ||
-    fit.physicalBasisSha256 !== source.physicalBasisSha256 ||
-    fit.topologySha256 !== source.topologySha256 ||
-    fit.skeletonHierarchySha256 !== source.skeletonHierarchySha256
-  ) {
+  if (!hairAssetMatchesRecipeFit(asset, source)) {
     return {
       status: 'stale-fit',
       selectable: false,
@@ -140,6 +165,36 @@ export function classifyHairAssetAvailability(
     }
   }
   return { status: 'ready', selectable: true, label: 'Ready', message: null }
+}
+
+/** A single visible style card resolves only an exact compatible selectable fit. */
+export function projectBuiltinHairStyleCards(
+  assets: readonly HairAssetV1[], source: RecipeSourceIdentity | null
+): Array<{ asset: HairAssetV1; availability: HairAssetAvailability }> {
+  const groups = new Map<string, HairAssetV1[]>()
+  for (const asset of assets) {
+    if (asset.sourceClass !== 'builtin') continue
+    const group = groups.get(asset.assetId) ?? []
+    group.push(asset)
+    groups.set(asset.assetId, group)
+  }
+  return [...groups.values()].map((group): { asset: HairAssetV1; availability: HairAssetAvailability } => {
+    // Display fallback is deterministic and prefers the target's technical
+    // family; it never grants selection without an exact fit.
+    const ordered = [...group].sort((left, right) =>
+      hairAssetStyleFitKey(left).localeCompare(hairAssetStyleFitKey(right)) || left.revisionId.localeCompare(right.revisionId))
+    const compatible = source ? ordered.filter((asset) => hairAssetMatchesRecipeFit(asset, source)) : []
+    if (compatible.length > 1) {
+      return { asset: ordered[0]!, availability: {
+        status: 'ambiguous-fit', selectable: false, label: 'Fit unavailable',
+        message: 'More than one fit matches this Goon. The style cannot be selected until the catalog is corrected.'
+      } }
+    }
+    const sameFamily = source && ordered.find((asset) => asset.compatibility.baseId === source.baseId && asset.compatibility.fitFamily === source.fitFamily)
+    const sameBase = source && ordered.find((asset) => asset.compatibility.baseId === source.baseId)
+    const asset = compatible[0] ?? sameFamily ?? sameBase ?? ordered[0]!
+    return { asset, availability: classifyHairAssetAvailability(asset, source) }
+  })
 }
 
 export function resolveHairSelectionCatalogStatus(

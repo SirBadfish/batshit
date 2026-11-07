@@ -335,7 +335,12 @@
       }
 
       const result = await response.json()
-      const remoteSettings: UserSettingsRow | null = result?.settings ?? null
+      if (!result || typeof result !== 'object' || Array.isArray(result) || result.success === false ||
+        !Object.hasOwn(result, 'settings') || result.settings !== null &&
+        (typeof result.settings !== 'object' || Array.isArray(result.settings))) {
+        throw new Error('User settings response did not include a valid settings record.')
+      }
+      const remoteSettings: UserSettingsRow | null = result.settings
       // The read is the only source: a read that succeeded and found no record opens with the
       // defaults, never with the page's older copy.
       const next = normaliseSettings(remoteSettings)

@@ -1,30 +1,13 @@
 <script lang="ts">
-  import type {
-    SlashCommandDescriptor,
-    SlashCommandScope,
-    SlashCommandSource
-  } from '$lib/types/slashCommands'
+  import type { SlashCommandDescriptor, SlashCommandScope } from '$lib/types/slashCommands'
 
   interface Props {
     options: SlashCommandDescriptor[]
     highlightIndex: number
     onSelect: (option: SlashCommandDescriptor) => void
-    isInvocationCollision: (option: SlashCommandDescriptor) => boolean
   }
 
-  let { options, highlightIndex, onSelect, isInvocationCollision }: Props = $props()
-
-  function getSlashSourceClass(source: SlashCommandSource) {
-    if (source === 'claude') return 'is-claude'
-    if (source === 'codex') return 'is-codex'
-    return 'is-batshit'
-  }
-
-  function getSlashSourceLabel(source: SlashCommandSource) {
-    if (source === 'claude') return 'Claude'
-    if (source === 'codex') return 'Codex'
-    return 'Batshit'
-  }
+  let { options, highlightIndex, onSelect }: Props = $props()
 
   function getSlashScopeLabel(scope?: SlashCommandScope) {
     if (scope === 'project') return 'project'
@@ -42,16 +25,14 @@
         class="chat-autocomplete-option is-slash {index === highlightIndex ? 'is-active' : ''}"
         onclick={() => onSelect(option)}
       >
-        <span class={`chat-slash-source-dot ${getSlashSourceClass(option.source)}`}></span>
+        <span class="chat-slash-source-dot is-batshit"></span>
         <span class="chat-autocomplete-copy">
           <span class="chat-autocomplete-title-row">
             <span class="chat-autocomplete-invocation">{option.invocation}</span>
             {#if option.plugin}
               <span class="chat-autocomplete-plugin">({option.plugin})</span>
             {/if}
-            <span class="chat-autocomplete-pill">
-              {getSlashSourceLabel(option.source)}
-            </span>
+            <span class="chat-autocomplete-pill">Batshit</span>
             {#if option.scope}
               <span class="chat-autocomplete-scope">
                 {getSlashScopeLabel(option.scope)}
@@ -65,13 +46,6 @@
           {:else if option.argumentHint}
             <span class="chat-autocomplete-hint">
               {option.argumentHint}
-            </span>
-          {/if}
-          {#if isInvocationCollision(option)}
-            <span class="chat-autocomplete-warning">
-              {option.source === 'batshit'
-                ? 'Collision: typed slash favors Batshit.'
-                : 'Collision: select this entry to force CLI usage.'}
             </span>
           {/if}
         </span>
@@ -126,14 +100,6 @@
     border-radius: 9999px;
   }
 
-  .chat-slash-source-dot.is-claude {
-    background: oklch(0.68 0.16 48);
-  }
-
-  .chat-slash-source-dot.is-codex {
-    background: oklch(0.62 0.18 250);
-  }
-
   .chat-slash-source-dot.is-batshit {
     background: var(--primary-text);
   }
@@ -181,12 +147,5 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .chat-autocomplete-warning {
-    display: block;
-    margin-top: 0.25rem;
-    color: oklch(0.72 0.12 78);
-    font-size: 0.625rem;
   }
 </style>

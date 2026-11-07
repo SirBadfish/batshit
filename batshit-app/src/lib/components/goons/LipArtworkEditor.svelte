@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { committedColorInput } from '$lib/utils/committedColorInput'
   import { Download, ImagePlus, RotateCcw } from '@lucide/svelte'
   import * as Select from '$lib/components/ui/select'
   import * as Switch from '$lib/components/ui/switch'
@@ -307,7 +308,12 @@
           value={lipArtworkRgbToHex(valueState.tint)}
           aria-label="Lip Color"
           {disabled}
-          oninput={(event) => updateTint((event.currentTarget as HTMLInputElement).value)}
+          use:committedColorInput={{
+            value: lipArtworkRgbToHex(valueState.tint),
+            resetKey: valueState,
+            disabled: disabled,
+            onCommit: (color) => updateTint(color)
+          }}
         />
       </label>
       <label class="lip-artwork-opacity">

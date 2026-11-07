@@ -360,17 +360,14 @@ describe('in-place edits are decided from the command words (Bug Q)', () => {
   it.each([
     // The bug: a quoted script that merely contains the text ` -i `.
     "sed 's/ -i / x /' app.js",
-    "sed -n 's/ -i / x /p' app.js",
     "sed -e 's/ -i / x /' app.js",
     `sed "s/ -i / x /" app.js`,
     "sed 's/ --in-place / x /' app.js",
-    "sed -n '/ -i /p' app.js",
     "sed 's/sed -i/sed/' app.js",
     `sed "s/\\" -i \\"/x/" app.js`,
     // Codex wraps every command in a login shell.
     `/bin/zsh -lc "sed 's/ -i / x /' app.js"`,
     // Long options that are not `--in-place`.
-    "sed --quiet 's/foo/bar/p' app.js",
     "sed --expression='s/foo/bar/' app.js",
     // A comment is not part of the command.
     "cat app.js # later: sed -i s/foo/bar/ app.js"
@@ -381,12 +378,27 @@ describe('in-place edits are decided from the command words (Bug Q)', () => {
     expect(mapped.args.filePath).toBe('app.js')
   })
 
+  // BL-2037 (review N2): `s///p` under -n prints only the lines it changed: a search, never an edit.
+  it.each(["sed -n 's/ -i / x /p' app.js", "sed --quiet 's/foo/bar/p' app.js", "sed -n -- '/x/p' app.js"])(
+    'maps `%s` as a search of app.js, not an edit', (command) => {
+      expect(mapBashCommandToRendererTool(command)).toMatchObject({ toolName: 'batshit_server_search_files', reason: 'read-piped-into-search' })
+    })
+
+  // BL-2037: a `sed -n` that prints by a pattern is a search of app.js, still never an edit.
+  it('keeps `sed -n \'/ -i /p\' app.js` a search of app.js, not an edit', () => {
+    expect(mapBashCommandToRendererTool("sed -n '/ -i /p' app.js")).toMatchObject({
+      toolName: 'batshit_server_search_files',
+      reason: 'read-piped-into-search',
+      args: { path: 'app.js' }
+    })
+  })
+
   it.each([
     // Another command's `-i` next to the letters "sed" or "perl" is not sed's or perl's flag.
     ['grep -i used notes.txt', 'batshit_server_search_files'],
     ['grep -rin perl src', 'batshit_server_search_files'],
     [`grep -rn "sed -i" docs`, 'batshit_server_search_files'],
-    ["sed -n '1,5p' app.js | grep -i foo", 'batshit_server_read_file'],
+    ["sed -n '1,5p' app.js | grep -i foo", 'batshit_server_search_files'],
     // After `--`, a word that starts with `-i` is a file name.
     ['sed -n p -- -important.txt', 'batshit_server_read_file'],
     // A word the shell fills in is sed's or perl's only when its text says so.
@@ -516,24 +528,33 @@ describe("a shell's -c value is its command line, and only a shell's (item 6)", 
  */
 describe('a piped read takes its path from its own stage (item 7)', () => {
   it.each([
-    // How `cat`, `head`, and `tail` were already read.
-    'cat app.js | grep foo',
-    'head app.js | grep foo',
-    'tail -n 3 app.js | grep foo',
-    // sed, the same way.
-    "sed -n '1,5p' app.js | grep -i foo",
+    // sed, the same way as `cat`, `head` and `tail`.
     'sed -n 1,5p app.js | head -3',
     'sed -n 1,5p app.js | head -n 3',
     'sed -n 1,5p app.js | cat -n',
-    'sed -n 1,5p app.js | tail -1',
-    `sed -n "s/x/|/p" app.js | grep y`,
-    'sed -n 1,5p app.js |& grep y',
-    `/bin/zsh -lc "sed -n '1,5p' app.js | grep -i foo"`
+    'sed -n 1,5p app.js | tail -1'
   ])('maps `%s` as a read of app.js', (command) => {
     expect(mapBashCommandToRendererTool(command)).toMatchObject({
       toolName: 'batshit_server_read_file',
       reason: 'read-command',
       args: { filePath: 'app.js', path: 'app.js' }
+    })
+  })
+
+  // BL-2037: the same reads piped into a search print findings, so they are searches of app.js.
+  it.each([
+    'cat app.js | grep foo',
+    'head app.js | grep foo',
+    'tail -n 3 app.js | grep foo',
+    "sed -n '1,5p' app.js | grep -i foo",
+    `sed -n "s/x/|/p" app.js | grep y`,
+    'sed -n 1,5p app.js |& grep y',
+    `/bin/zsh -lc "sed -n '1,5p' app.js | grep -i foo"`
+  ])('maps `%s` as a search of app.js (BL-2037)', (command) => {
+    expect(mapBashCommandToRendererTool(command)).toMatchObject({
+      toolName: 'batshit_server_search_files',
+      reason: 'read-piped-into-search',
+      args: { path: 'app.js' }
     })
   })
 
@@ -543,7 +564,8 @@ describe('a piped read takes its path from its own stage (item 7)', () => {
     `sed -n "s/\\"|/x/p" app.js | grep y`,
     'sed -n /foo\\|bar/p app.js | head -3'
   ])("never splits `%s` at a `|` that is sed's own", (command) => {
-    expect(mapBashCommandToRendererTool(command).args.filePath).toBe('app.js')
+    // BL-2037: each prints search findings (a pattern address or a grep), a search of app.js.
+    expect(mapBashCommandToRendererTool(command).args.path).toBe('app.js')
   })
 })
 
@@ -563,8 +585,6 @@ describe('a sed read ending in an output redirect (BL-13)', () => {
     'sed -n 1,5p app.js &>/dev/null',
     'sed -n 1,5p app.js 2>>/dev/null',
     'sed -n 1,5p app.js 1>&2',
-    // The pipeline case the item-7 fix left a plain command.
-    'sed -n 1,5p app.js 2>&1 | grep y',
     "sed -n '1,5p' app.js 2>/dev/null | head -3",
     // How Codex sends it.
     `/bin/zsh -lc "sed -n '1,5p' app.js 2>/dev/null"`
@@ -573,6 +593,14 @@ describe('a sed read ending in an output redirect (BL-13)', () => {
       toolName: 'batshit_server_read_file',
       reason: 'read-command',
       args: { filePath: 'app.js', path: 'app.js' }
+    })
+  })
+
+  // The pipeline case the item-7 fix left a plain command; BL-2037: its grep makes it a search.
+  it('maps `sed -n 1,5p app.js 2>&1 | grep y` as a search of app.js', () => {
+    expect(mapBashCommandToRendererTool('sed -n 1,5p app.js 2>&1 | grep y')).toMatchObject({
+      toolName: 'batshit_server_search_files',
+      args: { path: 'app.js' }
     })
   })
 
@@ -770,5 +798,43 @@ describe('weekly shell mapping regressions', () => {
   it('decodes escaped quotes in a real Codex wrapper without truncation', () => {
     expect(extractShellCommand('/bin/zsh -lc "rg \\"two words\\" notes.md"'.replaceAll('\\\\', '\\')))
       .toBe('rg "two words" notes.md')
+  })
+})
+
+/**
+ * BL-2037 (Josh, 2026-10-22): a read piped into a search, or a `sed -n` that prints by a pattern,
+ * prints search findings, not the file, so it is a Search Files result and follows Search Files'
+ * zip settings. A read piped only into a line window stays a Read File, and so does a wildcard read
+ * (it prints file text; no refresh can name its files).
+ */
+describe('a read whose output is a search (BL-2037)', () => {
+  it.each([
+    'cat notes.md | grep foo',
+    'cat notes.md | grep -c zzz',
+    'cat -n notes.md | grep TODO',
+    "cat data.json | jq '.name'",
+    "cat notes.md | awk '/x/ {print $1}'",
+    'cat notes.md | rg foo',
+    'cat notes.md | head -50 | grep foo',
+    "sed -n '/TODO/p' notes.md",
+    "sed -n -e '/TODO/,/END/p' notes.md",
+    "cat notes.md | sed -n '/TODO/p'",
+    'cd docs && cat notes.md | egrep "a|b"',
+    'cat list.txt | xargs grep TODO'
+  ])('maps `%s` as Search Files', (command) => {
+    expect(mapBashCommandToRendererTool(command)).toMatchObject({ toolName: 'batshit_server_search_files', reason: 'read-piped-into-search' })
+    expect(mapBashCommandToMode4Tool(command).toolName).toBe('batshit_server_search_files')
+  })
+
+  it.each([
+    ['cat notes.md', 'notes.md'],
+    ['cat notes.md | head -20', 'notes.md'],
+    ["sed -n '2,5p' notes.md", 'notes.md'],
+    ["sed 's/a/b/' notes.md", 'notes.md'],
+    ["sed -n '2,5p' notes.md | tail -2", 'notes.md'],
+    ['cat src/*.js', 'src/*.js'],
+    ['cat notes.md | wc -l', 'notes.md']
+  ])('keeps `%s` a Read File', (command, filePath) => {
+    expect(mapBashCommandToRendererTool(command)).toMatchObject({ toolName: 'batshit_server_read_file', reason: 'read-command', args: { filePath } })
   })
 })

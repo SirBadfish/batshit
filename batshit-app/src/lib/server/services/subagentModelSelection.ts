@@ -5,11 +5,14 @@ import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
 import { buildRuntimeModelSettings, type RuntimeModelSettings } from '$lib/utils/modelSettingsMapper'
 import { resolveModelIds } from '$lib/utils/modelIdResolver'
 import { loadRuntimeModelPreset } from './runtimeModelPreset'
+import { namesClaudeCliModel } from '$lib/utils/cliRuntimeIdentity'
 
 export class SubagentModelSelectionError extends Error {
-  readonly code = 'subagent_model_connection_missing'
-
-  constructor(message: string) {
+  constructor(
+    message: string,
+    /** SA-139 R5: `subagent_model_preset_retired` is a kept leftover Claude Code CLI preset. */
+    readonly code: 'subagent_model_connection_missing' | 'subagent_model_preset_retired' = 'subagent_model_connection_missing',
+  ) {
     super(message)
     this.name = 'SubagentModelSelectionError'
   }
@@ -89,7 +92,7 @@ export async function resolveApiSubagentModel(input: {
   if (!ownModel) {
     const parentModelId = input.parentModelId?.trim() ?? ''
     if (!parentModelId) {
-      throw new Error('API Subagent needs a model selection or a parent model to inherit.')
+      throw new Error('This Subagent needs a model selection or a parent model to inherit.')
     }
     return {
       modelId: parentModelId,
@@ -112,6 +115,15 @@ export async function resolveApiSubagentModel(input: {
   }
 
   const preset = await loadRuntimeModelPreset(presetId, 'Subagent')
+  // SA-139 R5: a record that still keeps a leftover Claude Code CLI preset (an older save or a
+  // restored backup) is refused readably here, before its run reaches a provider.
+  if (preset && namesClaudeCliModel({ primary_model_provider: preset.provider, primary_model_name: preset.modelId, primary_model_connection: preset.connection })) {
+    const name = subagent.displayName?.trim() || 'This Subagent'
+    throw new SubagentModelSelectionError(
+      `${name}'s model is a Claude Code CLI preset, which Batshit no longer runs. Open Settings → Agents → ${name} and pick another model, for example a Claude plan model.`,
+      'subagent_model_preset_retired',
+    )
+  }
   const selection = resolveRuntimeModelSelection({
     preset,
     presetId,

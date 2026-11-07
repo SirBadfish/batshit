@@ -92,6 +92,7 @@ describe('Goon quick controls', () => {
       ])
     )
     const closetOptions = projection?.closet.groups.flatMap((group) => group.options) ?? []
+    expect(closetOptions.some(option => option.action.kind === 'slot' && option.action.value === 'jacket')).toBe(true)
     expect(closetOptions).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ action: { kind: 'outfit', outfitId: 'evening' }, current: true }),

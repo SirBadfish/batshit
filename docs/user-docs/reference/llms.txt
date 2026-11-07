@@ -15,8 +15,8 @@ Project:
 - Brand: Batshit trademarks/brand assets are separate from the AGPL code license.
 
 Canonical terms:
-- Primary Agents: API, CLI.
-- Subagents: API Subagents, CLI Subagents, n8n Workflow Subagents.
+- Primary Agents: one kind, on any model connection (API key, Local AI, ChatGPT plan, Claude plan). The Codex CLI and Claude Code CLI agent lanes were removed.
+- Subagents: one kind, on any model connection, the Claude plan included; Workers are throwaway helpers. The Claude Code CLI and Codex CLI Subagents and the n8n Workflow Subagent were removed.
 - Batshit-original concepts (little or no outside equivalent; teach from zero): Zips, Clips, Tool Grid, DCM (Dynamic Current Message), Schema Hints, Group Chat single-speaker queue, Execution Viewer, Artifact Zones, Goons/Goon Dock, Memory & Infinite Sessions (Awareness/STM/LTM lanes, episodes, naps, dreaming).
 - Do not use retired numbered primary-agent labels or describe n8n as a Primary Agent type.
 - Use Batshit in prose. All-caps brand spelling appears only inside literal env var names.
@@ -24,7 +24,7 @@ Canonical terms:
 
 UserDocs information architecture:
 - Pages are grouped by subject/feature, not by document type. Each subject owns its own folder.
-- Install-first: Installation and Providers come first, then Security & trust, then the feature subjects, then Chat, Admin, Resources, Troubleshooting, and Reference.
+- Install-first: Installation and Providers come first, then Security & trust, then the feature subjects, then Chat, Admin, Troubleshooting, and Reference.
 
 Current UserDocs entry points (subject folders):
 - docs/user-docs/README.md
@@ -45,7 +45,6 @@ Current UserDocs entry points (subject folders):
 - docs/user-docs/local-ai/
 - docs/user-docs/admin/
 - docs/user-docs/chat/
-- docs/user-docs/resources/
 - docs/user-docs/troubleshooting/
 - docs/user-docs/reference/ports-and-urls.md
 - docs/user-docs/reference/env-vars.md
@@ -83,8 +82,7 @@ Docker core:
 n8n:
 - n8n workflows and credentials stay in n8n.
 - Batshit Settings API keys are not copied into n8n provider credentials.
-- Current official Batshit n8n Native Tools use scoped `x-batshit-native-tool-token`.
-- Current public-safe n8n templates live in docs/user-docs/user-templates/batshit-official-n8n-workflow-templates/.
+- The current public-safe n8n template (wake an agent on a schedule) lives in docs/user-docs/user-templates/batshit-official-n8n-workflow-templates/.
 
 Portable Skills:
 - Portable Skills are Batshit system-skill bundles installed into outside coding agents.

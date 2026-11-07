@@ -25,6 +25,7 @@ vi.mock('node:os', async (importOriginal) => {
   if (!testHome.current) {
     testHome.current = nodePath.join(real.tmpdir(), `batshit-backup-host-home-${process.pid}-${Date.now()}`)
   }
+  vi.stubEnv('BATSHIT_HOME_DIR', nodePath.join(testHome.current, '.batshit'))
   const homedir = () => testHome.current
   return { ...real, homedir, default: { ...real, homedir } }
 })
@@ -84,6 +85,7 @@ afterAll(async () => {
 beforeEach(async () => {
   // `systemSlashCommands.resolveUserSkillDir` reads `process.env.HOME`, not `os.homedir()`.
   vi.stubEnv('HOME', testHome.current)
+  vi.stubEnv('BATSHIT_HOME_DIR', path.join(testHome.current, '.batshit'))
   vi.stubEnv('BATSHIT_TOKEN', 'backup-host-files-test-token')
   vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
     expect(url).toMatch(/\/api\/upload\/asset-maintenance\/(begin|end)$/)
@@ -216,6 +218,20 @@ async function stage(bytes: Uint8Array, userId: string) {
 }
 
 describe('host files in the backup (BL-373, BL-369)', () => {
+  it.each([false, true])('excludes a credential hardlink in an allowed skill folder (includeSecrets=%s)', async includeSecrets => {
+    const data = path.join(testHome.current, 'synthetic-mac-data'), config = path.join(data, 'config')
+    await fs.mkdir(config, { recursive: true })
+    const secret = path.join(config, 'runtime.env')
+    await fs.writeFile(secret, 'HOST_FILE_CREDENTIAL_SENTINEL')
+    vi.stubEnv('BATSHIT_RUNTIME_OWNER', 'mac-app'); vi.stubEnv('BATSHIT_CONTAINERIZED', '0'); vi.stubEnv('BATSHIT_MAC_DATA_DIR', data)
+    await seedSkill('source', 'zc_intruder', { 'SKILL.md': 'safe skill metadata' })
+    await fs.link(secret, path.join(SKILLS(), 'zc_intruder', 'hidden-key.txt'))
+    const bundle = await createBackupBundle('source', { includeSecrets })
+    const entries = entriesOf(bundle.bytes)
+    expect(Object.keys(entries).some(name => name.startsWith('files/host/skills/zc_intruder/'))).toBe(false)
+    expect(Object.values(entries).map(bytes => Buffer.from(bytes).toString('utf8')).join('\n')).not.toContain('HOST_FILE_CREDENTIAL_SENTINEL')
+    expect(manifestOf(bundle.bytes).hostFiles.notCarried).toContainEqual(expect.objectContaining({ folder: 'zc_intruder', reason: 'unreadable' }))
+  })
   it("carries a user skill's folder and a clone voice's recording, never a built-in skill", async () => {
     await seedSkill('source', 'zc_notes', {
       'SKILL.md': '---\nname: zc-notes\n---\n# Notes\n',

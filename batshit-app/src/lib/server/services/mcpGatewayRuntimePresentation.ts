@@ -1,3 +1,5 @@
+import type { SettingsLifecycleSnapshot } from './appActions/settings/lifecycle'
+import { humanGatewaySourceRevision } from './mcpGatewayService'
 import { env } from '$env/dynamic/private'
 import type { MCPGateway } from '$lib/types/database'
 import { buildDockerGatewayUpstreamUrl } from './dockerGatewayConfig'
@@ -68,8 +70,10 @@ export const redactGatewaySecretsForBrowser = (gateway: MCPGateway): MCPGateway 
 }
 
 /** What a gateway route answers: the runtime presentation, then the browser redaction. */
-export const presentMcpGatewayForBrowser = (gateway: MCPGateway): MCPGateway =>
-  redactGatewaySecretsForBrowser(decorateMcpGatewayForRuntime(gateway))
+export const presentMcpGatewayForBrowser = (gateway: MCPGateway, userId?: string, lifecycle?: SettingsLifecycleSnapshot): MCPGateway & { sourceRevision?: string } => {
+  const sourceRevision = userId && lifecycle ? humanGatewaySourceRevision(userId, gateway, lifecycle) : undefined
+  return { ...redactGatewaySecretsForBrowser(decorateMcpGatewayForRuntime(gateway)), ...(sourceRevision ? { sourceRevision } : {}) }
+}
 
-export const presentMcpGatewaysForBrowser = (gateways: MCPGateway[]): MCPGateway[] =>
-  gateways.map(presentMcpGatewayForBrowser)
+export const presentMcpGatewaysForBrowser = (gateways: MCPGateway[], userId?: string, lifecycle?: SettingsLifecycleSnapshot): Array<MCPGateway & { sourceRevision?: string }> =>
+  gateways.map(gateway => presentMcpGatewayForBrowser(gateway, userId, lifecycle))

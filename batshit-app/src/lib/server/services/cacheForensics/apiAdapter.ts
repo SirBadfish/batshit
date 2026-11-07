@@ -7,6 +7,8 @@ import type {
   CacheForensicsSegmentType,
 } from '$lib/types/cacheForensics'
 import {
+  COMPILED_HISTORY_CLOSE,
+  COMPILED_HISTORY_OPEN,
   COMPILED_STANDING_MEDIA_OPEN,
   COMPILED_TEXT_PART_TYPES,
   compiledTextPartValue,
@@ -97,6 +99,30 @@ function responsesInputNameSuffix(element: unknown): string {
  * boundary scan needs the TYPE test alone (a malformed text part still ends
  * the leading image run), so it cannot use `compiledTextPartValue`.
  */
+// History cache blocks (2026-10-21): on direct Anthropic, OpenRouter with a Claude model or an OpenAI
+// GPT-5.6+ model, and direct OpenAI on GPT-5.6 and later (BL-1991, Responses `input_text` parts) the
+// cache policy sends the compiled chat as one text part per history turn plus a tail part
+// (`splitCompiledHistoryText`).
+// Joined, they are the one compiled text, so the run is joined back here and segments as it always has.
+function joinSplitCompiledHistory(content: unknown[]): unknown[] {
+  const start = content.findIndex((part) => {
+    const text = compiledTextPartValue(part)
+    return text !== null && text.startsWith(COMPILED_HISTORY_OPEN) && !text.includes(COMPILED_HISTORY_CLOSE)
+  })
+  if (start === -1) return content
+  let end = start + 1
+  while (end < content.length) {
+    const text = compiledTextPartValue(content[end])
+    if (text === null) return content
+    if (text.startsWith(COMPILED_HISTORY_CLOSE)) break
+    end += 1
+  }
+  if (end >= content.length) return content
+  const joined = content.slice(start, end + 1).map((part) => compiledTextPartValue(part)).join('')
+  const type = (content[start] as Record<string, unknown>).type
+  return [...content.slice(0, start), { type, text: joined }, ...content.slice(end + 1)]
+}
+
 function isCompiledTextPartType(part: unknown): boolean {
   const partType =
     part && typeof part === 'object' ? (part as Record<string, unknown>).type : undefined
@@ -122,13 +148,14 @@ function expandMessageElement(
   const single: CacheForensicsSegmentInput[] = [{ type, label, content: element ?? null }]
   if (!element || typeof element !== 'object') return single
 
-  const content = (element as Record<string, unknown>).content
+  const rawContent = (element as Record<string, unknown>).content
 
-  if (typeof content === 'string') {
-    return segmentCompiledUserMessage(content, label) ?? single
+  if (typeof rawContent === 'string') {
+    return segmentCompiledUserMessage(rawContent, label) ?? single
   }
 
-  if (Array.isArray(content)) {
+  if (Array.isArray(rawContent)) {
+    const content = joinSplitCompiledHistory(rawContent)
     const expanded: CacheForensicsSegmentInput[] = []
     let splitAnyPart = false
     let startIndex = 0

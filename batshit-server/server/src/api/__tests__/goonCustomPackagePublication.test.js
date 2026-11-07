@@ -3,6 +3,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const express = require('express');
+const { zipSync, strToU8 } = require('fflate');
 
 const mockUploadRoot = path.join(os.tmpdir(), `batshit-recipe-publication-${process.pid}-${Date.now()}`);
 jest.mock('../../config', () => ({ uploadsDir: mockUploadRoot }));
@@ -196,6 +197,14 @@ async function uploadArchive(marker) {
   return { status: response.status, body: await response.json() };
 }
 
+async function inspectPackage(filename) {
+  const response = await fetch(`${baseUrl}/api/upload/goon-custom-package/inspect`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ filename })
+  });
+  return { status: response.status, body: await response.json() };
+}
+
 async function reserveAsset(uploadType, filename) {
   const response = await fetch(`${baseUrl}/api/upload/asset-deletion/reserve`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -227,6 +236,151 @@ async function waitFor(predicate) {
   }
   throw new Error('Timed out waiting for concurrent upload state');
 }
+
+test('inspection measures stored package members and removes only its temporary output', async () => {
+  const upload = await uploadArchive('inspect');
+  const filename = upload.body.files.package.filename;
+  const result = await inspectPackage(filename);
+  expect(result.status).toBe(200);
+  expect(result.body).toMatchObject({
+    contract: 'recipe-archive-inspection/v1',
+    archive: { sha256: upload.body.files.package.sha256, bytes: upload.body.files.package.size }
+  });
+  expect(result.body.members).toEqual(expect.arrayContaining([
+    { role: 'model', sha256: modelHash, bytes: modelBytes.length },
+    { role: 'manifest', sha256: manifestHash, bytes: manifestBytes.length }
+  ]));
+  expect((await fs.readdir(path.join(mockUploadRoot, '_tmp'))).filter(name => name.startsWith('recipe-inspect-'))).toEqual([]);
+  expect(records.size).toBe(3);
+});
+
+test('the real file-service extractor inspects a compressed uploaded archive', async () => {
+  const actual = jest.requireActual('../../services/goonRecipeArchiveService');
+  recipeArchiveService.inspectAndExtractRecipeArchive.mockImplementation(actual.inspectAndExtractRecipeArchive);
+  const model = crypto.randomBytes(256);
+  model.write('glTF', 0, 'ascii');
+  const manifest = strToU8('{"name":"Compressed Source"}');
+  const archive = zipSync({ 'avatar.glb': model, 'avatar.json': manifest }, { level: 6 });
+  const form = new FormData();
+  form.append('file', new Blob([archive]), 'compressed.bgoon');
+  const response = await fetch(`${baseUrl}/api/upload/goon-custom-package`, { method: 'POST', body: form });
+  expect(response.status).toBe(200);
+  const uploaded = await response.json();
+  const inspected = await inspectPackage(uploaded.files.package.filename);
+  expect(inspected.status).toBe(200);
+  expect(inspected.body.archive).toEqual({ sha256: sha256(archive), bytes: archive.length });
+  expect(inspected.body.members).toEqual(expect.arrayContaining([
+    { role: 'model', sha256: sha256(model), bytes: model.length },
+    { role: 'manifest', sha256: sha256(manifest), bytes: manifest.length }
+  ]));
+  expect((await fs.readdir(path.join(mockUploadRoot, '_tmp'))).filter(name => name.startsWith('recipe-inspect-'))).toEqual([]);
+});
+
+test('inspection refuses unsafe names and missing records, preserves a restored path, and rejects symlinked files', async () => {
+  const upload = await uploadArchive('inspect-negative');
+  const filename = upload.body.files.package.filename;
+  expect((await inspectPackage('../escape.bgoon')).status).toBe(400);
+  expect((await inspectPackage('missing.bgoon')).status).toBe(400);
+  const key = `upload:goon_custom_packages:${filename}`;
+  const original = records.get(key);
+  const originalPath = path.join(mockUploadRoot, 'goon_custom_packages', filename);
+  const sourcePath = path.join(mockUploadRoot, 'restored', filename);
+  await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+  await fs.rename(originalPath, sourcePath);
+  records.set(key, { ...original, relativePath: `restored/${filename}`, filePath: sourcePath });
+  expect((await inspectPackage(filename)).status).toBe(200);
+  records.set(key, { ...original, relativePath: `restored/${filename}`, filePath: sourcePath, sha256: '0'.repeat(64) });
+  expect((await inspectPackage(filename)).status).toBe(400);
+  const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-inspection-outside-'));
+  try {
+    await fs.copyFile(sourcePath, path.join(outsideRoot, filename));
+    await fs.symlink(outsideRoot, path.join(mockUploadRoot, 'escape'), 'dir');
+    records.set(key, { ...original, relativePath: `escape/${filename}` });
+    expect((await inspectPackage(filename)).status).toBe(400);
+  } finally {
+    await fs.rm(outsideRoot, { recursive: true, force: true });
+  }
+  records.set(key, { ...original, relativePath: `restored/${filename}`, filePath: sourcePath });
+  const movedPath = path.join(mockUploadRoot, 'moved.bgoon');
+  await fs.rename(sourcePath, movedPath);
+  await fs.symlink(movedPath, sourcePath);
+  expect((await inspectPackage(filename)).status).toBe(400);
+  expect(await fs.readFile(movedPath)).toEqual(Buffer.from('PK\x03\x04inspect-negative'));
+});
+
+test('inspection holds deletion and restore exclusion through extraction and cleanup', async () => {
+  const upload = await uploadArchive('inspect-race');
+  const filename = upload.body.files.package.filename;
+  const original = recipeArchiveService.inspectAndExtractRecipeArchive.getMockImplementation();
+  let entered;
+  let release;
+  const reached = new Promise(resolve => { entered = resolve; });
+  const hold = new Promise(resolve => { release = resolve; });
+  recipeArchiveService.inspectAndExtractRecipeArchive.mockImplementation(async (input) => {
+    const result = await original(input);
+    if (input.archiveHandle) { entered(); await hold; }
+    return result;
+  });
+  const inspecting = inspectPackage(filename);
+  await reached;
+  let reserved = false;
+  const reservation = reserveAsset('goon_custom_packages', filename).then(result => { reserved = true; return result; });
+  const restoreToken = crypto.randomUUID();
+  const restore = maintenance('begin', restoreToken);
+  await new Promise(resolve => setImmediate(resolve));
+  expect(reserved).toBe(false);
+  release();
+  expect((await inspecting).status).toBe(200);
+  const reservedResult = await reservation;
+  const restoreResult = await restore;
+  expect([200, 409]).toContain(reservedResult.status);
+  expect(restoreResult.status).toBe(200);
+  expect((await fs.readdir(path.join(mockUploadRoot, '_tmp'))).filter(name => name.startsWith('recipe-inspect-'))).toEqual([]);
+  expect((await maintenance('end', restoreToken)).status).toBe(200);
+});
+
+test('a disconnected inspection still holds restore until its temporary files settle', async () => {
+  const upload = await uploadArchive('inspect-disconnect');
+  const filename = upload.body.files.package.filename;
+  const original = recipeArchiveService.inspectAndExtractRecipeArchive.getMockImplementation();
+  let entered;
+  let release;
+  const reached = new Promise(resolve => { entered = resolve; });
+  const hold = new Promise(resolve => { release = resolve; });
+  recipeArchiveService.inspectAndExtractRecipeArchive.mockImplementation(async (input) => {
+    const result = await original(input);
+    if (input.archiveHandle) { entered(); await hold; }
+    return result;
+  });
+  const controller = new AbortController();
+  const request = fetch(`${baseUrl}/api/upload/goon-custom-package/inspect`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ filename }), signal: controller.signal
+  }).catch(error => error);
+  await reached;
+  controller.abort();
+  await request;
+  const token = crypto.randomUUID();
+  let restored = false;
+  const restore = maintenance('begin', token).then(result => { restored = true; return result; });
+  await new Promise(resolve => setImmediate(resolve));
+  expect(restored).toBe(false);
+  release();
+  expect((await restore).status).toBe(200);
+  expect((await fs.readdir(path.join(mockUploadRoot, '_tmp'))).filter(name => name.startsWith('recipe-inspect-'))).toEqual([]);
+  expect((await maintenance('end', token)).status).toBe(200);
+});
+
+test('inspection does not report success when its owned temporary directory cannot be removed', async () => {
+  const upload = await uploadArchive('inspect-cleanup-failure');
+  const realRm = fs.rm.bind(fs);
+  jest.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
+    if (path.basename(target).startsWith('recipe-inspect-')) throw new Error('injected cleanup failure');
+    return realRm(target, options);
+  });
+  expect((await inspectPackage(upload.body.files.package.filename)).status).toBe(500);
+  expect((await fs.readdir(path.join(mockUploadRoot, '_tmp'))).some(name => name.startsWith('recipe-inspect-'))).toBe(true);
+});
 
 test('a failed archive cleans up before a different archive may publish shared model and manifest bytes', async () => {
   failManifest = true;

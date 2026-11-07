@@ -1,6 +1,7 @@
 import { json, error, isHttpError, isRedirect, type RequestHandler } from '@sveltejs/kit';
 import { apiError, serviceRefusalResponse } from '$lib/server/services/apiResponses'
 import { ArtifactsService } from '$lib/server/artifacts/artifactsService';
+import { serializeArtifactGrantFailure } from '$lib/server/artifacts/artifactGrantLifecycle'
 import {
   isOpaqueArtifactRuntimeRequest,
   requireArtifactRuntimeClaims,
@@ -84,6 +85,8 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
   } catch (err) {
     // A refusal (not found, access denied, a structure or field-name rule) answers with its own
     // status and sentence; SvelteKit turned the rethrown refusal into 500 "Internal Error" (BL-89).
+    const grantFailure = serializeArtifactGrantFailure(err)
+    if (grantFailure) { const { status, ...body } = grantFailure; return json(body, { status }) }
     const refusal = serviceRefusalResponse(err);
     if (refusal) {
       console.warn('Artifact update refused:', err instanceof Error ? err.message.split('\n')[0] : err);

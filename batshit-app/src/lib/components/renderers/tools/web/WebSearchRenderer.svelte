@@ -78,7 +78,7 @@
 			{/each}
 		{:else if !tool.error && resultsUnavailable}
 			<div class="provider-note">
-				Search completed, but Codex did not expose result rows for this run.
+				Search completed, but the runtime did not expose result rows for this run.
 			</div>
 			{#if queries.length > 0}
 				<div class="query-list">

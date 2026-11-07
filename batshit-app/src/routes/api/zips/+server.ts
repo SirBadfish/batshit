@@ -4,7 +4,6 @@ import { redis } from '$lib/server/redis'
 import {
   canAccessZipData,
   normalizeZipIds,
-  requireOwnedSession,
   requireUser
 } from '$lib/server/services/routeSecurity'
 import { enrichCoolToolPromptTokens } from '$lib/server/services/coolToolPromptTokens'
@@ -35,48 +34,9 @@ export const GET: RequestHandler = async ({ url, locals }) => {
   }
 }
 
-// POST /api/zips - Create a new zip
-export const POST: RequestHandler = async ({ request, locals }) => {
-  const user = requireUser(locals)
-  if (!user.ok) return user.response
-  
-  try {
-    const zip = await request.json()
-    
-    // Validate required fields
-    if (!zip.id || !zip.content || !zip.type) {
-      return json({ error: 'Missing required fields: id, content, type' }, { status: 400 })
-    }
-
-    const sessionId = zip.sessionId || zip.metadata?.sessionId
-    const sessionCheck = await requireOwnedSession(sessionId, user.value.id)
-    if (!sessionCheck.ok) return sessionCheck.response
-    
-    // Create the zip in Redis
-    await redis.createZip({
-      id: zip.id,
-      content: zip.content,
-      type: zip.type,
-      tokens:
-        zip.metadata?.promptTokens ||
-        zip.metadata?.aiTokens ||
-        zip.tokens ||
-        Math.ceil(zip.content.length / 4),
-      description: zip.description || '',
-      metadata: {
-        ...zip.metadata,
-        userId: user.value.id,
-        sessionId,
-        messageId: zip.messageId || zip.metadata?.messageId
-      }
-    })
-    
-    return json({ success: true, id: zip.id })
-  } catch (error) {
-    console.error('Error creating zip:', error)
-    return json({ error: 'Failed to create zip' }, { status: 500 })
-  }
-}
+// BL-1997 (BL-1825): no POST. Every zip is written by the server that produced it (the stream
+// adapter, the managed helpers, backup restore). The old browser create took an id, content and
+// metadata from the request and overwrote any zip with JSON.SET; no app code called it.
 
 // DELETE /api/zips - Delete a zip
 export const DELETE: RequestHandler = async ({ url, locals }) => {

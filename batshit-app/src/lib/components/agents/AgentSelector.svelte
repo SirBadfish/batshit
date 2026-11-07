@@ -18,10 +18,6 @@
 		resolveSessionTargetAgentId,
 		shouldAutoSyncSessionTarget
 	} from '$lib/components/agents/sessionTargetSync';
-	import {
-		getPrimaryAgentDisplayLabel,
-		normalizePrimaryAgentType
-	} from '$lib/utils/primaryAgentType';
 	import { isFixedSession, resolveFixedSessionAgentId } from '$lib/utils/fixedSession';
 	
 const { data } = $props();
@@ -383,14 +379,6 @@ function handleEditClick(e: Event, agentId: string) {
 		const safeName = name || 'Group';
 		return safeName.split(' ').map(word => word[0]).join('').toUpperCase().slice(0, 2);
 	}
-
-	function getAgentTypeBadgeClass(agent: agentStore.Agent) {
-		return `batshit-agent-type-badge agent-selector-type-badge is-agent-type-${normalizePrimaryAgentType(agent)}`;
-	}
-
-	function getAgentTypeBadgeLabel(agent: agentStore.Agent) {
-		return getPrimaryAgentDisplayLabel(normalizePrimaryAgentType(agent));
-	}
 </script>
 
 <style>
@@ -428,9 +416,10 @@ function handleEditClick(e: Event, agentId: string) {
 		font-size: 0.75rem;
 	}
 
+	/* `.agent-selector-menu-item` sits on the DropdownMenu.Item component; its min-width is the
+	   :global rule above. */
 	.agent-selector-trigger-inner,
 	.agent-selector-menu-row,
-	.agent-selector-menu-item,
 	.agent-selector-label {
 		min-width: 0;
 	}
@@ -457,13 +446,6 @@ function handleEditClick(e: Event, agentId: string) {
 		flex: 1 1 auto;
 	}
 
-	.agent-selector-type-badge {
-		min-height: 1rem;
-		padding: 0 0.34rem;
-		font-size: 0.58rem;
-		line-height: 1rem;
-	}
-
 	.agent-selector-group-badge {
 		display: inline-flex;
 		align-items: center;
@@ -486,7 +468,7 @@ function handleEditClick(e: Event, agentId: string) {
 		opacity: 0.48;
 	}
 
-	.agent-selector-menu-row.is-unavailable .agent-selector-menu-item {
+	.agent-selector-menu-row.is-unavailable :global(.agent-selector-menu-item) {
 		cursor: not-allowed;
 	}
 
@@ -548,9 +530,6 @@ function handleEditClick(e: Event, agentId: string) {
 				{/key}
 				<span class="agent-selector-trigger-text flex items-center gap-1 agent-selector-label">
 					<span class="agent-selector-name">{getAgentDisplayName(currentAgent)}</span>
-					<span class={getAgentTypeBadgeClass(currentAgent)}>
-						{getAgentTypeBadgeLabel(currentAgent)}
-					</span>
 				</span>
 			{:else}
 				<span class="text-muted-foreground agent-selector-trigger-text">Select Agent or Group</span>
@@ -591,9 +570,6 @@ function handleEditClick(e: Event, agentId: string) {
 						/>
 						<span class="agent-selector-item agent-selector-menu-label flex items-center gap-1 agent-selector-label">
 							<span class="agent-selector-name">{getAgentDisplayName(agent)}</span>
-							<span class={getAgentTypeBadgeClass(agent)}>
-								{getAgentTypeBadgeLabel(agent)}
-							</span>
 							{#if unavailableReason}
 								<span class="agent-selector-unavailable-reason">{unavailableReason}</span>
 							{/if}

@@ -1,15 +1,35 @@
 import { defineConfig } from 'vitest/config';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
+import { realpathSync } from 'node:fs';
+import { searchForWorkspaceRoot } from 'vite';
 import path from 'path';
+import sveltekitOptions from './build-scripts/sveltekit-options.mjs';
+
+const workspaceRoot = searchForWorkspaceRoot(process.cwd());
+const sharedNodeModulesPath = (() => {
+  try {
+    return realpathSync(path.resolve(process.cwd(), 'node_modules'));
+  } catch {
+    return path.resolve(process.cwd(), 'node_modules');
+  }
+})();
 
 export default defineConfig({
   plugins: [
     svelte({
+      configFile: false,
+      preprocess: sveltekitOptions.preprocess,
       compilerOptions: {
+        ...sveltekitOptions.compilerOptions,
         hmr: false
       }
     })
   ],
+  server: {
+    fs: {
+      allow: [workspaceRoot, sharedNodeModulesPath]
+    }
+  },
   test: {
     ssr: false,
     environment: 'jsdom',
@@ -36,7 +56,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '$lib': path.resolve('./src/lib'),
-      '$app/environment': path.resolve('./src/lib/test-utils/app-environment-mock.ts'),
+      '$app/env': path.resolve('./src/lib/test-utils/app-environment-mock.ts'),
       '$app/state': path.resolve('./src/lib/test-utils/app-state-mock.ts'),
       '$app/stores': path.resolve('./src/lib/test-utils/app-stores-mock.ts'),
       // BL-485: `$app/navigation` is a SvelteKit virtual module, never a file the fallback

@@ -1,3 +1,4 @@
+import type { P5ApiCanonicalLineage } from '../appActions/mcp/originalTask'
 /**
  * SA-120 P1 — the route-side glue for one send's Judge Juice lanes.
  *
@@ -58,6 +59,7 @@ import {
   resolveAgentJevMemoryRecallEnabled,
   resolveAgentJevReplyCheckEnabled,
   resolveAgentJevSkillToolHintsEnabled,
+  resolveAgentJevSkillSessionsEnabled,
   resolveAgentJevStyleCoachEnabled,
   resolveJevSmartZipEnabled
 } from '$lib/utils/jevJuiceControl'
@@ -70,7 +72,7 @@ import type { ZipExposed } from '$lib/services/messageCompiler'
 import { CONTROL_TAGS, findControlBlocks, removeControlBlocks } from '$lib/utils/controlTags'
 import { calculateZipActivation } from '$lib/utils/zipActivation'
 import { stripZipControlBlocks } from '$lib/utils/zipControl'
-import { replaceLooseZipReferences, scanLooseZipReferences } from '$lib/utils/zipReferenceSafety'
+import { replaceZipReferences, scanZipReferences } from '$lib/utils/zipReferenceSafety'
 import { redis } from '$lib/server/redis'
 import { publishUserEvent } from '$lib/server/ssePublisher'
 import {
@@ -91,12 +93,15 @@ import {
   type PostTurnToolFact
 } from '../postTurnCheck.jev'
 import { loadPostTurnRecord, writePostTurnRecord } from '../postTurnCheckState'
+import { readAnsweredApprovalIds } from '../toolApprovalState'
+import { isHeldForApprovalCard, readWaitsForApproval } from '$lib/utils/heldForApproval'
 import { buildUntrustedTextDcmLines } from '../untrustedText.jev'
 import { getDm } from '../dm/dmStore'
 import type { DmRecord } from '$lib/types/dm'
 import type { JevJuiceHintProvider, JevJuiceSmartZipProvider } from './jevJuiceHintContext'
 import { appendTypesafeCallRecords } from './typesafeEvidence'
 import type { TypesafeClient } from './typesafeClient'
+import { readSkillSessionHintExclusions } from '../skillSessions'
 
 export interface JevJuiceTurnCollector {
   records: TypesafeCallRecord[]
@@ -112,6 +117,7 @@ export function createJevJuiceTurnCollector(): JevJuiceTurnCollector {
 
 export interface SkillToolHintProviderInput {
   userId: string
+  sessionId?: string
   agent: Record<string, any> | null | undefined
   message: string
   isGroupTurn: boolean
@@ -134,6 +140,8 @@ export function buildSkillToolHintProvider(input: SkillToolHintProviderInput): J
         agent: input.agent as Record<string, any>,
         message,
         skills: context.skills,
+        excludedSkillIds: input.sessionId && input.agent?.id
+          ? await readSkillSessionHintExclusions({ userId: input.userId, sessionId: input.sessionId, agentId: input.agent.id }) : [],
         discoverable: context.discoverable,
         resolvedGatewayIds: context.resolvedGatewayIds,
         client: input.client
@@ -213,14 +221,15 @@ const RENDER_HIDDEN_TAG_IDS = new Set(CONTROL_TAGS.filter((spec) => spec.hideFro
  * The finished reply as prose for Jev: hidden control blocks are gone (the shared registry
  * names them all), and each inline zip reference reads as the tool result it stands for, so
  * the judgment is about what the agent SAID, never about Batshit's record marks. The references
- * are read once (BL-707): the old pattern searched to the first `}` again from every opener.
+ * are read once (BL-707: the old pattern searched to the first `}` again from every opener),
+ * with the trust reader's shape (BL-609), where the chat view shows a card.
  */
 export function replyProseForJudgment(raw: string): string {
   const stripped = stripZipControlBlocks(typeof raw === 'string' ? raw : '')
   // BL-442: the blocks the registry's scanner reads in a finished reply; an example in code and a
   // tag named in a sentence are what the agent said, and stay.
   const hidden = findControlBlocks(stripped, { final: true }).filter((block) => RENDER_HIDDEN_TAG_IDS.has(block.id))
-  return replaceLooseZipReferences(removeControlBlocks(stripped, hidden), (_match, _id, description) =>
+  return replaceZipReferences(removeControlBlocks(stripped, hidden), (_match, _id, description) =>
     description && description.trim() ? `[tool result: ${description.trim()}]` : '[tool result]'
   )
     .replace(/\n{3,}/g, '\n\n')
@@ -327,11 +336,29 @@ export function approvalResumeReplyTurn(
   return { request, history: paused.history, earlierParts: [earlierReplyPartOf(prior)] }
 }
 
+/** Successful management parts are not failures or approval notes. Only the
+ * actual original/canonical owner can identify this chain; body metadata cannot. */
+export async function originalApiContinuationReplyTurn(lineage: P5ApiCanonicalLineage): Promise<ContinuedReplyTurn> {
+  const { readP5ApiCanonicalLineage } = await import('../appActions/mcp/originalTask')
+  const actual = readP5ApiCanonicalLineage(lineage)
+  return { request: actual.request, history: actual.history, earlierParts: actual.earlier.map(earlierReplyPartOf) }
+}
+
+/** The last assistant message `id` names in the history, or -1. */
+function lastAssistantIndexOf(messages: readonly PostTurnHistoryMessage[], id: string): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === 'assistant' && messages[index]?.id === id) return index
+  }
+  return -1
+}
+
 /**
  * A context continuation answers in a NEW message, after the run (or runs) that ran out of room.
  * Its reply is every failed part directly before it, back to the user message they answer: the
- * part `previousMessageId` names, and any earlier continuation part before that one. `null` when
- * the history does not hold that shape; the steps then do not run (logged by the route).
+ * part `previousMessageId` names, and any earlier part before that one (`walkBackToRequest`; since
+ * BL-1443 that includes a CLI control-approval resume that ran out of room and the card's reply it
+ * finished). `null` when the history does not hold that shape; the steps then do not run (logged by
+ * the route).
  */
 export function findContextContinuationTurn(
   messages: readonly PostTurnHistoryMessage[],
@@ -339,22 +366,105 @@ export function findContextContinuationTurn(
 ): ContinuedReplyTurn | null {
   const id = typeof previousMessageId === 'string' ? previousMessageId.trim() : ''
   if (!id || !Array.isArray(messages)) return null
-  let cursor = -1
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role === 'assistant' && messages[index]?.id === id) {
-      cursor = index
-      break
+  const start = lastAssistantIndexOf(messages, id)
+  if (start < 0 || messages[start]?.metadata?.response_failed !== true) return null
+  return walkBackToRequest(messages, start, [])
+}
+
+/**
+ * The approval records a managed CLI control-approval resume's note names, or `null` for any other
+ * message: send-routed writes `metadata.approvalResume.approvalIds` on that note and on no other
+ * user message.
+ */
+function controlApprovalResumeNoteIds(message: PostTurnHistoryMessage | undefined): string[] | null {
+  if (message?.role !== 'user') return null
+  const ids = message.metadata?.approvalResume?.approvalIds
+  if (!Array.isArray(ids)) return null
+  const named = ids.filter((id: unknown): id is string => typeof id === 'string' && id.length > 0)
+  return named.length > 0 ? named : null
+}
+
+/** A user message that carries the resume note's mark at all, valid ids or not: never a request. */
+function carriesControlApprovalResumeMark(message: PostTurnHistoryMessage | undefined): boolean {
+  return message?.role === 'user' && message.metadata?.approvalResume != null
+}
+
+/**
+ * Words held for the card on `cardMessageId` (`isHeldForApprovalCard`) that are still to answer:
+ * not let go as unanswered (a stopped or failed resume, `steerPromoted.disposition`) and not
+ * marked for the page's expiry Deny (`approvalCardExpired`). The rule `heldSteerIds`
+ * (`steerPromotion.ts`) applies to the steers a resume run owns; it is private there, so it is
+ * stated again here, and the two must change together.
+ */
+function isStillHeldForCard(message: PostTurnHistoryMessage | undefined, cardMessageId: string): boolean {
+  if (!isHeldForApprovalCard(message, cardMessageId)) return false
+  const metadata = (message?.metadata ?? {}) as Record<string, any>
+  return metadata.approvalCardExpired !== true && metadata.steerPromoted?.disposition !== 'unanswered'
+}
+
+/**
+ * BL-1443: ONE walk back from the last part of a reply (`messages[start]`, already in the reply) to
+ * the user message the whole reply answers. On the way it takes in
+ *   - a failed part before it (a run that ran out of room, continued by the next part), and
+ *   - a CLI control-approval note with the card's reply it resumed: the reply right before the
+ *     note, past the words held for THAT card while it waited (BL-455), and only when that reply's
+ *     card answered every approval the note names (`answeredApprovalIds`). The resume answered the
+ *     ones still to answer (`isStillHeldForCard`: its reply follows them), so those join the
+ *     request, in chat order; words let go as unanswered are stepped over but not joined.
+ * `heldAfterStart` are the still-held words for the reply's own last card (`start`), and the caller
+ * takes them only from the user messages that END the chat after it: the hold mark is never
+ * removed, so words a reply already answered (a Send now) are not this resume's.
+ * Stops at anything else. The request is a user message with words that carries no resume mark at
+ * all (a note is never the request); `null` otherwise.
+ */
+function walkBackToRequest(
+  messages: readonly PostTurnHistoryMessage[],
+  start: number,
+  heldAfterStart: readonly PostTurnHistoryMessage[]
+): ContinuedReplyTurn | null {
+  const parts: PostTurnHistoryMessage[] = [messages[start]]
+  const held: PostTurnHistoryMessage[] = [...heldAfterStart]
+  let cursor = start - 1
+  while (cursor >= 0) {
+    const message = messages[cursor]
+    if (message?.role === 'assistant' && message.metadata?.response_failed === true) {
+      parts.unshift(message)
+      cursor -= 1
+      continue
     }
+    const noteIds = controlApprovalResumeNoteIds(message)
+    if (noteIds) {
+      let resumedAt = cursor - 1
+      while (resumedAt >= 0 && messages[resumedAt]?.role === 'user' && readWaitsForApproval(messages[resumedAt]?.metadata)) {
+        resumedAt -= 1
+      }
+      const resumed = resumedAt >= 0 ? messages[resumedAt] : undefined
+      if (resumed?.role === 'assistant') {
+        const answered = readAnsweredApprovalIds(resumed.metadata)
+        const cardId = typeof resumed.id === 'string' ? resumed.id : ''
+        const heldForIt = messages.slice(resumedAt + 1, cursor)
+        if (noteIds.every((approvalId) => answered.has(approvalId)) && heldForIt.every((entry) => isHeldForApprovalCard(entry, cardId))) {
+          parts.unshift(resumed)
+          held.unshift(...heldForIt.filter((entry) => isStillHeldForCard(entry, cardId)))
+          cursor = resumedAt - 1
+          continue
+        }
+      }
+    }
+    break
   }
-  const parts: PostTurnHistoryMessage[] = []
-  while (cursor >= 0 && messages[cursor]?.role === 'assistant' && messages[cursor]?.metadata?.response_failed === true) {
-    parts.unshift(messages[cursor])
-    cursor -= 1
-  }
-  if (parts.length === 0 || cursor < 0 || messages[cursor]?.role !== 'user') return null
-  const request = messageTextOf(messages[cursor].content).trim()
-  if (!request) return null
+  const asked = messages[cursor]
+  if (cursor < 0 || asked?.role !== 'user' || carriesControlApprovalResumeMark(asked)) return null
+  const requestWords = messageTextOf(asked.content).trim()
+  if (!requestWords) return null
+  const request = [requestWords, ...held.map((entry) => messageTextOf(entry.content).trim())].filter(Boolean).join('\n\n')
   return { request, history: messages.slice(0, cursor), earlierParts: parts.map(earlierReplyPartOf) }
+}
+
+/** Read-only original-task lookup using the same approval/continuation walk as reply checks. */
+export function savedReplyTask(messages: PostTurnHistoryMessage[], messageId: string): ContinuedReplyTurn | null {
+  const index = lastAssistantIndexOf(messages, messageId)
+  return index < 0 ? null : walkBackToRequest(messages, index, [])
 }
 
 /** The after-reply steps of a run that finishes a reply an earlier run began, and that reply's earlier parts. */
@@ -362,12 +472,13 @@ export interface ContinuedReplySteps {
   smartZip?: SmartZipAfterReply
   postTurnCheck?: PostTurnCheckAfterReply
   earlierParts: EarlierReplyPart[]
+  skillSessionContext?: ContinuedReplyTurn
 }
 
 /**
  * BL-527: the two after-reply steps alone, for a run with no user turn of its own (an API approval
- * resume, a context continuation). `continued` is the request that reply answers and the parts the
- * earlier runs stored (`approvalResumeReplyTurn`, `findContextContinuationTurn`). `null` when there
+ * resume or a context continuation). `continued` is the request that reply answers and the parts
+ * earlier runs stored. `null` when there
  * is nothing to build: no step switched on, a group turn, or a history without that shape, which
  * is said in the log when a step is switched on, never skipped in silence.
  */
@@ -394,7 +505,14 @@ export function buildContinuedReplySteps(input: {
     }
     return null
   }
-  const smartZip = buildSmartZipAfterReply({ userId, sessionId, agent, globalZipSettings, isGroupTurn, message: continued.request })
+  const smartZip = buildSmartZipAfterReply({
+    userId,
+    sessionId,
+    agent,
+    globalZipSettings,
+    isGroupTurn,
+    message: continued.request
+  })
   const postTurnCheck = buildPostTurnCheckAfterReply({
     userId,
     sessionId,
@@ -403,8 +521,10 @@ export function buildContinuedReplySteps(input: {
     message: continued.request,
     history: continued.history
   })
-  if (!smartZip && !postTurnCheck) return null
-  return { smartZip, postTurnCheck, earlierParts: continued.earlierParts }
+  const skillSessions = !!agent && !isGroupTurn && resolveAgentJevSkillSessionsEnabled(agent)
+  if (!smartZip && !postTurnCheck && !skillSessions) return null
+  return { smartZip, postTurnCheck, earlierParts: continued.earlierParts,
+    ...(skillSessions ? { skillSessionContext: continued } : {}) }
 }
 
 /**
@@ -412,7 +532,7 @@ export function buildContinuedReplySteps(input: {
  * saved message joins them (`joinResumedContent`): a blank line between, and a run whose own words
  * already begin with the earlier ones is not given them twice.
  */
-function joinReplyParts(earlierParts: readonly EarlierReplyPart[], reply: string): string {
+export function joinReplyParts(earlierParts: readonly EarlierReplyPart[], reply: string): string {
   const own = typeof reply === 'string' ? reply.trim() : ''
   const before = earlierParts
     .map((part) => part.text.trim())
@@ -540,11 +660,11 @@ function smartZipTurnMessage(input: Pick<SmartZipTurnInput, 'agent' | 'globalZip
 }
 
 /**
- * BL-527: smart zip's after-reply step ALONE, for a run that finishes a reply an earlier run began
- * (an API approval resume, a context continuation). Same gates as `buildSmartZipTurn`, with the
- * request that reply answers as its message. No open provider, no replay, no commit: this run is
- * not a new user turn. Its compile handed no exposed observer to the compiler, so the step judges
- * only the results the whole reply made.
+ * BL-527: smart zip's after-reply step ALONE, for a run that finishes a reply an earlier run began.
+ * Same gates as `buildSmartZipTurn`, with the request that reply answers as its message. No open
+ * provider, no replay, no commit. An API approval resume and a context continuation are not new
+ * user turns: their compile handed the compiler no exposed observer, so the step judges only the
+ * results the whole reply made.
  */
 export function buildSmartZipAfterReply(
   input: Omit<SmartZipTurnInput, 'collector' | 'loadUntoldRezips'>
@@ -595,6 +715,7 @@ function createSmartZipPostTurn(
 
       let zipped: SmartZipRezip[] = []
       if (outcome.rezips.length > 0) {
+        const skipped: Array<{ zipId: string; reason: string }> = []
         const stored = await deps.writeRezips(
           input.sessionId,
           outcome.rezips.map((rezip) => ({
@@ -602,12 +723,12 @@ function createSmartZipPostTurn(
             description: rezip.description,
             done: rezip.done,
             again: rezip.again
-          }))
+          })),
+          { onSkipped: (entry) => skipped.push(entry) }
         )
         zipped = outcome.rezips.filter((rezip) => stored.includes(rezip.zipId))
         if (zipped.length < outcome.rezips.length) {
-          // The user or the agent acted on one between the judgment and the write: they win.
-          outcome.record.detail = `${outcome.record.detail ? `${outcome.record.detail}; ` : ''}${outcome.rezips.length - zipped.length} left alone: the user or the agent changed it first`
+          outcome.record.detail = `${outcome.record.detail ? `${outcome.record.detail}; ` : ''}${outcome.rezips.length - zipped.length} left alone: ${skipped.map((entry) => `${entry.zipId} (${entry.reason})`).join(', ') || 'state changed before the write'}`
         }
         if (zipped.length > 0) {
           await deps.publish(input.userId, {
@@ -719,13 +840,14 @@ function isFinishedReply(message: PostTurnHistoryMessage): boolean {
 
 /**
  * The one-line labels of tool results from earlier replies, oldest first: the description of each
- * zip reference that has one. Each reply is read once (BL-707).
+ * zip reference that has one. Each reply is read once (BL-707), with the trust reader's shape
+ * (BL-609).
  */
 export function collectEarlierToolLabels(history: PostTurnHistoryMessage[]): string[] {
   const labels: string[] = []
   for (const message of history) {
     if (message.role !== 'assistant') continue
-    for (const reference of scanLooseZipReferences(textOf(message.content))) {
+    for (const reference of scanZipReferences(textOf(message.content))) {
       if (reference.description === undefined) continue
       const label = reference.description.trim()
       if (label && !labels.includes(label)) labels.push(label)

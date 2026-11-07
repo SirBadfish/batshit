@@ -284,13 +284,15 @@ export class ReasoningStreamSourceArbiter {
 
 export function buildReasoningPersistenceEvidence(args: {
   showReasoning: boolean
+  /** API capture is independent of display. Omitted preserves the CLI evidence contract. */
+  captureReasoning?: boolean
   preserveReasoning: boolean
   reasoningSummary?: string | null
   interruptedReasoningRecovery?: InterruptedReasoningRecovery | null
 }): ExecutionReasoningPersistence {
   const summary =
     typeof args.reasoningSummary === 'string' ? args.reasoningSummary : ''
-  const requested = args.showReasoning
+  const requested = args.captureReasoning ?? args.showReasoning
 
   return {
     userHistoryStatus: !requested ? 'not-requested' : summary ? 'saved' : 'not-emitted',

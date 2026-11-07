@@ -1,5 +1,30 @@
 import type { ModelPurpose } from '$lib/types/savedModels'
 
+// Exact endpoint facts, checked 2026-10-23. These correct stale catalog purpose
+// metadata as well as fresh discovery; they do not qualify an execution adapter.
+// https://www.baseten.co/library/elephant-1/ and /library/mammoth-1/
+// https://ai-gateway.vercel.sh/v1/models
+// https://replicate.com/pixverse/pixverse-v6-max
+const REVIEWED_ENDPOINT_PURPOSES: Readonly<Record<string, Readonly<Record<string, ModelPurpose>>>> = {
+  'vercel-gateway': { 'baseten/elephant-1': 'utility', 'baseten/mammoth-1': 'utility' },
+  'direct:baseten': {
+    'decision-models/baseten-elephant-9b-latest': 'utility',
+    'decision-models/baseten-mammoth-27b-latest': 'utility'
+  },
+  'direct:replicate': { 'pixverse/pixverse-v6-max': 'visual' }
+}
+
+export function reviewedModelPurpose({ id, connectionId, modelType }: {
+  id?: string | null
+  connectionId?: string | null
+  modelType?: string | null
+}): ModelPurpose | undefined {
+  if (normalize(modelType) === 'evaluation') return 'utility'
+  const facts = Object.hasOwn(REVIEWED_ENDPOINT_PURPOSES, connectionId ?? '')
+    ? REVIEWED_ENDPOINT_PURPOSES[connectionId ?? ''] : undefined
+  return facts && Object.hasOwn(facts, id ?? '') ? facts[id ?? ''] : undefined
+}
+
 function normalize(value?: string | null) {
   return value?.toLowerCase().trim() ?? ''
 }
@@ -78,13 +103,17 @@ export function inferModelPurpose({
   id,
   name,
   modelType,
-  tags
+  tags,
+  connectionId
 }: {
   id?: string | null
   name?: string | null
   modelType?: string | null
   tags?: Iterable<string> | null
+  connectionId?: string | null
 }): ModelPurpose {
+  const reviewed = reviewedModelPurpose({ id, connectionId, modelType })
+  if (reviewed) return reviewed
   const normalizedId = normalize(id)
   const normalizedName = normalize(name)
   const normalizedType = normalize(modelType)

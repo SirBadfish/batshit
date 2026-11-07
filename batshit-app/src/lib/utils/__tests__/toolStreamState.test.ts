@@ -169,5 +169,88 @@ describe('toolStreamState helpers', () => {
       const next = resetToolStreamStateFromContent(previous, 'Intro.\n\n', () => order++)
       expect(composeToolStreamContent(next)).toBe(`Intro.\n\n${missing}`)
     })
+
+    // BL-946: the tab's live text has no line breaks around its cards (they are added when the
+    // text is drawn); the server's text has them. A kept card's place was measured in the tab's
+    // text, so it landed 2 to 4 characters early for each card before it, in the middle of a word.
+    describe('a kept card after a card the text names (BL-946)', () => {
+      const missing = '{{batshit-zip:cool_tool_missing_call-2:::Tool execution: bash}}'
+
+      // The tab's state as the page builds it while streaming: chunks, then cards by position.
+      function liveState() {
+        let order = 0
+        const state = {
+          textBuffer: 'Intro. Then more.Half a sen',
+          insertions: [
+            { pos: 'Intro.'.length, ref: card, order: order++ },
+            { pos: 'Intro. Then more.'.length, ref: missing, order: order++ }
+          ],
+          toolPositions: new Map<string, { pos: number; order: number }>()
+        }
+        return { state, nextOrder: () => order++ }
+      }
+      const serverText = `Intro.\n\n${card}\n\n Then more.`
+
+      it('stays after the words it followed, not in the middle of one', () => {
+        const { state, nextOrder } = liveState()
+        const next = resetToolStreamStateFromContent(state, serverText, nextOrder)
+        expect(composeToolStreamContent(next)).toBe(`Intro.\n\n${card}\n\n Then more.\n\n${missing}`)
+      })
+
+      it('a running card keeps its place after the card the text names', () => {
+        const { state, nextOrder } = liveState()
+        state.insertions.pop()
+        state.toolPositions.set('call-3', { pos: 'Intro. Then'.length, order: 9 })
+        const next = resetToolStreamStateFromContent(state, serverText, nextOrder)
+        expect(next.textBuffer.slice(0, next.toolPositions.get('call-3')?.pos)).toBe(`Intro.\n\n\n\n Then`)
+      })
+
+      it('a running card started right after the named card lands after it, not before it', () => {
+        const { state, nextOrder } = liveState()
+        state.insertions.pop()
+        state.toolPositions.set('call-3', { pos: 'Intro.'.length, order: 9 })
+        const next = resetToolStreamStateFromContent(state, serverText, nextOrder)
+        // Its result is inserted at this place with the newest order, so after the named card.
+        next.insertions.push({ pos: next.toolPositions.get('call-3')?.pos ?? -1, ref: missing, order: nextOrder() })
+        expect(composeToolStreamContent(next)).toBe(`Intro.\n\n${card}\n\n${missing}\n\n Then more.`)
+      })
+
+      it('two cards at one place keep their order, either way round', () => {
+        // Kept card drawn after the named one, at the same point of the text.
+        let order = 0
+        const after = {
+          textBuffer: 'Intro.Next words.',
+          insertions: [
+            { pos: 6, ref: card, order: order++ },
+            { pos: 6, ref: missing, order: order++ }
+          ],
+          toolPositions: new Map<string, { pos: number; order: number }>()
+        }
+        const text = `Intro.\n\n${card}\n\nNext words.`
+        expect(composeToolStreamContent(resetToolStreamStateFromContent(after, text, () => order++))).toBe(
+          `Intro.\n\n${card}\n\n${missing}\n\nNext words.`
+        )
+        // Kept card drawn before it.
+        const before = { ...after, insertions: [after.insertions[1], after.insertions[0]].map((entry, index) => ({ ...entry, order: index })) }
+        expect(composeToolStreamContent(resetToolStreamStateFromContent(before, text, () => order++))).toBe(
+          `Intro.\n\n${missing}\n\n${card}\n\nNext words.`
+        )
+      })
+
+      it('a card the text names last, then a kept one at the very end', () => {
+        let order = 0
+        const state = {
+          textBuffer: 'Intro.',
+          insertions: [
+            { pos: 6, ref: card, order: order++ },
+            { pos: 6, ref: missing, order: order++ }
+          ],
+          toolPositions: new Map<string, { pos: number; order: number }>()
+        }
+        expect(composeToolStreamContent(resetToolStreamStateFromContent(state, `Intro.\n\n${card}`, () => order++))).toBe(
+          `Intro.\n\n${card}\n\n${missing}`
+        )
+      })
+    })
   })
 })

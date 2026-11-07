@@ -22,7 +22,8 @@
   import * as agentStore from '$lib/stores/agents.svelte'
   import { getUserSettings } from '$lib/stores/userSettings.svelte'
   import { normalizeId } from '$lib/utils/idNormalizer'
-  import { getDeadCopyReason, refreshDeadCopies } from '$lib/stores/zipDeadCopies.svelte'
+  import { getDeadCopyReason, getLiveReadCopyFact, refreshDeadCopies } from '$lib/stores/zipDeadCopies.svelte'
+  import { liveSnapshotFromFact, liveSnapshotTokens, snapshotCompressesCopy, withLiveSnapshotSize, type ZipLiveSnapshot } from '$lib/utils/zipLiveSnapshot'
   import { describeHoldForUser, isUserHold } from '$lib/utils/zipHoldWords'
   import type { DeadCopyReason } from '$lib/utils/zipDeadCopies'
   import { calculateAgentMessagesFromEndByIndex } from '$lib/utils/zipMessageAge'
@@ -47,6 +48,7 @@
   import { getProjectTreeIconRef } from '$lib/icons/fileTypeIcons'
   import FullTool from '$lib/components/renderers/tools/templates/FullTool.svelte'
   import ZipbatshitWrapper from '$lib/components/renderers/wrappers/ZipbatshitWrapper.svelte'
+  import type { OpenSkillSession } from '$lib/utils/skillSessions'
 
   type ZipManagerSort = 'chat' | 'manual' | 'tokens' | 'newest'
   type ZipManagerToolStatus = 'loading' | 'success' | 'error' | 'info'
@@ -85,8 +87,13 @@
     aboutToZip: boolean
     /** SA-129 P2: "Held by you", "Held by you (3 messages left)", "Held by <agent>". */
     holdLabel: string | null
+    skillSessionOpen: boolean
     deadCopyReason: DeadCopyReason | null
+    /** The stored hold is the user's: the row never offers a new Hold over it (Release stays). */
+    userHeld: boolean
     sizeGuard: ToolResultSizeGuard
+    /** SA-137 P4: the newest reply showed this read as a file snapshot (size, and whether sent). */
+    liveSnapshot: ZipLiveSnapshot | null
     presentation: ZipStatusPresentation
     toolTitle: string
     toolSubtitle: string
@@ -104,6 +111,55 @@
   let loadError = $state<string | null>(null)
   let filter = $state<ZipManagerFilter>('expanded')
   let sortMode = $state<ZipManagerSort>('chat')
+  type SkillRow = Pick<OpenSkillSession, 'agentId' | 'skillId' | 'name' | 'generation' | 'revision' | 'openMessages'>
+  let openSkills = $state<SkillRow[]>([])
+  let skillLoadError = $state<string | null>(null)
+  let closingSkill = $state<string | null>(null)
+  let skillLoadGeneration = 0
+
+  async function loadOpenSkills() {
+    const target = sessionId
+    const generation = ++skillLoadGeneration
+    if (!target) { openSkills = []; skillLoadError = null; return }
+    try {
+      const response = await fetch(`/api/skill-sessions?sessionId=${encodeURIComponent(target)}`, {
+        headers: { 'x-internal-api-request': '1' }
+      })
+      const payload = await response.json()
+      if (!response.ok || !Array.isArray(payload.skills)) throw new Error(payload.error || 'Open skills could not be read.')
+      if (sessionId === target && generation === skillLoadGeneration) {
+        openSkills = payload.skills
+        skillLoadError = null
+      }
+    } catch (error) {
+      if (sessionId === target && generation === skillLoadGeneration) skillLoadError = error instanceof Error ? error.message : 'Open skills could not be read.'
+    }
+  }
+
+  async function closeSkill(skill: SkillRow) {
+    const target = sessionId
+    if (!target || closingSkill) return
+    closingSkill = `${skill.agentId}:${skill.skillId}`
+    try {
+      const response = await fetch('/api/skill-sessions', {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-internal-api-request': '1' },
+        body: JSON.stringify({ sessionId: target, agentId: skill.agentId, skillId: skill.skillId, generation: skill.generation, revision: skill.revision })
+      })
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.error || 'The skill close could not be confirmed.')
+      if (sessionId !== target) return
+      await zippingService.refreshFromServer(target)
+      await loadOpenSkills()
+      syncUnzippedItems()
+      await loadZipItems()
+      dispatchZipManagerActivity()
+    } catch (error) {
+      if (sessionId === target) {
+        toast.error(error instanceof Error ? error.message : 'The skill close could not be confirmed.')
+        await loadOpenSkills()
+      }
+    } finally { closingSkill = null }
+  }
 
   const sortOptions: { value: ZipManagerSort; label: string }[] = [
     { value: 'chat', label: 'Chat order' },
@@ -173,6 +229,8 @@
     if (sessionId !== previousSessionId) {
       const targetSessionId = sessionId
       previousSessionId = targetSessionId
+      openSkills = []
+      void loadOpenSkills()
       if (targetSessionId) {
         allZips = []
         unzippedItems = []
@@ -283,6 +341,7 @@
 
     if (detail?.sessionId !== sessionId) return
     syncUnzippedItems(detail.unzipped)
+    void loadOpenSkills()
   }
 
   function handleZipActivity(event: Event) {
@@ -439,7 +498,7 @@
 
   function handleOpenChange(open: boolean) {
     isOpen = open
-    if (open) void loadZipItems()
+    if (open) { void loadZipItems(); void loadOpenSkills() }
   }
 
   function getMessageContext(zip: ZipListItem) {
@@ -502,7 +561,8 @@
 
   function resolveRemainingMessages(
     unzippedItem: UnzippedItem | null,
-    activation: ReturnType<typeof calculateZipActivation>
+    activation: ReturnType<typeof calculateZipActivation>,
+    compressed: boolean
   ) {
     if (unzippedItem && !unzippedItem.permanent && typeof unzippedItem.duration === 'number') {
       return Math.max(0, unzippedItem.duration - (unzippedItem.messageCount || 0))
@@ -510,7 +570,7 @@
 
     if (
       !unzippedItem &&
-      !activation.shouldCompress &&
+      !compressed &&
       activation.meetsThreshold &&
       activation.bufferSize > 0
     ) {
@@ -533,6 +593,9 @@
       zippingService.getRezippedSource(normalizedId)
     const context = getMessageContext(zip)
     const deadCopyReason = getDeadCopyReason(sessionId, normalizedId)
+    // SA-137 P4: the size guard judges the size the newest reply's compile saw (a file snapshot),
+    // as the chat badge does; the row's token label keeps the stored size.
+    const liveSnapshot = liveSnapshotFromFact(getLiveReadCopyFact(sessionId, normalizedId))
     const holdLabel = describeHoldForUser(
       unzippedItem,
       unzippedItem?.agentId ? agentStore.getAgentById(unzippedItem.agentId)?.displayName ?? null : null
@@ -540,17 +603,17 @@
     const activation = calculateZipActivation({
       zipType: zip.type || 'all_other',
       messagesFromEnd: context.messagesFromEnd,
-      zipData: {
+      zipData: withLiveSnapshotSize({
         type: zip.type,
         tokens: zip.tokens,
         metadata: zip.metadata || {},
         name: zip.name,
         content: undefined
-      },
+      }, liveSnapshot),
       agentSettings: context.agent,
       globalSettings: globalZipSettings,
       toolName: zip.metadata?.toolName || zip.name,
-      fallbackTokens: zip.tokens || 0,
+      fallbackTokens: liveSnapshotTokens(liveSnapshot) ?? (zip.tokens || 0),
       isUnzipped: Boolean(unzippedItem),
       isInferredUnzipped: unzippedItem?.source === 'inferred',
       isRezipped,
@@ -560,13 +623,16 @@
     })
     const isManuallyUnzipped = Boolean(unzippedItem)
     const deadCopyCompressed = Boolean(activation.deadCopy) && activation.shouldCompress
-    const isUnzippedNow = !activation.shouldCompress
+    // Round 2: a copy the newest reply did not refresh was zipped that turn, whatever its buffer,
+    // Hold or Off says; the row keeps its hold (Release stays) and says why.
+    const compressed = activation.shouldCompress || snapshotCompressesCopy(liveSnapshot)
+    const isUnzippedNow = !compressed
     // SA-120 P5: the same reading of stored sources the chat badges use.
     const actors = resolveZipStateActors(unzippedItem?.source, rezippedSource, isManuallyUnzipped && isUnzippedNow)
     const expandedReason = isManuallyUnzipped && isUnzippedNow
       ? actors.expandedReason
       : isUnzippedNow ? 'buffer' : undefined
-    const remainingMessages = resolveRemainingMessages(unzippedItem, activation)
+    const remainingMessages = resolveRemainingMessages(unzippedItem, activation, compressed)
     const aboutToZip =
       isUnzippedNow &&
       activation.sizeGuard === null &&
@@ -592,6 +658,7 @@
       holdLabel,
       deadCopyReason: deadCopyCompressed ? activation.deadCopy : null,
       sizeGuard: activation.sizeGuard,
+      liveSnapshot,
       tokens: activation.tokens
     })
     const labelParts = splitZipDescription(zip.description || zip.name || zip.id)
@@ -614,8 +681,11 @@
       inferredControlled,
       aboutToZip,
       holdLabel,
+      skillSessionOpen: Boolean(unzippedItem?.skillSessionContext),
       deadCopyReason: deadCopyCompressed ? activation.deadCopy : null,
+      userHeld: isUserHold(unzippedItem),
       sizeGuard: activation.sizeGuard,
+      liveSnapshot,
       presentation,
       ...toolPresentation
     }
@@ -918,6 +988,9 @@
     data-ab-control="manage-zips"
   >
     <BatshitIcon id="zip" class="zips-manager-trigger-icon" />
+    {#if openSkills.length > 0}
+      <span class="zips-manager-skill-light" title={`${openSkills.length} open skills`} aria-label={`${openSkills.length} open skills`}></span>
+    {/if}
     {#if triggerManualUnzippedCount > 0}
       <Badge class="zips-manager-count-badge" variant="secondary">
         {triggerManualUnzippedCount}
@@ -927,6 +1000,21 @@
   </DropdownMenu.Trigger>
 
   <DropdownMenu.Content align="end" class="zips-manager-content">
+    {#if openSkills.length > 0 || skillLoadError}
+      <div class="zips-manager-header">
+        <div class="zips-manager-title">Open skills</div>
+        {#if skillLoadError}<div class="zips-manager-empty-title" role="status">{skillLoadError}</div>{/if}
+        {#each openSkills as skill (`${skill.agentId}:${skill.skillId}`)}
+          <div class="zips-manager-header-row">
+            <div class="zips-manager-heading">
+              <div class="zips-manager-title">{skill.name}</div>
+              <div class="zips-manager-stat">{agentStore.getAgentById(skill.agentId)?.displayName || skill.agentId}, open {skill.openMessages} messages</div>
+            </div>
+            <Button variant="outline" size="xs" disabled={closingSkill !== null} onclick={() => closeSkill(skill)}>Close</Button>
+          </div>
+        {/each}
+      </div>
+    {/if}
     <div class="zips-manager-header">
       <div class="zips-manager-header-row">
         <div class="zips-manager-heading">
@@ -1035,8 +1123,11 @@
                 agentControlled={row.agentControlled}
                 inferredControlled={row.inferredControlled}
                 holdLabel={row.holdLabel}
+                skillSessionOpen={row.skillSessionOpen}
                 deadCopyReason={row.deadCopyReason}
+                userHeld={row.userHeld}
                 sizeGuard={row.sizeGuard}
+                liveSnapshot={row.liveSnapshot}
                 manualZip={row.manualZip}
                 onToggleUnzip={(permanent: boolean) => handleUnzip(row, permanent)}
                 onZipNow={() => handleZip(row)}
@@ -1071,6 +1162,12 @@
 </DropdownMenu.Root>
 
 <style>
+  .zips-manager-skill-light {
+    width: 0.3rem;
+    height: 0.3rem;
+    border-radius: 50%;
+    background: var(--bs-app-success-text);
+  }
   :global(.zips-manager-trigger) {
     position: relative;
     display: inline-flex;

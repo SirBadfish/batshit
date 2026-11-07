@@ -84,6 +84,10 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     forward.append('file', file, file.name)
     forward.append('map', role)
     forward.append('definitionSha256', goon.definition.definitionSha256)
+    // The backend must prepare Base Color for this authenticated Goon's
+    // parsed package canvas, not the unrelated global reference canvas.
+    forward.append('canvasWidth', String(goon.definition.canvas.width))
+    forward.append('canvasHeight', String(goon.definition.canvas.height))
     const provenance = form.get('provenance')
     if (typeof provenance === 'string') forward.append('provenance', provenance)
 

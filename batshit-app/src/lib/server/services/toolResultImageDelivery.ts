@@ -24,13 +24,14 @@
 
 import type { ModelCapabilities } from '$lib/types/savedModels'
 import { modelAllowsImageInput } from './modelInputCapabilities'
+import { isClaudePlanConnection } from '$lib/utils/claudePlanConnection'
 
 // ---------------------------------------------------------------- lane
 
 export type ToolResultImageLane = 'tool_result' | 'synthetic_user' | 'none'
 
 /** Which managed runtime is consuming the tool result. */
-export type ToolResultImageRuntime = 'api' | 'codex' | 'claude'
+export type ToolResultImageRuntime = 'api' | 'claude'
 
 export interface ToolResultImageDeliveryDecision {
   lane: ToolResultImageLane
@@ -113,18 +114,17 @@ export function resolveToolResultImageDelivery(
     // 2026-03). Emitting image content here would cost tokens for nothing.
     return { lane: 'none', reason: 'claude_cli_stores_mcp_images_as_text' }
   }
-  if (runtime === 'codex') {
-    // Codex renders MCP `image` content blocks into the model's turn
-    // (openai/codex#4819, closed by PR #5600). The one hard constraint is on the
-    // producing side, not here: the helper bridge must never set
-    // `structuredContent` on the same result, because Codex drops `content[]`
-    // entirely when it is present (openai/codex#10334). Proven live in P3.
-    return { lane: 'tool_result', reason: 'codex_cli_mcp_image_content' }
-  }
 
   const providerId = normalizeId(input.providerId)
   if (!providerId) {
     return { lane: 'synthetic_user', reason: 'provider_unknown_defaults_text_safe' }
+  }
+
+  if (isClaudePlanConnection(providerId)) {
+    // SA-139 (D5, P0 §A): the Claude plan run hands a tool's image to Claude inside the MCP result,
+    // which Claude Code records as a real image block (BL-2336, on 2.1.296). A synthetic user
+    // message would edit what the native run already holds, which the adapter refuses.
+    return { lane: 'tool_result', reason: 'claude_plan_mcp_image_content' }
   }
 
   if (GATEWAY_PROVIDER_IDS.has(providerId)) {
@@ -350,6 +350,8 @@ export interface EphemeralImageDelivery {
 }
 
 export interface EphemeralImageRegistryEntry {
+  /** Only synthetic entries are injected in an ordinary step. */
+  deliveryLane?: 'tool_result' | 'synthetic_user'
   /** The tool that produced the images, named in the synthetic message text. */
   source: string
   /** Short human label for the synthetic message text (`recalled memory media`). */
@@ -373,6 +375,7 @@ export interface EphemeralImageRegistry {
     source: string,
     images: EphemeralImageDelivery[],
     purpose?: string | null,
+    deliveryLane?: 'tool_result' | 'synthetic_user',
   ): void
   /** Reads AND clears, so a delivery is injected exactly once. */
   take(toolCallId: string): EphemeralImageRegistryEntry | undefined
@@ -385,14 +388,17 @@ export interface EphemeralImageRegistry {
   registered(): number
 }
 
+const imageRegistries = new WeakSet<object>()
+
 export function createEphemeralImageRegistry(): EphemeralImageRegistry {
   const entries = new Map<string, EphemeralImageRegistryEntry>()
   let registeredImages = 0
-  return {
-    register(toolCallId, source, images, purpose) {
+  const registry: EphemeralImageRegistry = {
+    register(toolCallId, source, images, purpose, deliveryLane) {
       if (!toolCallId || !images.length) return
-      registeredImages += images.length
-      entries.set(toolCallId, { source, purpose: purpose ?? null, images })
+      // Preserve ordinary synthetic-input accounting; native queue is custody only.
+      if (deliveryLane !== 'tool_result') registeredImages += images.length
+      entries.set(toolCallId, { source, purpose: purpose ?? null, images, ...(deliveryLane ? { deliveryLane } : {}) })
     },
     take(toolCallId) {
       const entry = entries.get(toolCallId)
@@ -406,6 +412,29 @@ export function createEphemeralImageRegistry(): EphemeralImageRegistry {
       return registeredImages
     }
   }
+  imageRegistries.add(registry)
+  return registry
+}
+
+/** Existing per-run queues only. IDs must come from the actual completed SDK step. */
+export function takeCompletedToolImages(registry: EphemeralImageRegistry, toolCallIds: readonly string[]): Array<[string, EphemeralImageRegistryEntry]> {
+  if (!imageRegistries.has(registry)) throw new Error('The actual in-turn image registry is unavailable.')
+  const result: Array<[string, EphemeralImageRegistryEntry]> = []
+  for (const id of new Set(toolCallIds)) { const entry = registry.take(id); if (entry) result.push([id, entry]) }
+  return result
+}
+/** New original-owned step uses the existing ephemeral user-file channel once.
+ * Admission limits/destination policy are checked by its actual brain before this move. */
+export function restoreCompletedToolImages(registry: EphemeralImageRegistry, entries: Array<[string, EphemeralImageRegistryEntry]>, lane: ToolResultImageLane): { ids: string[]; deferred: string[] } {
+  if (!imageRegistries.has(registry)) throw new Error('The actual destination image registry is unavailable.')
+  const ids: string[] = [], deferred: string[] = []
+  for (const [id, entry] of entries) {
+    // Source bytes already passed its own cap. Recheck destination policy/MIME/count.
+    const answer = admitToolResultImages(entry.images.map((image, index) => ({ ...image, id: String(index) })), { lane })
+    if (answer.admitted.length) { registry.register(id, entry.source, answer.admitted, entry.purpose, 'synthetic_user'); ids.push(id) }
+    if (answer.deferred.length) deferred.push(`[Tool images from ${entry.source} were not shown to the current model: ${[...new Set(answer.deferred.map(item => item.reason))].join(', ')}.]`)
+  }
+  return { ids, deferred }
 }
 
 /**

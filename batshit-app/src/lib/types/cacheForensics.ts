@@ -34,6 +34,7 @@
  */
 export const CACHE_FORENSICS_SCHEMA_VERSION = 4
 
+/** `codex`: only records saved before Codex CLI retired (SA-139 R1); nothing writes it now. */
 export type CacheForensicsRuntime = 'vercel' | 'codex' | 'claude' | 'n8n'
 
 /**

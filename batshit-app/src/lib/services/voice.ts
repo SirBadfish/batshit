@@ -1,3 +1,4 @@
+import { readVoiceProviderEnvelope } from '$lib/utils/voiceProviderEnvelope'
 import { getUserSettings } from '$lib/stores/userSettings.svelte'
 import { logger } from '$lib/utils/logger'
 import { buildTextTimingLipSyncAnalysis } from '$lib/goons/lipSyncAnalyzer'
@@ -335,7 +336,7 @@ export class VoiceService {
       const data = await response.json()
       this.providerSummaryCache = {
         loadedAt: now,
-        providers: Array.isArray(data?.providers) ? data.providers : []
+        providers: readVoiceProviderEnvelope(data)
       }
     }
 

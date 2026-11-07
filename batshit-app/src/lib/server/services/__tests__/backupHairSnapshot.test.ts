@@ -106,7 +106,7 @@ it('parses original JSON.GET text in JS and keeps nested full-precision numbers 
   const evalCut = vi.fn(async () => ['OK', ['hair_asset:user:a:r1', 'json', -1, raw],
     ['user:user:hair_assets', 'set', 45, ['z@r1', 'a@r1']]])
   const result = await readHairBackupSnapshot({ eval: evalCut })
-  expect(result.get('hair_asset:user:a:r1')?.value).toEqual(JSON.parse(raw))
+  expect(result.get('hair_asset:user:a:r1')).toMatchObject({ value: JSON.parse(raw), ttlSeconds: null })
   expect(result.get('user:user:hair_assets')).toMatchObject({ value: ['a@r1', 'z@r1'], ttlSeconds: 45 })
   expect(evalCut).toHaveBeenCalledWith(HAIR_BACKUP_SNAPSHOT_SCRIPT, { keys: [], arguments: [4096, 256 * 1024 * 1024, 4096, 128 * 1024 * 1024].map(String) })
   expect(HAIR_BACKUP_SNAPSHOT_LIMITS.recordBytes).toBeGreaterThan(64 * 1024 * 1024 * 4 / 3)
@@ -114,6 +114,10 @@ it('parses original JSON.GET text in JS and keeps nested full-precision numbers 
 
 it.each([['LIMIT', 'record count'], ['LIMIT', 'record bytes'], ['LIMIT', 'collection items'], ['READ_FAILED', 'record read']])('refuses %s/%s without accepting a truncated cut', (status, reason) => {
   expect(() => parseHairBackupSnapshot([status, reason])).toThrow(/Retry backup/)
+})
+
+it.each([0, -2, -3, undefined, null, '45', 0.5, Number.NaN, Number.POSITIVE_INFINITY])('refuses raw TTL %s instead of promoting expiry to persistence', (ttl) => {
+  expect(() => parseHairBackupSnapshot(['OK', ['hair_asset:user:a:r1', 'json', ttl, '{"value":null}']])).toThrow(/expiry metadata/)
 })
 
 it('requires EVAL instead of a sequential production fallback', async () => {

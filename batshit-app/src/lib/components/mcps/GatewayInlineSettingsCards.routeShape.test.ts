@@ -20,11 +20,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() }))
 vi.mock('svelte-sonner', () => ({ toast }))
 const profileSync = vi.hoisted(() => ({
-  codex: vi.fn(async () => undefined),
   claude: vi.fn(async () => ({}))
 }))
 const writer = vi.hoisted(() => vi.fn(async (_profile: string) => undefined))
-vi.mock('$lib/server/services/codexProfileManager', () => ({ syncAgentCodexProfiles: profileSync.codex }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({ syncAgentClaudeProfiles: profileSync.claude }))
 vi.mock('$lib/server/services/workflowDiscovery', () => ({
   workflowDiscovery: { discoverDirectMCPClients: vi.fn(async () => []) }
@@ -37,7 +35,6 @@ vi.mock('$lib/server/services/dockerGatewayProfileConfig', async (importOriginal
 import { env } from '$env/dynamic/private'
 import { redis } from '$lib/server/redis'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
-import { presentMcpGatewayForBrowser } from '$lib/server/services/mcpGatewayRuntimePresentation'
 import type { MCPGateway } from '$lib/types/database'
 import { GET as getRoute, PUT as putRoute } from '../../../routes/api/mcp/gateways/[id]/+server'
 import GatewayInlineSettingsCards from './GatewayInlineSettingsCards.svelte'
@@ -68,8 +65,9 @@ async function storedGateway(id: string): Promise<any> {
 
 /** The gateway as `GET /api/mcp/gateways/[id]` presents it to the browser. */
 async function presented(id: string): Promise<MCPGateway> {
-  const stored = await mcpGatewayService.get(USER, id)
-  return presentMcpGatewayForBrowser(stored!)
+  const response = await getRoute(routeEvent(id))
+  if (response.status !== 200) throw new Error('The actual source detail read failed.')
+  return (await response.json()).gateway
 }
 
 async function mount(gateway: MCPGateway) {
@@ -161,7 +159,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1377: Gateway S
     await editAndWaitForTheSave(view.container, '#gateway-name-gw-d', 'Docker Renamed')
 
     expect(sent[0].status).toBe(200)
-    expect(sent[0].body).toEqual({ name: 'Docker Renamed', icon_ref: sent[0].body.icon_ref })
+    expect(sent[0].body).toEqual({ name: 'Docker Renamed', icon_ref: sent[0].body.icon_ref, expectedGatewaySource: expect.stringMatching(/^source1:[a-f0-9]{64}$/) })
     const stored = await storedGateway('gw-d')
     expect(stored.name).toBe('Docker Renamed')
     expect(stored.url).toBe(STORED_URL)

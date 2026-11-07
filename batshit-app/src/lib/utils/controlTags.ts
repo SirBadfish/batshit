@@ -285,6 +285,8 @@ export function realtimeHiddenTagOpenPrefixes(): string[] {
  *   `<batshit-` in full and is then part of a tag's name at the very end, or the full name
  *   followed by spaces or nothing. Everything else is text: `<` or `<bat`, and a full tag name
  *   followed by anything but spaces (R4 strict, Faye 2026-09-27). Finished words are never cut.
+ *   While a reply streams, a case (b) candidate whose own closing tag is still being written at
+ *   the text's end is held the same way, from its opening tag (BL-767).
  *
  * A tag inside a block's payload is payload, not a block: a case (a) opening tag takes the FIRST
  * closing tag of its name after it (as the lazy regexes did), and the scan goes on after that
@@ -517,6 +519,8 @@ function scanControlBlocks(
   /** Everything from here on is hidden by an unclosed block. */
   let hiddenFrom = Number.POSITIVE_INFINITY
   const candidatePrefix = `<${TAG_NAME_PREFIX}`
+  /** The text's last `<`: where a tag still being written at its end starts (R4, BL-767). */
+  const lastOpenAngle = folded.lastIndexOf('<')
   // Every closing tag and every opening-tag start of each registered name, in order, read once
   // when first needed: a block's closing tag and R2 (b)'s "no other opening tag between" are then
   // binary searches, never a search of the rest of the text per tag.
@@ -574,7 +578,27 @@ function scanControlBlocks(
           break
         }
       }
-      if (!closing) continue
+      if (!closing) {
+        // BL-767: while the reply streams, its own closing tag still being written at the text's
+        // end (from `<` to `</name` and spaces, outside code) makes it a block once whole, so it
+        // is held from its opening tag on until the next chunk decides; the raw tag never shows
+        // just before it is hidden. Before that `<` arrives it reads as a mention: nothing can
+        // tell the two apart yet, and holding every mention would hide sentences that name a tag.
+        const partial = lastOpenAngle
+        if (
+          !options.final &&
+          at < hiddenFrom &&
+          partial >= bodyStart &&
+          partial < limit &&
+          closingTagAt(folded, spec.tag, partial) === 'partial' &&
+          !inBlockCode(partial) &&
+          !(ahead ??= spanReader().fork()).covers(partial)
+        ) {
+          blocks.push(heldStart(spec, at))
+          return { blocks, accepted, layout }
+        }
+        continue
+      }
       const block: ControlBlock = { id: spec.id, tag: spec.tag, kind: 'paired', start: at, end: closing.end, bodyStart, bodyEnd: closing.start }
       blocks.push(block)
       accepted.push(block)
@@ -599,7 +623,7 @@ function scanControlBlocks(
 
   // R4: a last `<` that can still become an opening tag: held while the reply streams; at the end,
   // hidden only when it holds `<batshit-` in full (a cut block), otherwise text.
-  const lastOpen = folded.lastIndexOf('<')
+  const lastOpen = lastOpenAngle
   if (lastOpen >= scanFrom && lastOpen < hiddenFrom) {
     const spec = heldStartSpec(folded.slice(lastOpen), options.final)
     if (spec && !inCode(lastOpen)) blocks.push(heldStart(spec, lastOpen))

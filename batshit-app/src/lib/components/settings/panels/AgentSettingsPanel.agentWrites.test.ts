@@ -1,8 +1,50 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+// Default mounted fixtures refuse physical Redis/network before production imports. The real
+// lane retains its existing admission; these counters qualify only the fake mounted boundary.
+const mountedScope = await vi.hoisted(async () => {
+  const real = process.env.VITEST_USE_REAL_REDIS === 'true'
+  const previousHome = process.env.BATSHIT_HOME_DIR
+  const previousRuntime = process.env.BATSHIT_AGENT_RUNTIME_ROOT
+  const originalFetch = globalThis.fetch
+  const attempts = { redis: 0, fetch: 0 }
+  const fetchFacts: Array<{ url: string; method: string; stack: string | undefined }> = []
+  const blockedFetch: typeof fetch = async (input, init) => {
+    attempts.fetch += 1
+    const error = new Error('Network fetch is not admitted by this mounted fixture.')
+    fetchFacts.push({ url: String(input), method: init?.method ?? 'GET', stack: error.stack })
+    throw error
+  }
+  const { mkdtempSync, realpathSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const root = real ? undefined : realpathSync(mkdtempSync(join(tmpdir(), 'batshit-mounted-agent-writes-')))
+  if (root) {
+    process.env.BATSHIT_HOME_DIR = root
+    process.env.BATSHIT_AGENT_RUNTIME_ROOT = root
+    globalThis.fetch = blockedFetch
+  }
+  return { real, root, previousHome, previousRuntime, originalFetch, blockedFetch, attempts, fetchFacts,
+    remove: () => { if (root) rmSync(root, { recursive: true, force: true }) } }
+})
+vi.mock('redis', async importOriginal => {
+  const actual = await importOriginal<typeof import('redis')>()
+  if (mountedScope.real) return actual
+  const createClient = () => {
+    mountedScope.attempts.redis += 1
+    throw new Error('Physical Redis is not admitted by this mounted fixture.')
+  }
+  const defaultExport = (actual as any).default
+  return { ...actual, createClient,
+    ...(defaultExport ? { default: { ...defaultExport, createClient } } : {}) }
+})
+
 import { redis } from '$lib/server/redis'
+import { BUILTIN_PLUGIN_SKILLS, BUNDLED_BATSHIT_PLUGIN_ID, BUNDLED_BATSHIT_PLUGIN_VERSION } from '$lib/server/services/systemPluginPackage'
 import * as agentStore from '$lib/stores/agents.svelte'
+import { setUserSettings } from '$lib/stores/userSettings.svelte'
+import { BUNDLED_VOICE_PROVIDER_SUMMARIES } from '$lib/data/builtinVoiceProviderBaseline'
 import { buildPickedPresetModelFields } from '$lib/utils/modelPresetPick'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
 import { jsonResponse, loadAgentRoute, storedAgent, type AgentPut } from '$lib/test-utils/agentPutRoute'
@@ -48,10 +90,8 @@ vi.mock('$lib/components/ui/sonner/settings-toast', async (original) => {
   })
   return { ...actual, toast }
 })
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   syncAgentClaudeProfiles: vi.fn(async () => {}),
@@ -64,9 +104,39 @@ vi.mock('$lib/components/settings/agent/AgentMcpDefaultsCard.svelte', async () =
 
 useRedisTestServer()
 
+function expectNoPhysicalAttempts() {
+  if (!mountedScope.real) expect(mountedScope.attempts, JSON.stringify(mountedScope.fetchFacts)).toEqual({ redis: 0, fetch: 0 })
+}
+beforeEach(() => {
+  expectNoPhysicalAttempts()
+  if (!mountedScope.real) globalThis.fetch = mountedScope.blockedFetch
+})
+afterAll(async () => {
+  try { cleanup(); await vi.dynamicImportSettled(); expectNoPhysicalAttempts() }
+  finally {
+    if (!mountedScope.real) {
+      if (mountedScope.previousHome === undefined) delete process.env.BATSHIT_HOME_DIR
+      else process.env.BATSHIT_HOME_DIR = mountedScope.previousHome
+      if (mountedScope.previousRuntime === undefined) delete process.env.BATSHIT_AGENT_RUNTIME_ROOT
+      else process.env.BATSHIT_AGENT_RUNTIME_ROOT = mountedScope.previousRuntime
+      globalThis.fetch = mountedScope.originalFetch
+      mountedScope.remove()
+    }
+  }
+})
+
 const USER = 'a1y_user'
 const AGENT = 'a1y_agent'
 const NAME = 'Write probe'
+// Unrelated mounted Plugin Access starts from a complete, explicitly all-off catalog.
+// The real client still validates it; this fixture never grants or writes plugin access.
+const PLUGINS = [{
+  id: BUNDLED_BATSHIT_PLUGIN_ID, name: 'Batshit', description: 'Built-in Batshit skills.',
+  version: BUNDLED_BATSHIT_PLUGIN_VERSION, revision: 'agent-writes-startup', builtIn: true,
+  enabled_for_all_agents: false, enabled_agent_ids: [],
+  skills: BUILTIN_PLUGIN_SKILLS.map(skill => ({ commandId: skill.commandId, skillId: skill.skillId,
+    name: skill.displayName, invocation: `/batshit:${skill.commandId}` }))
+}]
 const OTHER = 'a1y_other'
 const OTHER_NAME = 'Other write probe'
 const KEY = `agent:${AGENT}`
@@ -127,13 +197,18 @@ let agentGets = 0
 let otherGets = 0
 /** While set, the agent's next GET reads the record, then waits for it before answering (a slow first load). */
 let holdAgentGet: Promise<void> | null = null
+let qwenVoiceFixture = false
+let inworldVoiceFixture = false
 const originalFetch = global.fetch
 
 beforeAll(async () => {
   routeModule = await loadAgentRoute()
 }, 60_000)
 
-beforeEach(() => {
+beforeEach(async () => {
+  // loadAgentRoute's read twins (3f6b10c8b) are spies, and afterEach's restoreAllMocks removes them
+  // after the first case: reinstall them for each case.
+  routeModule = await loadAgentRoute()
   ensureBrowserStubs()
   puts = []
   beforePut = []
@@ -141,6 +216,8 @@ beforeEach(() => {
   agentGets = 0
   otherGets = 0
   holdAgentGet = null
+  qwenVoiceFixture = false
+  inworldVoiceFixture = false
   toasts.warning = []
   toasts.error = []
   channel.listeners.clear()
@@ -148,12 +225,16 @@ beforeEach(() => {
   vi.spyOn(console, 'warn').mockImplementation(() => {})
 })
 
-afterEach(() => {
+afterEach(async () => {
   cleanup()
+  // Hydration may still continue after its record read; retain the case route until it settles.
+  await vi.dynamicImportSettled()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   global.fetch = originalFetch
   agentStore.setAgents([])
+  setUserSettings(null)
+  expectNoPhysicalAttempts()
 })
 
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -203,15 +284,22 @@ function installRoutes() {
     if (path === '/api/user/saved-models') return jsonResponse({ models: [PRESET] })
     if (path === '/api/models') return jsonResponse({ data: { connections: [] } })
     if (path === '/api/settings/api-keys') return jsonResponse({ keys: {} })
-    if (path === '/api/goons') return jsonResponse({ goons: [] })
+    if (path === '/api/goons') return jsonResponse({ ownerId: 'josh', goons: [] })
+    if (path === '/api/plugins' && method === 'GET') return jsonResponse({ plugins: PLUGINS })
     if (path === '/api/mcp/gateways') return jsonResponse({ gateways: [] })
     if (path === '/api/cli-tools') return jsonResponse({ tools: [] })
     if (path === '/api/icons/library') return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
+    if (qwenVoiceFixture && path === '/api/voice/providers') return jsonResponse({ providers: BUNDLED_VOICE_PROVIDER_SUMMARIES.filter(provider => ['browser', 'alibaba'].includes(provider.id)).map(provider => ({ ...provider, ready: true })) })
+    if (qwenVoiceFixture && path === '/api/voice/profiles') return jsonResponse({ profiles: [] })
+    if (qwenVoiceFixture && path === '/api/voice/voices') return jsonResponse({ voices: [{ id: 'Cherry', name: 'Cherry', provider: 'alibaba' }] })
+    if (inworldVoiceFixture && path === '/api/voice/providers') return jsonResponse({ providers: BUNDLED_VOICE_PROVIDER_SUMMARIES.filter(provider => ['browser', 'inworld'].includes(provider.id)).map(provider => provider.id === 'inworld' ? { ...provider, ready: true, ttsModels: ['inworld-tts-2', 'inworld-tts-2-flash'] } : provider) })
+    if (inworldVoiceFixture && path === '/api/voice/profiles') return jsonResponse({ profiles: [] })
+    if (inworldVoiceFixture && path === '/api/voice/voices') return jsonResponse({ voices: [{ id: 'Zoe', name: 'Zoe', provider: 'inworld' }] })
     return jsonResponse({ error: `not routed in this test: ${method} ${path}` }, 404)
   }))
 }
 
-async function openPanel() {
+async function openPanel(preferences: Record<string, unknown> = {}, userSettings?: Record<string, unknown>) {
   await redis.createAgent({
     id: OTHER,
     user_id: USER,
@@ -229,11 +317,12 @@ async function openPanel() {
     ...buildPickedPresetModelFields(PRESET as any),
     primary_model_connection: resolveSavedModelConnection(PRESET as any),
     provider_specific_settings: { temperature: 0.7 },
-    ...MEMORY
+    ...MEMORY,
+    ...preferences
   } as any)
   installRoutes()
   render((await import('./AgentSettingsPanel.svelte')).default, {
-    props: { data: { user: { id: USER } } as any, initialAgentId: AGENT }
+    props: { data: { user: { id: USER }, userSettings } as any, initialAgentId: AGENT }
   })
   await screen.findByDisplayValue(NAME, {}, { timeout: 15_000 })
   await waitFor(() => expect(budgetInput('Awareness')).toBeTruthy(), { timeout: 10_000 })
@@ -273,6 +362,45 @@ function readWaitNote() {
 }
 
 describe('Agent Settings and the agent saving its own Settings (SA-122 A-1y)', () => {
+  it('shows model-specific TTS badges in the dropdown and inherited selected label without saving', async () => {
+    inworldVoiceFixture = true
+    const globalSettings = { voice_settings: { tts: { providerId: 'inworld', modelId: 'inworld-tts-2-flash', voiceId: 'Zoe' } } }
+    setUserSettings(globalSettings as any)
+    await openPanel({ voice_profile: { tts: { providerId: 'inworld' } } }, globalSettings)
+    await fireEvent.click(screen.getByRole('tab', { name: 'Voice', exact: true }))
+    const summary = (await screen.findByText('Voice Mode (Input/STT + TTS)', { exact: true })).closest('summary')!
+    if (!summary.closest('details')?.open) await fireEvent.click(summary)
+    const block = [...document.querySelectorAll('.batshit-settings-card-subtle-frame')].find(element => element.querySelector('p.batshit-settings-form-label')?.textContent?.trim() === 'Text-to-Speech (TTS)')!
+    const row = [...block.querySelectorAll('.batshit-settings-form-row')].find(element => element.querySelector('.batshit-settings-form-label')?.textContent?.trim() === 'Model')!
+    await waitFor(() => expect(row.querySelector('button[aria-haspopup="listbox"]')).toBeTruthy())
+    const trigger = row.querySelector('button[aria-haspopup="listbox"]')!
+    expect(trigger).toHaveTextContent('Use Default (inworld-tts-2-flash)')
+    expect(trigger).toHaveTextContent('Batch TTS')
+    await fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+    expect(await screen.findByRole('option', { name: /^inworld-tts-2-flash\s+Batch TTS/ })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: /Use Default \(inworld-tts-2-flash\).*Batch TTS/ })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: /^inworld-tts-2\s+Realtime TTS/ })).toBeInTheDocument()
+    expect(puts).toEqual([])
+  }, SLOW)
+
+  it('offers model-region voices for an inherited Qwen model without changing the saved agent', async () => {
+    qwenVoiceFixture = true
+    const endpoint = 'https://workspace-123.ap-southeast-1.maas.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer'
+    const globalSettings = { voice_settings: { tts: { providerId: 'alibaba', modelId: 'qwen-audio-3.1-tts-flash' }, ttsEngineSettings: { alibaba: { common: { endpoint } } } } }
+    setUserSettings(globalSettings as any)
+    await openPanel({ voice_profile: { tts: { providerId: 'alibaba' } } }, globalSettings)
+    await fireEvent.click(screen.getByRole('tab', { name: 'Voice', exact: true }))
+    const summary = (await screen.findByText('Voice Mode (Input/STT + TTS)', { exact: true })).closest('summary')!
+    if (!summary.closest('details')?.open) await fireEvent.click(summary)
+    const block = [...document.querySelectorAll('.batshit-settings-card-subtle-frame')].find(element => element.querySelector('p.batshit-settings-form-label')?.textContent?.trim() === 'Text-to-Speech (TTS)')!
+    const row = [...block.querySelectorAll('.batshit-settings-form-row')].find(element => element.querySelector('.batshit-settings-form-label')?.textContent?.trim() === 'Voice')!
+    await waitFor(() => expect(row.querySelector('button[aria-haspopup="listbox"]')).toBeTruthy())
+    await fireEvent.keyDown(row.querySelector('button[aria-haspopup="listbox"]')!, { key: 'ArrowDown' })
+    expect(await screen.findByRole('option', { name: 'longanhuan_v3.1', exact: true })).toBeTruthy()
+    expect(screen.queryByRole('option', { name: 'Cherry', exact: true })).toBeNull()
+    expect(puts).toEqual([])
+  }, SLOW)
+
   it('at rest: the event reads the agent; the panel shows its name and memory and saves nothing', async () => {
     await openPanel()
     const getsAfterOpen = agentGets
@@ -288,8 +416,9 @@ describe('Agent Settings and the agent saving its own Settings (SA-122 A-1y)', (
     expect(puts).toEqual([])
     expect(agentGets).toBeGreaterThan(getsAfterOpen)
 
-    // One listener per mounted panel, gone with it.
-    expect(channel.listeners.size).toBe(1)
+    // Two listeners per mounted panel, gone with it: the panel's own and, since 605457633, the
+    // always-mounted AgentAppActionsAccessCard's.
+    expect(channel.listeners.size).toBe(2)
     cleanup()
     expect(channel.listeners.size).toBe(0)
   }, SLOW)

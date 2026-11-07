@@ -1,21 +1,18 @@
 # Agents and tools troubleshooting
 
-Batshit has two Primary Agent types:
+Every Primary Agent and Subagent runs in Batshit on the saved model you pick: an API key, a Local AI runtime, your ChatGPT plan or your Claude plan.
 
-- `API`: chat runs directly through Batshit using saved provider connections.
-- `CLI`: chat runs through a managed CLI runtime such as Codex or Claude Code.
+Many tool problems are really permission or runtime-boundary problems.
 
-Many tool problems are really agent-type, permission, or runtime-boundary problems.
+**"Claude Code CLI Subagents were removed from Batshit."** A leftover Claude Code CLI Subagent can only be deleted, and your Primary Agents no longer see it. To use your Claude plan, create a new Subagent and pick a Claude plan model.
+
+**"Codex CLI Subagents were removed from Batshit."** A leftover Codex CLI Subagent can only be deleted. For ChatGPT models, create a new Subagent with the ChatGPT plan connection or an OpenAI API key.
+
+**"Claude Code CLI presets were removed from Batshit."** A saved Claude Code CLI model preset can no longer be picked for an agent or Subagent. Pick another model, for example a Claude plan model, and delete the old preset in Settings → Models when you like.
 
 ## The agent doesn't respond
 
-First identify the agent type.
-
-For `API`: the provider API key is saved in Settings → API Keys, the selected model preset is available, the provider/model supports the requested features, and rate limits or provider errors are visible.
-
-For `CLI`: the CLI runtime is installed where Batshit runs, the CLI is logged in, the CLI settings/profile generated correctly, and Docker Codex login was performed inside the app container when using Docker.
-
-Use the [Execution Viewer](../chat/execution-viewer.md) when available — it shows what Batshit tried to send and where the run failed.
+Check that the provider API key is saved in Settings → API Keys, the selected model preset is available, the provider/model supports the requested features, and rate limits or provider errors are visible. On the Claude plan connection, check that Settings → API Keys → Claude Plan says **Ready**.
 
 ## Model or provider is missing
 
@@ -23,40 +20,18 @@ Check that Settings → API Keys has the provider key, Settings → Models has a
 
 Saving a key in Batshit helps `API` agents and Batshit-owned services. It doesn't automatically create n8n credentials or CLI login.
 
-## CLI agent is locked or unauthorized
+## Claude Code is not installed or not signed in
 
-First, make sure the CLI is installed at all. If it's not, Agent Settings shows a one-click install card for Codex CLI and Claude Code CLI in the model section — Batshit downloads and manages an official verified copy. Your own existing install (found on PATH) also works.
+The Claude plan connection needs Claude Code installed and signed in where Batshit runs it. Open **Settings → API Keys → Claude Plan**: the card shows whether Claude Code is installed, which copy Batshit uses (your own or the Batshit-managed one), and whether it is signed in with a Claude plan. If it is not installed, install it from the card; Batshit downloads and manages an official verified copy.
 
-Native install: check the install card in Agent Settings (it shows which copy Batshit is using — your own, or the Batshit-managed one), confirm the CLI is logged in, and check Agent Settings for the generated profile/config.
-
-Docker install: install through the same one-click card (saved in a persistent Docker volume), then run the login command Batshit shows in Agent Settings. For a Batshit-managed install:
-
-```sh
-docker compose --env-file .env.docker exec app /home/batshit-cli/.batshit/installs/cli/bin/codex login --device-auth
-docker compose --env-file .env.docker exec --user batshit-cli --env HOME=/home/batshit-cli --env USER=batshit-cli --env LOGNAME=batshit-cli --env SHELL=/bin/sh app /home/batshit-cli/.batshit/installs/cli/bin/claude auth login
-```
-
-If using the n8n profile and your Compose commands include `--profile n8n`, include that profile in the login command. An OpenAI `401 Unauthorized` from a Docker Codex run usually means the container-side Codex CLI isn't logged in.
 
 On Windows, Claude Code may print `Paste code here if prompted >` after the browser login. Paste the browser auth code at that prompt, then press Enter. The pasted code may not appear in the terminal, so do not wait for visible text. Do not save or share auth codes in docs or chat.
 
-Docker Claude runs as the non-root `batshit-cli` user so Claude Code Bypass Permissions can work. If a Docker Claude agent still reports that Bypass Permissions cannot run as root, rebuild the app image from current source and use the exact login command shown in Agent Settings.
 
-## A CLI agent says its model is no longer offered
+**"The Claude Code CLI lane was removed from Batshit."** Batshit no longer runs Primary Agents on the Claude Code CLI lane. Delete the old agent and make a new one. To use your Claude plan, pick a Claude plan model for it.
 
-Batshit's Codex and Claude model lists change as OpenAI and Anthropic change theirs. An agent or Subagent saved with a model that has since left the list keeps it. Batshit then does not start its runs, and the chat says which agent it is and where to change it. Open Settings → Agents → the agent (or the Subagent) → **Codex CLI Defaults** → **Default Codex Model** (or **Claude Code CLI Defaults** → **Default Claude Model**) and pick another model. The picker marks the old model with a line under it.
+**"Codex CLI agents were removed from Batshit."** Delete the old agent and create a new one with a ChatGPT plan model or an OpenAI API key.
 
-A model name you typed yourself is never refused, because it may be valid for your account.
-
-If Codex answers that a model "requires a newer version of Codex", the Codex that Batshit found on your computer is older than the one it installs. The install card in Agent Settings says so. Install Batshit's copy there, or pick an older model.
-
-Claude agents in Plan mode write their plan in the reply. Batshit does not let them save plan files in your own `~/.claude/plans` folder, and Claude Code no longer saves its own copy of each chat in `~/.claude/projects`. Batshit keeps the chat.
-
-## A Codex edit says “Diff unavailable”
-
-This means Batshit could not establish a reliable before-and-after comparison. It does not mean the command failed or the file stayed unchanged. Check the command result and the current file.
-
-A preview may be unavailable for an untracked file, a file using Git conversion filters, an oversized or non-text file, or a project path that changed while Batshit read it. Batshit also withholds the Git-based preview when its safe project reader is missing or unsupported; native Windows does not yet have this reader. Do not loosen file permissions or disable path checks to make a preview appear.
 
 ## Tools are missing from the agent
 
@@ -122,11 +97,6 @@ If the selected backend is Docker Sandbox and the operator is missing, Batshit s
 
 Native install: Agent Browser may use the host runtime path. Check Agent Browser settings and runtime status, and check browser/profile/session settings if the host runtime uses them.
 
-Docker install: Agent Browser uses the optional sidecar/controller. It does not use host Chrome cookies or display, and raw app-container `agent-browser ...` Bash commands are blocked. Start the sidecar:
-
-```sh
-docker compose --env-file .env.docker --profile agent-browser up -d --build agent-browser
-```
 
 Then use Batshit's Agent Browser tools/settings, not raw Bash.
 
@@ -146,16 +116,16 @@ Current user-only panel artifacts don't become agent tools: HuggingFace embeds, 
 
 Primary Agents fetch a saved Zip through the tool broker: `batshit_tool_use` with ref `fabric:sys.zip.fetch`.
 
-Fetch Zip reaches a Subagent only on the API lane, when its Fetch Zip toggle is on. CLI and n8n Workflow Subagents never get it. If one of those needs prior zipped content, have the Primary Agent fetch or summarize it, then call the Subagent with the relevant context.
+Fetch Zip reaches a Subagent when its Fetch Zip toggle is on. If it is off and the Subagent needs prior zipped content, have the Primary Agent fetch or summarize it, then call the Subagent with the relevant context.
 
 If a Primary Agent cannot fetch a Zip, verify the Zip ID exists in the session, the current agent/session can access it, and the message was saved with trusted Zip references.
 
 ## Group Chat behaves oddly
 
-[Group Chat](../groups/overview.md) uses the two live Primary Agent types. Check that:
+[Group Chat](../groups/overview.md) uses your current Primary Agents. Check that:
 
-- the group contains supported agent types
-- the Group driver is set intentionally if using Goons
+- every member is available; a leftover CLI or n8n agent cannot run
+- the Group driver is set intentionally
 - agent speak policies are sane
 - shared tool visibility is intentional
 - each agent's model/provider works alone first

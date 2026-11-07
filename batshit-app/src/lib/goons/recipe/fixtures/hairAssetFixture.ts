@@ -515,6 +515,7 @@ export async function createHairAssetFixture(input: {
   mainBytes: Uint8Array
   headNode: string
   sourceClass?: HairAssetSourceClass
+  flatUserRefs?: boolean
   tags?: string[]
   follower?: {
     bytes: Uint8Array
@@ -534,7 +535,9 @@ export async function createHairAssetFixture(input: {
   const prefix =
     sourceClass === 'builtin'
       ? '/goon-assets/hair/v1/h1-test-fixture/'
-      : '/uploads/goon_hair_assets/h1-test-fixture/'
+      : input.flatUserRefs
+        ? '/uploads/goon_hair_assets/h1-test-fixture-'
+        : '/uploads/goon_hair_assets/h1-test-fixture/'
   const draft = {
     schemaVersion: HAIR_ASSET_CONTRACT,
     assetId: 'h1-test-hair',

@@ -1,14 +1,18 @@
 import { storeGoonReferenceRecordForClient } from '$lib/server/services/goonCustomAssetOwnership.server'
+import {
+  readStoredGoonAnimationLibrary,
+  normalizeGoonAnimationFileRef as normalizeFileRef,
+  normalizeGoonMotionMeta as normalizeMotionMeta
+} from '$lib/server/services/goonAnimationLibraryNormalization.server'
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerUrl,
-  normalizeUploadUrlForStorage,
   resolveUploadUrlsForBrowserInPayload,
   rewriteInternalBatshitServerUrlsInPayload
 } from '$lib/server/services/batshitServerUrls'
-import type { GoonAnimationLibrary, GoonFileRef, GoonMotionMetadata } from '$lib/types/goons'
+import type { GoonAnimationLibrary, GoonFileRef } from '$lib/types/goons'
 import { resolveGoonAnimationName } from '$lib/goons/animationLoadPlan'
 import {
   collectGoonUploadReferencesForClient,
@@ -87,75 +91,6 @@ async function convertFbxToVrma(sourceFile: File) {
   }
 }
 
-function normalizeLibrary(value: unknown): GoonAnimationLibrary {
-  if (!value || typeof value !== 'object') {
-    return { vrma: [] }
-  }
-  const record = value as GoonAnimationLibrary
-  return {
-    ...record,
-    vrma: Array.isArray(record.vrma) ? record.vrma.map((entry) => normalizeFileRef(entry)) : []
-  }
-}
-
-function normalizeNestedFileRef(value: unknown): GoonFileRef | undefined {
-  if (!value || typeof value !== 'object') return undefined
-  const raw = value as Record<string, unknown>
-  const url = typeof raw.url === 'string' ? raw.url : ''
-  const filename = typeof raw.filename === 'string' ? raw.filename : ''
-  if (!url || !filename) return undefined
-  return {
-    url: normalizeUploadUrlForStorage(url),
-    filename,
-    originalName: typeof raw.originalName === 'string' ? raw.originalName : undefined,
-    size: typeof raw.size === 'number' ? raw.size : undefined,
-    mimeType:
-      typeof raw.mimeType === 'string'
-        ? raw.mimeType
-        : typeof raw.mimetype === 'string'
-          ? raw.mimetype
-          : undefined,
-    uploadedAt:
-      typeof raw.uploadedAt === 'string'
-        ? raw.uploadedAt
-        : typeof raw.uploaded_at === 'string'
-          ? raw.uploaded_at
-          : undefined
-  }
-}
-
-function normalizeFileRef(value: unknown): GoonFileRef {
-  const raw = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>
-  return {
-    url: typeof raw.url === 'string' ? normalizeUploadUrlForStorage(raw.url) : '',
-    filename: typeof raw.filename === 'string' ? raw.filename : '',
-    displayName: typeof raw.displayName === 'string' && raw.displayName.trim() ? raw.displayName.trim() : undefined,
-    originalName:
-      typeof raw.originalName === 'string'
-        ? raw.originalName
-        : typeof raw.originalname === 'string'
-          ? raw.originalname
-          : undefined,
-    size: typeof raw.size === 'number' ? raw.size : undefined,
-    mimeType:
-      typeof raw.mimeType === 'string'
-        ? raw.mimeType
-        : typeof raw.mimetype === 'string'
-          ? raw.mimetype
-          : undefined,
-    uploadedAt:
-      typeof raw.uploadedAt === 'string'
-        ? raw.uploadedAt
-        : typeof raw.uploaded_at === 'string'
-          ? raw.uploaded_at
-          : undefined,
-    metaUpdatedAt: typeof raw.metaUpdatedAt === 'string' ? raw.metaUpdatedAt : undefined,
-    tags: Array.isArray(raw.tags) ? raw.tags.filter((entry): entry is string => typeof entry === 'string') : undefined,
-    motionMeta: normalizeMotionMeta(raw.motionMeta),
-    previewVideo: normalizeNestedFileRef(raw.previewVideo)
-  }
-}
-
 // Unified motion library pairing: same-base-name files (one motion, VRMA +
 // GLB versions) share their user-facing metadata. The pair key is the same
 // sanitized name cues and engine clip registration resolve.
@@ -205,25 +140,6 @@ function normalizeTags(value: unknown): string[] {
   return Array.from(new Set(tags))
 }
 
-function normalizeMotionMeta(value: unknown): GoonMotionMetadata | undefined {
-  if (!value || typeof value !== 'object') return undefined
-  const record = value as Record<string, unknown>
-  const posture =
-    typeof record.posture === 'string' && record.posture.trim()
-      ? record.posture.trim()
-      : undefined
-  const playback =
-    record.playback === 'loop' || record.playback === 'oneshot' ? record.playback : undefined
-  const eyeContact = record.eyeContact === 'off' ? record.eyeContact : undefined
-
-  if (!posture && !playback && !eyeContact) return undefined
-  return {
-    ...(posture ? { posture } : {}),
-    ...(playback ? { playback } : {}),
-    ...(eyeContact ? { eyeContact } : {})
-  }
-}
-
 export const GET: RequestHandler = async ({ locals }) => {
   if (!locals.user?.id) {
     return json({ error: 'Unauthorized' }, { status: 401 })
@@ -231,13 +147,10 @@ export const GET: RequestHandler = async ({ locals }) => {
 
   try {
     const library = await redis.execute(async (client) => {
-      const existing = (await client.json.get(
-        `user:${locals.user!.id}:goons_animation_library`
-      )) as GoonAnimationLibrary | null
-      return normalizeLibrary(existing)
+      return readStoredGoonAnimationLibrary(client, `user:${locals.user!.id}:goons_animation_library`)
     })
 
-    return json({ library: resolveUploadUrlsForBrowserInPayload(library) })
+    return json({ library: resolveUploadUrlsForBrowserInPayload(library), ownerId: locals.user.id })
   } catch (error) {
     console.error('Error loading goon animation library:', error)
     return json({ error: 'Failed to load animation library' }, { status: 500 })
@@ -278,20 +191,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       { url: '', filename: file.name, originalName: file.name },
       file.name
     )
+    const initialLibrary = await redis.execute((client) =>
+      readStoredGoonAnimationLibrary(client, `user:${locals.user!.id}:goons_animation_library`))
     if (!replaceExisting) {
-      const conflictEntry = await redis.execute(async (client) => {
-        const existing = (await client.json.get(
-          `user:${locals.user!.id}:goons_animation_library`
-        )) as GoonAnimationLibrary | null
-        const library = normalizeLibrary(existing)
-        return (
-          library.vrma.find(
-            (entry) =>
-              resolveMotionPairKey(entry) === uploadPairKey &&
-              isGlbLaneFileRef(entry) === uploadLaneIsGlb
-          ) ?? null
-        )
-      })
+      const conflictEntry = initialLibrary.vrma.find(
+        (entry) => resolveMotionPairKey(entry) === uploadPairKey && isGlbLaneFileRef(entry) === uploadLaneIsGlb
+      ) ?? null
       if (conflictEntry) {
         const laneLabel = uploadLaneIsGlb ? 'GLB' : 'VRMA'
         return json(
@@ -339,7 +244,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     )
     const fileInfo = uploadPayload?.file
 
-    if (!fileInfo?.url || !fileInfo?.filename) {
+    if (typeof fileInfo?.url !== 'string' || !fileInfo.url.trim() ||
+      typeof fileInfo?.filename !== 'string' || !fileInfo.filename.trim()) {
       return json({ error: 'Goon animation upload failed to return a URL.' }, { status: 500 })
     }
 
@@ -359,8 +265,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     const { library: updated, replacedEntry } = await redis.execute(async (client) => {
       const key = `user:${locals.user!.id}:goons_animation_library`
-      const existing = (await client.json.get(key)) as GoonAnimationLibrary | null
-      const library = normalizeLibrary(existing)
+      const library = await readStoredGoonAnimationLibrary(client, key)
       const current = Array.isArray(library.vrma) ? library.vrma : []
 
       let replaced: GoonFileRef | null = null
@@ -429,7 +334,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     return json({
       library: resolveUploadUrlsForBrowserInPayload(updated),
-      animation: resolveUploadUrlsForBrowserInPayload(animationFile)
+      animation: resolveUploadUrlsForBrowserInPayload(animationFile),
+      ownerId: locals.user.id
     })
   } catch (error) {
     console.error('Error uploading goon animation library file:', error)
@@ -458,8 +364,7 @@ export const PATCH: RequestHandler = async ({ request, locals }) => {
 
     const updated = await redis.execute(async (client) => {
       const key = `user:${locals.user!.id}:goons_animation_library`
-      const existing = (await client.json.get(key)) as GoonAnimationLibrary | null
-      const library = normalizeLibrary(existing)
+      const library = await readStoredGoonAnimationLibrary(client, key)
       const current = Array.isArray(library.vrma) ? library.vrma : []
       const target = current.find((entry) => entry.filename === filename)
       if (!target) {
@@ -506,7 +411,7 @@ export const PATCH: RequestHandler = async ({ request, locals }) => {
       return json({ error: 'Animation not found.' }, { status: 404 })
     }
 
-    return json({ library: resolveUploadUrlsForBrowserInPayload(updated) })
+    return json({ library: resolveUploadUrlsForBrowserInPayload(updated), ownerId: locals.user.id })
   } catch (error) {
     console.error('Error updating animation tags:', error)
     return json(
@@ -538,8 +443,7 @@ export const DELETE: RequestHandler = async ({ request, locals }) => {
 
 	    const result = await redis.execute(async (client) => {
 	      const key = `user:${locals.user!.id}:goons_animation_library`
-	      const existing = (await client.json.get(key)) as GoonAnimationLibrary | null
-	      const library = normalizeLibrary(existing)
+	      const library = await readStoredGoonAnimationLibrary(client, key)
 	      const current = Array.isArray(library.vrma) ? library.vrma : []
 	      const targetSet = new Set(targetFilenames)
 	      const removedEntries = current.filter((entry) => targetSet.has(entry.filename))
@@ -572,7 +476,7 @@ export const DELETE: RequestHandler = async ({ request, locals }) => {
 	      }
 	    }
 
-	    return json({ library: resolveUploadUrlsForBrowserInPayload(result.library) })
+	    return json({ library: resolveUploadUrlsForBrowserInPayload(result.library), ownerId: locals.user.id })
   } catch (error) {
     console.error('Error deleting goon animation library file:', error)
     return json(

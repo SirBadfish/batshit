@@ -76,15 +76,8 @@
     description: string
   }
 
-  // Batshit Guide was retired in SA-092 (now the /batshit-guide system skill);
-  // Goon Guide remains the only System Clip until the post-SA-090 Goon skills.
-  const SYSTEM_CLIP_TEMPLATES: SystemClipTemplate[] = [
-    {
-      id: 'goon_guide',
-      filename: 'Goon Guide',
-      description: 'VRoid-first Goons + motion vault (VRMA/FBX).'
-    }
-  ]
+  // Both former system guides are now skills in the built-in Batshit plugin.
+  const SYSTEM_CLIP_TEMPLATES: SystemClipTemplate[] = []
 
   let systemClips = $state<SystemClip[]>([])
   let systemClipError = $state<string | null>(null)
@@ -1057,7 +1050,6 @@
           <div class="batshit-settings-inline-strong">Published registry snapshot</div>
           <div class="mt-1">
             <code>Publish</code> pushes the reviewed matrix in this editor to the hosted Upstash registry.
-            Local n8n parameter support refreshes from the Model Preset surface when Workflow Subagents use it.
           </div>
         </div>
       </Card.Content>

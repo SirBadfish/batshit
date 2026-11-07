@@ -8,7 +8,7 @@ import { realpath, stat } from 'node:fs/promises'
 import { createSandboxLifecycleGate } from './sandboxLifecycleGate'
 import { recordAppleContainerSystemStart } from './appleContainerSystemRecord'
 import { resolveVoiceRuntimeLaunchOwner } from './voiceRuntimeLaunchRecords'
-import { sandboxProtectedHomeRoots, sandboxHomeMountIdentity, ensureBatshitHomeSandboxMountPaths, SANDBOX_BATSHIT_PROTECTED_DIRS, SANDBOX_MOUNT_VERSION } from './sandboxHomeMounts'
+import { assertSandboxMountRootsSafe, sandboxHomeMountIdentity, ensureBatshitHomeSandboxMountPaths, SANDBOX_BATSHIT_PROTECTED_DIRS, SANDBOX_MOUNT_VERSION } from './sandboxHomeMounts'
 import { stripHostOperatorAuthorityFromChildEnv } from './cliChildEnv'
 import { limitedOutput } from './commandOutputLimit'
 import { attachCommandModelCapture, createCommandModelCapture } from './commandModelCapture'
@@ -746,19 +746,11 @@ async function startAppleContainerSandbox(sandboxName: string, workspace: Resolv
     const batshitHomeMount = batshitHomeMountRootOverride ?? getBatshitHomeDir()
     const batshitHomeMounts = await ensureBatshitHomeSandboxMountPaths(batshitHomeMount, batshitHomeMountRootOverride ?? getDefaultBatshitHomeDir())
     const volumeArgs = ['--volume', `${workspace.workspaceRoot}:${workspace.workspaceRoot}`]
-    for (const protectedRoot of sandboxProtectedHomeRoots(batshitHomeMount, batshitHomeMountRootOverride ?? getDefaultBatshitHomeDir())) {
-      const resolvedRoot = await realpath(protectedRoot).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === 'ENOENT') return protectedRoot
-        throw error
-      })
-      if ([protectedRoot, resolvedRoot].some((root) =>
-        [workspace.workspaceRoot, ...batshitHomeMounts].some((mount) =>
-          isPathInsideSandboxRoot(root, mount) || isPathInsideSandboxRoot(mount, root)
-        )
-      )) {
-        throw new Error('Sandbox workspace exposes managed agent homes or protected runtime/Pinokio data.')
-      }
-    }
+    await assertSandboxMountRootsSafe(
+      [workspace.workspaceRoot, ...batshitHomeMounts],
+      batshitHomeMount,
+      batshitHomeMountRootOverride ?? getDefaultBatshitHomeDir()
+    )
     for (const mount of batshitHomeMounts) {
       if (!isPathInsideSandboxRoot(mount, workspace.workspaceRoot)) {
         volumeArgs.push('--volume', `${mount}:${mount}`)

@@ -8,10 +8,10 @@ Use it when local voice setup is too long or technical to do by hand, especially
 
 - Batshit running locally.
 - A Portable Skill Token with the `Voice Engines` scope.
-- The downloaded `voice-engine-installer` Portable Skill bundle.
+- The `voice-engine-installer` skill from the current complete Batshit plugin.
 - Enough local disk/CPU/GPU room for the engine you want.
 
-Download links are listed in [Portable Skill downloads](../reference/portable-skills.md).
+Download the current package from **Settings → Plugins & shit → Plugins → Batshit → Download Plugin**; see [outside-agent setup](portable-skills.md).
 
 ## What the skill is allowed to do
 

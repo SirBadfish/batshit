@@ -1,11 +1,13 @@
 {
   "version": 1,
-  "description": "Manifest-driven sync of UserDocs pages into built-in system skill reference folders. Every .md under each sync's sourceRoot must be listed as include or exclude so new UserDocs pages fail loudly instead of silently skipping the skill. Destination reference folders are pure mirrors: --write copies includes and deletes unlisted files; --check fails on any drift.",
+  "description": "Manifest-driven sync of UserDocs into the canonical Batshit plugin. Every source page is included or excluded. Explicit preservedReferences belong to the skill and are never deleted by mirror upkeep.",
   "syncs": [
     {
       "id": "batshit-guide",
       "sourceRoot": "docs/user-docs",
-      "destinationRoot": "batshit-app/src/lib/server/system-skills/batshit-guide/references",
+      "destinationRoot": "batshit-app/src/lib/server/system-plugins/batshit/skills/batshit-guide/references",
+      "referenceIndex": "guide-index.md",
+      "preservedReferences": ["native.md", "outside.md", "guide-index.md"],
       "include": [
         { "source": "admin/backup-and-restore.md", "reference": "admin-backup-and-restore.md" },
         { "source": "admin/overview.md", "reference": "admin-overview.md" },
@@ -29,6 +31,7 @@
         { "source": "chat/sessions-sidebar.md", "reference": "chat-sessions-sidebar.md" },
         { "source": "chat/zip-manager.md", "reference": "chat-zip-manager.md" },
         { "source": "clips/overview.md", "reference": "clips-overview.md" },
+        { "source": "fabric/app-actions.md", "reference": "fabric-app-actions.md" },
         { "source": "fabric/overview.md", "reference": "fabric-overview.md" },
         { "source": "goons/overview.md", "reference": "goons-overview.md" },
         { "source": "judge-juice/overview.md", "reference": "judge-juice-overview.md" },
@@ -39,6 +42,7 @@
         { "source": "installation/first-run.md", "reference": "installation-first-run.md" },
         { "source": "installation/install-docker.md", "reference": "installation-install-docker.md" },
         { "source": "installation/install-mac-app.md", "reference": "installation-install-mac-app.md" },
+        { "source": "installation/install-pinokio.md", "reference": "installation-install-pinokio.md" },
         { "source": "installation/updating-batshit.md", "reference": "installation-updating-batshit.md" },
         { "source": "local-ai/model-settings.md", "reference": "local-ai-model-settings.md" },
         { "source": "local-ai/overview.md", "reference": "local-ai-overview.md" },
@@ -49,6 +53,7 @@
         { "source": "primary-agents/overview.md", "reference": "primary-agents-overview.md" },
         { "source": "projects/overview.md", "reference": "projects-overview.md" },
         { "source": "providers/api-keys-and-models.md", "reference": "providers-api-keys-and-models.md" },
+    { "source": "providers/claude-plan.md", "reference": "providers-claude-plan.md" },
         { "source": "providers/model-catalog.md", "reference": "providers-model-catalog.md" },
         { "source": "providers/overview.md", "reference": "providers-overview.md" },
         { "source": "quick-start/overview.md", "reference": "quick-start-overview.md" },
@@ -57,8 +62,8 @@
         { "source": "reference/portable-skills.md", "reference": "reference-portable-skills.md" },
         { "source": "reference/provider-prompt-caching.md", "reference": "reference-provider-prompt-caching.md" },
         { "source": "reference/ports-and-urls.md", "reference": "reference-ports-and-urls.md" },
+        { "source": "reference/release-notes.md", "reference": "reference-release-notes.md" },
         { "source": "reference/templates.md", "reference": "reference-templates.md" },
-        { "source": "resources/n8n-workflow-templates.md", "reference": "resources-n8n-workflow-templates.md" },
         { "source": "security/overview.md", "reference": "security-overview.md" },
         { "source": "skills/overview.md", "reference": "skills-overview.md" },
         { "source": "skills/portable-skills-artifact-creator.md", "reference": "skills-portable-skills-artifact-creator.md" },
@@ -86,7 +91,7 @@
       "exclude": [
         { "source": "README.md", "reason": "Docs-tree readme for repo browsing, not product knowledge." },
         { "source": "index.md", "reason": "Docs-site navigation page; the skill's SKILL.md owns the agent-facing index." },
-        { "source": "user-templates/README.md", "reason": "Folder navigation shim; resources/n8n-workflow-templates.md is the real template doc." },
+        { "source": "user-templates/README.md", "reason": "Folder navigation shim; reference/templates.md is the real template doc." },
         { "source": "user-templates/batshit-official-n8n-workflow-templates/README.md", "reason": "Folder navigation shim beside the template JSON payloads." }
       ]
     }

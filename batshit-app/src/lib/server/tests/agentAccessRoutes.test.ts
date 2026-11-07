@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 // BL-544: the real RedisService, even if other suites mocked the module earlier.
 vi.mock('$lib/server/redis', async () => {
@@ -11,6 +11,10 @@ import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { ArtifactsService } from '$lib/server/artifacts/artifactsService'
 import { PUT as skillAccessPut } from '../../../routes/api/slash-commands/[id]/agent-access/+server'
 import { PUT as artifactAccessPut } from '../../../routes/api/artifacts/[id]/agent-access/+server'
+import { POST as artifactPost } from '../../../routes/api/artifacts/+server'
+import { PUT as artifactPut } from '../../../routes/api/artifacts/[id]/+server'
+import { ArtifactGrantUnknownError } from '$lib/server/artifacts/artifactGrantLifecycle'
+import { SET_SLASH_COMMAND_AGENT_ACCESS_SCRIPT } from '$lib/server/services/agentAccessLists'
 
 /**
  * BL-544: Settings > Agents > Access turns ONE agent on or off, and the server adds or removes
@@ -162,14 +166,33 @@ describe.runIf(REAL_REDIS_LANE)('Access turns one agent on or off (BL-544)', () 
       expect(stored?.can_be_attached_to_agents).toBe(true)
     })
 
-    it('turns a Subagent on too, and two toggles at the same moment both land', async () => {
+    it('turns a Subagent on and refuses one concurrent original-basis change without rebasing or replay', async () => {
       await seedAgents()
       await seedCommand({ enabled_agent_ids: [] })
+      expect((await toggleSkill('ssacc_scout', true)).status).toBe(200)
+      expect((await storedCommand())?.enabled_agent_ids).toEqual(['ssacc_scout'])
+      expect((await toggleSkill('ssacc_scout', false)).status).toBe(200)
 
-      const results = await Promise.all([toggleSkill('ssacc_scout', true), toggleSkill('ssacc_orla', true)])
-
-      expect(results.map((result) => result.status)).toEqual([200, 200])
-      expect([...((await storedCommand())?.enabled_agent_ids ?? [])].sort()).toEqual(['ssacc_orla', 'ssacc_scout'])
+      const client = await redis.execute(connection => connection)
+      const evaluate = client.eval.bind(client)
+      let release!: () => void
+      const held = new Promise<void>(resolve => { release = resolve })
+      let issued = 0
+      const spy = vi.spyOn(client, 'eval').mockImplementation(async (script, options) => {
+        if (script === SET_SLASH_COMMAND_AGENT_ACCESS_SCRIPT && options?.keys?.[0] === KEY) { issued++; await held }
+        return evaluate(script, options)
+      })
+      try {
+        const targets = ['ssacc_scout', 'ssacc_orla']
+        const pending = Promise.all(targets.map(target => toggleSkill(target, true)))
+        await vi.waitFor(() => expect(issued).toBe(2))
+        release()
+        const results = await pending
+        expect(results.map(result => result.status).sort()).toEqual([200, 409])
+        expect(results.find(result => result.status === 409)?.body).toMatchObject({ code: 'SLASH_COMMAND_CONFLICT' })
+        expect((await storedCommand())?.enabled_agent_ids).toEqual(targets.filter((_target, index) => results[index].status === 200))
+        expect(issued).toBe(2)
+      } finally { release(); spy.mockRestore() }
     })
 
     it('a skill with no list is on for every agent: turning one on changes nothing, turning one off keeps every other agent and Subagent on', async () => {
@@ -278,11 +301,51 @@ describe.runIf(REAL_REDIS_LANE)('Access turns one agent on or off (BL-544)', () 
       const created = await createArtifact()
 
       expect((await toggleArtifact(created.id, 'ssacc_ghost', true)).status).toBe(404)
-      expect((await toggleArtifact(created.id, 'ssacc_orla', true, OTHER_USER)).status).toBe(404)
+      expect((await toggleArtifact(created.id, 'ssacc_orla', true, OTHER_USER)).status).toBe(403)
       expect((await toggleArtifact(created.id, 'ssacc_orla', 1)).status).toBe(400)
       expect((await toggleArtifact(created.id, 'ssacc_orla', true, null)).status).toBe(401)
       expect((await toggleArtifact('artifact_ssacc_missing', 'ssacc_orla', true)).status).toBe(404)
       expect((await service.getOwned(created.id, USER)).agent_allowlist).toEqual(['ssacc_nova'])
     })
+
+    it('refuses enabling an already-referenced missing or foreign subject and still permits removing it', async () => {
+      await seedAgents()
+      const created = await createArtifact()
+      for (const id of ['ssacc_ghost', 'ssacc_foreign']) {
+        // Deliberately saved legacy reference, not a new-grant fixture bypass.
+        await redis.json.set(`artifact:${created.id}`, '$.agent_allowlist', [id])
+        const refusal = await toggleArtifact(created.id, id, true)
+        expect(refusal.status).toBe(404)
+        expect(refusal.body).toMatchObject({ code: 'ARTIFACT_GRANT_SUBJECT_INVALID', outcome: 'not_written' })
+        expect((await service.getOwned(created.id, USER)).agent_allowlist).toEqual([id])
+        expect((await toggleArtifact(created.id, id, false)).status).toBe(200)
+        expect((await service.getOwned(created.id, USER)).agent_allowlist).toEqual([])
+      }
+    })
+  })
+})
+
+describe('recognized grant custody reaches actual HTTP callers (BL1635)', () => {
+  afterEach(() => vi.restoreAllMocks())
+  it.each(['create', 'update', 'one-id'] as const)('preserves safe %s stage/progress without raw error state', async kind => {
+    const record = kind === 'create' ? 'saved' : 'unknown'
+    const index = kind === 'create' ? 'unknown' : 'unchanged'
+    const failure = new ArtifactGrantUnknownError('artifact_safe_fixture', record, index)
+    Object.assign(failure, { rawInternal: 'private fixture value must not cross the boundary' })
+    const method = kind === 'create' ? 'create' : kind === 'update' ? 'update' : 'setAgentAccess'
+    vi.spyOn(ArtifactsService.prototype, method).mockRejectedValueOnce(failure)
+    const handler = kind === 'create' ? artifactPost : kind === 'update' ? artifactPut : artifactAccessPut
+    const response = await handler({ params: { id: 'artifact_safe_fixture' }, locals: { user: { id: USER } },
+      request: new Request('http://localhost/api/artifacts/artifact_safe_fixture', { method: kind === 'create' ? 'POST' : 'PUT',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(kind === 'one-id' ? { agentId: 'ssacc_nova', enabled: true } : { name: 'Fixture' }) }) } as any)
+    expect(response.status).toBe(503)
+    expect(await response.json()).toEqual({ success: false, error: failure.message, code: 'ARTIFACT_GRANT_UNCONFIRMED', outcome: 'unknown',
+      details: { artifactId: 'artifact_safe_fixture', record, indexPublication: index, outcome: 'unknown' } })
+  })
+
+  it('keeps an unrecognized503 error inside the ordinary generic server-failure boundary', async () => {
+    vi.spyOn(ArtifactsService.prototype, 'create').mockRejectedValueOnce(Object.assign(new Error('private fixture error'), { status: 503, code: 'NOT_A_GRANT_OWNER' }))
+    await expect(artifactPost({ locals: { user: { id: USER } }, request: new Request('http://localhost/api/artifacts', {
+      method: 'POST', body: '{}' }) } as any)).rejects.toMatchObject({ status: 500, body: { message: 'Failed to create artifact' } })
   })
 })

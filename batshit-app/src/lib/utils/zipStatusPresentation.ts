@@ -1,5 +1,7 @@
 import { describeTooLargeToolResult, type ToolResultSizeGuard } from './toolResultSizeGuard'
 import { UNKNOWN_JUDGE_NAME } from './judgeProviders'
+import { describeNotRefreshedReason } from './liveFileReads'
+import type { ZipLiveSnapshot } from './zipLiveSnapshot'
 
 /**
  * Who holds a zip open. `inferred` (SA-120 P5) is Batshit acting on a Judge Juice judgment: the
@@ -29,6 +31,13 @@ export interface ZipStatusPresentationInput {
   holdLabel?: string | null
   /** SA-129 P2 (BL-333): the prompt compresses this read as a dead copy, and why. */
   deadCopyReason?: 'superseded' | 'stale' | null
+  /**
+   * SA-137 P4 (D9, D10): the chat's newest reply showed this Read File as a file snapshot taken at
+   * that reply's start, this size; `issued` once that reply's first model request was sent with it.
+   * The card's own text stays the original read; this only adds the snapshot line. Round 2:
+   * `not-refreshed` says the newest reply's compile zipped this copy instead (strict freshness).
+   */
+  liveSnapshot?: ZipLiveSnapshot | null
   sizeGuard?: ToolResultSizeGuard
   tokens?: number
   /**
@@ -93,10 +102,45 @@ function resolveActor(input: ZipStatusPresentationInput): ZipStatusActor {
   return 'auto'
 }
 
-/** The reason a dead copy is compressed, in the words its zip reference uses (SA-129 DL-01). */
+/**
+ * The reason a dead copy is compressed, for the user's badge (SA-129 DL-01). The model's
+ * reference never says why (BL-1541); its Zip Index line does, in its own words.
+ */
 const DEAD_COPY_TOOLTIP: Record<'superseded' | 'stale', string> = {
   superseded: 'superseded by a later read',
   stale: 'stale, edited since'
+}
+
+/**
+ * SA-137 P4: the snapshot line, after the state ("Compressed: …", "Held by you", …). An open copy's
+ * snapshot text went to the model with the newest reply; a compressed one was only measured (its
+ * reference was sent, not its text), so it never says "used".
+ */
+function withLiveSnapshot(tooltip: string, input: ZipStatusPresentationInput, compressed: boolean): string {
+  const snapshot = input.liveSnapshot
+  if (!snapshot) return tooltip
+  const lead = tooltip.endsWith('.') ? tooltip : `${tooltip}.`
+  if (snapshot.delivery === 'unknown') {
+    return `${lead} Whether the newest reply showed this file as a fresh snapshot is unknown (no record for that reply), so this state may not match it`
+  }
+  // Round 2: said whatever the state above is (a hold included); never "used" or "stale".
+  if (snapshot.delivery === 'not-refreshed') {
+    return `${lead} Not shown to the agent in the newest reply: not refreshed (${describeNotRefreshedReason(snapshot.reason)}). Batshit tries again at the next reply.`
+  }
+  const size = `${Math.max(0, Math.round(snapshot.promptTokens)).toLocaleString('en-US')} tokens`
+  // A dead copy with a refreshed snapshot died after the newest reply's turn start (no stale exemption
+  // since 2026-11-04). The receipt does not say whether that compile showed its text (the size guard
+  // or its age may have compressed it), so the line claims neither "sent" nor "not sent".
+  if (compressed && input.deadCopyReason) {
+    return `${lead} File snapshot taken for the newest reply (${size}); compressed since`
+  }
+  if (compressed) {
+    return `${lead} Measured from the file as it was when the newest reply started (${size}); compressed, so its text was not sent`
+  }
+  const line = snapshot.delivery === 'issued'
+    ? `File snapshot used for the newest reply: the file as it was when that reply started (${size})`
+    : `File snapshot prepared for the newest reply (${size}); sending it was not confirmed`
+  return `${lead} ${line}`
 }
 
 function judgeOf(input: ZipStatusPresentationInput): string {
@@ -139,7 +183,7 @@ export function buildZipStatusPresentation(
   input: ZipStatusPresentationInput
 ): ZipStatusPresentation {
   if (input.sizeGuard === 'too_large') {
-    const tooltip = describeTooLargeToolResult(input.tokens ?? 0)
+    const tooltip = withLiveSnapshot(describeTooLargeToolResult(input.tokens ?? 0), input, true)
     return {
       state: 'zipped',
       actor: null,
@@ -153,10 +197,15 @@ export function buildZipStatusPresentation(
   if (input.isZipped) {
     const deadCopy = input.deadCopyReason ? DEAD_COPY_TOOLTIP[input.deadCopyReason] : null
     // BL-1485: one vocabulary. The state is "Compressed"; who zipped it, when someone did, follows.
-    const tooltip = deadCopy
+    // Round 2: a held copy the newest reply did not refresh is compressed; its hold stays (Batshit
+    // tries the refresh again at the next reply), and the hold is still said.
+    const heldNotRefreshed = input.liveSnapshot?.delivery === 'not-refreshed' && Boolean(input.holdLabel)
+    const tooltip = withLiveSnapshot(deadCopy
       ? input.holdLabel
         ? `Compressed: ${deadCopy}. ${input.holdLabel}; the hold moves to the next whole read`
         : `Compressed: ${deadCopy}`
+      : heldNotRefreshed
+      ? `Compressed. ${input.holdLabel}`
       : input.manualZip && input.inferredControlled && !input.agentControlled
       ? `Compressed by ${judgeOf(input)}: the agent seemed done with it`
       : input.agentControlled
@@ -165,7 +214,7 @@ export function buildZipStatusPresentation(
       ? 'Compressed: you zipped it'
       : input.autoZip
         ? 'Compressed at once (Auto)'
-        : 'Compressed'
+        : 'Compressed', input, true)
 
     return {
       state: 'zipped',
@@ -185,7 +234,7 @@ export function buildZipStatusPresentation(
     : remainingMessages !== null
       ? 'countdown'
       : 'none'
-  const tooltip = buildUnzippedTooltip(actor, duration, remainingMessages, input.holdLabel ?? null, judgeOf(input))
+  const tooltip = withLiveSnapshot(buildUnzippedTooltip(actor, duration, remainingMessages, input.holdLabel ?? null, judgeOf(input)), input, false)
 
   return {
     state: 'unzipped',

@@ -1,17 +1,19 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 /**
- * SA-111 P4 (DL-111-09) — the three Worker caps.
+ * SA-111 P4 (DL-111-09), delegation limits (Josh, 2026-10-24, decision 6) — the Worker caps:
+ * six per call and six at a time, Codex's default, with no per-turn total.
  *
  * These are the only thing standing between a primary agent and an unbounded fan-out, and
  * they must refuse rather than throw, so the model can adapt instead of seeing a tool
- * error. Both lanes share this module, so proving it here proves it for both.
+ * error. SA-139 R5 removed the CLI Worker and its profile-slot pool, so Workers run on one lane;
+ * `WORKER_PROFILE_SLOTS` stays as the number of leftover slot folders an agent's delete removes.
  */
 
 import {
+  WORKER_PROFILE_SLOTS,
   WORKERS_MAX_CONCURRENT,
   WORKERS_MAX_PER_CALL,
-  WORKERS_MAX_RUNS_PER_TURN,
 } from '$lib/utils/delegationCapabilities'
 import {
   __resetWorkerTurnBudgetForTests,
@@ -52,18 +54,28 @@ describe('worker turn budget (DL-111-09)', () => {
     expect(reserveWorkerRuns(TURN, 1).ok).toBe(true)
   })
 
-  it('counts every run against the turn total, released or not', () => {
-    let used = 0
-    while (used + WORKERS_MAX_PER_CALL <= WORKERS_MAX_RUNS_PER_TURN) {
-      const reservation = reserveWorkerRuns(TURN, WORKERS_MAX_PER_CALL)
-      expect(reservation.ok).toBe(true)
-      ;(reservation as any).release()
-      used += WORKERS_MAX_PER_CALL
-    }
+  it('pins the caps Josh chose: six per call, six at a time', () => {
+    expect(WORKERS_MAX_PER_CALL).toBe(6)
+    expect(WORKERS_MAX_CONCURRENT).toBe(6)
+    expect(WORKER_PROFILE_SLOTS).toBe(WORKERS_MAX_CONCURRENT)
+  })
 
-    expect(used).toBe(WORKERS_MAX_RUNS_PER_TURN)
-    const over = reserveWorkerRuns(TURN, 1)
-    expect(over).toMatchObject({ ok: false, code: 'worker_turn_limit' })
+  it('runs six at once and refuses a seventh with a readable result', () => {
+    const six = reserveWorkerRuns(TURN, 6)
+    expect(six.ok).toBe(true)
+    const seventh = reserveWorkerRuns(TURN, 1)
+    expect(seventh).toMatchObject({ ok: false, code: 'worker_concurrency_limit' })
+    expect((seventh as any).message).toContain('6 worker(s) are already running')
+    expect((seventh as any).message).toContain('6 at a time')
+  })
+
+  it('has no per-turn total: a turn may start batch after batch as each returns', () => {
+    // DL-111-09's nine-per-turn cap is gone (decision 6). Twenty full batches in one turn.
+    for (let batch = 0; batch < 20; batch += 1) {
+      const reservation = reserveWorkerRuns(TURN, WORKERS_MAX_PER_CALL)
+      expect(reservation.ok, `batch ${batch + 1}`).toBe(true)
+      ;(reservation as any).release()
+    }
   })
 
   it('gives each parent turn its own budget', () => {

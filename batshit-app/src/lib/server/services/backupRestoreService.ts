@@ -1,3 +1,5 @@
+import { materializeArchiveToolSettings } from './toolSettingsArchive'
+import { withoutServerReplayFields } from '$lib/utils/serverReplayFields'
 import { isHairSnapshotKey, isRetainedHairOwnerKey, RETAINED_HAIR_OWNER_PATTERNS, needsHairBackupSnapshot, readHairBackupSnapshot, stagedHairUploadKeys } from './backupHairSnapshot'
 import { createReadStream, createWriteStream } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
@@ -13,14 +15,27 @@ import * as yauzl from 'yauzl'
 import type { Entry, ZipFile } from 'yauzl'
 
 import { redis } from '$lib/server/redis'
+import { invalidateUserSettingsCache } from '$lib/services/databaseRedis.server'
+import { initializeSystemSlashCommandsForUser } from './systemSlashCommands'
+import { agentSetupCache } from './agentSetupCache'
 import { reconcileMemoryIndexesAfterRestore } from '$lib/server/services/memory/memoryIndex'
 import { invalidateScheduleDueCache } from '$lib/server/services/schedules/scheduleStore'
+import { restoredPinokioMachineRegistry } from './pinokioMachineService'
+import { removeRetiredSkillReadSettings } from './retiredSkillReadSettings'
+import { describeZipDefaultsSweep, sweepOldZipDefaults } from './zipDefaultsSweep'
+import { forgetPinokioAppEndpoint } from './pinokioAppEndpoint'
+import { fencePinokioOperations, PinokioAdmissionError } from './pinokioAdmission'
+import { backupRestoreActivity, enterBackupRestoreHttpRequest, notifyBackupRestoreRequestDrainWaiters, waitForBackupRestoreRequestDrain } from './backupRestoreActivity'
+export { enterBackupRestoreHttpRequest } from './backupRestoreActivity'
+import { closeClaudePlanRunAdmission, endClaudePlanRuns } from './claudePlanRunRegistry'
+import { invalidatePortableAppActionsForRestore, PortableAppActionsRestoreRefusal } from './portableSkillTokens'
 import { mcpToolListCache } from '$lib/server/services/mcpToolListCache'
 import {
   corePromptMetadataKey,
   listCoreSystemPromptDefinitions,
   readPackagedCoreSystemPromptDefault,
-  reconcileCoreSystemPromptsAfterRestore
+  reconcileCoreSystemPromptsAfterRestore,
+  retiredZipToolPromptKeys
 } from '$lib/server/services/systemPromptRegistry'
 import {
   HOST_FILE_LIMITS,
@@ -67,6 +82,8 @@ import {
   type BackupPartialRequest
 } from '$lib/utils/backupPartialSummary'
 import { withRecipeVerificationRestore as withRecipeVerificationRestoreEpoch } from './recipeVerificationEpoch.server'
+import { withSettingsRestoreFence, acquireSettingsRestoreMutation, SettingsLifecycleRefusal } from './appActions/settings/lifecycle'
+import { slashCommandRevisionKey } from './slashCommandRevisionProtocol'
 import { assertNoGoonAssetMaintenanceForRestore } from './goonAssetCleanupService'
 import { keepQueuedSessionTurnsHeldAtApprovalCards } from './streamAbortRegistry'
 import {
@@ -119,11 +136,58 @@ export const BACKUP_PARTIAL_SCHEMA_VERSION = 2
 export const BACKUP_READER_MAX_SCHEMA_VERSION = 2
 
 function withRecipeVerificationRestore<T>(restore: () => Promise<T>, recover = false): Promise<T> {
-  return withRecipeVerificationRestoreEpoch(() =>
+  // Both restore entrypoints and journal recovery share this boundary. Do not reuse an
+  // endpoint observed before destructive replacement, including after rollback/failure.
+  forgetPinokioAppEndpoint()
+  return withPinokioRestoreFence(() => withSettingsRestoreFence(() => withRecipeVerificationRestoreEpoch(() =>
     withGoonAssetRestoreBarrier(resolveBackupStagingDir(), async () => {
       if (!recover) await assertNoGoonAssetMaintenanceForRestore()
       return restore()
-    }, { recover }))
+    }, { recover }))).catch(error => {
+      if (error instanceof SettingsLifecycleRefusal) throw new BackupRestoreError(error.message, error.status)
+      throw error
+    }).finally(() => forgetPinokioAppEndpoint()))
+}
+
+/** Admission closes synchronously; a failed/cancelled observer is never treated as settled. */
+function withPinokioRestoreFence<T>(restore: () => Promise<T>): Promise<T> {
+  const hold = fencePinokioOperations()
+  return (async () => {
+    try {
+      try { await hold.settle() }
+      catch (error) {
+        if (error instanceof PinokioAdmissionError) throw new BackupRestoreError(error.message, error.status)
+        throw error
+      }
+      return await restore()
+    } finally { hold.release() }
+  })()
+}
+async function fenceAppActionsForRestore(userId: string) {
+  try { await invalidatePortableAppActionsForRestore(userId) }
+  catch (error) {
+    if (error instanceof PortableAppActionsRestoreRefusal) throw new BackupRestoreError(error.message, error.status)
+    throw error
+  }
+  // Catalogue revisions are concurrency metadata, never backup/rollback data.
+  // Only actual confirmed restore/recovery clears this user's exact key; the
+  // closed lifecycle fence invalidates held reports and prevents new admission.
+  const key = slashCommandRevisionKey(userId)
+  await redis.execute(async client => {
+    const lease = acquireSettingsRestoreMutation()
+    let issued = false
+    try {
+      lease.check()
+      issued = true
+      const removed = await client.del(key)
+      if (removed !== 0 && removed !== 1) throw new Error('Unexpected catalogue cleanup answer.')
+    } catch (error) {
+      if (!issued) { lease.settle(); throw error }
+      lease.unknown()
+      throw new BackupRestoreError('The skill access catalogue reset has an unknown outcome. Data replacement is held.', 503)
+    }
+    lease.settle()
+  })
 }
 
 const MANIFEST_PATH = 'manifest.json'
@@ -146,12 +210,10 @@ const PROJECT_RESTORE_PATH_FIELDS = new Set([
 
 const SYSTEM_PROMPT_KEYS = [
   'batshit:batshit_mode3_system_prompt',
-  'batshit:batshit_mode4_system_prompt',
   'batshit:sub_system_prompt',
   'batshit:worker_prompt',
   'batshit:subagent_guidance',
-  'batshit:tool_guidance_zip_enabled_prompt',
-  'batshit:tool_guidance_zip_disabled_prompt',
+  'batshit:tool_guidance_zip_prompt',
   'batshit:tool_guidance_memory_prompt',
   'batshit:dm_guidance',
   'batshit:jev_juice_guidance',
@@ -160,12 +222,10 @@ const SYSTEM_PROMPT_KEYS = [
   'batshit:primary_system_prompt',
   'batshit:system_prompt',
   'batshit:batshit_mode3_system_prompt:last_updated',
-  'batshit:batshit_mode4_system_prompt:last_updated',
   'batshit:sub_system_prompt:last_updated',
   'batshit:worker_prompt:last_updated',
   'batshit:subagent_guidance:last_updated',
-  'batshit:tool_guidance_zip_enabled_prompt:last_updated',
-  'batshit:tool_guidance_zip_disabled_prompt:last_updated',
+  'batshit:tool_guidance_zip_prompt:last_updated',
   'batshit:tool_guidance_memory_prompt:last_updated',
   'batshit:dm_guidance:last_updated',
   'batshit:jev_juice_guidance:last_updated',
@@ -187,10 +247,19 @@ const SYSTEM_PROMPT_META_KEYS: readonly string[] = listCoreSystemPromptDefinitio
 
 const SYSTEM_PROMPT_META_PREFIX = 'batshit:system_prompt_meta:'
 
+/**
+ * BL-1777: the two zip tool prompts that became "Tool Prompt: Zips" (text, time, metadata). They
+ * stay restorable, so a backup made before the merge restores (an unknown key fails the whole
+ * restore) and `reconcileCoreSystemPromptsAfterRestore` folds them; an export carries one that
+ * still exists (an edit the one record could not take, which Batshit keeps).
+ */
+const RETIRED_ZIP_TOOL_PROMPT_KEYS: readonly string[] = retiredZipToolPromptKeys()
+
 function isSystemPromptKey(key: string) {
   return (
     SYSTEM_PROMPT_KEYS.includes(key as (typeof SYSTEM_PROMPT_KEYS)[number]) ||
-    SYSTEM_PROMPT_META_KEYS.includes(key)
+    SYSTEM_PROMPT_META_KEYS.includes(key) ||
+    RETIRED_ZIP_TOOL_PROMPT_KEYS.includes(key)
   )
 }
 
@@ -201,7 +270,69 @@ function isSystemPromptKey(key: string) {
  * so (`describeRetiredPromptMetadata`).
  */
 function isRetiredPromptMetadataKey(key: string) {
-  return key.startsWith(SYSTEM_PROMPT_META_PREFIX) && !SYSTEM_PROMPT_META_KEYS.includes(key)
+  return (
+    key.startsWith(SYSTEM_PROMPT_META_PREFIX) &&
+    !SYSTEM_PROMPT_META_KEYS.includes(key) &&
+    !RETIRED_ZIP_TOOL_PROMPT_KEYS.includes(key) &&
+    !RETIRED_CLI_PRIMARY_PROMPT_KEYS.has(key)
+  )
+}
+
+// SA-139 R4 (D14): the CLI Primary Agent System Prompt (text, time, metadata) went with the
+// Claude Code CLI Primary lane, and the startup sweep removes them (`removeRetiredSystemPrompts`).
+// An older backup or automatic recovery copy that carries them still verifies and restores, and
+// the restore leaves them out. Keep this exact: similarly named unknown keys must still refuse the
+// archive. They stay in the `prompts` group, the group an older export gave them.
+const RETIRED_CLI_PRIMARY_PROMPT_KEYS = new Set([
+  'batshit:batshit_mode4_system_prompt',
+  'batshit:batshit_mode4_system_prompt:last_updated',
+  'batshit:system_prompt_meta:cli_primary'
+])
+
+function describeRetiredCliPrimaryPrompt(records: BackupRedisRecord[]) {
+  return records.some(record => RETIRED_CLI_PRIMARY_PROMPT_KEYS.has(record.key)) ? [
+    'This backup carries the CLI Primary Agent System Prompt. The Claude Code CLI lane was removed, so Batshit leaves it out.'
+  ] : []
+}
+
+// SA-111 retired this prompt's text/timestamp, not today's delegation guidance.
+// Keep this exact: similarly named unknown keys must still refuse the archive.
+const RETIRED_SUBAGENT_INSTRUCTION_KEYS = new Set([
+  'batshit:subagent_instructions',
+  'batshit:subagent_instructions:last_updated'
+])
+
+// SA-139 R2: the removed n8n Workflow Subagent's thread ids (`subagent_thread:{sessionId}:{slug}`).
+// Nothing writes them any more; an older backup that carries them still restores and leaves them out.
+const RETIRED_SUBAGENT_THREAD_ID_PREFIX = 'subagent_thread:'
+
+function isRetiredSubagentThreadIdKey(key: string) {
+  return key.startsWith(RETIRED_SUBAGENT_THREAD_ID_PREFIX)
+}
+
+function describeRetiredSubagentThreadIds(records: BackupRedisRecord[]) {
+  const count = records.filter(record => isRetiredSubagentThreadIdKey(record.key)).length
+  return count ? [
+    `This backup carries ${count} n8n Workflow Subagent thread ${count === 1 ? 'id' : 'ids'}. n8n Workflow Subagents were removed, so Batshit leaves ${count === 1 ? 'it' : 'them'} out.`
+  ] : []
+}
+
+function describeRetiredSubagentInstructions(records: BackupRedisRecord[]) {
+  const retired = [...new Set(records.filter(record => RETIRED_SUBAGENT_INSTRUCTION_KEYS.has(record.key)).map(record => record.key))]
+  return retired.length ? [
+    `This backup carries retired Subagent instruction records (${retired.join(', ')}). Batshit leaves them out; they do not replace current Subagent & Worker Guidance.`
+  ] : []
+}
+
+/** BL-1777: a backup made before the two zip tool prompts became one record. */
+function describeRetiredZipToolPrompts(records: BackupRedisRecord[]) {
+  const texts = new Set(RETIRED_ZIP_TOOL_PROMPT_KEYS.filter((key) => key.endsWith('_prompt')))
+  if (!records.some((record) => texts.has(record.key))) return []
+  return [
+    'This backup has the two older zip tool prompts ("Tool Prompt: Zip Control Enabled" and "Tool Prompt: Zip Control Disabled"); ' +
+      'this Batshit has one, "Tool Prompt: Zips". After the restore it takes an edit from them (the Disabled one first) ' +
+      'and removes the ones that hold only a default; an edit it cannot take is kept and named in the log.'
+  ]
 }
 
 function describeRetiredPromptMetadata(records: BackupRedisRecord[]) {
@@ -240,7 +371,7 @@ const GROUP_DEFINITIONS = [
     id: 'settings',
     label: 'Settings and Admin preferences',
     classification: 'required',
-    description: 'User settings, Admin defaults, Docker MCP settings, project preferences, and icon library preferences.'
+    description: 'User settings, Admin defaults, Pinokio connections, Docker MCP settings, project preferences, and icon library preferences.'
   },
   {
     id: 'prompts',
@@ -461,6 +592,8 @@ export interface BackupPreflightSummary {
 
 export interface RestoreResult {
   restored: true
+  /** Reconciliation failed after commit; restored data remains committed and must not be replayed. */
+  warnings?: string[]
   redisRecordCount: number
   fileAssetCount: number
   fileAssetBytes: number
@@ -1419,15 +1552,16 @@ function remapUserKey(key: string, sourceUserId: string, targetUserId: string) {
     [`icon_library:${sourceUserId}:`, `icon_library:${targetUserId}:`],
     [`clip:${sourceUserId}:`, `clip:${targetUserId}:`],
     [`mcp_gateways:${sourceUserId}`, `mcp_gateways:${targetUserId}`],
+    [`pinokio_machines:${sourceUserId}`, `pinokio_machines:${targetUserId}`],
     [`cli_tool_registry:${sourceUserId}`, `cli_tool_registry:${targetUserId}`],
     [`slash_command:${sourceUserId}:`, `slash_command:${targetUserId}:`],
+    [`agent_plugin:${sourceUserId}:`, `agent_plugin:${targetUserId}:`],
     [`skill:${sourceUserId}:`, `skill:${targetUserId}:`],
     [`goon_recipe_revision:${sourceUserId}:`, `goon_recipe_revision:${targetUserId}:`],
     [`goon_recipe_document:${sourceUserId}:`, `goon_recipe_document:${targetUserId}:`],
     [`goon_recipe_job:${sourceUserId}:`, `goon_recipe_job:${targetUserId}:`],
     [`hair_asset:${sourceUserId}:`, `hair_asset:${targetUserId}:`],
     [`hair_refit_source:${sourceUserId}:`, `hair_refit_source:${targetUserId}:`],
-    [`clothing_asset:${sourceUserId}:`, `clothing_asset:${targetUserId}:`],
     [`voice_engine_registry:${sourceUserId}`, `voice_engine_registry:${targetUserId}`],
     [`user_artifact_usage:${sourceUserId}`, `user_artifact_usage:${targetUserId}`],
     // SA-113 P2 (DL-113-02): the two user-scoped DM/webhook keys. The DM records and the
@@ -1521,15 +1655,18 @@ function rewriteContainerProjectPaths(key: string, value: unknown, targetUserId:
 }
 
 function groupForKey(key: string, userId: string): BackupGroupId {
-  if (isSystemPromptKey(key)) return 'prompts'
+  if (isSystemPromptKey(key) || RETIRED_CLI_PRIMARY_PROMPT_KEYS.has(key)) return 'prompts'
   if (key.startsWith('upload:memory-media:')) return 'memory'
   if (
     key === `user:${userId}:settings` ||
     key === `project_prefs:${userId}` ||
+    key === `pinokio_machines:${userId}` ||
     key === `icon_library:${userId}:prefs` ||
     key === 'system:settings:docker-mcp' ||
     // SA-120: the instance-level Judge Juice config (master switch, pinned model, timeout).
-    key === 'batshit:typesafe_config'
+    key === 'batshit:typesafe_config' ||
+    // SA-126: the once-per-instance marker of the old default zip rows sweep (zipDefaultsSweep.ts).
+    key === 'batshit:zip_defaults_sweep:v1'
   ) {
     return 'settings'
   }
@@ -1581,11 +1718,9 @@ function groupForKey(key: string, userId: string): BackupGroupId {
     // through this key, so a restore without it would offer the restored files as orphans.
     key === `user:${userId}:goons_animation_library` ||
     key === `user:${userId}:hair_assets` ||
-    key === `user:${userId}:clothing_assets` ||
     key.startsWith('goon:') ||
     key.startsWith(`hair_asset:${userId}:`) ||
     key.startsWith(`hair_refit_source:${userId}:`) ||
-    key.startsWith(`clothing_asset:${userId}:`) ||
     key.startsWith(`goon_recipe_revision:${userId}:`) ||
     key.startsWith(`goon_recipe_document:${userId}:`) ||
     key.startsWith(`goon_recipe_job:${userId}:`)
@@ -1610,6 +1745,7 @@ function groupForKey(key: string, userId: string): BackupGroupId {
     key === `mcp_gateways:${userId}` ||
     key === `cli_tool_registry:${userId}` ||
     key.startsWith(`slash_command:${userId}:`) ||
+    key.startsWith(`agent_plugin:${userId}:`) ||
     key.startsWith(`skill:${userId}:`)
   ) {
     return 'tools'
@@ -1646,9 +1782,11 @@ function groupForKey(key: string, userId: string): BackupGroupId {
 }
 
 function isRestorableKeyForUser(key: string, userId: string) {
+  if (key === slashCommandRevisionKey(userId)) return false // Live concurrency marker; excluded on both archive sides.
   if (isSystemPromptKey(key)) return true
   if (key === 'system:settings:docker-mcp') return true
   if (key === 'batshit:typesafe_config') return true
+  if (key === 'batshit:zip_defaults_sweep:v1') return true
   if (
     key === 'batshit:memory_config' ||
     key === 'batshit:memory_index_meta' ||
@@ -1668,7 +1806,6 @@ function isRestorableKeyForUser(key: string, userId: string) {
     `user:${userId}:goons`,
     `user:${userId}:goons_animation_library`,
     `user:${userId}:hair_assets`,
-    `user:${userId}:clothing_assets`,
     `user:${userId}:icons`,
     `user:${userId}:artifacts`,
     `user:${userId}:voice_profiles`,
@@ -1679,6 +1816,7 @@ function isRestorableKeyForUser(key: string, userId: string) {
     `icon_library:${userId}:prefs`,
     `voice_engine_registry:${userId}`,
     `mcp_gateways:${userId}`,
+    `pinokio_machines:${userId}`,
     `cli_tool_registry:${userId}`,
     'user:system:clips'
   ])
@@ -1701,13 +1839,13 @@ function isRestorableKeyForUser(key: string, userId: string) {
     `artifact_runtime_storage:${userId}:`,
     `icon:${userId}:`,
     `slash_command:${userId}:`,
+    `agent_plugin:${userId}:`,
     `skill:${userId}:`,
     `goon_recipe_revision:${userId}:`,
     `goon_recipe_document:${userId}:`,
     `goon_recipe_job:${userId}:`,
     `hair_asset:${userId}:`,
     `hair_refit_source:${userId}:`,
-    `clothing_asset:${userId}:`
   ]
   if (userPrefixes.some((prefix) => key.startsWith(prefix))) return true
 
@@ -1726,17 +1864,20 @@ function isRestorableKeyForUser(key: string, userId: string) {
     // Chat data, written only by `postTurnCheckState.ts`.
     'jev_post_turn:',
     'jev_post_turn_item:',
+    // SA-139 R1: a stopped Codex CLI reply's cleanup warnings. Nothing writes or reads them since
+    // Codex CLI was removed; existing ones travel with their chat, an older archive that carries
+    // them still restores, and the chat and reply deletes sweep them (`redis.ts`).
     'codex_cleanup_warnings:',
     'codex_cleanup_warning:',
     // BL-474 step 2: where each reply's outside pictures came from (`imageAddressOrigins.ts`).
     'image_origins:',
+    'skill_sessions:',
     'image_origin:',
     'session_clip:',
     'subagent_sessions:',
-    // SA-111 P2 (DL-111-06): the Batshit-issued n8n Workflow Subagent thread id. The
-    // conversation itself lives in n8n's Redis and is not Batshit's to back up, but the id
-    // that names it is session data. The in-flight `subagent_lock:` keys are deliberately
-    // absent — transient run state, never restored.
+    // The in-flight `subagent_lock:` keys are deliberately absent — transient run state, never
+    // restored. SA-139 R2 removed the n8n Workflow Subagent's `subagent_thread:` ids; an older
+    // archive's copies are dropped on restore (`isRetiredSubagentThreadIdKey`).
     //
     // SA-117 P1 (DL-117-09): `agent_run_credential:` and `agent_run_credentials:` are
     // deliberately absent for the same reason, and it is worth saying why the usual
@@ -1748,7 +1889,6 @@ function isRestorableKeyForUser(key: string, userId: string) {
     // list means absent from BOTH `collectCandidateKeys` (never exported) and
     // `isRestorableKeyForUser` (a hand-built archive carrying one is refused outright at
     // `buildTargetRecords`), and `backupRestoreService.test.ts` pins both halves.
-    'subagent_thread:',
     'pins:',
     'agent:',
     'subagent:',
@@ -1768,6 +1908,7 @@ function isRestorableKeyForUser(key: string, userId: string) {
     'memfold:',
     'episode:',
     'memlinger:',
+    'whiteboard:',
     // SA-113 P2 (DL-113-02). DMs are agent-scoped, so they follow the agent-prefix shape
     // the memory keys use rather than a user prefix.
     'dm:',
@@ -1789,6 +1930,9 @@ function isDefinitelyRuntimeOnlyKey(key: string) {
     key.startsWith('email:') ||
     key === 'users:all' ||
     key === 'user:admin' ||
+    // SA-134: local human consent/destination and attempt status never travel to another instance.
+    key === 'batshit:automatic_backup_config' ||
+    key === 'batshit:automatic_backup_status' ||
     key.startsWith('ratelimit:') ||
     key.startsWith('artifact_runtime_token:') ||
     key.startsWith('tool_approval:') ||
@@ -1799,18 +1943,74 @@ function isDefinitelyRuntimeOnlyKey(key: string) {
     key.startsWith('control_approval:') ||
     key.startsWith('control_approvals:') ||
     key.startsWith('control_risk_approval:') ||
-    key.startsWith('codex_bridge:')
+    // SA-137 P4 (D10): what live file reads did for a chat's newest turn, in this app process only.
+    // Never exported; a restore deletes the chats' receipts (`restoreArchive`'s replacement).
+    key.startsWith('live_file_reads:')
   )
 }
 
+function sourceReadFailure(key: string, operation: string, reason = 'could not be read') {
+  return new BackupRestoreError(`Backup source ${boundedKeyForMessage(key)} ${reason}.`, 500, {
+    code: 'BACKUP_SOURCE_READ_FAILED', key: boundedKeyForMessage(key), operation
+  })
+}
+
+async function readSource<T>(key: string, operation: string, read: () => Promise<T>): Promise<T> {
+  try { return await read() }
+  catch (error) {
+    if (error instanceof BackupRestoreError) throw error
+    throw sourceReadFailure(key, operation)
+  }
+}
+
+/** JSON.GET must round-trip as data, including null/scalars/empty roots, without lossy coercion. */
+function isJsonData(value: unknown): boolean {
+  const pending: Array<{ value: unknown; exit?: boolean }> = [{ value }]
+  const active = new Set<object>()
+  while (pending.length) {
+    const next = pending.pop()!
+    if (next.exit) { active.delete(next.value as object); continue }
+    const item = next.value
+    if (item === null || typeof item === 'string' || typeof item === 'boolean') continue
+    if (typeof item === 'number') { if (!Number.isFinite(item)) return false; continue }
+    if (typeof item !== 'object' || active.has(item)) return false
+    const array = Array.isArray(item)
+    if (!array && Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null) return false
+    const keys = Reflect.ownKeys(item)
+    if (array && keys.length !== item.length + 1) return false // sparse arrays or ignored side fields
+    active.add(item)
+    pending.push({ value: item, exit: true })
+    for (const key of keys) {
+      if (array && key === 'length') continue
+      if (typeof key !== 'string') return false
+      const descriptor = Object.getOwnPropertyDescriptor(item, key)!
+      if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) return false
+      if (array && (!/^(0|[1-9]\d*)$/.test(key) || Number(key) >= item.length)) return false
+      pending.push({ value: descriptor.value })
+    }
+  }
+  try { return JSON.stringify(value) !== undefined } catch { return false }
+}
+
+function isSavedValue(type: RedisRecordType, value: unknown): boolean {
+  if (!isJsonData(value)) return false
+  if (type === 'json') return true
+  if (type === 'string') return typeof value === 'string'
+  if (type === 'set' || type === 'list') return Array.isArray(value) && value.every((item) => typeof item === 'string')
+  if (type === 'hash') return isPlainObject(value) && Object.values(value).every((item) => typeof item === 'string')
+  return Array.isArray(value) && value.every((item) => isPlainObject(item) && typeof item.value === 'string' && typeof item.score === 'number' && Number.isFinite(item.score))
+}
+
 async function readRedisRecord(client: any, key: string, groupId: BackupGroupId, requireRecoverable = false): Promise<BackupRedisRecord | null> {
-  const rawType = await client.type(key)
+  const rawType: unknown = await readSource(key, 'TYPE', () => client.type(key))
+  if (typeof rawType !== 'string') throw sourceReadFailure(key, 'TYPE', 'returned an invalid Redis type')
   const type = normalizeRedisType(rawType)
   if (!type) {
     if (requireRecoverable && rawType !== 'none') {
       throw new BackupRestoreError('Current Hair job state has an unsupported Redis type. Restore stopped before replacement.', 500)
     }
-    return null
+    if (rawType === 'none') return null
+    throw sourceReadFailure(key, 'TYPE', 'has an unsupported Redis type')
   }
 
   let value: unknown
@@ -1819,29 +2019,39 @@ async function readRedisRecord(client: any, key: string, groupId: BackupGroupId,
     // with one entry is still a list: flattening it saved a chat's one-run Execution Viewer
     // log as the bare run, which the viewer cannot read after a restore (BL-128; BL-118 was
     // the same unwrap in the artifact list).
-    value = await client.json.get(key)
+    value = await readSource(key, 'JSON.GET', () => client.json.get(key))
   } else if (type === 'string') {
-    value = await client.get(key)
+    value = await readSource(key, 'GET', () => client.get(key))
   } else if (type === 'set') {
-    value = (await client.sMembers(key)).sort()
+    value = await readSource(key, 'SMEMBERS', () => client.sMembers(key))
   } else if (type === 'list') {
-    value = await client.lRange(key, 0, -1)
+    value = await readSource(key, 'LRANGE', () => client.lRange(key, 0, -1))
   } else if (type === 'hash') {
-    value = await client.hGetAll(key)
+    value = await readSource(key, 'HGETALL', () => client.hGetAll(key))
   } else if (type === 'zset') {
-    value = await client.zRangeWithScores(key, 0, -1)
+    value = await readSource(key, 'ZRANGE_WITH_SCORES', () => client.zRangeWithScores(key, 0, -1))
   }
 
-  const ttl = await client.ttl(key)
+  const ttl: unknown = await readSource(key, 'TTL', () => client.ttl(key))
+  if (typeof ttl !== 'number' || !Number.isInteger(ttl) || ttl < -2) throw sourceReadFailure(key, 'TTL', 'returned invalid expiry metadata')
+  // A row may legitimately expire or be removed between discovery and this read.
+  if (ttl === -2) return null
+  if (ttl === 0) {
+    // This format writes a positive relative TTL or no expiry. A live subsecond deadline
+    // cannot be represented without reviving it as persistent data. Confirm true absence
+    // once; otherwise refuse before publication or destructive replacement.
+    if (await readSource(key, 'TYPE', () => client.type(key)) === 'none') return null
+    throw sourceReadFailure(key, 'TTL', 'has a subsecond expiry that this backup format cannot preserve')
+  }
+  const strings = (items: unknown): items is string[] => Array.isArray(items) && items.every((item) => typeof item === 'string')
+  if (!isSavedValue(type, value)) throw sourceReadFailure(key, type, 'returned an invalid saved-data value')
+  if (type === 'set') value = (value as string[]).sort()
   if (requireRecoverable) {
     // Missing rows are benign. Local rollback has relative TTLs, not absolute
     // deadlines: replaying an expiring control row could revive cleanup authority.
-    if (ttl === -2) return null
-    const strings = (items: unknown): items is string[] =>
-      Array.isArray(items) && items.length > 0 && items.every((item) => typeof item === 'string')
     const recoverable = type === 'json' ? value !== undefined :
       type === 'string' ? typeof value === 'string' :
-      type === 'set' || type === 'list' ? strings(value) :
+      type === 'set' || type === 'list' ? strings(value) && value.length > 0 :
       type === 'hash' ? isPlainObject(value) && Object.keys(value).length > 0 && Object.values(value).every((item) => typeof item === 'string') :
       Array.isArray(value) && value.length > 0 && value.every((item) =>
         isPlainObject(item) && typeof item.value === 'string' && typeof item.score === 'number' && Number.isFinite(item.score))
@@ -1861,7 +2071,8 @@ async function readRedisRecord(client: any, key: string, groupId: BackupGroupId,
 /** Local rollback only: these keys never acquire archive/import authority. */
 async function captureCurrentHairJobRecords(client: any, userId: string) {
   const prefix = `hair_import_job:${userId}:`
-  const matches: unknown = await client.keys(`${prefix.replace(/[\\*?[\]]/g, '\\$&')}*`)
+  const pattern = `${prefix.replace(/[\\*?[\]]/g, '\\$&')}*`
+  const matches: unknown = await readSource(pattern, 'KEYS', () => client.keys(pattern))
   if (!Array.isArray(matches) || matches.some((key) => typeof key !== 'string' || !key.startsWith(prefix))) {
     throw new BackupRestoreError('Current Hair job inventory is outside the target namespace. Restore stopped before replacement.', 500)
   }
@@ -1876,52 +2087,55 @@ async function captureCurrentHairJobRecords(client: any, userId: string) {
 
 async function addExistingKey(keys: Set<string>, client: any, key: string) {
   if (isDefinitelyRuntimeOnlyKey(key)) return
-  if ((await client.exists(key)) === 1) keys.add(key)
+  const exists = await readSource(key, 'EXISTS', () => client.exists(key))
+  if (exists !== 0 && exists !== 1) throw sourceReadFailure(key, 'EXISTS', 'returned an invalid key-existence reply')
+  if (exists === 1) keys.add(key)
 }
 
 async function addPatternKeys(keys: Set<string>, client: any, pattern: string) {
-  const matches = await client.keys(pattern)
+  const matches = await readSource(pattern, 'KEYS', () => client.keys(pattern))
+  if (!Array.isArray(matches) || !matches.every((key) => typeof key === 'string' && key.length > 0)) throw sourceReadFailure(pattern, 'KEYS', 'returned an invalid key inventory')
   for (const key of matches) {
     if (!isDefinitelyRuntimeOnlyKey(key)) keys.add(key)
   }
 }
 
-async function safeSetMembers(client: any, key: string) {
-  try {
-    if ((await client.exists(key)) !== 1) return []
-    const type = await client.type(key)
-    if (type !== 'set') return []
-    return await client.sMembers(key)
-  } catch {
-    return []
+async function strictIndexMembers(client: any, key: string, expectedType: 'set' | 'zset'): Promise<string[]> {
+  const type = await readSource(key, 'TYPE', () => client.type(key))
+  if (type === 'none') return []
+  if (type !== expectedType) throw sourceReadFailure(key, 'TYPE', 'has the wrong Redis type')
+  const members: unknown = expectedType === 'set' ? await readSource(key, 'SMEMBERS', () => client.sMembers(key)) : await readSource(key, 'ZRANGE', () => client.zRange(key, 0, -1))
+  if (!Array.isArray(members) || !isJsonData(members) || !members.every((member) => typeof member === 'string' && member.length > 0 && !member.includes('\0')) || new Set(members).size !== members.length) {
+    throw sourceReadFailure(key, expectedType === 'set' ? 'SMEMBERS' : 'ZRANGE', 'has invalid members')
   }
+  return members as string[]
+}
+
+async function safeSetMembers(client: any, key: string) {
+  return strictIndexMembers(client, key, 'set')
 }
 
 /** SA-113 P2: the DM indexes are sorted sets, not sets — same shape of safe read. */
 async function safeZsetMembers(client: any, key: string) {
-  try {
-    if ((await client.exists(key)) !== 1) return []
-    const type = await client.type(key)
-    if (type !== 'zset') return []
-    const members = await client.zRange(key, 0, -1)
-    return Array.isArray(members) ? (members as string[]) : []
-  } catch {
-    return []
-  }
+  return strictIndexMembers(client, key, 'zset')
 }
 
 async function collectCandidateKeys(client: any, userId: string) {
   const keys = new Set<string>()
-  const sessionIds = await safeSetMembers(client, `user:${userId}:sessions`)
-  const agentIds = await safeSetMembers(client, `user:${userId}:agents`)
-  const subagentIds = await safeSetMembers(client, `user:${userId}:subagents`)
-  const groupIds = await safeSetMembers(client, `user:${userId}:groups`)
-  const folderIds = await safeSetMembers(client, `user:${userId}:folders`)
-  const modelIds = await safeSetMembers(client, `user:${userId}:models`)
-  const clipIds = await safeSetMembers(client, `user:${userId}:clips`)
-  const artifactIds = await safeSetMembers(client, `user:${userId}:artifacts`)
-  const goonIds = await safeSetMembers(client, `user:${userId}:goons`)
-  const voiceProfileIds = await safeSetMembers(client, `user:${userId}:voice_profiles`)
+  const setMembers = (key: string) => safeSetMembers(client, key)
+  const zsetMembers = (key: string) => safeZsetMembers(client, key)
+  const addKey = (key: string) => addExistingKey(keys, client, key)
+  const addPattern = (pattern: string) => addPatternKeys(keys, client, pattern)
+  const sessionIds = await setMembers(`user:${userId}:sessions`)
+  const agentIds = await setMembers(`user:${userId}:agents`)
+  const subagentIds = await setMembers(`user:${userId}:subagents`)
+  const groupIds = await setMembers(`user:${userId}:groups`)
+  const folderIds = await setMembers(`user:${userId}:folders`)
+  const modelIds = await setMembers(`user:${userId}:models`)
+  const clipIds = await setMembers(`user:${userId}:clips`)
+  const artifactIds = await setMembers(`user:${userId}:artifacts`)
+  const goonIds = await setMembers(`user:${userId}:goons`)
+  const voiceProfileIds = await setMembers(`user:${userId}:voice_profiles`)
 
   for (const key of [
     `user:${userId}:settings`,
@@ -1936,7 +2150,6 @@ async function collectCandidateKeys(client: any, userId: string) {
     `user:${userId}:goons`,
     `user:${userId}:goons_animation_library`,
     `user:${userId}:hair_assets`,
-    `user:${userId}:clothing_assets`,
     `user:${userId}:icons`,
     `user:${userId}:artifacts`,
     `user:${userId}:voice_profiles`,
@@ -1946,6 +2159,7 @@ async function collectCandidateKeys(client: any, userId: string) {
     `icon_library:${userId}:prefs`,
     `voice_engine_registry:${userId}`,
     `mcp_gateways:${userId}`,
+    `pinokio_machines:${userId}`,
     `cli_tool_registry:${userId}`,
     `user_artifact_usage:${userId}`,
     'user:system:clips',
@@ -1954,10 +2168,12 @@ async function collectCandidateKeys(client: any, userId: string) {
     'batshit:memory_config',
     'batshit:memory_index_meta',
     'batshit:memory_media_migration:v1',
+    'batshit:zip_defaults_sweep:v1',
     ...SYSTEM_PROMPT_KEYS,
-    ...SYSTEM_PROMPT_META_KEYS
+    ...SYSTEM_PROMPT_META_KEYS,
+    ...RETIRED_ZIP_TOOL_PROMPT_KEYS
   ]) {
-    await addExistingKey(keys, client, key)
+    await addKey(key)
   }
 
   for (const sessionId of sessionIds) {
@@ -1975,116 +2191,126 @@ async function collectCandidateKeys(client: any, userId: string) {
       `jev_post_turn:${sessionId}`,
       `codex_cleanup_warnings:${sessionId}`,
       `image_origins:${sessionId}`,
+      `skill_sessions:${sessionId}`,
       `pins:${sessionId}`,
       `session:${sessionId}:episodes`,
       `memlinger:${sessionId}`
     ]) {
-      await addExistingKey(keys, client, key)
+      await addKey(key)
     }
-    await addPatternKeys(keys, client, `episode:${sessionId}:*`)
-    await addPatternKeys(keys, client, `message:${sessionId}:*`)
-    await addPatternKeys(keys, client, `session_clip:${sessionId}:*`)
-    await addPatternKeys(keys, client, `subagent_sessions:${sessionId}:subagent:*`)
-    await addPatternKeys(keys, client, `subagent_thread:${sessionId}:*`)
-    await addPatternKeys(keys, client, `unzipped_item:${sessionId}:*`)
-    await addPatternKeys(keys, client, `rezipped_item:${sessionId}:*`)
-    await addPatternKeys(keys, client, `jev_post_turn_item:${sessionId}:*`)
-    await addPatternKeys(keys, client, `codex_cleanup_warning:${sessionId}:*`)
-    await addPatternKeys(keys, client, `image_origin:${sessionId}:*`)
-    await addPatternKeys(keys, client, `zip_temp:${sessionId}:*`)
-    await addPatternKeys(keys, client, `zip_temp_meta:${sessionId}:*`)
+    await addPattern(`episode:${sessionId}:*`)
+    await addPattern(`whiteboard:${sessionId}:*`)
+    await addPattern(`message:${sessionId}:*`)
+    await addPattern(`session_clip:${sessionId}:*`)
+    await addPattern(`subagent_sessions:${sessionId}:subagent:*`)
+    await addPattern(`unzipped_item:${sessionId}:*`)
+    await addPattern(`rezipped_item:${sessionId}:*`)
+    await addPattern(`jev_post_turn_item:${sessionId}:*`)
+    await addPattern(`codex_cleanup_warning:${sessionId}:*`)
+    await addPattern(`image_origin:${sessionId}:*`)
+    await addPattern(`zip_temp:${sessionId}:*`)
+    await addPattern(`zip_temp_meta:${sessionId}:*`)
   }
 
   for (const folderId of folderIds) {
-    await addExistingKey(keys, client, `folder:${userId}:${folderId}`)
-    await addExistingKey(keys, client, `folder:${userId}:${folderId}:sessions`)
+    await addKey(`folder:${userId}:${folderId}`)
+    await addKey(`folder:${userId}:${folderId}:sessions`)
   }
 
   for (const agentId of agentIds) {
-    await addExistingKey(keys, client, `agent:${agentId}`)
-    await addExistingKey(keys, client, `agent:${agentId}:subagents`)
-    await addPatternKeys(keys, client, `memory:${agentId}:*`)
-    await addPatternKeys(keys, client, `memseg:${agentId}:*`)
-    await addPatternKeys(keys, client, `memdream:${agentId}:*`)
-    await addExistingKey(keys, client, `memdream_index:${agentId}`)
-    await addExistingKey(keys, client, `memfold:${agentId}`)
-    await addPatternKeys(keys, client, `upload:memory-media:${agentId}/*`)
+    await addKey(`agent:${agentId}`)
+    await addKey(`agent:${agentId}:subagents`)
+    await addPattern(`memory:${agentId}:*`)
+    await addPattern(`memseg:${agentId}:*`)
+    await addPattern(`memdream:${agentId}:*`)
+    await addKey(`memdream_index:${agentId}`)
+    await addKey(`memfold:${agentId}`)
+    await addPattern(`upload:memory-media:${agentId}/*`)
     // SA-113 P2: the agent's inbox and sent indexes. The DM records themselves are
     // collected from those indexes below, because a DM's id carries no agent segment.
-    await addExistingKey(keys, client, `dm_inbox:${agentId}`)
-    await addExistingKey(keys, client, `dm_sent:${agentId}`)
+    await addKey(`dm_inbox:${agentId}`)
+    await addKey(`dm_sent:${agentId}`)
   }
 
   // SA-113 P2: DM records, reached through the per-user index so a DM whose recipient was
   // deleted is still exported while its record survives retention.
-  await addExistingKey(keys, client, `dm_index:${userId}`)
-  await addExistingKey(keys, client, `wake_hooks:${userId}`)
-  for (const dmId of await safeZsetMembers(client, `dm_index:${userId}`)) {
-    await addExistingKey(keys, client, `dm:${dmId}`)
+  await addKey(`dm_index:${userId}`)
+  await addKey(`wake_hooks:${userId}`)
+  for (const dmId of await zsetMembers(`dm_index:${userId}`)) {
+    await addKey(`dm:${dmId}`)
   }
-  for (const hookId of await safeSetMembers(client, `wake_hooks:${userId}`)) {
-    await addExistingKey(keys, client, `wake_hook:${hookId}`)
+  for (const hookId of await setMembers(`wake_hooks:${userId}`)) {
+    await addKey(`wake_hook:${hookId}`)
   }
 
   // SA-115 P3: schedules, reached through their user-scoped index the same way — a SET,
   // like `wake_hooks:`, so `safeSetMembers` is the right reader.
-  await addExistingKey(keys, client, `schedules:${userId}`)
-  for (const scheduleId of await safeSetMembers(client, `schedules:${userId}`)) {
-    await addExistingKey(keys, client, `schedule:${scheduleId}`)
+  await addKey(`schedules:${userId}`)
+  for (const scheduleId of await setMembers(`schedules:${userId}`)) {
+    await addKey(`schedule:${scheduleId}`)
   }
 
   for (const subagentId of subagentIds) {
-    await addExistingKey(keys, client, `subagent:${subagentId}`)
+    await addKey(`subagent:${subagentId}`)
   }
 
   for (const groupId of groupIds) {
-    await addExistingKey(keys, client, `group:${groupId}`)
+    await addKey(`group:${groupId}`)
   }
 
   for (const modelId of modelIds) {
-    await addExistingKey(keys, client, `model:${modelId}`)
+    await addKey(`model:${modelId}`)
   }
 
   for (const clipId of clipIds) {
-    await addExistingKey(keys, client, `clip:${userId}:${clipId}`)
-    await addExistingKey(keys, client, `clip_usage:${clipId}`)
+    await addKey(`clip:${userId}:${clipId}`)
+    await addKey(`clip_usage:${clipId}`)
   }
 
   for (const artifactId of artifactIds) {
-    await addExistingKey(keys, client, `artifact:${artifactId}`)
-    await addExistingKey(keys, client, `artifact_runtime_storage:${userId}:${artifactId}`)
+    await addKey(`artifact:${artifactId}`)
+    await addKey(`artifact_runtime_storage:${userId}:${artifactId}`)
   }
 
   for (const goonId of goonIds) {
-    await addExistingKey(keys, client, `goon:${goonId}`)
+    await addKey(`goon:${goonId}`)
   }
 
   for (const profileId of voiceProfileIds) {
-    await addExistingKey(keys, client, `voice_profile:${profileId}`)
+    await addKey(`voice_profile:${profileId}`)
   }
 
-  await addPatternKeys(keys, client, `api_keys:${userId}:*`)
-  await addPatternKeys(keys, client, `custom_provider:${userId}:*`)
-  await addPatternKeys(keys, client, `local_provider:${userId}:*`)
-  await addPatternKeys(keys, client, `project:${userId}:*`)
-  await addPatternKeys(keys, client, `icon:${userId}:*`)
-  await addPatternKeys(keys, client, `user:${userId}:artifact_order:*`)
-  await addPatternKeys(keys, client, `slash_command:${userId}:*`)
-  await addPatternKeys(keys, client, `skill:${userId}:*`)
-  await addPatternKeys(keys, client, `goon_recipe_revision:${userId}:*`)
-  await addPatternKeys(keys, client, `goon_recipe_document:${userId}:*`)
-  await addPatternKeys(keys, client, `goon_recipe_job:${userId}:*`)
-  await addPatternKeys(keys, client, `hair_asset:${userId}:*`)
-  await addPatternKeys(keys, client, `hair_refit_source:${userId}:*`)
-  await addPatternKeys(keys, client, `clothing_asset:${userId}:*`)
-  await addPatternKeys(keys, client, 'clip:system:*')
-  await addPatternKeys(keys, client, 'upload:*')
-  await addPatternKeys(keys, client, 'zip:*')
-  await addPatternKeys(keys, client, 'artifact_usage:*')
+  await addPattern(`api_keys:${userId}:*`)
+  await addPattern(`custom_provider:${userId}:*`)
+  await addPattern(`local_provider:${userId}:*`)
+  await addPattern(`project:${userId}:*`)
+  await addPattern(`icon:${userId}:*`)
+  await addPattern(`user:${userId}:artifact_order:*`)
+  await addPattern(`slash_command:${userId}:*`)
+  await addPattern(`agent_plugin:${userId}:*`)
+  await addPattern(`skill:${userId}:*`)
+  await addPattern(`goon_recipe_revision:${userId}:*`)
+  await addPattern(`goon_recipe_document:${userId}:*`)
+  await addPattern(`goon_recipe_job:${userId}:*`)
+  await addPattern(`hair_asset:${userId}:*`)
+  await addPattern(`hair_refit_source:${userId}:*`)
+  await addPattern('clip:system:*')
+  await addPattern('upload:*')
+  await addPattern('zip:*')
+  await addPattern('artifact_usage:*')
 
   return Array.from(keys)
     .filter((key) => isRestorableKeyForUser(key, userId))
     .sort((left, right) => left.localeCompare(right))
+}
+
+/**
+ * A paused reply's replay fields (the whiteboard fragment, SA-137's live-file-read snapshot) are
+ * transient consent for one call: never exported, With Secrets included, and never restored.
+ */
+function withoutWhiteboardReplaySnapshot(key: string, value: unknown): unknown {
+  if (!key.startsWith('message:') || !isPlainObject(value)) return value
+  return withoutServerReplayFields(value)
 }
 
 function normalizeRecordForExport(
@@ -2092,6 +2318,7 @@ function normalizeRecordForExport(
   options: CollectOptions,
   redactions: RedactionState
 ): BackupRedisRecord | null {
+  record = { ...record, value: withoutWhiteboardReplaySnapshot(record.key, record.value) }
   if (!options.includeSecrets && isSecretRecordKey(record.key, options.userId)) {
     redactions.excludedRecordCount += 1
     redactions.redactedPaths.add(record.key)
@@ -2124,13 +2351,18 @@ async function collectExportRecords(client: any, keys: string[], userId: string)
   // extra owner records only conserve referenced files and are never silently archived.
   const retained = new Map(captured.filter((record) => isRetainedHairOwnerKey(record.key)).map((record) => [record.key, record]))
   for (const pattern of RETAINED_HAIR_OWNER_PATTERNS) {
-    for (const key of await client.keys(pattern)) {
+    const matches = await readSource(pattern, 'KEYS', () => client.keys(pattern))
+    if (!Array.isArray(matches) || !matches.every((key) => typeof key === 'string' && key.length > 0)) throw sourceReadFailure(pattern, 'KEYS', 'returned an invalid key inventory')
+    for (const key of matches) {
       if (retained.has(key)) continue
       const record = await readRedisRecord(client, key, groupForKey(key, userId))
       if (record) retained.set(key, record)
     }
   }
-  const snapshot = await readHairBackupSnapshot(client)
+  const snapshot = await readSource('hair_import_snapshot', 'EVAL', () => readHairBackupSnapshot(client))
+  for (const record of snapshot.values()) {
+    if (!isSavedValue(record.type, record.value)) throw sourceReadFailure(record.key, 'EVAL', 'returned an invalid saved-data value')
+  }
   const omitted = stagedHairUploadKeys(snapshot, [...retained.values()])
   for (const record of snapshot.values()) {
     if (isRestorableKeyForUser(record.key, userId) && !omitted.has(record.key)) {
@@ -2194,6 +2426,54 @@ function isFilesystemBackedUploadValue(value: Record<string, unknown>) {
   )
 }
 
+/**
+ * BL-2401: batshit-server's own test for whether an upload record names a file on disk
+ * (`resolveFilesystemUploadPath`, serve-uploads.js): a non-empty `relativePath` string, else a
+ * `filePath` string. A record that names one is served from that file and never from content in
+ * the record (`serveUpload` tries the file first, and a missing file is a 404, not a fallback).
+ */
+function uploadValueNamesDiskPath(value: Record<string, unknown>) {
+  return (
+    (typeof value.relativePath === 'string' && value.relativePath.length > 0) ||
+    typeof value.filePath === 'string'
+  )
+}
+
+/**
+ * BL-2401: an upload stored in Redis as text. Its content is the record's own `textContent` and
+ * it names no file (`uploadValueNamesDiskPath`), so batshit-server serves it from the record and
+ * there is no file for it anywhere. The one writer is `storeRedisUploadAsset` (upload-redis.js),
+ * which keeps every Advanced/Blender Goon package's `avatar.json` as
+ * `upload:goon_guided_manifests:<file>` (JSON `{ originalName, mimetype, size, uploadType,
+ * uploadedAt, textContent }`, no TTL, no storage marker); the startup migration only moves Base64
+ * payloads, so these stay in Redis. The export keeps such a record exactly as stored, with no
+ * `relativePath`, so `archivedUploadFilePath` gives it no file: the archive carries the record and
+ * its text, and the inventory counts, the automatic verifier and the restore expect no file.
+ * Its text wins over any storage marker or Base64 copy beside it, because the server serves the
+ * text first. A record that also names a file is file-backed: the server serves the file, so the
+ * backup needs that file (and a missing one stops the export, BL-378). A Base64 copy without text
+ * is not this: the export carries its decoded bytes as a file (the legacy normalization below).
+ */
+function isRedisStoredTextUpload(value: unknown) {
+  return isPlainObject(value) && typeof value.textContent === 'string' && !uploadValueNamesDiskPath(value)
+}
+
+/**
+ * BL-2401: the ONE rule for which file in the archive an upload record of the archive needs. The
+ * export writes `relativePath` on exactly the records whose bytes it carries as
+ * `files/uploads/<relativePath>` (a file-backed upload, or a legacy Base64 copy it decodes), so
+ * that path is the file; a Redis-stored text upload, a record that names no file and a Redis
+ * string record carry no file. The export's inspection targets (and so its file inventory and
+ * the Check Upload Files audit), the partial-backup reader, the automatic backup verifier and the
+ * restore all ask this, so none can expect a file another does not carry. (Before BL-2401 the
+ * verifier asked `uploadRelativePathForExport`, the raw record's rule, whose fallback to the key's
+ * path invented a file for every Goon package manifest and refused every automatic backup.)
+ */
+function archivedUploadFilePath(record: Pick<BackupRedisRecord, 'key' | 'value'>) {
+  if (!record.key.startsWith('upload:')) return null
+  return isPlainObject(record.value) ? normalizeUploadRelativePath(record.value) : null
+}
+
 function uploadRelativePathFromKey(key: string) {
   if (!key.startsWith('upload:')) return null
   const parts = key
@@ -2204,6 +2484,12 @@ function uploadRelativePathFromKey(key: string) {
   return parts.length >= 2 ? toPosixPath(parts.join('/')) : null
 }
 
+/**
+ * Restore's URL index: the upload path each archived record is served at, by file name. This is
+ * where a URL points, not which archive file a record needs (that is `archivedUploadFilePath`),
+ * so it keeps the key's path for a Redis-stored upload: `/uploads/<type>/<file>` is the URL the
+ * server answers from the record (BL-2401).
+ */
 function buildUploadRelativePathIndex(records: BackupRedisRecord[]) {
   const byBasename = new Map<string, string>()
   for (const record of records) {
@@ -2275,6 +2561,8 @@ function normalizeUploadRecordForExport(record: BackupRedisRecord): {
   if (!record.key.startsWith('upload:') || !isPlainObject(record.value)) {
     return { record, redisBase64Asset: null }
   }
+  // BL-2401: served from its own text, so it travels exactly as stored and needs no file.
+  if (isRedisStoredTextUpload(record.value)) return { record, redisBase64Asset: null }
 
   const relativePath = uploadRelativePathForExport(record)
   if (!relativePath) return { record, redisBase64Asset: null }
@@ -2383,7 +2671,7 @@ function uploadInspectionTargets(
       if (unsupported) targets.push(unsupported)
       continue
     }
-    const relativePath = normalizeUploadRelativePath(record.value)
+    const relativePath = archivedUploadFilePath(record)
     if (!relativePath) continue
     const { size, uploadedAt, originalName, sha256 } = record.value
     targets.push({
@@ -2868,7 +3156,7 @@ function assertPartialManifestFits(encoded: Uint8Array) {
 
 async function collectBackupBundleParts(
   userId: string,
-  options?: { includeSecrets?: boolean; partial?: BackupPartialRequest | null }
+  options?: { includeSecrets?: boolean; partial?: BackupPartialRequest | null; strictInventory?: boolean }
 ) {
   const includeSecrets = options?.includeSecrets === true
   const partialRequest = options?.partial ?? null
@@ -3064,7 +3352,8 @@ export async function createBackupBundle(
  */
 export async function createBackupBundleStream(
   userId: string,
-  options?: { includeSecrets?: boolean; partial?: BackupPartialRequest | null }
+  // strictInventory remains accepted for the existing automatic caller; every owner is strict.
+  options?: { includeSecrets?: boolean; partial?: BackupPartialRequest | null; strictInventory?: boolean }
 ): Promise<BackupBundleStream> {
   const endWork = enterBackupRestoreHttpRequest()
   if (!endWork) {
@@ -3302,7 +3591,7 @@ function assertPartialManifestAgreement(
   for (const entry of listed.values()) {
     const record = uploadRecords.get(entry.key)
     if (!record) partialListError(`listed upload record ${boundedKeyForMessage(entry.key)} is not in the archive`)
-    if (normalizeUploadRelativePath(record.value) !== entry.relativePath) {
+    if (archivedUploadFilePath(record) !== entry.relativePath) {
       partialListError(`listed upload record ${boundedKeyForMessage(entry.key)} does not name the listed file`)
     }
     if (archivedRecordSha256(record) !== entry.archivedRecordSha256) {
@@ -3313,17 +3602,15 @@ function assertPartialManifestAgreement(
     }
   }
   for (const record of uploadRecords.values()) {
-    const relativePath = normalizeUploadRelativePath(record.value)
+    const relativePath = archivedUploadFilePath(record)
     if (relativePath && !uploadFilePaths.has(relativePath) && !listed.has(record.key)) {
       partialListError(`upload record ${boundedKeyForMessage(record.key)} has no file in the archive and is not listed`)
     }
   }
 }
 
-async function countCurrentRecords(userId: string) {
-  return await redis.execute(async (client) => {
-    return (await collectCandidateKeys(client, userId)).length
-  })
+async function countCurrentRecords(userId: string, targetKeys: string[] = []) {
+  return (await measureCurrentRestoreState(userId, targetKeys)).currentRecordCount
 }
 
 export async function preflightBackupRestore(
@@ -3341,7 +3628,7 @@ export async function preflightBackupRestore(
   assertHostFoldersHaveOwners(archiveHostFiles, preflightTargetRecords, userId)
   await rehashTransformedRecipeGraph(preflightTargetRecords, userId)
   await validateRecipeRestoreGraph(preflightTargetRecords, userId)
-  const currentRecordCount = await countCurrentRecords(userId)
+  const currentRecordCount = await countCurrentRecords(userId, preflightTargetRecords.map((record) => record.key))
   const fileAssetNames = Object.keys(bundle.zipEntries).filter((name) => name.startsWith(UPLOAD_FILE_ROOT))
   const fileAssetBytes = fileAssetNames.reduce(
     (sum, name) => sum + (bundle.zipEntries[name]?.byteLength ?? 0),
@@ -3676,6 +3963,10 @@ async function buildPreflightWarnings(
     warnings.push(...describeStrippedCustomProviderHeaders(bundle.records))
   }
   warnings.push(...describeRetiredPromptMetadata(bundle.records))
+  warnings.push(...describeRetiredSubagentInstructions(bundle.records))
+  warnings.push(...describeRetiredSubagentThreadIds(bundle.records))
+  warnings.push(...describeRetiredCliPrimaryPrompt(bundle.records))
+  warnings.push(...describeRetiredZipToolPrompts(bundle.records))
   warnings.push(...(await describeCorePromptsWithoutMetadata(bundle.records)))
   warnings.push(...describeHostFileWarnings(bundle, archiveHostFiles))
   warnings.push(...(await describeHostFoldersToReplace(bundle, archiveHostFiles)))
@@ -3750,13 +4041,22 @@ function buildTargetRecords(
   const uploadRoot = resolveUploadsDir()
   const uploadRelativePathByBasename = buildUploadRelativePathIndex(bundle.records)
   const avatarServingOverrides = buildAvatarServingUrlOverrides(bundle.records)
-  return bundle.records.filter((record) => !isRetiredPromptMetadataKey(record.key)).map((record) => {
+  const targetRecords = bundle.records.filter((record) => !isRetiredPromptMetadataKey(record.key) && !RETIRED_SUBAGENT_INSTRUCTION_KEYS.has(record.key) &&
+    !isRetiredSubagentThreadIdKey(record.key) && !RETIRED_CLI_PRIMARY_PROMPT_KEYS.has(record.key)).map((record) => {
     const key = remapUserKey(record.key, sourceUserId, targetUserId)
     if (!isRestorableKeyForUser(key, targetUserId)) {
       throw new BackupRestoreError(`Backup contains a key Batshit will not restore: ${record.key}`, 400)
     }
 
-    let value = remapUserValue(cloneJson(record.value), sourceUserId, targetUserId)
+    let value = remapUserValue(withoutWhiteboardReplaySnapshot(key, cloneJson(record.value)), sourceUserId, targetUserId)
+    if (key === `pinokio_machines:${targetUserId}`) {
+      if (record.type !== 'json') throw new BackupRestoreError('Saved Pinokio connections must be a RedisJSON registry.', 400)
+      try {
+        value = restoredPinokioMachineRegistry(value)
+      } catch {
+        throw new BackupRestoreError('The backup contains an invalid Pinokio connection registry.', 400)
+      }
+    }
     if (key === `local_provider:${targetUserId}:koboldcpp` && isPlainObject(value)) {
       // Restored preferences cannot mint/reuse host-local filesystem authority.
       // Only a NEW explicit local enrollment after this restore may be bound.
@@ -3770,8 +4070,9 @@ function buildTargetRecords(
     if (isFlattenedListRecord({ key, type: record.type, value })) {
       value = [value]
     }
-    if (key.startsWith('upload:') && isPlainObject(value) && value.storage === 'filesystem') {
-      const relativePath = normalizeUploadRelativePath(value)
+    // BL-2401: a Redis-stored text upload comes back exactly as archived (no file, no filePath).
+    if (key.startsWith('upload:') && isPlainObject(value) && value.storage === 'filesystem' && !isRedisStoredTextUpload(value)) {
+      const relativePath = archivedUploadFilePath({ key, value })
       if (!relativePath) {
         throw new BackupRestoreError(`Filesystem upload record "${record.key}" is missing relativePath.`, 400)
       }
@@ -3792,6 +4093,7 @@ function buildTargetRecords(
       value
     }
   })
+  return materializeArchiveToolSettings(targetRecords, targetUserId)
 }
 
 function recipeRestoreError(message: string): never {
@@ -3853,6 +4155,12 @@ async function validateRecipeRestoreGraph(records: BackupRedisRecord[], userId: 
   const owners = new Map<string, GoonRecipeV2>()
   for (const record of records) {
     if (record.type !== 'json' || !record.key.startsWith('goon:')) continue
+    const goonValue = record.value
+    if (isPlainObject(goonValue) && (
+      ['anatomyPresence', 'clothingState', 'clothingCloset', 'sphericalEyelid'].some(field => Object.hasOwn(goonValue, field)) ||
+      isPlainObject(goonValue.closet) && Object.hasOwn(goonValue.closet, 'clothingPresets') ||
+      isPlainObject(goonValue.recipe) && Object.hasOwn(goonValue.recipe, 'requiredMotionPreparation')
+    )) recipeRestoreError(`Goon ${record.key.slice('goon:'.length)} contains fields this release does not support; its backup was not applied.`)
     if (!isPlainObject(record.value) || !isPlainObject(record.value.recipe)) continue
     if (record.value.recipe.contract !== GOON_RECIPE_OWNER_V2_CONTRACT) continue
     const goonId = record.key.slice('goon:'.length)
@@ -4169,37 +4477,39 @@ export async function restoreBackupBundle(
   bytes: Uint8Array,
   options?: { confirmReplace?: boolean }
 ): Promise<RestoreResult> {
-  await ensureBackupRestoreReadyForRequest()
-  const stageId = randomUUID()
-  const paths = stagedRestorePaths(stageId)
-  await fs.mkdir(paths.stagingRoot, { recursive: true, mode: 0o700 })
-  try {
-    const archive = await fs.open(paths.archivePath, 'wx', 0o600)
+  return withPinokioRestoreFence(async () => {
+    await ensureBackupRestoreReadyForRequest()
+    const stageId = randomUUID()
+    const paths = stagedRestorePaths(stageId)
+    await fs.mkdir(paths.stagingRoot, { recursive: true, mode: 0o700 })
     try {
-      await archive.writeFile(bytes)
-      await archive.sync()
+      const archive = await fs.open(paths.archivePath, 'wx', 0o600)
+      try {
+        await archive.writeFile(bytes)
+        await archive.sync()
+      } finally {
+        await archive.close()
+      }
+      await fs.chmod(paths.archivePath, 0o400)
+      await writeJsonAtomic(paths.metadataPath, {
+        contract: 'batshit-backup-stage/v1', stageId, userId,
+        filename: 'batshit-backup.zip', bytes: bytes.byteLength,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+        stagedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+        archivePath: paths.archivePath
+      } satisfies BackupStageMetadata)
+      return await restoreStagedBackup(userId, stageId, options)
     } finally {
-      await archive.close()
+      // Retain the complete recovery input if rollback could not finish.
+      if (!await pathExists(paths.journalPath)) {
+        await Promise.all([
+          fs.rm(paths.archivePath, { force: true }),
+          fs.rm(paths.metadataPath, { force: true })
+        ])
+      }
     }
-    await fs.chmod(paths.archivePath, 0o400)
-    await writeJsonAtomic(paths.metadataPath, {
-      contract: 'batshit-backup-stage/v1', stageId, userId,
-      filename: 'batshit-backup.zip', bytes: bytes.byteLength,
-      sha256: createHash('sha256').update(bytes).digest('hex'),
-      stagedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-      archivePath: paths.archivePath
-    } satisfies BackupStageMetadata)
-    return await restoreStagedBackup(userId, stageId, options)
-  } finally {
-    // Retain the complete recovery input if rollback could not finish.
-    if (!await pathExists(paths.journalPath)) {
-      await Promise.all([
-        fs.rm(paths.archivePath, { force: true }),
-        fs.rm(paths.metadataPath, { force: true })
-      ])
-    }
-  }
+  })
 }
 
 type AsyncZipFile = ZipFile & {
@@ -4289,75 +4599,52 @@ const MAX_LEGACY_RECORDS_BYTES = 512 * 1024 * 1024
 const RESTORE_LOCK_NAME = 'active-restore.lock'
 const RESTORE_REQUEST_DRAIN_TIMEOUT_MS = 30_000
 
-let backupRestoreMaintenanceActive = false
-let backupRestoreHttpRequestCount = 0
-const backupRestoreRequestDrainWaiters = new Set<() => void>()
-
-function notifyBackupRestoreRequestDrainWaiters() {
-  for (const waiter of backupRestoreRequestDrainWaiters) waiter()
-  backupRestoreRequestDrainWaiters.clear()
-}
-
-export function enterBackupRestoreHttpRequest() {
-  if (backupRestoreMaintenanceActive) return null
-  backupRestoreHttpRequestCount += 1
-  let released = false
-  return () => {
-    if (released) return
-    released = true
-    backupRestoreHttpRequestCount = Math.max(0, backupRestoreHttpRequestCount - 1)
-    notifyBackupRestoreRequestDrainWaiters()
-  }
-}
-
-function waitForBackupRestoreRequestDrain(timeoutMs: number) {
-  return new Promise<void>((resolve) => {
-    let settled = false
-    let timer: ReturnType<typeof setTimeout>
-    const finish = () => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      backupRestoreRequestDrainWaiters.delete(finish)
-      resolve()
-    }
-    timer = setTimeout(finish, timeoutMs)
-    backupRestoreRequestDrainWaiters.add(finish)
-  })
-}
-
 export async function beginBackupRestoreMaintenance() {
-  if (backupRestoreMaintenanceActive) {
+  if (backupRestoreActivity.maintenanceActive) {
     throw new BackupRestoreError('Another backup restore is already running.', 409)
   }
-  backupRestoreMaintenanceActive = true
-  const deadline = Date.now() + RESTORE_REQUEST_DRAIN_TIMEOUT_MS
-  for (;;) {
-    // BL-713: a restore never waits for an approval card. A send that waits in a chat's line holds
-    // this gate for its request, and a line that holds for the user's answer to a card could wait
-    // fifteen minutes; each is kept like a shutdown's instead (its words move to the end of the
-    // chat, unanswered), so its request lets go at once. Asked at the start and again before every
-    // wait: a hold can form during the drain (the reply ahead stops at a card and lets go). A line
-    // behind a running reply is that reply's, and the drain waits for it as before.
-    keepQueuedSessionTurnsHeldAtApprovalCards('shutdown')
-    if (backupRestoreHttpRequestCount <= 1) break
-    const remainingMs = deadline - Date.now()
-    if (remainingMs <= 0) {
-      backupRestoreMaintenanceActive = false
-      notifyBackupRestoreRequestDrainWaiters()
-      throw new BackupRestoreError(
-        'Restore is waiting for active Batshit work to finish. Stop the current task and try again.',
-        409
-      )
+  // Before the first drain await: prevent unsent native/app requests and abort only
+  // Batshit's finite observers. Pinokio apps/computations keep their native lifetime.
+  const hold = fencePinokioOperations()
+  backupRestoreActivity.maintenanceActive = true
+  forgetPinokioAppEndpoint()
+  let reopenClaudePlanRuns: (() => void) | null = null
+  try {
+    const deadline = Date.now() + RESTORE_REQUEST_DRAIN_TIMEOUT_MS
+    for (;;) {
+      keepQueuedSessionTurnsHeldAtApprovalCards('shutdown')
+      if (backupRestoreActivity.httpRequestCount <= 1) break
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) throw new BackupRestoreError(
+        'Restore is waiting for active Batshit work to finish. Stop the current task and try again.', 409)
+      await waitForBackupRestoreRequestDrain(remainingMs)
     }
-    await waitForBackupRestoreRequestDrain(remainingMs)
+    try { await hold.settle(Math.max(1, deadline - Date.now())) }
+    catch (error) {
+      if (error instanceof PinokioAdmissionError) throw new BackupRestoreError(error.message, error.status)
+      throw error
+    }
+    // SA-139 (D6, D10): no Claude plan run starts while the restore runs, and every live one (a run
+    // held at an approval card included) ends and its Claude Code exit is confirmed before any data
+    // is replaced; SIGTERM alone is not settlement, so an unconfirmed exit refuses the restore.
+    reopenClaudePlanRuns = closeClaudePlanRunAdmission('A backup restore is running. Send again when it is done.')
+    const plan = await endClaudePlanRuns({}, 'A backup restore is replacing Batshit data.')
+    if (plan.unsettled > 0) throw new BackupRestoreError('Restore is waiting for a Claude Code run to stop. Try again in a moment; if this keeps happening, restart Batshit.', 409)
+  } catch (error) {
+    reopenClaudePlanRuns?.()
+    backupRestoreActivity.maintenanceActive = false
+    hold.release()
+    notifyBackupRestoreRequestDrainWaiters()
+    throw error
   }
-
   let ended = false
   return () => {
     if (ended) return
     ended = true
-    backupRestoreMaintenanceActive = false
+    reopenClaudePlanRuns?.()
+    backupRestoreActivity.maintenanceActive = false
+    forgetPinokioAppEndpoint()
+    hold.release()
     notifyBackupRestoreRequestDrainWaiters()
   }
 }
@@ -4598,6 +4885,142 @@ async function readStagedBackup(userId: string, stageId: string): Promise<Staged
   }
 }
 
+/**
+ * SA-134: an unattended recovery copy must be complete and every entry must actually read.
+ * The manual staged reader intentionally only inventories binary entries; keep that flow
+ * unchanged. Here CRC and byte counts come from all decompressed bytes, never ZIP metadata
+ * alone. Only the bounded manifest and one Redis record at a time are buffered.
+ */
+export async function verifyAutomaticBackupArchive(archivePath: string, userId: string, signal?: AbortSignal): Promise<BackupManifest> {
+  let zipFile: AsyncZipFile | null = null
+  try {
+    signal?.throwIfAborted()
+    zipFile = await openLazyZip(archivePath)
+    const seen = new Set<string>()
+    const records: BackupRedisRecord[] = []
+    const uploadFiles = new Map<string, number>()
+    const hostFiles: ArchiveHostFile[] = []
+    let manifest: BackupManifest | null = null
+
+    for await (const entry of zipFile.eachEntry()) {
+      signal?.throwIfAborted()
+      assertReadableBackupEntry(entry)
+      if (seen.has(entry.fileName)) throw new BackupRestoreError(`Backup contains duplicate entry "${entry.fileName}".`, 400)
+      seen.add(entry.fileName)
+      const isManifest = entry.fileName === MANIFEST_PATH
+      const isRecord = entry.fileName.startsWith(REDIS_RECORDS_DIR) && entry.fileName.endsWith('.json')
+      const isUpload = entry.fileName.startsWith(UPLOAD_FILE_ROOT)
+      const isHost = entry.fileName.startsWith(HOST_FILE_ZIP_ROOT)
+      if (!isManifest && !isRecord && !isUpload && !isHost) {
+        throw new BackupRestoreError(`Automatic backup contains an unexpected entry "${entry.fileName}".`, 400)
+      }
+      const limit = isManifest ? MAX_MANIFEST_BYTES : isRecord ? MAX_REDIS_RECORD_BYTES : Number.MAX_SAFE_INTEGER
+      if (entry.uncompressedSize > limit) throw new BackupRestoreError(`Backup entry "${entry.fileName}" is too large to validate safely.`, 400)
+      const chunks: Buffer[] = []
+      let bytes = 0
+      let crc = 0xffffffff
+      const stream = await zipFile.openReadStreamPromise(entry)
+      for await (const raw of stream) {
+        signal?.throwIfAborted()
+        const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array)
+        bytes += chunk.length
+        if (bytes > limit || bytes > entry.uncompressedSize) throw new BackupRestoreError(`Backup entry "${entry.fileName}" exceeded its validated size.`, 400)
+        crc = crc32Update(crc, chunk)
+        if (isManifest || isRecord) chunks.push(chunk)
+      }
+      if (bytes !== entry.uncompressedSize || ((crc ^ 0xffffffff) >>> 0) !== entry.crc32) {
+        throw new BackupRestoreError(`Backup entry "${entry.fileName}" failed its byte-count or CRC check.`, 400)
+      }
+      if (isManifest || isRecord) {
+        let value: unknown
+        try { value = JSON.parse(Buffer.concat(chunks, bytes).toString('utf8')) }
+        catch { throw new BackupRestoreError(`Backup contains invalid JSON at ${entry.fileName}.`, 400) }
+        if (isManifest) manifest = value as BackupManifest
+        else records.push(value as BackupRedisRecord)
+      } else if (isUpload) {
+        const relative = entry.fileName.slice(UPLOAD_FILE_ROOT.length)
+        if (!relative || entry.fileName.endsWith('/')) throw new BackupRestoreError('Backup contains an empty upload path.', 400)
+        uploadFiles.set(relative, bytes)
+      } else {
+        hostFiles.push(parseArchiveHostFile(entry.fileName, bytes))
+      }
+    }
+    if (!manifest) throw new BackupRestoreError('Backup is missing manifest.json.', 400)
+    validateManifest(manifest)
+    if (manifest.schemaVersion !== BACKUP_COMPLETE_SCHEMA_VERSION || manifest.completeness !== undefined || manifest.uploads !== undefined) {
+      throw new BackupRestoreError('Automatic backups require a complete archive; partial backups cannot replace a recovery copy.', 409)
+    }
+    if (manifest.source.userId !== userId || manifest.options?.includeSecrets !== false || manifest.secrets?.included !== false) {
+      throw new BackupRestoreError('Automatic backup owner or secret policy does not match this instance.', 409)
+    }
+    if (!manifest.hostFiles || !Array.isArray(manifest.hostFiles.notCarried) || manifest.hostFiles.notCarried.length !== 0) {
+      throw new BackupRestoreError('Automatic backup did not carry every supported skill and voice folder. Existing recovery copies were kept.', 409)
+    }
+    validateRecords(records)
+    const keys = new Set<string>()
+    const groupCounts = new Map<BackupGroupId, { records: number; files: number }>(GROUP_DEFINITIONS.map((group) => [group.id, { records: 0, files: 0 }]))
+    const groupedUploads = new Set<string>()
+    for (const record of records) {
+      // An older recovery copy may carry the removed n8n Workflow Subagent's thread ids (SA-139 R2)
+      // or the retired CLI Primary Agent System Prompt (R4): they are counted as the copy's
+      // inventory says, and the restore leaves them out.
+      if (keys.has(record.key) || !isRestorableKeyForUser(record.key, userId) && !isRetiredSubagentThreadIdKey(record.key) &&
+        !RETIRED_CLI_PRIMARY_PROMPT_KEYS.has(record.key) ||
+        isSecretRecordKey(record.key, userId)) {
+        throw new BackupRestoreError('Automatic backup contains duplicate or unsupported Redis records.', 400)
+      }
+      keys.add(record.key)
+      const counts = groupCounts.get(record.groupId)
+      if (!counts || record.groupId !== groupForKey(record.key, userId)) throw new BackupRestoreError('Automatic backup record groups do not match the inventory.', 400)
+      counts.records++
+      if (record.key.startsWith('upload:')) {
+        // BL-2401: exactly the file the export carries for this record (none for a Redis-stored upload).
+        const relative = archivedUploadFilePath(record)
+        if (relative && !uploadFiles.has(relative)) throw new BackupRestoreError(`Automatic backup is missing the file for ${boundedKeyForMessage(record.key)}.`, 400)
+        if (relative && !groupedUploads.has(relative)) { counts.files++; groupedUploads.add(relative) }
+      }
+    }
+    for (const file of hostFiles) groupCounts.get(hostFileGroupId(file.root))!.files++
+    const manifestGroups = manifest.contents?.groups
+    const expectedGroups = GROUP_DEFINITIONS.filter((group) => {
+      const counts = groupCounts.get(group.id)!
+      return counts.records > 0 || counts.files > 0 || group.classification === 'secret'
+    })
+    if (!Array.isArray(manifestGroups) || manifestGroups.length !== expectedGroups.length ||
+      new Set(manifestGroups.map((group) => group.id)).size !== manifestGroups.length ||
+      expectedGroups.some((group) => {
+        const actual = manifestGroups.find((item) => item.id === group.id)
+        const counts = groupCounts.get(group.id)!
+        return !actual || actual.recordCount !== counts.records || actual.fileAssetCount !== counts.files
+      })) {
+      throw new BackupRestoreError('Automatic backup group inventory does not match the manifest.', 400)
+    }
+    const uploadBytes = Array.from(uploadFiles.values()).reduce((sum, value) => sum + value, 0)
+    if (records.length === 0 || records.length !== manifest.contents?.redisRecordCount ||
+      uploadFiles.size !== manifest.contents.fileAssetCount || uploadBytes !== manifest.contents.fileAssetBytes) {
+      throw new BackupRestoreError('Automatic backup inventory does not match the manifest.', 400)
+    }
+    assertArchiveHostFilesWithinLimits(hostFiles)
+    assertArchiveHostFileInventory(manifest, hostFiles)
+    assertHostFoldersHaveOwners(hostFiles, records, userId)
+    const expectedHost = hostFolderRefsFromRecords(records, userId, { containerized: isContainerizedRuntime() })
+    if (expectedHost.notCarried.length > 0) throw new BackupRestoreError('Automatic backup cannot recover every supported skill and voice folder.', 409)
+    for (const ref of expectedHost.refs) {
+      const requiredFile = ref.root === 'skills' ? 'SKILL.md' : ref.requiredFile
+      if (!requiredFile || !hostFiles.some((file) => file.root === ref.root && file.folder === ref.folder && file.relativePath === requiredFile)) {
+        throw new BackupRestoreError(`Automatic backup is missing the required file for ${ref.root === 'skills' ? 'skill' : 'voice profile'} "${ref.folder}".`, 409)
+      }
+    }
+    await validateRecipeRestoreGraph(records, userId)
+    signal?.throwIfAborted()
+    return manifest
+  } catch (error) {
+    signal?.throwIfAborted()
+    if (error instanceof BackupRestoreError) throw error
+    throw new BackupRestoreError(error instanceof Error ? `Automatic backup is not readable: ${error.message}` : 'Automatic backup is not readable.', 400)
+  } finally { zipFile?.close() }
+}
+
 function asBackupBundle(bundle: StagedBackupBundle): BackupBundle {
   return {
     manifest: bundle.manifest,
@@ -4606,16 +5029,21 @@ function asBackupBundle(bundle: StagedBackupBundle): BackupBundle {
   }
 }
 
-async function measureCurrentRestoreState(userId: string) {
+async function measureCurrentRestoreState(userId: string, targetKeys: string[] = []) {
   return await redis.execute(async (client) => {
     const hairJobRecords = await captureCurrentHairJobRecords(client, userId)
     const keys = await collectCandidateKeys(client, userId)
+    const discovered = new Set(keys)
+    let currentRecordCount = keys.length + hairJobRecords.length
     let rollbackBytes = hairJobRecords.reduce((sum, record) => sum + Buffer.byteLength(JSON.stringify(record), 'utf8') + 1, 0)
-    for (const key of keys) {
+    for (const key of new Set([...keys, ...targetKeys])) {
       const record = await readRedisRecord(client, key, groupForKey(key, userId))
-      if (record) rollbackBytes += Buffer.byteLength(JSON.stringify(record), 'utf8') + 1
+      if (record) {
+        rollbackBytes += Buffer.byteLength(JSON.stringify(record), 'utf8') + 1
+        if (!discovered.has(key)) currentRecordCount++
+      }
     }
-    return { currentRecordCount: keys.length + hairJobRecords.length, rollbackBytes, hairJobRecords }
+    return { currentRecordCount, rollbackBytes, hairJobRecords }
   })
 }
 
@@ -4711,7 +5139,7 @@ export async function preflightStagedBackupRestore(
   await rehashTransformedRecipeGraph(targetRecords, userId)
   await validateRecipeRestoreGraph(targetRecords, userId)
 
-  const { currentRecordCount, rollbackBytes } = await measureCurrentRestoreState(userId)
+  const { currentRecordCount, rollbackBytes } = await measureCurrentRestoreState(userId, targetRecords.map((record) => record.key))
   const fileAssetBytes = bundle.fileAssets.reduce((sum, asset) => sum + asset.byteLength, 0)
   const restorePlanBytes = targetRecords.reduce(
     (sum, record) => sum + Buffer.byteLength(JSON.stringify(record), 'utf8') + 1,
@@ -4772,17 +5200,21 @@ async function writeRecordsNdjson(filePath: string, records: BackupRedisRecord[]
   }
 }
 
-async function writeCurrentRollbackNdjson(filePath: string, userId: string, hairJobRecords: BackupRedisRecord[]) {
-  await redis.execute(async (client) => {
+async function writeCurrentRollbackNdjson(filePath: string, userId: string, hairJobRecords: BackupRedisRecord[], targetKeys: string[]) {
+  return await redis.execute(async (client) => {
     const handle = await fs.open(filePath, 'w', 0o600)
+    const confirmedKeys = new Set<string>()
     try {
       const keys = await collectCandidateKeys(client, userId)
-      for (const key of keys) {
+      // An incoming exact key can collide with current data absent from a damaged index.
+      // It is already a replacement target, so capture its opaque old value too. No sweep.
+      for (const key of new Set([...keys, ...targetKeys])) {
         const record = await readRedisRecord(client, key, groupForKey(key, userId))
-        if (record) await handle.write(`${JSON.stringify(record)}\n`)
+        if (record) { await handle.write(`${JSON.stringify(record)}\n`); confirmedKeys.add(record.key) }
       }
-      for (const record of hairJobRecords) await handle.write(`${JSON.stringify(record)}\n`)
+      for (const record of hairJobRecords) { await handle.write(`${JSON.stringify(record)}\n`); confirmedKeys.add(record.key) }
       await handle.sync()
+      return [...confirmedKeys]
     } finally {
       await handle.close()
     }
@@ -5354,6 +5786,7 @@ async function recoverRestoreJournal(journalPath: string) {
 
   const hostEntries = requireHostEntries(raw)
   if (raw.phase === 'redis-complete' || raw.phase === 'rollback-complete') {
+    agentSetupCache.clearUser(raw.userId)
     if (raw.phase === 'rollback-complete') await planHostFolderRecovery(hostEntries, paths.storageKey)
     const kept = await cleanupRestoreOperation(paths, raw.phase === 'redis-complete', hostEntries, raw.createdAt)
     for (const folder of kept) {
@@ -5369,7 +5802,9 @@ async function recoverRestoreJournal(journalPath: string) {
   // Admit every host folder before replay can mutate Redis or the upload tree. The
   // host apply step repeats the census so an intervening change never borrows this look.
   await planHostFolderRecovery(hostEntries, paths.storageKey)
+  await fenceAppActionsForRestore(raw.userId)
   if (raw.phase === 'redis-replacing') {
+    agentSetupCache.clearUser(raw.userId)
     await restoreRedisFromRollback(paths.planPath, paths.rollbackPath, raw)
   }
   await restoreUploadTree(paths, entries)
@@ -5425,7 +5860,7 @@ function recoverRestoreJournals() {
           }
         }, true)
       } else if (pendingAssetRestore) {
-        await withRecipeVerificationRestoreEpoch(() => completePendingGoonAssetRestore(stagingRoot))
+        await withPinokioRestoreFence(() => withRecipeVerificationRestoreEpoch(() => completePendingGoonAssetRestore(stagingRoot)))
       }
     })().finally(() => {
       restoreRecoveryPromise = null
@@ -5483,9 +5918,23 @@ export async function restoreStagedBackup(
   stageId: string,
   options?: { confirmReplace?: boolean }
 ): Promise<RestoreResult> {
-  await ensureBackupRestoreReadyForRequest()
-  const { withKoboldSettingsMutation } = await import('./localAiModelManagement')
-  return withKoboldSettingsMutation(userId, () => withRecipeVerificationRestore(() => restoreStagedBackupData(userId, stageId, options)))
+  return withPinokioRestoreFence(async () => {
+    await ensureBackupRestoreReadyForRequest()
+    const { withKoboldSettingsMutation } = await import('./localAiModelManagement')
+    const result = await withKoboldSettingsMutation(userId, () => withRecipeVerificationRestore(() => restoreStagedBackupData(userId, stageId, options)))
+    // The confirmed restore has returned and its Settings fence has closed. Reconcile
+    // through normal command/access mutation admission while HTTP maintenance still holds.
+    // Never bypass that fence or roll back/retry completed replacement on a later failure.
+    try {
+      await initializeSystemSlashCommandsForUser(userId)
+      return result
+    } catch (error) {
+      console.error('[BackupRestore] Restore completed but built-in skill initialization failed; restored data was kept:', error)
+      return { ...result, warnings: [
+        'Your restored data was kept, but built-in skills could not be initialized safely. Check the app logs and repair the problem before using skills. Do not restore the backup again to fix this warning.'
+      ] }
+    }
+  })
 }
 
 async function restoreStagedBackupData(
@@ -5498,7 +5947,12 @@ async function restoreStagedBackupData(
   try {
     const bundle = await readStagedBackup(userId, stageId)
     await validateRecipeRestoreGraph(bundle.records, bundle.manifest.source.userId)
-    const { currentRecordCount, rollbackBytes, hairJobRecords } = await measureCurrentRestoreState(userId)
+    const placedHostFolders = hostFoldersToPlace(bundle.hostFiles)
+    const targetRecords = buildTargetRecords(asBackupBundle(bundle), userId, new Set(placedHostFolders.keys()))
+    assertHostFoldersHaveOwners(bundle.hostFiles, targetRecords, userId)
+    await rehashTransformedRecipeGraph(targetRecords, userId)
+    await validateRecipeRestoreGraph(targetRecords, userId)
+    const { currentRecordCount, rollbackBytes, hairJobRecords } = await measureCurrentRestoreState(userId, targetRecords.map((record) => record.key))
     if (currentRecordCount > 0 && options?.confirmReplace !== true) {
       throw new BackupRestoreError(
         'Restore would replace existing Batshit data. Confirm destructive restore first.',
@@ -5506,12 +5960,6 @@ async function restoreStagedBackupData(
         { currentRecordCount }
       )
     }
-
-    const placedHostFolders = hostFoldersToPlace(bundle.hostFiles)
-    const targetRecords = buildTargetRecords(asBackupBundle(bundle), userId, new Set(placedHostFolders.keys()))
-    assertHostFoldersHaveOwners(bundle.hostFiles, targetRecords, userId)
-    await rehashTransformedRecipeGraph(targetRecords, userId)
-    await validateRecipeRestoreGraph(targetRecords, userId)
 
     const restorePlanBytes = targetRecords.reduce(
       (sum, record) => sum + Buffer.byteLength(JSON.stringify(record), 'utf8') + 1,
@@ -5533,7 +5981,7 @@ async function restoreStagedBackupData(
 
     const uploadedFiles = await extractStagedUploadFiles(bundle, paths.newUploadRoot)
     await writeRecordsNdjson(paths.planPath, targetRecords)
-    await writeCurrentRollbackNdjson(paths.rollbackPath, userId, hairJobRecords)
+    const currentKeys = await writeCurrentRollbackNdjson(paths.rollbackPath, userId, hairJobRecords, targetRecords.map((record) => record.key))
     const [plan, rollback] = await Promise.all([
       identifyRestoreFile(paths.planPath), identifyRestoreFile(paths.rollbackPath)
     ])
@@ -5556,6 +6004,7 @@ async function restoreStagedBackupData(
     await saveRestoreJournal(paths, journal)
 
     try {
+      await fenceAppActionsForRestore(userId)
       // Publish and fsync the host fence before destructive changes. This is
       // outside Redis rollback: failure after fencing keeps old grants inactive.
       // The explicit stage UUID makes same-operation retry idempotent; audit
@@ -5582,9 +6031,13 @@ async function restoreStagedBackupData(
 
       journal.phase = 'redis-replacing'
       await saveRestoreJournal(paths, journal)
+      agentSetupCache.clearUser(userId)
       await redis.execute(async (client) => {
-        const currentKeys = await collectCandidateKeys(client, userId)
-        await deleteRecords(client, [...currentKeys, ...targetRecords.map((record) => record.key), ...hairJobRecords.map((record) => record.key)])
+        // SA-137 P4 (D10): a live file read receipt describes a turn of the chat being replaced.
+        const liveReadReceipts = currentKeys
+          .filter((key) => /^session:[^:]+$/.test(key))
+          .map((key) => `live_file_reads:${key.slice('session:'.length)}`)
+        await deleteRecords(client, [...currentKeys, ...liveReadReceipts, ...targetRecords.map((record) => record.key)])
         for (const record of targetRecords) await writeRecord(client, record)
       })
     } catch (error) {
@@ -5615,7 +6068,9 @@ async function restoreStagedBackupData(
     // fails: rename may already have succeeded. Keep both trees and the fence;
     // recovery must use the actual persisted phase to finish or undo BOTH stores.
     journal.phase = 'redis-complete'
+    agentSetupCache.clearUser(userId)
     await saveRestoreJournal(paths, journal)
+    invalidateUserSettingsCache(userId)
     const keptHostFolders = await cleanupRestoreOperation(paths, true, hostEntries, journal.createdAt)
     for (const folder of keptHostFolders) {
       console.info(`[BackupRestore] The restore replaced ${folder.root}/${folder.folder}; Batshit kept the previous copy in ${folder.path}.`)
@@ -5645,6 +6100,20 @@ async function restoreStagedBackupData(
       console.error(
         '[BackupRestore] Restore completed but the core prompt default check failed; it runs again at the next start or Admin visit:',
         promptError
+      )
+    }
+
+    // SA-126 1d: a backup from before the old default zip rows sweep brought no marker back, so
+    // its records still hold the old stamps. Sweep them now, as the next start would; the app does
+    // not restart after a restore. A failure keeps the completed restore; the next start retries.
+    try {
+      await removeRetiredSkillReadSettings()
+      const swept = await sweepOldZipDefaults()
+      if (swept.rows > 0) console.info(`[BackupRestore] ${describeZipDefaultsSweep(swept)}`)
+    } catch (sweepError) {
+      console.error(
+        '[BackupRestore] Restore completed but the one-time sweep of old default zip rows failed; the next start retries:',
+        sweepError
       )
     }
 

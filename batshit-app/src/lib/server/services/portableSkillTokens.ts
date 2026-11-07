@@ -4,6 +4,9 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { redis } from '$lib/server/redis'
 import { buildPortableSkillEnvLines } from '$lib/utils/portableSkillEnv'
+import { publishUserEvent } from '$lib/server/ssePublisher'
+import { APP_ACTIONS_PORTABLE_REFRESH_EVENT } from '$lib/appActions/settings/managementContract'
+import { acquireSettingsRestoreMutation, assertSettingsRestoreAdmitted } from './appActions/settings/lifecycle'
 import type {
   PortableSkillEnvTemplateInfo,
   PortableSkillFamilyId,
@@ -47,12 +50,20 @@ end
 if redis.call('JSON.TYPE', KEYS[1], '$.revokedAt')[1] ~= 'null' then
   return 'REVOKED'
 end
+local generationRaw = redis.call('JSON.GET', KEYS[1], '$.authorityGeneration') or '[]'
+local generation = cjson.decode(generationRaw)[1]
+if generation == nil then generation = 0 end
+if type(generation) ~= 'number' or generation < 0 or generation ~= math.floor(generation) or generation >= 9007199254740991 then return 'MALFORMED' end
 if ARGV[4] == '1' then
   local families = cjson.decode(ARGV[5])
   if #families == 0 then
     return 'EMPTY_FAMILIES'
   end
   redis.call('JSON.SET', KEYS[1], '$.families', ARGV[5])
+  redis.call('JSON.SET', KEYS[1], '$.authorityGeneration', tostring(generation + 1))
+  local appActions = false
+  for _, family in ipairs(families) do if family == 'app-actions' then appActions = true end end
+  if not appActions then redis.call('JSON.SET', KEYS[1], '$.appActionsGrant', 'null') end
 end
 if ARGV[2] == '1' then
   redis.call('JSON.SET', KEYS[1], '$.label', ARGV[3])
@@ -75,7 +86,11 @@ end
 if redis.call('JSON.TYPE', KEYS[1], '$.tokenHash')[1] ~= 'string' then
   return 'MALFORMED'
 end
+local generation = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.authorityGeneration') or '[]')[1]
+if generation == nil then generation = 0 end
+if type(generation) ~= 'number' or generation < 0 or generation ~= math.floor(generation) or generation >= 9007199254740991 then return 'MALFORMED' end
 local oldHash = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.tokenHash'))[1]
+redis.call('JSON.SET', KEYS[1], '$.authorityGeneration', tostring(generation + 1))
 redis.call('JSON.SET', KEYS[1], '$.tokenHash', cjson.encode(ARGV[1]))
 redis.call('JSON.SET', KEYS[1], '$.tokenPrefix', cjson.encode(ARGV[2]))
 redis.call('JSON.SET', KEYS[1], '$.tokenSuffix', cjson.encode(ARGV[3]))
@@ -98,7 +113,11 @@ end
 if redis.call('JSON.TYPE', KEYS[1], '$.tokenHash')[1] ~= 'string' then
   return 'MALFORMED'
 end
+local generation = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.authorityGeneration') or '[]')[1]
+if generation == nil then generation = 0 end
+if type(generation) ~= 'number' or generation < 0 or generation ~= math.floor(generation) or generation >= 9007199254740991 then return 'MALFORMED' end
 local hash = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.tokenHash'))[1]
+redis.call('JSON.SET', KEYS[1], '$.authorityGeneration', tostring(generation + 1))
 redis.call('JSON.SET', KEYS[1], '$.revokedAt', cjson.encode(ARGV[1]))
 redis.call('JSON.SET', KEYS[1], '$.updatedAt', cjson.encode(ARGV[1]))
 redis.call('DEL', ARGV[3] .. hash)
@@ -108,7 +127,76 @@ return 'OK'
 
 export const PORTABLE_SKILL_TOKEN_HEADER = 'x-batshit-portable-token'
 
+export class PortableAppActionsRestoreRefusal extends Error {
+  constructor(message: string, readonly status: number) { super(message); this.name = 'PortableAppActionsRestoreRefusal' }
+}
+export const INVALIDATE_PORTABLE_APP_ACTIONS_FOR_RESTORE_SCRIPT = `
+-- BATSHIT_PORTABLE_APP_ACTIONS_RESTORE_FENCE_V1
+local changed = {}
+local output = {'OK'}
+for _, id in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+  local key = ARGV[2] .. id
+  if redis.call('EXISTS', key) == 1 then
+    if redis.call('JSON.TYPE', key, '$')[1] ~= 'object' then return {'REFUSED'} end
+    local row = cjson.decode(redis.call('JSON.GET', key, '$'))[1]
+    if row.id ~= id or row.userId ~= ARGV[1] or redis.call('JSON.TYPE', key, '$.families')[1] ~= 'array' then return {'REFUSED'} end
+    local active = row.revokedAt == nil or row.revokedAt == cjson.null
+    local applies = row.appActionsGrant ~= nil and row.appActionsGrant ~= cjson.null
+    for _, family in ipairs(row.families) do if family == 'app-actions' then applies = true end end
+    if active and applies then
+      local generation = row.authorityGeneration
+      if generation == nil then generation = 0 end
+      if type(generation) ~= 'number' or generation < 0 or generation ~= math.floor(generation) or generation >= 9007199254740990 then return {'REFUSED'} end
+      changed[#changed + 1] = {key, generation + 1}
+      output[#output + 1] = id
+      output[#output + 1] = tostring(generation + 1)
+    end
+  end
+end
+-- All records are checked before any write. Never touch the secret/hash/family scope.
+for _, item in ipairs(changed) do
+  redis.call('JSON.SET', item[1], '$.appActionsGrant', 'null')
+  redis.call('JSON.SET', item[1], '$.authorityGeneration', tostring(item[2]))
+  redis.call('JSON.SET', item[1], '$.updatedAt', cjson.encode(ARGV[3]))
+end
+return output
+`
+/** Excluded portable authority cannot rebind to restored/replaced subjects. This
+ * narrow owner is used only inside a confirmed restore/recovery fence, never preview. */
+export async function invalidatePortableAppActionsForRestore(userId: string): Promise<void> {
+  assertSettingsRestoreAdmitted()
+  const changed = await redis.execute(async client => {
+    // No token can gain a grant while the Settings restore fence is closed. This
+    // empty fast path also preserves the existing fake-lane restore fixture.
+    if (!(await client.sMembers(buildTokenSetKey(userId))).length) return [] as Array<[string, number]>
+    const lease = acquireSettingsRestoreMutation()
+    let answer: unknown
+    try { answer = await client.eval(INVALIDATE_PORTABLE_APP_ACTIONS_FOR_RESTORE_SCRIPT, {
+      keys: [buildTokenSetKey(userId)], arguments: [userId, buildTokenRecordKey(userId, ''), nowIso()]
+    }) } catch {
+      lease.unknown()
+      throw new PortableAppActionsRestoreRefusal('Portable App Actions grant invalidation has an unknown outcome. Data replacement is held.', 503)
+    }
+    if (Array.isArray(answer) && answer.length === 1 && answer[0] === 'REFUSED') {
+      lease.settle()
+      throw new PortableAppActionsRestoreRefusal('Portable App Actions grants could not be verified before data replacement.', 409)
+    }
+    if (!Array.isArray(answer) || answer[0] !== 'OK' || answer.length % 2 !== 1 || answer.slice(1).some(value => typeof value !== 'string')) {
+      lease.unknown()
+      throw new PortableAppActionsRestoreRefusal('Portable App Actions grant invalidation was not confirmed. Data replacement is held.', 503)
+    }
+    lease.settle()
+    return Array.from({ length: (answer.length - 1) / 2 }, (_, index) => [answer[index * 2 + 1] as string, Number(answer[index * 2 + 2])] as [string, number])
+  })
+  for (const [tokenId, authorityGeneration] of changed) await publishUserEvent(userId, { type: APP_ACTIONS_PORTABLE_REFRESH_EVENT, tokenId, authorityGeneration })
+}
+
 export const PORTABLE_SKILL_FAMILIES: PortableSkillTokenFamilyDefinition[] = [
+  {
+    id: 'app-actions', label: 'App Actions',
+    description: 'Scoped App Actions reports and changes with an explicit user grant and expiry; permitted instance status reads need no agent target.',
+    controlIds: ['sys.app_settings.portable.report', 'sys.app_settings.portable.change']
+  },
   {
     id: 'voice-engines',
     label: 'Voice Engines',
@@ -436,7 +524,8 @@ export async function createPortableSkillToken(options: {
     createdAt,
     updatedAt: createdAt,
     lastUsedAt: null,
-    revokedAt: null
+    revokedAt: null,
+    authorityGeneration: 1
   }
 
   await redis.execute(async (client: any) => {
@@ -505,6 +594,7 @@ export async function updatePortableSkillToken(options: {
   if (!record) {
     throw Object.assign(new Error('Portable Skill Token not found.'), { status: 404 })
   }
+  if (hasFamilies) await publishUserEvent(options.userId, { type: APP_ACTIONS_PORTABLE_REFRESH_EVENT, tokenId: record.id, authorityGeneration: record.authorityGeneration ?? 0 })
   return summarizeRecord(record)
 }
 
@@ -550,6 +640,7 @@ export async function rotatePortableSkillToken(options: {
     throw Object.assign(new Error('Portable Skill Token not found.'), { status: 404 })
   }
 
+  await publishUserEvent(options.userId, { type: APP_ACTIONS_PORTABLE_REFRESH_EVENT, tokenId: record.id, authorityGeneration: record.authorityGeneration ?? 0 })
   return {
     token: secret,
     record: summarizeRecord(record)
@@ -585,6 +676,7 @@ export async function revokePortableSkillToken(options: {
   if (!record) {
     throw Object.assign(new Error('Portable Skill Token not found.'), { status: 404 })
   }
+  await publishUserEvent(options.userId, { type: APP_ACTIONS_PORTABLE_REFRESH_EVENT, tokenId: record.id, authorityGeneration: record.authorityGeneration ?? 0 })
   return summarizeRecord(record)
 }
 

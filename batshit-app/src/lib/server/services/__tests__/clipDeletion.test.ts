@@ -93,7 +93,7 @@ describe('clipDeletion', () => {
     expect(mocks.redis.sAdd).toHaveBeenCalledWith('session:session-a:active_clips', 'clip-keep')
   })
 
-  it.each(['goon_hair_assets', 'goon_hair_imports'])('removes a borrowed %s Clip and session state without unlinking Hair', async (uploadType) => {
+  it.each(['goon_hair_assets', 'goon_hair_imports', 'goon_clothing_assets', 'goon_closet'])('removes a borrowed %s Clip and session state without unlinking attachment bytes', async (uploadType) => {
     values.set('clip:josh:borrowed', { id: 'borrowed', filename: 'hair.png', localUrl: `/uploads/${uploadType}/hair.png` })
     values.set('session:session-a:clip_state', { sessionId: 'session-a', clips: [{ clipId: 'borrowed', attachedAt: '2026-05-22T00:00:00Z' }] })
     expect(await deleteUserClips('josh', ['borrowed'])).toEqual([{ clipId: 'borrowed', deleted: true, missing: false }])

@@ -21,6 +21,7 @@ import {
   type ImageAddressOriginState
 } from '$lib/utils/imageAddressOrigin'
 
+/** `codex`: only records saved before Codex CLI retired (SA-139 R1); they still parse. */
 export type ImageOriginLane = 'api' | 'codex' | 'claude'
 
 export type ImageOriginAddressDecision = {

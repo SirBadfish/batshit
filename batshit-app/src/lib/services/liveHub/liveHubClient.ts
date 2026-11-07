@@ -18,7 +18,7 @@
  * the next message. It says `bye` on `pagehide` and re-sends at once when it is shown again.
  */
 
-import { version } from '$app/environment'
+import { version } from '$app/env'
 import { HubCore, type HubPortLike } from './hubCore'
 import { createBrowserHubOptions } from './browserHub'
 import type {

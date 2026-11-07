@@ -1,13 +1,15 @@
+import { MCP_SETTINGS_FIELDS, MCP_SETTINGS_REVISION_HEADER, mcpSettingsLeaves, readMcpSettingsRevisions, withExpectedMcpSettings, type ExpectedMcpSettings } from '$lib/utils/agentSettingsSectionSaves'
 // Agents store using Svelte 5 runes
 import type { ModelCapabilities, ModelConnectionInfo } from '$lib/types/savedModels'
-import type { CodexAgentSettings } from '$lib/types/codex'
 import type { ClaudeAgentSettings } from '$lib/types/claude'
+import type { AgentReasoningOverrides } from '$lib/types/reasoningControls'
 import type { AgentVoiceProfile } from '$lib/types/voice'
 import type { AgentDcmDisplaySettings } from '$lib/types/database'
 import type { AvatarIconFit, IconRef } from '$lib/icons/iconTypes'
 import type { StoredPrimaryAgentType } from '$lib/utils/primaryAgentType'
 import type { AgentAutoCompactSettings } from '$lib/utils/contextCompaction'
 import { applyAgentProviderSettingsUpdate } from '$lib/utils/agentProviderSettings'
+import { isAgentRuntimeSettingKey } from '$lib/utils/modelSettingsMapper'
 import {
   AGENT_FIELD_BY_FIELD_BLOCKS,
   applyAgentBlockUpdate,
@@ -15,6 +17,10 @@ import {
   type AgentFieldByFieldBlock
 } from '$lib/utils/agentBlockFieldSettings'
 import { AGENT_MEMORY_STORED_FIELDS } from '$lib/utils/agentSettingsSavePatch'
+import { captureAgentReasoningReads, preserveNewerReasoningLeaves } from '$lib/utils/agentReasoningReadGuard'
+import { sameJsonValue } from '$lib/utils/agentBlockFieldSettings'
+import { MODEL_SELECTION_FIELDS, isModelSelectionWrite, sameModelSelection, withModelSelection } from '$lib/appActions/settings/modelSelectionBaseline'
+import { namesInstructions, type InstructionsRevisions } from '$lib/appActions/settings/instructionsBaseline'
 export interface Agent {
   id: string
   user_id: string
@@ -30,6 +36,9 @@ export interface Agent {
   agentType?: StoredPrimaryAgentType
   show_reasoning?: boolean  // Display model reasoning summaries in chat
   preserve_reasoning?: boolean  // Include saved reasoning in this agent's later compiled model history
+  api_reasoning_retention?: import('$lib/utils/reasoningRetention').ApiReasoningRetentionMode | null
+  whiteboard_budget_tokens?: number | null
+  show_whiteboard?: boolean | null
   tool_approval_mode?: 'off' | 'all'
   auto_compact_settings?: AgentAutoCompactSettings | null
   voice_profile?: AgentVoiceProfile
@@ -42,9 +51,9 @@ export interface Agent {
   auto_zip_error?: boolean
   auto_zip_image?: boolean
   auto_zip_subagent?: boolean
-  zip_agent_control_experiment?: boolean | null  // The parked zip control permission (BL-1484); no UI
   zip_ai_view_mode?: 'inline' | 'appended' | null
   zip_tool_notes_enabled?: boolean | null
+  live_file_reads?: boolean | null  // SA-137: live file reads for this agent; null or absent inherits the global Tool Grid value
   zip_threshold_error?: number  // Tokens threshold for errors (default 0)
   zip_threshold_image?: number  // Tokens threshold for image blocks (default 0 in SA-019)
   zip_threshold_subagent?: number  // Tokens threshold for subagent conversations (default 0)
@@ -95,6 +104,7 @@ export interface Agent {
   primary_model_seed?: number | null
   primary_model_stop_sequences?: string[] | null
   primary_model_reasoning_effort?: string | null
+  model_reasoning_overrides?: AgentReasoningOverrides
   custom_model_settings?: string  // Advanced key=value pairs for power users
   model_routing_rules?: any  // JSONB
   ai_permissions?: any  // JSONB
@@ -113,21 +123,76 @@ export interface Agent {
   dcmDisplaySettings?: AgentDcmDisplaySettings
   // Subagent assignment (Story 6.8 → Architecture Simplification)
   assignedSubagents?: string[]  // Array of subagent IDs assigned to this agent
-  codex_settings?: CodexAgentSettings | null
   claude_settings?: ClaudeAgentSettings | null
 }
 
 /**
- * What a save of agent fields sends (`updateAgentSettings`). The Codex and Claude settings and the
+ * What a save of agent fields sends (`updateAgentSettings`). The Claude settings and the
  * Tool Grid display settings are written field by field (BL-848, BL-855), so a save of them names
  * only the keys (or map entries) it changes, a removed one as `null`: `diffAgentBlock` builds it.
  */
 export type AgentSettingsUpdate = Omit<Partial<Agent>, AgentFieldByFieldBlock> & {
   [Field in AgentFieldByFieldBlock]?: AgentBlockSaveByField[Field] | null
-}
+} & { expectedMcpSettings?: ExpectedMcpSettings; expectedModelSelection?: string; expectedInstructions?: Partial<InstructionsRevisions>; expectedAutoCompact?: string }
 
+type McpDetailCut = { record: Record<string, unknown>; revisions: ExpectedMcpSettings }
+let mcpDetailCuts = $state<Record<string, McpDetailCut>>({})
+const mcpWritesPending = new Map<string, number>(), mcpWriteGenerations = new Map<string, number>(), mcpRefreshRequested = new Set<string>()
+export function getAgentMcpSettingsCut(id: string): McpDetailCut | undefined { return mcpDetailCuts[id] }
+export function getAgentMcpSettingsReadState(id: string) { return { generation: mcpWriteGenerations.get(id) ?? 0, pending: (mcpWritesPending.get(id) ?? 0) > 0 } }
+export async function loadAgentMcpSettingsDetail(id: string) { const before = mcpDetailCuts[id]; await refreshAgentFieldsFromServer(id, 'mcp-settings'); const after = mcpDetailCuts[id]; return after && after !== before ? after : undefined }
+function mcpProjection(row: object) { return Object.fromEntries(MCP_SETTINGS_FIELDS.filter(field => Object.hasOwn(row, field)).map(field => [field, (row as Record<string, unknown>)[field]])) }
 let agents = $state<Agent[]>([])
 let currentAgentId = $state<string | null>(null)
+const modelWriteGenerations = new Map<string, number>()
+const modelWritesPending = new Map<string, number>()
+const modelRefreshRequested = new Set<string>()
+const instructionsWriteGenerations = new Map<string, number>()
+const instructionsWritesPending = new Map<string, number>()
+const instructionsRefreshRequested = new Set<string>()
+const autoCompactWriteGenerations = new Map<string, number>()
+const autoCompactWritesPending = new Map<string, number>()
+const autoCompactRefreshRequested = new Set<string>()
+const providerWriteGenerations = new Map<string, number>()
+const providerWritesPending = new Map<string, number>()
+/** Join a small native-choice surface to the existing provider read/write owner. */
+export function getAgentProviderSettingsReadState(id: string) {
+  return { generation: providerWriteGenerations.get(id) ?? 0, pending: (providerWritesPending.get(id) ?? 0) > 0, record: getAgentById(id) }
+}
+const providerReadsPending = new Set<string>()
+const providerRefreshRequested = new Set<string>()
+function drainProviderRefresh(id: string) {
+  if (providerReadsPending.has(id) || (providerWritesPending.get(id) ?? 0) > 0 || !providerRefreshRequested.delete(id)) return
+  void refreshAgentFieldsFromServer(id, 'provider-settings')
+}
+function drainAutoCompactRefresh(id: string) {
+  if ((autoCompactWritesPending.get(id) ?? 0) > 0 || !autoCompactRefreshRequested.delete(id)) return
+  void refreshAgentFieldsFromServer(id, 'auto-compact')
+}
+function drainInstructionsRefresh(id: string) {
+  if ((instructionsWritesPending.get(id) ?? 0) > 0 || !instructionsRefreshRequested.delete(id)) return
+  void refreshAgentFieldsFromServer(id, 'instructions')
+}
+function instructionsProjection(row: object): Record<string, unknown> {
+  return Object.fromEntries(['system_prompt', 'include_global_prompt'].filter(field => Object.hasOwn(row, field)).map(field => [field, (row as Record<string, unknown>)[field]]))
+}
+function withInstructions<T extends object>(row: T, incoming: object): T {
+  const result = { ...row } as Record<string, unknown>
+  for (const field of ['system_prompt', 'include_global_prompt']) {
+    if (Object.hasOwn(incoming, field)) result[field] = (incoming as Record<string, unknown>)[field]
+    else delete result[field]
+  }
+  return result as T
+}
+function drainModelRefresh(id: string) {
+  if ((modelWritesPending.get(id) ?? 0) > 0 || !modelRefreshRequested.delete(id)) return
+  void refreshAgentFieldsFromServer(id, 'model-selection')
+}
+
+/** Read owners must not install a model source over a pending optimistic model save. */
+export function getAgentModelSelectionReadState(id: string) {
+  return { generation: modelWriteGenerations.get(id) ?? 0, pending: (modelWritesPending.get(id) ?? 0) > 0 }
+}
 
 export function getAgents() {
   return agents
@@ -138,6 +203,7 @@ export function getCurrentAgentId() {
 }
 
 export function setAgents(newAgents: Agent[]) {
+  for (const agent of newAgents) providerWriteGenerations.set(agent.id, (providerWriteGenerations.get(agent.id) ?? 0) + 1)
   agents = newAgents
 }
 
@@ -152,10 +218,16 @@ export function setCurrentAgentId(id: string | null) {
 }
 
 export function addAgent(agent: Agent) {
+  providerWriteGenerations.set(agent.id, (providerWriteGenerations.get(agent.id) ?? 0) + 1)
   agents = [...agents, agent]
 }
 
 export function updateAgent(id: string, updates: Partial<Agent>) {
+  // Raw mounted owners also accept their saved/detail copies through this function.
+  // Even a same-value instruction save supersedes a read that started before it.
+  if (namesInstructions(updates as Record<string, unknown>)) instructionsWriteGenerations.set(id, (instructionsWriteGenerations.get(id) ?? 0) + 1)
+  if (Object.hasOwn(updates, 'auto_compact_settings')) autoCompactWriteGenerations.set(id, (autoCompactWriteGenerations.get(id) ?? 0) + 1)
+  if (Object.hasOwn(updates, 'provider_specific_settings')) providerWriteGenerations.set(id, (providerWriteGenerations.get(id) ?? 0) + 1)
   agents = agents.map(a => 
     a.id === id ? { ...a, ...updates } : a
   )
@@ -197,12 +269,27 @@ export function getAgentById(id: string | null | undefined) {
 
 // Function to update agent settings (alias for updateAgent)
 export async function updateAgentSettings(id: string, updates: AgentSettingsUpdate) {
+  const mcpWrite = mcpSettingsLeaves(updates).length > 0
+  if (mcpWrite) withExpectedMcpSettings(updates, updates.expectedMcpSettings) // original caller cut, never GET at save
+  let mcpKnownSaved = false
   const previousAgent = agents.find((agent) => agent.id === id) ?? null
+  const modelWrite = isModelSelectionWrite('agent', updates as Record<string, unknown>)
+  const instructionsWrite = namesInstructions(updates as Record<string, unknown>)
+  const autoCompactWrite = Object.hasOwn(updates, 'auto_compact_settings')
+  const providerWrite = updates.provider_specific_settings !== undefined
+  let providerKnownSaved = false
+  let autoCompactKnownSaved = false
+  let instructionsKnownSaved = false
+  let modelKnownSaved = false
   // BL-514: the copy takes the save the way the server stores it: a block's model keys replace
   // the old ones and the agent's own keys stay unless the save names them. BL-848, BL-855: the
-  // Codex and Claude settings and the Tool Grid display settings take the keys (and map entries)
+  // Claude settings and the Tool Grid display settings take the keys (and map entries)
   // the save names and keep the rest, never a shallow replace of the block.
   const localUpdates: Record<string, unknown> = { ...updates }
+  delete localUpdates.expectedMcpSettings
+  delete localUpdates.expectedModelSelection
+  delete localUpdates.expectedInstructions
+  delete localUpdates.expectedAutoCompact
   if ('provider_specific_settings' in updates) {
     localUpdates.provider_specific_settings = applyAgentProviderSettingsUpdate(
       previousAgent?.provider_specific_settings,
@@ -212,10 +299,27 @@ export async function updateAgentSettings(id: string, updates: AgentSettingsUpda
   for (const field of AGENT_FIELD_BY_FIELD_BLOCKS) {
     if (field in updates) localUpdates[field] = applyAgentBlockUpdate(field, previousAgent?.[field], updates[field])
   }
-  updateAgent(id, localUpdates as Partial<Agent>)
+  if (mcpWrite) { mcpWritesPending.set(id, (mcpWritesPending.get(id) ?? 0) + 1); mcpWriteGenerations.set(id, (mcpWriteGenerations.get(id) ?? 0) + 1) }
+  if (modelWrite) {
+    modelWriteGenerations.set(id, (modelWriteGenerations.get(id) ?? 0) + 1)
+    modelWritesPending.set(id, (modelWritesPending.get(id) ?? 0) + 1)
+  }
+  if (instructionsWrite) {
+    instructionsWriteGenerations.set(id, (instructionsWriteGenerations.get(id) ?? 0) + 1)
+    instructionsWritesPending.set(id, (instructionsWritesPending.get(id) ?? 0) + 1)
+  }
+  if (autoCompactWrite) {
+    autoCompactWriteGenerations.set(id, (autoCompactWriteGenerations.get(id) ?? 0) + 1)
+    autoCompactWritesPending.set(id, (autoCompactWritesPending.get(id) ?? 0) + 1)
+  }
+  if (providerWrite) {
+    providerWriteGenerations.set(id, (providerWriteGenerations.get(id) ?? 0) + 1)
+    providerWritesPending.set(id, (providerWritesPending.get(id) ?? 0) + 1)
+  }
   
   // Also update in database
   try {
+    updateAgent(id, localUpdates as Partial<Agent>)
     const response = await fetch(`/api/agents/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -223,23 +327,113 @@ export async function updateAgentSettings(id: string, updates: AgentSettingsUpda
     })
     
     if (!response.ok) {
+      if (mcpWrite) {
+        const payload = await response.clone().json().catch(() => null)
+        mcpKnownSaved = payload?.mcpSettingsSaved === true
+        if (response.status === 409 || mcpKnownSaved) mcpRefreshRequested.add(id)
+        throw Object.assign(new Error(payload?.error || 'The Tool Settings save could not be confirmed.'), { status: response.status, code: payload?.code, mcpSettingsSaved: mcpKnownSaved, mcpSettings: payload?.mcpSettings })
+      }
+      if (autoCompactWrite) {
+        const payload = await response.clone().json().catch(() => null)
+        if (payload?.code === 'auto_compact_settings_changed') autoCompactRefreshRequested.add(id)
+        throw Object.assign(new Error(typeof payload?.error === 'string' ? payload.error : 'Unable to confirm the Auto Compact save.'), { code: payload?.code, status: response.status })
+      }
+      if (instructionsWrite && response.status === 409) instructionsRefreshRequested.add(id)
+      if (updates.expectedInstructions) {
+        const payload = await response.clone().json().catch(() => null)
+        throw Object.assign(new Error(typeof payload?.error === 'string' ? payload.error : 'Unable to confirm the instructions save.'), { code: payload?.code, status: response.status })
+      }
+      if (modelWrite && response.status === 409) modelRefreshRequested.add(id)
+      if (updates.expectedModelSelection) {
+        const payload = await response.clone().json().catch(() => null)
+        throw Object.assign(new Error(typeof payload?.error === 'string' ? payload.error : 'Unable to confirm the model selection.'),
+          { code: payload?.code, status: response.status })
+      }
       throw new Error('Failed to update agent in database')
     }
+    mcpKnownSaved = true
+    providerKnownSaved = true
+    if (mcpWrite) {
+      const payload = await response.clone().json()
+      const revisions = readMcpSettingsRevisions(JSON.stringify(payload?.mcpSettings?.revisions))
+      if (!revisions || mcpSettingsLeaves(updates).some(field => !revisions[field])) throw new Error('The acknowledged Tool Settings base is missing. Check saved values; do not repeat this save.')
+      return payload
+    }
+    modelKnownSaved = true
+    instructionsKnownSaved = true
+    autoCompactKnownSaved = true
   } catch (error) {
-    if (previousAgent) {
+    if (mcpWrite && mcpKnownSaved) {
+      // Actual known ACK survives unrelated post-save/profile failure; no optimistic rollback.
+    } else if (previousAgent && (instructionsWrite || autoCompactWrite || mcpWrite)) {
+      const current = getAgentById(id)
+      if (current?.user_id === previousAgent.user_id) {
+        // A mixed request was refused as a whole. Roll back only leaves still owned by
+        // this optimistic request, preserving a later local edit to any other leaf.
+        const rollback = { ...current } as Record<string, unknown>
+        for (const field of Object.keys(localUpdates)) {
+          if (!sameJsonValue(rollback[field], localUpdates[field])) continue
+          if (Object.hasOwn(previousAgent, field)) rollback[field] = (previousAgent as unknown as Record<string, unknown>)[field]
+          else delete rollback[field]
+        }
+        agents = agents.map(row => row.id === id ? rollback as unknown as Agent : row)
+      }
+    } else if (previousAgent && updates.expectedModelSelection) {
+      const current = getAgentById(id)
+      if (current && sameModelSelection('agent', current as unknown as Record<string, unknown>, { ...previousAgent, ...localUpdates } as unknown as Record<string, unknown>)) {
+        updateAgent(id, withModelSelection('agent', current as unknown as Record<string, unknown>, previousAgent as unknown as Record<string, unknown>) as Partial<Agent>)
+      }
+    } else if (previousAgent) {
       updateAgent(id, previousAgent)
     }
     console.error('Error updating agent settings:', error)
     throw error
+  } finally {
+    if (providerWrite) {
+      providerWritesPending.set(id, Math.max(0, (providerWritesPending.get(id) ?? 1) - 1))
+      providerWriteGenerations.set(id, (providerWriteGenerations.get(id) ?? 0) + 1)
+      if (providerKnownSaved) providerRefreshRequested.add(id)
+      drainProviderRefresh(id)
+    }
+    if (mcpWrite) {
+      mcpWritesPending.set(id, Math.max(0, (mcpWritesPending.get(id) ?? 1) - 1)); mcpWriteGenerations.set(id, (mcpWriteGenerations.get(id) ?? 0) + 1)
+      if (mcpKnownSaved) mcpRefreshRequested.add(id)
+      if (!(mcpWritesPending.get(id) ?? 0) && mcpRefreshRequested.delete(id)) void refreshAgentFieldsFromServer(id, 'mcp-settings')
+    }
+    if (autoCompactWrite) {
+      autoCompactWritesPending.set(id, Math.max(0, (autoCompactWritesPending.get(id) ?? 1) - 1))
+      autoCompactWriteGenerations.set(id, (autoCompactWriteGenerations.get(id) ?? 0) + 1)
+      if (autoCompactKnownSaved) autoCompactRefreshRequested.add(id)
+      drainAutoCompactRefresh(id)
+    }
+    if (instructionsWrite) {
+      instructionsWritesPending.set(id, Math.max(0, (instructionsWritesPending.get(id) ?? 1) - 1))
+      instructionsWriteGenerations.set(id, (instructionsWriteGenerations.get(id) ?? 0) + 1)
+      if (instructionsKnownSaved) instructionsRefreshRequested.add(id)
+      drainInstructionsRefresh(id)
+    }
+    if (modelWrite) {
+      modelWritesPending.set(id, Math.max(0, (modelWritesPending.get(id) ?? 1) - 1))
+      modelWriteGenerations.set(id, (modelWriteGenerations.get(id) ?? 0) + 1)
+      if (modelKnownSaved) modelRefreshRequested.add(id)
+      drainModelRefresh(id)
+    }
   }
 }
 
-export type AgentSettingsFamily = 'memory' | 'identity'
+export type AgentSettingsFamily = 'mcp-settings' | 'provider-settings' | 'memory' | 'identity' | 'retention' | 'model-selection' | 'instructions' | 'auto-compact' | 'voice-selection'
 
 /** The record fields each family of an agent's own Settings save can change (App Actions). */
 const AGENT_SETTINGS_FAMILY_FIELDS: Record<AgentSettingsFamily, readonly string[]> = {
   identity: ['displayName'],
-  memory: AGENT_MEMORY_STORED_FIELDS
+  'provider-settings': ['provider_specific_settings'],
+  retention: ['api_reasoning_retention', 'whiteboard_budget_tokens', 'show_whiteboard', 'show_reasoning', 'preserve_reasoning'],
+  memory: AGENT_MEMORY_STORED_FIELDS,
+  'mcp-settings': MCP_SETTINGS_FIELDS,
+  'model-selection': MODEL_SELECTION_FIELDS,
+  instructions: ['system_prompt', 'include_global_prompt'],
+  'auto-compact': ['auto_compact_settings'],
+  'voice-selection': ['voice_profile']
 }
 
 /**
@@ -248,6 +442,64 @@ const AGENT_SETTINGS_FAMILY_FIELDS: Record<AgentSettingsFamily, readonly string[
  * an older one, whatever order their answers come in.
  */
 const familyReadGenerations = new Map<string, number>()
+
+function isProviderToolSetting(key: string): boolean {
+  // These two legacy mirrors belong to withModelSelection, even though they are
+  // agent-runtime keys for provider serialization purposes (`codex_model` survives only as a
+  // stored leftover of the removed Codex CLI, SA-139 R1).
+  return isAgentRuntimeSettingKey(key) && key !== 'codex_model' && key !== 'claude_model'
+}
+function providerRuntimeProjection(settings: Agent['provider_specific_settings']): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(settings ?? {}).filter(([key]) => isProviderToolSetting(key)))
+}
+
+/** BL-1876: this family owns runtime/tool keys, while model parameters keep their model-selection owner. */
+async function refreshProviderSettingsFromServer(agentId: string): Promise<void> {
+  if (providerReadsPending.has(agentId) || (providerWritesPending.get(agentId) ?? 0) > 0) {
+    providerRefreshRequested.add(agentId)
+    return
+  }
+  const before = getAgentById(agentId)
+  if (!before) return
+  const generation = providerWriteGenerations.get(agentId) ?? 0
+  const beforeSettings = JSON.stringify(providerRuntimeProjection(before.provider_specific_settings))
+  providerRefreshRequested.delete(agentId)
+  providerReadsPending.add(agentId)
+  try {
+    const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, { cache: 'no-store' })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const record = await response.json()
+    if (!record || typeof record !== 'object' || Array.isArray(record) || record.id !== agentId ||
+      record.user_id !== before.user_id || record.agentType !== before.agentType || record.created_at !== before.created_at ||
+      record.provider_specific_settings != null && (typeof record.provider_specific_settings !== 'object' || Array.isArray(record.provider_specific_settings))) {
+      throw new Error('The saved provider settings are unreadable or belong to a different agent.')
+    }
+    const current = getAgentById(agentId)
+    if (!current || current.user_id !== before.user_id || current.agentType !== before.agentType || current.created_at !== before.created_at) return
+    if (generation !== (providerWriteGenerations.get(agentId) ?? 0) || (providerWritesPending.get(agentId) ?? 0) > 0 ||
+      providerRefreshRequested.has(agentId) || JSON.stringify(providerRuntimeProjection(current.provider_specific_settings)) !== beforeSettings) {
+      // A model/source read may have installed only its part of this block while this
+      // event was in flight. Retain one fresh read so its tool change is not lost.
+      providerRefreshRequested.add(agentId)
+      return
+    }
+    agents = agents.map(row => {
+      if (row.id !== agentId) return row
+      const next = { ...row }
+      const settings = { ...row.provider_specific_settings }
+      for (const key of Object.keys(settings)) if (isProviderToolSetting(key)) delete settings[key]
+      Object.assign(settings, providerRuntimeProjection(record.provider_specific_settings))
+      if (Object.keys(settings).length) next.provider_specific_settings = settings
+      else delete next.provider_specific_settings
+      return next
+    })
+  } catch (error) {
+    console.warn(`[agents] Could not read agent ${agentId} again after its provider-settings changed:`, error)
+  } finally {
+    providerReadsPending.delete(agentId)
+    drainProviderRefresh(agentId)
+  }
+}
 
 /**
  * SA-122 A-1y (LS-067/LS-068): the agent changed its own Settings (`agent_settings_changed` on the
@@ -259,6 +511,20 @@ const familyReadGenerations = new Map<string, number>()
  */
 export async function refreshAgentFieldsFromServer(agentId: string, family: AgentSettingsFamily): Promise<void> {
   if (!agents.some((agent) => agent.id === agentId)) return
+  if (family === 'provider-settings') return refreshProviderSettingsFromServer(agentId)
+  if (family === 'mcp-settings' && (mcpWritesPending.get(agentId) ?? 0) > 0) { mcpRefreshRequested.add(agentId); return }
+  const mcpGeneration = mcpWriteGenerations.get(agentId) ?? 0, mcpBefore = getAgentById(agentId)
+  let mcpRevisions: ExpectedMcpSettings | undefined
+  if (family === 'model-selection' && (modelWritesPending.get(agentId) ?? 0) > 0) { modelRefreshRequested.add(agentId); return }
+  if (family === 'instructions' && (instructionsWritesPending.get(agentId) ?? 0) > 0) { instructionsRefreshRequested.add(agentId); return }
+  if (family === 'auto-compact' && (autoCompactWritesPending.get(agentId) ?? 0) > 0) { autoCompactRefreshRequested.add(agentId); return }
+  const autoCompactGeneration = autoCompactWriteGenerations.get(agentId) ?? 0
+  const autoCompactBefore = family === 'auto-compact' ? getAgentById(agentId) : null
+  const instructionsGeneration = instructionsWriteGenerations.get(agentId) ?? 0
+  const instructionsBefore = family === 'instructions' ? getAgentById(agentId) : null
+  const modelReadGeneration = modelWriteGenerations.get(agentId) ?? 0
+  const fields = AGENT_SETTINGS_FAMILY_FIELDS[family]
+  const modelBefore = family === 'model-selection' ? getAgentById(agentId) : null
   const key = `${agentId}\n${family}`
   const generation = (familyReadGenerations.get(key) ?? 0) + 1
   familyReadGenerations.set(key, generation)
@@ -266,6 +532,7 @@ export async function refreshAgentFieldsFromServer(agentId: string, family: Agen
   try {
     const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, { cache: 'no-store' })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    mcpRevisions = readMcpSettingsRevisions(response.headers.get(MCP_SETTINGS_REVISION_HEADER))
     record = await response.json()
     if (!record || typeof record !== 'object' || Array.isArray(record) || record.id !== agentId) {
       throw new Error('the answer is not this agent')
@@ -275,12 +542,50 @@ export async function refreshAgentFieldsFromServer(agentId: string, family: Agen
     return
   }
   if (familyReadGenerations.get(key) !== generation) return
-  const fields = AGENT_SETTINGS_FAMILY_FIELDS[family]
+  if (family === 'mcp-settings') {
+    const current = getAgentById(agentId)
+    if (!current || !mcpBefore || record.user_id !== current.user_id || record.agentType !== current.agentType || !mcpRevisions || MCP_SETTINGS_FIELDS.some(field => !mcpRevisions![field]) ||
+      mcpGeneration !== (mcpWriteGenerations.get(agentId) ?? 0) || (mcpWritesPending.get(agentId) ?? 0) > 0 || !sameJsonValue(mcpProjection(current), mcpProjection(mcpBefore))) return
+    const projection = mcpProjection(record)
+    agents = agents.map(row => { if (row.id !== agentId) return row; const next = { ...row } as Record<string, unknown>; for (const field of MCP_SETTINGS_FIELDS) { if (Object.hasOwn(projection, field)) next[field] = projection[field]; else delete next[field] }; return next as unknown as Agent })
+    mcpDetailCuts = { ...mcpDetailCuts, [agentId]: { record: structuredClone(record), revisions: { ...mcpRevisions } } }
+    return
+  }
+  if (family === 'auto-compact') {
+    const current = getAgentById(agentId)
+    if (!current || !autoCompactBefore || record.user_id !== current.user_id || record.agentType !== current.agentType ||
+      autoCompactGeneration !== (autoCompactWriteGenerations.get(agentId) ?? 0) || (autoCompactWritesPending.get(agentId) ?? 0) > 0 ||
+      !sameJsonValue(current.auto_compact_settings, autoCompactBefore.auto_compact_settings)) return
+    agents = agents.map(row => {
+      if (row.id !== agentId) return row
+      const next = { ...row }
+      if (Object.hasOwn(record, 'auto_compact_settings')) next.auto_compact_settings = record.auto_compact_settings as Agent['auto_compact_settings']
+      else delete next.auto_compact_settings
+      return next
+    })
+    return
+  }
+  if (family === 'instructions') {
+    const current = getAgentById(agentId)
+    if (!current || !instructionsBefore || record.user_id !== current.user_id || record.agentType !== current.agentType ||
+      instructionsGeneration !== (instructionsWriteGenerations.get(agentId) ?? 0) || (instructionsWritesPending.get(agentId) ?? 0) > 0 ||
+      !sameJsonValue(instructionsProjection(current), instructionsProjection(instructionsBefore))) return
+    agents = agents.map(row => row.id === agentId ? withInstructions(row, record) : row)
+    return
+  }
+  if (family === 'model-selection') {
+    const current = getAgentById(agentId)
+    if (!current || !modelBefore || record.user_id !== current.user_id || modelReadGeneration !== (modelWriteGenerations.get(agentId) ?? 0) ||
+      (modelWritesPending.get(agentId) ?? 0) > 0 || !sameModelSelection('agent', modelBefore as unknown as Record<string, unknown>, current as unknown as Record<string, unknown>)) return
+    updateAgent(agentId, withModelSelection('agent', current as unknown as Record<string, unknown>, record) as Partial<Agent>)
+    return
+  }
   updateAgent(agentId, Object.fromEntries(fields.map((field) => [field, record[field]])) as Partial<Agent>)
 }
 
 // Function to load agents from database
 export async function loadAgents(userId: string) {
+  const reasoningReads = captureAgentReasoningReads()
   try {
     // Import DatabaseService dynamically to avoid circular dependencies
     const { DatabaseService } = await import('$lib/services/databaseRedis.client')
@@ -289,11 +594,13 @@ export async function loadAgents(userId: string) {
     const data = await db.getAgents(userId)
     
     // Map database snake_case to frontend camelCase
-    agents = (data || []).map(a => ({
+    setAgents((data || []).map(a => ({
       ...a,
+      model_reasoning_overrides: preserveNewerReasoningLeaves(a.id, a.model_reasoning_overrides,
+        getAgentById(a.id)?.model_reasoning_overrides, reasoningReads.get(a.id) ?? 0),
       displayName: a.displayName || '', // Map displayName
       avatar_url: a.avatar || a.avatar_url || undefined
-    }))
+    })))
     
     return agents
   } catch (error) {

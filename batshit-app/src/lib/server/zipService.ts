@@ -29,6 +29,9 @@ export interface ZipReference {
   zipId?: string
   placeholder?: string
   reference: string
+  /** Trusted lifecycle side effect, reported through the reply-end control-error channel. */
+  skillSessionError?: string
+  skillSessionChanged?: boolean
   position?: {
     start: number
     end: number
@@ -344,11 +347,13 @@ export async function createPermanentZip(
     description,
     createdAt: Date.now(),
     source: 'stream-to-zip',
+    // The chat and reply this zip is written for come LAST (review of BL-1798, N1): the record
+    // must name the chat whose set lists it, which the chat delete trusts.
     metadata: {
-      sessionId,
-      messageId,
       originalChunkCount: content.split('\n').length,
-      ...metadata
+      ...metadata,
+      sessionId,
+      messageId
     }
   }
 
@@ -416,10 +421,11 @@ export async function createZipFromContent(
     description,
     createdAt: Date.now(),
     source: 'manual',
+    // The chat and reply come last, as in `createPermanentZip` (review of BL-1798, N1).
     metadata: {
+      ...metadata,
       sessionId,
-      messageId,
-      ...metadata
+      messageId
     }
   }
 

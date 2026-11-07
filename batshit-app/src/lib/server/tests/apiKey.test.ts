@@ -3,9 +3,9 @@ import { env } from '$env/dynamic/private'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import { apiKeyEncryption, assertApiKeyEncryptionConfigured } from '$lib/services/encryption.server'
-import { apiKeyService, __resetApiKeyRateLimitCacheForTests } from '$lib/services/apiKey.server'
+import { apiKeyService, READ_API_KEY_REFERENCE_SCRIPT, __resetApiKeyRateLimitCacheForTests } from '$lib/services/apiKey.server'
 
-vi.mock('$app/environment', () => ({
+vi.mock('$app/env', () => ({
   building: false,
   dev: false
 }))
@@ -17,6 +17,85 @@ beforeEach(() => {
 })
 
 describe('API Key Encryption Service', () => {
+  test('I1 reference-only cuts retain exact saved source without decrypting, including an undecryptable present record', async () => {
+    const userId = 'i1_reference_user', key = apiKeyService.storedKeyName('custom-mcp', userId)
+    const decrypt = vi.spyOn(apiKeyEncryption, 'decrypt')
+    // Default-lane reply adapter tests private DTO custody/no decryption, not Lua.
+    // The genuine portable route case exercises this script on admitted real Redis.
+    let reply = ['', 'absent']
+    const read = vi.fn(async (script: string, options: { keys: string[] }) => {
+      expect(script).toBe(READ_API_KEY_REFERENCE_SCRIPT); expect(options.keys).toEqual([key]); return reply
+    })
+    const execute = vi.spyOn(redis, 'execute').mockImplementation(async callback => callback({ eval: read } as never))
+    try {
+      expect(await apiKeyService.readReferenceState('custom-mcp', userId)).toEqual({ key, raw: '', present: false, shapeValid: true })
+      await redis.json.set(key, '$', { encrypted: 'not-a-ciphertext', iv: 'not-an-iv', authTag: 'not-a-tag' })
+      reply = [(await redis.json.getRaw(key, '$'))!, 'present']
+      const state = await apiKeyService.readReferenceState('custom-mcp', userId)
+      expect(state).toMatchObject({ key, present: true, shapeValid: true })
+      expect(state.raw).toBe(await redis.json.getRaw(key, '$'))
+      expect(state).not.toHaveProperty('value')
+      expect(decrypt).not.toHaveBeenCalled()
+      await redis.json.set(key, '$', { encrypted: null })
+      reply = ['', 'malformed']
+      expect(await apiKeyService.readReferenceState('custom-mcp', userId)).toMatchObject({ present: true, shapeValid: false })
+      await redis.json.set(key, '$', { encrypted: 'x'.repeat(16385) })
+      reply = [(await redis.json.getRaw(key, '$'))!, 'present']
+      await expect(apiKeyService.readReferenceState('custom-mcp', userId)).rejects.toThrow('reference is unavailable')
+      await expect(apiKeyService.readReferenceState('batshit_token', userId)).rejects.toThrow('reference is unavailable')
+      expect(decrypt).not.toHaveBeenCalled()
+    } finally { execute.mockRestore(); decrypt.mockRestore() }
+  })
+  test('A10 private configured use binds the actual value to one bounded raw cut and clears its temporary value', async () => {
+    const userId = 'a10_account_key_user', key = apiKeyService.storedKeyName('fish', userId)
+    let held: import('$lib/services/apiKey.server').ConfiguredApiKeyUseState | undefined
+    expect(await apiKeyService.withConfiguredValue('fish', userId, async source => ({ state: source.state, raw: source.raw }))).toEqual({ state: 'absent', raw: '[]' })
+    await redis.json.set(key, '$', apiKeyEncryption.encrypt('A10_ACCOUNT_PRIVATE_VALUE'))
+    const answer = await apiKeyService.withConfiguredValue('fish', userId, async source => {
+      held = source
+      expect(source.value).toBe('A10_ACCOUNT_PRIVATE_VALUE')
+      expect(source.state).toBe('readable')
+      return { key: source.key, raw: source.raw }
+    })
+    expect(answer).toMatchObject({ key })
+    expect(JSON.stringify(answer)).not.toContain('A10_ACCOUNT_PRIVATE_VALUE')
+    expect(held?.value).toBeNull()
+  })
+  test('A10 private use keeps malformed input unreadable, bounds before consumption and preserves consumer failure', async () => {
+    const userId = 'a10_account_key_user', key = apiKeyService.storedKeyName('fish', userId)
+    await redis.json.set(key, '$', { encrypted: 'invalid', iv: 'invalid', authTag: 'invalid' })
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      expect(await apiKeyService.withConfiguredValue('fish', userId, async source => ({ state: source.state, value: source.value }))).toEqual({ state: 'unreadable', value: null })
+      const consume = vi.fn(async () => 'must not run')
+      await redis.json.set(key, '$', { encrypted: 'x'.repeat(16385), iv: 'invalid', authTag: 'invalid' })
+      await expect(apiKeyService.withConfiguredValue('fish', userId, consume)).rejects.toThrow('Configured key state is unavailable.')
+      expect(consume).not.toHaveBeenCalled()
+      await redis.json.set(key, '$', apiKeyEncryption.encrypt('A10_ACCOUNT_PRIVATE_VALUE'))
+      let held: import('$lib/services/apiKey.server').ConfiguredApiKeyUseState | undefined
+      await expect(apiKeyService.withConfiguredValue('fish', userId, async source => { held = source; throw new Error('consumer failed') })).rejects.toThrow('consumer failed')
+      expect(held?.value).toBeNull()
+      expect(log).not.toHaveBeenCalled()
+    } finally { log.mockRestore() }
+  })
+  test('A10 configured-state evidence distinguishes absent/unreadable and never retains or logs plaintext', async () => {
+    const userId = 'a10_configured_key_user', key = apiKeyService.storedKeyName('openai', userId)
+    expect(await apiKeyService.readConfiguredState('openai', userId)).toEqual({ key, raw: '[]', configured: false, readable: true })
+    await redis.json.set(key, '$', apiKeyEncryption.encrypt('A10_PRIVATE_SYNTHETIC_VALUE'))
+    const saved = await apiKeyService.readConfiguredState('openai', userId)
+    expect(saved).toMatchObject({ key, configured: true, readable: true })
+    expect(JSON.stringify(saved)).not.toContain('A10_PRIVATE_SYNTHETIC_VALUE')
+    await redis.json.set(key, '$', { encrypted: 'invalid', iv: 'invalid', authTag: 'invalid' })
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      expect(await apiKeyService.readConfiguredState('openai', userId)).toMatchObject({ key, configured: false, readable: false })
+      expect(log).not.toHaveBeenCalled()
+      await redis.json.set(key, '$', { encrypted: 'x'.repeat(16385), iv: 'invalid', authTag: 'invalid' })
+      await expect(apiKeyService.readConfiguredState('openai', userId)).rejects.toThrow('Configured key state is unavailable.')
+      expect(log).not.toHaveBeenCalled()
+    } finally { log.mockRestore() }
+  })
+
   describe('Encryption/Decryption', () => {
     const originalEnv = { ...env }
 

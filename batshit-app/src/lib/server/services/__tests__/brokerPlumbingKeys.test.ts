@@ -93,6 +93,28 @@ describe('the Batshit Tool broker: plumbing is the server', () => {
     }
   })
 
+  it.each([
+    ['batshit_tool_search', { family: 'mcp', query: 'anything' }],
+    ['batshit_tool_use', { ref: 'mcp:any_tool', input: {} }]
+  ])('the dispatch still reads a caller’s selectedGateways as a narrowing filter for %s (BL-686)', async (action, payload) => {
+    // Josh (2026-10-23) cut `selectedGateways` from what the API lane's model is offered; the
+    // dispatch keeps the full schemas, so this filter still reaches the scope resolver.
+    await redis.set('agent:agent-broker-scope', {
+      id: 'agent-broker-scope',
+      user_id: 'josh',
+      provider_specific_settings: { nativeTools: MCP_ONLY }
+    } as any)
+
+    await nativeToolService.dispatchNativeAutomationPackAction({
+      userId: 'josh',
+      action: action as 'batshit_tool_search' | 'batshit_tool_use',
+      payloadInput: { ...payload, selectedGateways: ['gw-a'] },
+      context: { session_id: 'session-broker-scope', agent_id: 'agent-broker-scope', mode: 'mode2', actor_type: 'primary' }
+    })
+
+    expect(scopeCalls.some((call) => Array.isArray(call.selectedGateways) && call.selectedGateways.includes('gw-a'))).toBe(true)
+  })
+
   it('the dispatch (managed CLI helpers, n8n) keeps the scope the server resolved', async () => {
     await redis.set('agent:agent-broker-scope', {
       id: 'agent-broker-scope',

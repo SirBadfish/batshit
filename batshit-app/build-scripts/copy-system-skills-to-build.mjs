@@ -1,10 +1,10 @@
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const appRoot = dirname(dirname(fileURLToPath(import.meta.url)))
 const repoRoot = dirname(appRoot)
-const systemSkillSourceDir = join(appRoot, 'src', 'lib', 'server', 'system-skills')
+const systemPluginSourceDir = join(appRoot, 'src', 'lib', 'server', 'system-plugins')
 const promptDefaultsSourceDir = join(repoRoot, 'docs', 'batshit_System_Prompts')
 
 const serverRoots = [
@@ -34,7 +34,7 @@ function findVercelFunctionDirs(rootDir) {
 
 const vercelFunctionDirs = findVercelFunctionDirs(join(appRoot, '.vercel', 'output', 'functions'))
 
-function copyBundle({ sourceDir, outputDirs, label }) {
+function copyBundle({ sourceDir, outputDirs, label, pluginManifests = false }) {
   if (!existsSync(sourceDir)) {
     throw new Error(`${label} source directory not found: ${sourceDir}`)
   }
@@ -50,7 +50,14 @@ function copyBundle({ sourceDir, outputDirs, label }) {
     rmSync(outputDir, { recursive: true, force: true })
     cpSync(sourceDir, outputDir, {
       recursive: true,
-      filter: (source) => !source.split(/[\\/]/).some((part) => part.startsWith('.'))
+      filter: (source) => {
+        if (lstatSync(source).isSymbolicLink()) return false
+        const parts = relative(sourceDir, source).split(/[\\/]/)
+        return !parts.some((part, index) => part.startsWith('.') && !(
+          pluginManifests && index === 1 && part === '.claude-plugin' &&
+          (parts.length === 2 || (parts.length === 3 && parts[2] === 'plugin.json'))
+        ))
+      }
     })
     copied += 1
   }
@@ -65,13 +72,20 @@ function copyBundle({ sourceDir, outputDirs, label }) {
 }
 
 copyBundle({
-  sourceDir: systemSkillSourceDir,
+  sourceDir: systemPluginSourceDir,
   outputDirs: [
-    ...serverRoots.map((root) => join(root, 'system-skills')),
-    ...vercelFunctionDirs.map((root) => join(root, 'system-skills'))
+    ...serverRoots.map((root) => join(root, 'system-plugins')),
+    ...vercelFunctionDirs.map((root) => join(root, 'system-plugins'))
   ],
-  label: 'system skills'
+  label: 'system plugins',
+  pluginManifests: true
 })
+
+// Incremental builds must not keep the superseded authored bundle beside the
+// canonical package. Only generated output roots are eligible for this cleanup.
+for (const root of [...serverRoots, ...vercelFunctionDirs]) {
+  if (existsSync(join(root, 'system-plugins'))) rmSync(join(root, 'system-skills'), { recursive: true, force: true })
+}
 
 copyBundle({
   sourceDir: promptDefaultsSourceDir,

@@ -43,6 +43,7 @@ const {
 } = require('../services/skinSurfaceArtworkValidator');
 const {
   hashFile,
+  hashOpenFile,
   inspectAndExtractRecipeArchive
 } = require('../services/goonRecipeArchiveService');
 const { GOON_MANIFEST_MAX_BYTES, GOON_CUSTOM_MODEL_MAX_BYTES } = require('../services/goonPackageLimits.json');
@@ -1948,7 +1949,7 @@ router.post('/upload/asset-deletion/reserve', enterCustomAssetMaintenance, async
   }
 });
 
-router.delete('/upload/asset', maybeEnterCustomAssetMaintenance, async (req, res) => {
+async function deleteUploadAssetHandler(req, res) {
   let deletionNotStarted = true;
   let fencedError = false;
   try {
@@ -1972,15 +1973,16 @@ router.delete('/upload/asset', maybeEnterCustomAssetMaintenance, async (req, res
           atomicContext = matched.context;
           expectedFile = cleanupFileFromContext(req.body.cleanupContext, matched.job, uploadType, filename);
         }
-        if (uploadType === 'goon_hair_assets' || uploadType === 'goon_hair_imports') {
+        if (uploadType === 'goon_hair_assets' || uploadType === 'goon_hair_imports' || uploadType === 'goon_closet') {
+          const label = uploadType === 'goon_closet' ? 'Closet' : 'Hair';
           const record = await readUploadRecordForDelete(`upload:${uploadType}:${filename}`);
           if (record) {
             const filePath = resolveFileBackedPayloadPath(record);
             legacyInline = typeof record.base64 === 'string' && record.base64.length > 0;
-            if (!filePath && !legacyInline) throw new Error('Hair upload has no verified file path or legacy inline bytes. Repair it before cleanup.');
-            if (record.uploadType !== undefined && record.uploadType !== uploadType) throw new Error('Hair upload namespace does not match its cleanup key.');
+            if (!filePath && !legacyInline) throw new Error(`${label} upload has no verified file path or legacy inline bytes. Repair it before cleanup.`);
+            if (record.uploadType !== undefined && record.uploadType !== uploadType) throw new Error(`${label} upload namespace does not match its cleanup key.`);
             if (filePath && filePath !== resolveStoredUploadPath(uploadType, filename)) {
-              throw Object.assign(new Error('Hair upload ownership path changed. Repair it before cleanup.'), { statusCode: 409 });
+              throw Object.assign(new Error(`${label} upload ownership path changed. Repair it before cleanup.`), { statusCode: 409 });
             }
             if (expectedFile) {
               let actualHash = record.sha256;
@@ -1991,7 +1993,7 @@ router.delete('/upload/asset', maybeEnterCustomAssetMaintenance, async (req, res
               }
               if (expectedFile.ref !== `/uploads/${uploadType}/${filename}` || actualHash !== expectedFile.sha256 ||
                   actualBytes !== expectedFile.bytes || (record.mimetype !== undefined && record.mimetype !== expectedFile.mimeType)) {
-                throw Object.assign(new Error('Hair upload no longer matches its exact cleanup receipt. Retry after repairing ownership.'), { statusCode: 409 });
+                throw Object.assign(new Error(`${label} upload no longer matches its exact cleanup receipt. Retry after repairing ownership.`), { statusCode: 409 });
               }
             }
           }
@@ -2028,7 +2030,8 @@ router.delete('/upload/asset', maybeEnterCustomAssetMaintenance, async (req, res
   } finally {
     releaseCustomAssetPermit(req);
   }
-});
+}
+router.delete('/upload/asset', maybeEnterCustomAssetMaintenance, deleteUploadAssetHandler);
 
 // Goon (VRM) upload endpoint
 router.post('/upload/goon', goonVrmUpload.single('file'), async (req, res) => {
@@ -2337,6 +2340,89 @@ router.post('/upload/goon-custom-package', enterCustomAssetMaintenance, parseCus
     } finally {
       releaseCustomAssetPermit(req);
     }
+  }
+});
+
+// Inspect an already stored Source without publishing another copy. Keep the
+// file-service maintenance permit and publication queue through extraction and
+// temporary-file cleanup, even when the caller disconnects.
+router.post('/upload/goon-custom-package/inspect', enterCustomAssetMaintenance, async (req, res) => {
+  try {
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body) ||
+        Object.keys(body).length !== 1 || typeof body.filename !== 'string' ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]*\.bgoon$/.test(body.filename) || body.filename.includes('..')) {
+      throw uploadValidationError('A canonical custom Goon package filename is required.');
+    }
+    const result = await recipePackagePublicationQueue.run(async () => {
+      const uploadType = 'goon_custom_packages';
+      const record = await readUploadRecordForDelete(`upload:${uploadType}:${body.filename}`);
+      const filePath = record && resolveFileBackedPayloadPath(record);
+      const expectedHash = record?.sha256;
+      if (!record || record.storage !== 'filesystem' || record.uploadType !== uploadType ||
+          typeof expectedHash !== 'string' || !/^[a-f0-9]{64}$/.test(expectedHash) ||
+          (/^[a-f0-9]{64}\.bgoon$/.test(body.filename) && body.filename.slice(0, 64) !== expectedHash) ||
+          !Number.isSafeInteger(record.size) || record.size < 1 ||
+          record.size > GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE || !filePath) {
+        throw uploadValidationError('The stored custom Goon package record is unavailable or invalid.');
+      }
+      const prior = await fs.lstat(filePath, { bigint: true });
+      if (!prior.isFile()) throw uploadValidationError('The stored custom Goon package is not a regular file.');
+      const uploadRoot = await fs.realpath(path.resolve(config.uploadsDir));
+      const realPath = await fs.realpath(filePath);
+      if (!realPath.startsWith(`${uploadRoot}${path.sep}`)) {
+        throw uploadValidationError('The stored custom Goon package escapes its upload root.');
+      }
+      const handle = await fs.open(filePath, fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW || 0));
+      let tempDir;
+      try {
+        const before = await handle.stat({ bigint: true });
+        if (!before.isFile() || before.dev !== prior.dev || before.ino !== prior.ino ||
+            before.size !== BigInt(record.size)) {
+          throw uploadValidationError('The stored custom Goon package is not the recorded regular file.');
+        }
+        await fs.mkdir(goonDiskUploadTempDir, { recursive: true });
+        tempDir = await fs.mkdtemp(path.join(goonDiskUploadTempDir, 'recipe-inspect-'));
+        const extraction = await inspectAndExtractRecipeArchive({
+          archivePath: filePath,
+          archiveHandle: handle,
+          outputDir: tempDir,
+          maxArchiveBytes: GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE,
+          maxModelBytes: GOON_CUSTOM_MODEL_MAX_BYTES,
+          maxManifestBytes: GOON_MANIFEST_MAX_BYTES,
+          maxTotalUncompressedBytes: GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE,
+          maxExpansionRatio: 20
+        });
+        const after = await handle.stat({ bigint: true });
+        const currentPath = await fs.lstat(filePath, { bigint: true });
+        const afterHash = await hashOpenFile(handle);
+        const finalPath = await fs.realpath(filePath);
+        if (!currentPath.isFile() || before.dev !== after.dev || before.ino !== after.ino ||
+            before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
+            currentPath.dev !== before.dev || currentPath.ino !== before.ino || finalPath !== realPath ||
+            extraction.archive.sha256 !== expectedHash || extraction.archive.bytes !== record.size ||
+            afterHash.sha256 !== expectedHash || afterHash.bytes !== record.size) {
+          throw uploadValidationError('The stored custom Goon package changed during inspection.');
+        }
+        return {
+          contract: 'recipe-archive-inspection/v1',
+          archive: { sha256: extraction.archive.sha256, bytes: extraction.archive.bytes },
+          members: extraction.members.map(({ role, sha256, bytes }) => ({ role, sha256, bytes }))
+        };
+      } finally {
+        try {
+          if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
+        } finally {
+          await handle.close();
+        }
+      }
+    });
+    return res.json(result);
+  } catch (error) {
+    writeErrorLog(logger, 'Custom Goon package inspection error', error);
+    return sendUploadError(res, 'Custom Goon package inspection failed', error);
+  } finally {
+    releaseCustomAssetPermit(req);
   }
 });
 
@@ -2944,7 +3030,12 @@ router.post('/upload/goon-clothing-asset', goonClothingAssetUpload.single('file'
 });
 
 // Goon closet texture upload endpoint (PNG only, no resizing)
-router.post('/upload/goon-closet', goonImageUpload.single('file'), async (req, res) => {
+router.post('/upload/goon-closet', enterCustomAssetMaintenance, (req, res, next) => {
+  goonImageUpload.single('file')(req, res, (error) => {
+    if (error) releaseCustomAssetPermit(req);
+    next(error);
+  });
+}, async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
@@ -2962,14 +3053,15 @@ router.post('/upload/goon-closet', goonImageUpload.single('file'), async (req, r
       'closet_texture';
 
     const timestamp = Date.now();
-    const filename = `${timestamp}_${safeBase}.png`;
-    const file = await storeFilesystemUploadAsset(req, {
-      uploadType: 'goon_closet',
-      originalName,
-      filename,
-      mimetype: req.file.mimetype || 'image/png',
-      buffer: req.file.buffer,
-      size: req.file.size
+    const filename = `${timestamp}_${crypto.randomUUID()}_${safeBase}.png`;
+    const file = await recipePackagePublicationQueue.run(async () => {
+      const claim = await claimCustomRecipePublication(redisService.client, [{ uploadType: 'goon_closet', filename }]);
+      const stored = await storeFilesystemUploadAsset(req, {
+        uploadType: 'goon_closet', originalName, filename,
+        mimetype: req.file.mimetype || 'image/png', buffer: req.file.buffer, size: req.file.size
+      });
+      await releaseCustomRecipePublication(redisService.client, claim);
+      return stored;
     });
 
     return res.json({
@@ -2978,23 +3070,14 @@ router.post('/upload/goon-closet', goonImageUpload.single('file'), async (req, r
     });
   } catch (error) {
     writeErrorLog(logger, 'Goon closet upload error', error);
-    res.status(500).json({ error: 'Closet upload failed', details: error.message });
-  }
+    sendUploadError(res, 'Closet upload failed', error);
+  } finally { releaseCustomAssetPermit(req); }
 });
 
-router.delete('/upload/goon-closet', async (req, res) => {
-  try {
-    const filename = req.body?.filename;
-    if (!filename) {
-      return res.status(400).json({ error: 'Filename is required' });
-    }
-    await deleteStoredUploadAsset('goon_closet', filename);
-    return res.json({ success: true });
-  } catch (error) {
-    writeErrorLog(logger, 'Goon closet delete error', error);
-    res.status(500).json({ error: 'Closet delete failed', details: error.message });
-  }
-});
+router.delete('/upload/goon-closet', (req, res, next) => {
+  req.body = { ...req.body, uploadType: 'goon_closet' };
+  enterCustomAssetMaintenance(req, res, next);
+}, deleteUploadAssetHandler);
 
 // Preserve original panorama media and generate a separate still thumbnail.
 router.post('/upload/goon-scene', goonSkyboxUpload.single('file'), async (req, res) => {

@@ -1,6 +1,29 @@
+import { createSkillReadDelivery } from '$lib/server/services/skillReadDelivery'
+import { readWhiteboardContextSnapshot } from '$lib/server/services/approvalResumeReplay'
+import { liveReadOtherReaders, refreshedFileReadsActiveFor } from '$lib/server/services/liveFileReadAccess.server'
+import { resolveLiveFileReadsEnabled } from '$lib/utils/liveFileReads'
+import { withoutServerReplayFields } from '$lib/utils/serverReplayFields'
+import {
+  LiveFileReadTurn,
+  buildLiveFileReadReplay,
+  liveFileReadReplayExpiry,
+  liveReadReplayApprovalIds,
+  checkLiveFileReadReplay,
+  scheduleLiveFileReadReplayExpiry
+} from '$lib/server/services/liveFileReadTurn.server'
+import { LiveFileReadOutcome } from '$lib/server/services/liveFileReadOutcome.server'
+import { primaryCliRuntimeCandidates, CLAUDE_CLI_PRESET_REFUSAL } from '$lib/utils/cliRuntimeIdentity'
+import { resolveApiReasoningRetention } from '$lib/utils/reasoningRetention'
+import { captureAgentLocalReasoning } from '$lib/server/services/localModelReasoning'
 import { ApiImageInputCollector, readUserInputSources } from '$lib/server/services/imageAddressApiInput'
 import { BATSHIT_SERVER_URL as BROWSER_BATSHIT_SERVER_URL } from '$lib/services/apiClient'
 import { readTurnMcpGatewaySnapshot, resolveTurnMcpGatewaySelection, type TurnMcpGatewayAuthority } from '$lib/server/services/turnMcpGatewayScope'
+import { captureP5OriginalLookup, p5OriginalLookupCurrent, prepareP5OriginalTask,
+  retireP5OriginalPreparation, sealP5OriginalPreparation, p5OriginalRequestForPreparation, p5CanonicalReplySealed,
+  captureP5ApiOriginalStdioSources, recordP5ResolvedApiScope, p5ApiPreparedScope, p5ApiPreparedGatewayFrontier, bindP5ApiReplyPart, recordP5ApiRequestView, captureP5ApiCanonicalLineage, p5ApiRunMustPause, holdP5ApiToolImages, assertP5ApiFreshSegment, takeP5ApiVerifiedContinuation,
+  assertP5ApiRunCurrent, p5ApiManagedMcpActive, type P5ApiOriginalRun, type P5ApiReplyPart,
+  pendingP5ApiApproval, prepareP5ApiApprovalResume, settleP5ApiApprovalResume,
+  type P5OriginalLookup, type P5OriginalPreparation } from '$lib/server/services/appActions/mcp/originalTask'
 import { open, unlink } from 'node:fs/promises'
 import { randomInt } from 'node:crypto'
 import os from 'node:os'
@@ -32,12 +55,6 @@ import {
   type ZipReference,
 } from '$lib/server/zipService'
 import { executionViewerService } from '$lib/server/services/executionViewerService'
-import { readCliContextReport } from '$lib/server/services/cliContextReportLookup'
-import {
-  claudeContextCappedByEnvironment, cliContextSettingsKey,
-  matchingCliContextReport, reportForCliSnapshot,
-  resolveEffectiveAgentCliModel, resolveCliContextWindow
-} from '$lib/utils/cliContextWindow'
 import {
   approvalResumeReplyTurn,
   attachJevJuiceRecords,
@@ -52,7 +69,7 @@ import {
   buildUntrustedTextHintProvider,
   composeJevJuiceHintProviders,
   createJevJuiceTurnCollector,
-  findContextContinuationTurn,
+  findContextContinuationTurn, originalApiContinuationReplyTurn,
   type GroupSpeakerProviderInput,
 } from '$lib/server/services/typesafe/jevJuiceTurn'
 import {
@@ -84,43 +101,36 @@ import {
 import { buildControlErrorRecord } from '$lib/utils/controlTags'
 import { markPostTurnRecordTold } from '$lib/server/services/postTurnCheckState'
 import type { TypesafeCallRecord } from '$lib/types/typesafe'
-import type { ExecutionRuntimeDetails, ExecutionSnapshot, ObservedUsage } from '$lib/types/executionViewer'
+import type { ExecutionRuntimeDetails, ExecutionSnapshot } from '$lib/types/executionViewer'
 import { getTypeZipSettings } from '$lib/utils/toolRenderMap'
 import { normalizeAgentBrowserCommandName } from '$lib/utils/toolNameNormalization'
 import { bytesToBlob } from '$lib/utils/binary'
 import {
-  isCliPrimaryAgentType,
-  isManagedPrimaryAgentType,
-  isN8nPrimaryAgentType,
+  isApiPrimaryAgentType,
   normalizePrimaryAgentType,
+  retiredPrimaryAgentRefusal,
 } from '$lib/utils/primaryAgentType'
 import {
   isSubagentCompatibleWithPrimaryAgent,
   normalizeSubagentType,
 } from '$lib/utils/subagentType'
 import {
-  buildClaudeLlmCapture,
-  buildCodexLlmCapture,
   buildTokenStat,
   buildTokenUsage,
   buildVercelLlmCapture,
-  reportedUsageConfidence,
-  sanitizeRuntimeEventLogForCapture,
 } from '$lib/server/services/executionViewerLlmCapture'
-import {
-  buildMeasuredMessagePerformance,
-  buildMessagePerformanceFromSteps,
-} from '$lib/server/services/messagePerformance'
+import { buildMessagePerformanceFromSteps } from '$lib/server/services/messagePerformance'
 import {
   buildApiCacheForensicsRecords,
   resolveCacheForensicsExperimentGroup,
 } from '$lib/server/services/cacheForensics/apiAdapter'
-import { buildCliCacheForensicsRecord } from '$lib/server/services/cacheForensics/cliAdapter'
 import {
   createLlmCaptureClaim,
   createStreamStepRecorder,
+  classifyIncompleteToolCallStreamFailure,
   isContextExhaustedStreamFailure,
   providerStreamErrorFrom,
+  resolveFailedApiUsage,
 } from '$lib/server/services/streamFailureEvidence'
 import {
   attachCacheForensicsToSnapshot,
@@ -147,7 +157,7 @@ import {
   type ApiUsageLike,
   withHonestLocalCacheUsage,
 } from '$lib/server/services/apiProviderUsage'
-import type { NativeModeRequest } from '$lib/server/services/vercelBrain'
+import type { NativeModeRequest, PreparedApiToolset } from '$lib/server/services/vercelBrain'
 import { buildDelegatedExecutionSummary } from '$lib/server/services/delegatedRunAccounting'
 import {
   initializeKeyspaceNotifications,
@@ -177,25 +187,17 @@ import {
 import {
   resolveAgentModelFallbacks,
   resolveRuntimeModelSelection,
+  type RuntimeModelSelectionArgs,
 } from '$lib/utils/modelPresetRuntime'
 import { resolveModelIds } from '$lib/utils/modelIdResolver'
 import { loadRuntimeModelPreset } from '$lib/server/services/runtimeModelPreset'
 import { N8N_ONLY_CONNECTION_IDS } from '$lib/server/constants/modelConnections'
 import { N8N_ONLY_PROVIDER_IDS } from '$lib/data/model-compatibility-registry'
 import { listLocalAiServers } from '$lib/server/services/localAiServers'
-import {
-  buildCodexRuntimeSettings,
-  resolveCodexTransportLane,
-  type CodexRunSettings
-} from '$lib/server/services/codexSettings'
-import { buildAgentProfileId } from '$lib/server/services/codexProfileManager'
-import {
-  buildClaudeRuntimeSettings,
-  type ClaudeRunSettings
-} from '$lib/server/services/claudeSettings'
 import { replacePromptVariables } from '$lib/utils/promptVariables'
-import { STEER_MISSED_REASON, resolveAgentDmsEnabled } from '$lib/utils/dmControl'
-import { resolveAgentJevJudgeToolEnabled } from '$lib/utils/jevJuiceControl'
+import { STEER_MISSED_REASON, readAgentDmsSwitch, resolveAgentDmsEnabled } from '$lib/utils/dmControl'
+import { buildSkillSessionTurn } from '$lib/server/services/skillSessionTurn'
+import { resolveAgentJevJudgeToolEnabled, resolveAgentJevSkillSessionsEnabled } from '$lib/utils/jevJuiceControl'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import { resolveWorkersEnabled } from '$lib/utils/delegationCapabilities'
 import { THINKING_INDICATOR } from '$lib/utils/thinkingIndicator'
@@ -239,6 +241,7 @@ import {
   shouldMoveSentMessageToEnd,
 } from '$lib/server/services/queuedSendRules'
 import { keepQueuedSendAtEnd } from '$lib/server/services/queuedSendKeeper'
+import { pickSendFacts } from '$lib/utils/sendFacts'
 import {
   getWakeAbortSignal,
   getWakeRun,
@@ -251,11 +254,7 @@ import {
   markImageOriginPending,
   writeImageOriginDecision,
 } from '$lib/server/services/imageAddressOrigins'
-import {
-  decideReplyImageOrigins,
-  emptyRunDelivery,
-  appendCliModelResult,
-} from '$lib/server/services/imageAddressTurnRecord'
+import { decideReplyImageOrigins } from '$lib/server/services/imageAddressTurnRecord'
 import {
   composeInPlaceResumeMessage,
   continueResumedSnapshotPatch,
@@ -267,7 +266,6 @@ import {
   isInPlaceApprovalResume,
   readStoredAssistantRecord,
   resolveFailedTurnContent,
-  readObservedUsage,
 } from '$lib/server/services/approvalResumeMessage'
 import {
   buildApprovalResumeReplay,
@@ -283,6 +281,12 @@ import { chatgptPlanAccountId } from '$lib/utils/chatgptPlanConnection'
 import { getChatgptPlanRuntime } from '$lib/server/services/chatgptPlanHost'
 import { PLAN_AGENT, type PlanLease } from '$lib/server/services/chatgptPlanRuntime'
 import { isPlanSelection, assertPlanSettings, chatgptPlanHttpStatus } from '$lib/server/services/chatgptPlanInference'
+import { claudePlanHttpStatus } from '$lib/server/services/claudePlanAdmission'
+import { CLAUDE_PLAN_HOOK_NOTE_LIMIT, ClaudePlanRunError, claudePlanRunHttpStatus } from '$lib/server/services/claudePlanProtocol'
+import { claimHeldClaudePlanRun, endHeldClaudePlanRuns, type ClaudePlanHeldState } from '$lib/server/services/claudePlanRunRegistry'
+import type { ClaudePlanRun } from '$lib/server/services/claudePlanRun'
+import { isClaudePlanSelection } from '$lib/utils/claudePlanConnection'
+import { CLAUDE_PLAN_SWITCHED_AWAY_REASON, claudePlanGoneReason, markClaudePlanCardRunEnded, planClaudePlanClick, type ClaudePlanClick } from '$lib/server/services/claudePlanApprovalClick'
 import { assertPlanApprovalSource } from '$lib/server/services/approvalResumeReplay'
 import {
   GROUP_APPROVAL_CLICK_REFUSAL,
@@ -306,6 +310,7 @@ import {
   judgeStreamEnd,
 } from '$lib/server/services/streamStop'
 import { relayAbort } from '$lib/server/services/turnAbortRelay'
+import { CONTEXT_ERROR_DRAIN_WAIT_MS, withToolResultsOnStop } from '$lib/server/services/lateToolResults'
 import {
   OUTPUT_LIMIT_ERROR_CODE,
   OUTPUT_LIMIT_FAILURE_KIND,
@@ -314,14 +319,17 @@ import {
   outputLimitFailureMetadata,
 } from '$lib/server/services/outputLimitStop'
 import {
+  GATEWAY_STREAM_FORMAT_ERROR_CODE,
+  createGatewayStreamFormatCheck,
+  isGatewayStreamFormatStep,
+} from '$lib/server/services/providers/gatewayStreamFormat'
+import {
   SESSION_DELETED_STOP_MESSAGE,
   isStoppedForSessionDelete,
 } from '$lib/server/services/sessionDeleteTurnStop'
 import {
-  attachSteerTransport,
   clearSteerInbox,
   clearSteerRun,
-  confirmSteerDelivery,
   drainDeliveredSteers,
   registerSteerRun,
   takeMissedDmSteers,
@@ -340,22 +348,21 @@ import {
   readHeldSteerIdsForHistory,
   publishUnansweredSteers,
   saveSteersWithoutAnswer,
-  readHeldSteerIds,
-  pickSendFacts,
   promoteSteersToNextTurn,
   readFollowUpHistory,
-  readHeldMessageToAnswer
+  readHeldMessageToAnswer,
+  moveUnansweredBehindHeldAnswer
 } from '$lib/server/services/steerPromotion'
 import {
   APPROVAL_EXPIRED_REASON,
   approvalSummaryIsPending,
-  isExpiryOnlyAnswer
+  isExpiryOnlyAnswer,
+  readWaitsForApproval
 } from '$lib/utils/heldForApproval'
 import {
   buildSteerPlaceholder,
   resolveSteerability,
-  type DeliveredSteer,
-  type SteerLane
+  type DeliveredSteer
 } from '$lib/utils/steerControl'
 import {
   acknowledgeDeliveredDmSteers,
@@ -397,10 +404,6 @@ import { toolStepFailureMessage } from '$lib/utils/toolResultProcessor'
 import { toolErrorAsFailedToolResult } from '$lib/server/services/toolErrorPart'
 import { collectCompiledImageInputs } from '$lib/server/services/compiledImageInputs'
 import {
-  MODE4_PRELAUNCH_STYLE,
-  resolveMode4MemoryOwner,
-} from '$lib/constants/mode4'
-import {
   applyImageTransportOverrides,
   classifyLocalImageUrlRuntimeFailure,
   type ImageTransportOverride,
@@ -428,28 +431,24 @@ import {
   settlesWithin,
   REPLY_RECORDED_EVENT_TYPES,
   REPLY_SAVED_FROM_OWN_COPY_KEY,
+  REPLY_ORDERED_EVENT_TYPES,
+  REPLY_ORDERED_FORWARD_GIVE_UP,
   rebuildRecordedReply,
+  persistCanonicalReply,
   takeStreamMadeZipReferences,
   type RecordedReplyEnd,
 } from '$lib/server/services/replyStreamRecord'
 import { finishReplyEndContent, replyEndZipIds } from '$lib/utils/replyEndContent'
 import { SegmentedText } from '$lib/utils/segmentedText'
-import { buildClaudeApprovalSummary, joinApprovalSummaries } from '$lib/server/services/claudeApprovalEvents'
 import { applyUnavailableWebSearchMetadata } from '$lib/utils/webSearchAvailability'
-import { nativeToolService } from '$lib/server/services/nativeTools'
+import { nativeToolService, resolveNativeToolSettings } from '$lib/server/services/nativeTools'
 import {
   attachControlApprovalRecords,
-  buildControlApprovalResumeContent,
-  buildControlApprovalInPlaceAddendum,
-  planControlApprovalResumeTurn,
   resolveApprovalResumeGrants,
-  settleControlApprovalCard,
   type ResolvedApprovalResumeGrants
 } from '$lib/server/services/brokerControlApprovals'
 import { markApprovalExpired } from '$lib/server/services/controlApprovals'
 import {
-  analyzeApprovalState,
-  buildApprovalHistoryMessages,
   buildToolApprovalTimeoutAddendum,
   buildControlApprovalEntry,
   readControlApprovalRequestFromToolResult,
@@ -459,6 +458,8 @@ import {
   TOOL_APPROVAL_TIMEOUT_MS,
   type ApprovalStateSnapshot
 } from '$lib/server/services/toolApprovalState'
+import { retireSavedCliApprovals, sweepApprovalState } from '$lib/server/services/approvalExpiry'
+import { isRetiredSavedApproval } from '$lib/utils/controlApprovalPresentation'
 import { normalizeAssignedSubagent } from '$lib/server/services/assignedSubagentNormalization'
 import {
   internalServiceHeaders,
@@ -480,26 +481,30 @@ import {
   resolveBudgetOutputReserve,
 } from '$lib/server/services/contextBudgetPreflight'
 import {
-  CODEX_NATIVE_BASE_OVERHEAD_TOKENS,
-  estimateCodexProjectInstructionTokens,
-  estimateCodexProjectInstructionChars,
-} from '$lib/server/services/contextTokenPreview'
-import { CLI_WRAPPER_OVERHEAD_TOKENS } from '$lib/utils/tokenPanel'
-import {
   resolveAutoCompactTriggerTokens,
   resolveEffectiveAutoCompactSettings,
 } from '$lib/utils/contextCompaction'
 
 type UsageLike = NonNullable<ApiUsageLike>
 
-const PRIMARY_CODEX_PROVIDER_ID = 'openai-codex'
-const PRIMARY_CLAUDE_PROVIDER_ID = 'anthropic-claude-cli'
-const CODEX_PROVIDER_IDS = new Set(['codex', PRIMARY_CODEX_PROVIDER_ID])
-const CLAUDE_PROVIDER_IDS = new Set(['claude-cli', PRIMARY_CLAUDE_PROVIDER_ID])
-const CODEX_CONNECTION_ID = 'codex-cli'
-const CLAUDE_CONNECTION_ID = 'claude-cli'
-const SIMULATED_STREAM_DELAY_MS = 22
-const SIMULATED_STREAM_CHUNK_TARGET = 36
+
+/** A Primary's model selection inputs: its saved preset (read fresh) and its record's copies. */
+function routedPrimarySelectionArgs(
+  agent: AgentRow,
+  presetId: string | null,
+  preset: SavedModel | null,
+): RuntimeModelSelectionArgs {
+  const agentMetadata = agent as Record<string, any>
+  return {
+    preset, presetId, reasoningOverrides: agent.model_reasoning_overrides,
+    provider: agentMetadata.primary_model_provider ?? agent.primary_model_provider,
+    modelId: agentMetadata.primary_model_name ?? agent.primary_model_name,
+    connection: agentMetadata.primary_model_connection ?? agent.primary_model_connection ?? null,
+    capabilities: agentMetadata.primary_model_capabilities ?? agent.primary_model_capabilities ?? null,
+    settings: (agentMetadata.provider_specific_settings ?? agent.provider_specific_settings ?? null) as Record<string, any> | null,
+  }
+}
+
 // Hard cap on automatic continuations after mid-run context-window exhaustion,
 // per user request, so a pathological task can never loop forever.
 const MAX_CONTEXT_CONTINUATIONS = 3
@@ -651,8 +656,13 @@ async function readAgentRecordForFollowUpTurn(userId: string, agentId: string): 
   return row
 }
 
+/** Plan connections (SA-130, SA-139) answer with their own readable refusal status (a plan limit: 429). */
+function planHttpStatus(error: unknown): number | null {
+  return chatgptPlanHttpStatus(error) ?? claudePlanHttpStatus(error) ?? claudePlanRunHttpStatus(error)
+}
+
 function getFailureStatus(error: unknown): number | null {
-  const planStatus = chatgptPlanHttpStatus(error)
+  const planStatus = planHttpStatus(error)
   if (planStatus !== null) return planStatus
   const status = (error as any)?.status ?? (error as any)?.statusCode
   return typeof status === 'number' && Number.isFinite(status) ? status : null
@@ -757,6 +767,8 @@ function carriedReplyEndMetadata(
 }
 
 async function persistFailedAssistantTurn(options: {
+  mcpOriginalPreparation?: P5OriginalPreparation
+  mcpApiPart?: P5ApiReplyPart
   sessionId?: string | null
   userId?: string | null
   agentId?: string | null
@@ -845,6 +857,16 @@ async function persistFailedAssistantTurn(options: {
           { ...incomingMetadata, usage: null },
         )
       : incomingMetadata
+    // SA-137 (D7): a failed resume ends its pause whichever writer built this metadata (a writer
+    // that already joined its accounting skips the merge above): its click is spent and never runs
+    // again, so its live-file-read replay is cleared, not left on the record. Absent stays absent.
+    const replayPrior = (options.replyEndPrior?.metadata ?? prior?.metadata) as Record<string, any> | undefined
+    const retiredLiveReplay =
+      inPlaceResume &&
+      !Object.prototype.hasOwnProperty.call(failureMetadata, 'liveFileReadSnapshot') &&
+      replayPrior?.liveFileReadSnapshot !== undefined && replayPrior?.liveFileReadSnapshot !== null
+        ? { liveFileReadSnapshot: null }
+        : {}
     const zipIds = Array.from(
       new Set([
         ...(Array.isArray(priorMetadata.zipIds) ? priorMetadata.zipIds.filter((id: unknown) => typeof id === 'string') : []),
@@ -870,7 +892,7 @@ async function persistFailedAssistantTurn(options: {
       model ??= namedText(agentRecord?.primary_model_name)
       provider ??= namedText(agentRecord?.primary_model_provider)
     }
-    await redis.saveMessage({
+    await persistCanonicalReply({
       id: messageId,
       session_id: sessionId,
       user_id: userId,
@@ -883,6 +905,7 @@ async function persistFailedAssistantTurn(options: {
       created_at: now,
       metadata: {
         ...failureMetadata,
+        ...retiredLiveReplay,
         ...carriedReplyEndMetadata(
           options.replyEndMetadata,
           inPlaceResume ? (options.replyEndPrior ?? null) : null,
@@ -905,7 +928,7 @@ async function persistFailedAssistantTurn(options: {
           ? { http_status: options.status }
           : {}),
       },
-    } as Partial<ChatMessage>)
+    } as Partial<ChatMessage>, options.mcpOriginalPreparation, options.mcpApiPart)
     if (inPlaceResume || options.noStreamEvent === true) {
       await publishUserEvent(userId, {
         type: 'session_messages_changed',
@@ -1160,17 +1183,6 @@ function normalizeToolApprovalMode(value: unknown): ToolApprovalMode {
   return 'off'
 }
 
-/**
- * BL-941 (R5): a CLI run's Tool Approval, with the agent's record as its upper bound. `all` (ask
- * before a tool runs) is tighter than `off`, so the tighter of the send's value and the record's
- * wins; a send that names none leaves the record's.
- */
-function tighterToolApprovalMode(sent: unknown, record: unknown): ToolApprovalMode {
-  const recordMode = normalizeToolApprovalMode(record)
-  if (sent === undefined || sent === null) return recordMode
-  return recordMode === 'all' || normalizeToolApprovalMode(sent) === 'all' ? 'all' : 'off'
-}
-
 function normalizeToolApprovalResponses(
   value: unknown,
 ): ToolApprovalResponse[] {
@@ -1423,10 +1435,6 @@ async function extractToolApprovalRequests(
 }
 
 type RawSubagent = Record<string, any>
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
 
 function stripToolPartOnlyText(value: unknown): string {
   if (typeof value !== 'string') return ''
@@ -2343,53 +2351,6 @@ function fileToImageOutput(file: any): ImageOutput | null {
   return null
 }
 
-type PlanItem = { text: string; completed?: boolean }
-const PLAN_TOOL_NAME = 'codex_plan_update'
-
-function isPlanUpdateTool(toolName?: string | null): boolean {
-  return (toolName || '').toLowerCase() === PLAN_TOOL_NAME
-}
-
-function normalizePlanItems(raw: any): PlanItem[] {
-  const source = Array.isArray(raw)
-    ? raw
-    : Array.isArray(raw?.items)
-      ? raw.items
-      : Array.isArray(raw?.item?.items)
-        ? raw.item.items
-        : Array.isArray(raw?.todo)
-          ? raw.todo
-          : Array.isArray(raw?.list)
-            ? raw.list
-            : []
-
-  if (!Array.isArray(source)) return []
-
-  return source
-    .map((entry: any) => {
-      const text =
-        typeof entry?.text === 'string'
-          ? entry.text
-          : typeof entry?.content === 'string'
-            ? entry.content
-            : typeof entry?.title === 'string'
-              ? entry.title
-              : ''
-      if (!text) return null
-      return {
-        text,
-        completed: Boolean(entry?.completed),
-      }
-    })
-    .filter(Boolean) as PlanItem[]
-}
-
-function formatPlanSummary(items: PlanItem[]): string {
-  return items
-    .map((item) => `- [${item.completed ? 'x' : ' '}] ${item.text}`)
-    .join('\n')
-}
-
 function resolveAssignedSubagentIds(agent: AgentRow): string[] {
   if (
     Array.isArray(agent.assignedSubagents) &&
@@ -2404,32 +2365,6 @@ function resolveAssignedSubagentIds(agent: AgentRow): string[] {
     return (agent as any).assigned_subagent_ids
   }
   return []
-}
-
-async function emitSimulatedChunks(
-  content: string,
-  emitter: (chunk: string) => Promise<void>,
-) {
-  if (content.length <= SIMULATED_STREAM_CHUNK_TARGET) {
-    await emitter(content)
-    return
-  }
-
-  const tokens = content.split(/(\s+)/).filter((token) => token.length > 0)
-  let buffer = ''
-
-  for (const token of tokens) {
-    buffer += token
-    if (buffer.length >= SIMULATED_STREAM_CHUNK_TARGET) {
-      await emitter(buffer)
-      buffer = ''
-      await sleep(SIMULATED_STREAM_DELAY_MS)
-    }
-  }
-
-  if (buffer) {
-    await emitter(buffer)
-  }
 }
 
 async function loadAssignedSubagents(agent: AgentRow): Promise<any[]> {
@@ -2512,7 +2447,7 @@ function normalizePrecompiledToolStep(step: any): any | null {
     null
   const normalizedInput =
     rawInput !== undefined && rawInput !== null
-      ? normalizeToolArgs(rawInput)
+      ? normalizeToolArgs(rawInput, toolName)
       : {}
 
   const rawResult =
@@ -2656,7 +2591,7 @@ function buildIntermediateStepsFromSteps(
       matchingResult?.args ??
       {}
 
-    const input = normalizeToolArgs(rawInput)
+    const input = normalizeToolArgs(rawInput, call.toolName)
 
     let toolResultRaw =
       matchingResult?.output ??
@@ -2722,8 +2657,21 @@ function buildIntermediateStepsFromSteps(
 // sandbox cleanup, request unregister and queued-notice settlement (BL-1055).
 type RequestPlanOwner = { leases: Set<PlanLease>; listeners: AbortController; stop?: AbortController }
 const requestPlanOwners = new WeakMap<Request, RequestPlanOwner>()
+/**
+ * SA-139 D6: the Claude plan run an approval click claimed (under the click's turn and before its
+ * answer is recorded), taken once by that request's stream so the SDK's replay runs in that run.
+ */
+const requestClaudePlanClaims = new WeakMap<Request, { run: ClaudePlanRun; state: ClaudePlanHeldState }>()
+function takeClaudePlanClaim(request: Request | undefined): { run: ClaudePlanRun; state: ClaudePlanHeldState } | null {
+  if (!request) return null
+  const claim = requestClaudePlanClaims.get(request) ?? null
+  requestClaudePlanClaims.delete(request)
+  return claim
+}
 
 interface BatshitStreamParams {
+  onP5ApiPart?: (part: P5ApiReplyPart) => void
+  mcpOriginalApiPending?: import('$lib/server/services/controlApprovals').P5PendingApprovalWrite
   content: string
   sessionId: string
   agent: AgentRow
@@ -2735,6 +2683,18 @@ interface BatshitStreamParams {
   abortSignal?: AbortSignal
   globalZipSettings?: Record<string, any>
   precompiledHistory?: PrecompiledHistory
+  /**
+   * SA-137: a group speaker's live-read turn, made with its precompiled history (same snapshot), or
+   * (Round 2, review M1) the turn of the reply a context continuation continues: same snapshot, no read.
+   */
+  liveFileReadTurn?: LiveFileReadTurn | null
+  /** SA-137 Round 2: told the turn this run made, so a context continuation can reuse it. */
+  onLiveFileReadTurn?: (turn: LiveFileReadTurn) => void
+  /**
+   * SA-137 Round 2: this run continues a reply (a context continuation): it uses that reply's turn
+   * or none, never a new one (a setting turned on mid-reply starts at the next ordinary turn).
+   */
+  continuesReply?: boolean
   streamMetadata?: Record<string, any>
   systemPromptAddendum?: string
   groupContext?: Record<string, any>
@@ -2750,6 +2710,8 @@ interface BatshitStreamParams {
   eventFetch: typeof fetch
   request: Request
   gatewayAuthority?: TurnMcpGatewayAuthority
+  /** Actual outer task owner; individual context children must not retire it. */
+  mcpOriginalPreparation?: P5OriginalPreparation
   consumeSessionClips?: boolean
   /** SA-104 P5: the already-loaded session record (Infinite Session episode opening). */
   sessionRecord?: Record<string, any> | null
@@ -2781,6 +2743,8 @@ interface BatshitStreamParams {
 }
 
 interface BatshitStreamResult {
+  /** Actual private owner disposition only; never HTTP/model metadata or success authority. */
+  p5ManagementPause?: true
   response: Response
   messageId: string
   content: string
@@ -2796,6 +2760,13 @@ interface BatshitStreamResult {
    * changed the card.
    */
   awaitsApproval?: boolean
+  /**
+   * BL-869: what `end` carried for the reply (the record the finalize saved, before
+   * `saveMessage`'s own small normalizing, BL-875), or null when nothing was saved (a silent
+   * `listening` reply, a failure with no words to keep, a save that failed). A group round's later
+   * speakers read this, not `content`.
+   */
+  savedReply?: { content: string; metadata: Record<string, any> } | null
 }
 
 async function handleBatshitAgentStream({
@@ -2810,6 +2781,9 @@ async function handleBatshitAgentStream({
   abortSignal: externalAbortSignal,
   globalZipSettings,
   precompiledHistory,
+  liveFileReadTurn: groupLiveFileReadTurn,
+  onLiveFileReadTurn,
+  continuesReply = false,
   streamMetadata,
   systemPromptAddendum,
   groupContext,
@@ -2819,6 +2793,9 @@ async function handleBatshitAgentStream({
   eventFetch,
   request,
   gatewayAuthority,
+  mcpOriginalPreparation,
+  mcpOriginalApiPending,
+  onP5ApiPart,
   consumeSessionClips = true,
   sessionRecord = null,
   jevJuiceGroupSelection = null,
@@ -2851,7 +2828,6 @@ async function handleBatshitAgentStream({
     }
   }
 
-  const imageOriginCliDelivery = emptyRunDelivery(false)
   const imageOriginApiInput = new ApiImageInputCollector()
 
   // BL-505 (C1): a woken turn spends no Clip countdown, because a countdown counts the user's
@@ -3025,6 +3001,9 @@ async function handleBatshitAgentStream({
   }
   // The prefix was frozen once, before the compile (`approvalResumePrior`, BL-322).
   const approvalResumeStart = approvalResumePrior ? createApprovalResumeStart(approvalResumePrior) : null
+  // SA-139 D6, D8 (P3 Part 4 review B S1): this segment continues the held run its click claimed (taken by the
+  // stream request below); the tools are prepared before that, and must know it.
+  const claudePlanResumesHeldRun = requestClaudePlanClaims.has(request)
 
   // BL-474 step 2: this reply's outside pictures are pending (no Load action) until its end decides
   // where each address came from; a reply whose end step fails stays pending. Written for this run's
@@ -3042,9 +3021,12 @@ async function handleBatshitAgentStream({
   }
 
 
-  const historyForCompilation = pausedApprovalTurn
+  // SA-137: whatever history a caller sent, the server-only replay fields of a paused reply are
+  // never compiled, recorded or forwarded from it; the resume reads them from the stored record.
+  const historyForCompilation = (pausedApprovalTurn
     ? pausedApprovalTurn.history
     : previousMessages
+  ).map(withoutServerReplayFields)
   const messageForCompilation =
     isApprovalResumeWithoutUserTurn || isContextContinuationRun
       ? undefined
@@ -3058,36 +3040,27 @@ async function handleBatshitAgentStream({
   const countsNewUserMessage =
     consumeSessionClips && !isApprovalResumeWithoutUserTurn && !isContextContinuationRun
 
+  // SA-139 R4 (D14): every turn kind reaches this (a direct, queued or woken send, a group
+  // speaker, an approval resume, a continuation), before MCP discovery, the compile, the memory
+  // commit and the Clip spend. A retired Primary type (`cli`, `n8n`) never runs: the run below is
+  // the API lane only.
+  const retiredPrimaryType = retiredPrimaryAgentRefusal(agent)
+  if (retiredPrimaryType) {
+    throw createRoutedInputError(
+      `${retiredPrimaryType.error} ${retiredPrimaryType.details}`,
+      retiredPrimaryType.code,
+      409,
+    )
+  }
   const primaryAgentType = normalizePrimaryAgentType(agent)
-  const connectionHint =
-    agent?.primary_model_connection?.id ||
-    agent?.primary_model_connection?.service ||
-    null
-  const providerHint = (
-    agent?.primary_model_provider ||
-    ''
-  )
-    .toLowerCase()
-    .trim()
-  const isCodexProviderHint =
-    CODEX_PROVIDER_IDS.has(providerHint) ||
-    connectionHint === CODEX_CONNECTION_ID
-  const isClaudeProviderHint =
-    CLAUDE_PROVIDER_IDS.has(providerHint) ||
-    connectionHint === CLAUDE_CONNECTION_ID
-  const runtimeFlavor = isCliPrimaryAgentType(primaryAgentType) && isCodexProviderHint
-    ? 'codex'
-    : isCliPrimaryAgentType(primaryAgentType) && isClaudeProviderHint
-      ? 'claude'
-      : isCliPrimaryAgentType(primaryAgentType)
-        ? 'codex'
-        : 'vercel'
 
   // SA-120 P1: Judge Juice skill/tool hints ride the DCM tail through a provider the
   // compiler calls once it knows the agent's skills and discoverable refs. The agent's
   // own switch OFF means no provider and no record; group turns get none (P3 owns
   // group judgments); a resume without a user turn has nothing to judge.
   const jevJuiceTurn = createJevJuiceTurnCollector()
+  const skillSessionTurn = buildSkillSessionTurn({ userId, sessionId, agentId: agent.id, agentCreatedAt: agent.created_at,
+    isGroupTurn: Boolean(groupContext) || streamMetadata?.groupChat === true })
   // SA-120 P3: a group speaker chosen (or nearly chosen) by Judge Juice replays the scheduler's
   // decided lines through the same seam; the call itself already happened before this stream.
   // SA-120 P5: smart zip, behind the ONE global switch in `global_zip_settings` (OFF or a
@@ -3126,8 +3099,9 @@ async function handleBatshitAgentStream({
   // parts the earlier runs stored. Nothing of a new user turn runs for it (no provider before the
   // reply, no notes told again, no accepted-send write: `messageForCompilation` stays empty), and
   // the earlier runs ran neither step (a reply waiting at a card, or cut short, is not finished).
-  const jevJuiceContinuedReply =
-    jevJuiceGroupSelection || !(isApprovalResumeWithoutUserTurn || isContextContinuationRun)
+  let jevJuiceContinuedReply =
+    jevJuiceGroupSelection ||
+    !(isApprovalResumeWithoutUserTurn || isContextContinuationRun)
       ? null
       : buildContinuedReplySteps({
           userId,
@@ -3135,10 +3109,9 @@ async function handleBatshitAgentStream({
           agent,
           globalZipSettings,
           isGroupTurn: Boolean(groupContext) || streamMetadata?.groupChat === true,
-          continued:
-            pausedApprovalTurn && approvalResumePrior
-              ? approvalResumeReplyTurn(pausedApprovalTurn, approvalResumePrior)
-              : findContextContinuationTurn(previousMessages, contextContinuationRaw?.previousMessageId),
+          continued: pausedApprovalTurn && approvalResumePrior
+            ? approvalResumeReplyTurn(pausedApprovalTurn, approvalResumePrior)
+            : findContextContinuationTurn(previousMessages, contextContinuationRaw?.previousMessageId),
         })
   // The compiler takes ONE tail provider, so the primary lanes are composed: they start side
   // by side and their lines keep a fixed order (skill and tool hints, then zips, then the
@@ -3148,12 +3121,13 @@ async function handleBatshitAgentStream({
     ? buildGroupSpeakerProvider(jevJuiceGroupSelection, jevJuiceTurn)
     : composeJevJuiceHintProviders([
         buildSkillToolHintProvider({
-          userId,
+          userId, sessionId,
           agent,
           message: typeof messageForCompilation === 'string' ? messageForCompilation : '',
           isGroupTurn: Boolean(groupContext) || streamMetadata?.groupChat === true,
           collector: jevJuiceTurn,
         }),
+        skillSessionTurn.hintProvider,
         jevJuiceSmartZip?.hintProvider,
         jevJuicePostTurnCheck?.hintProvider,
         // SA-120 P9: what Batshit did for the user by voice since the agent's last reply, read
@@ -3202,12 +3176,19 @@ async function handleBatshitAgentStream({
   let preloadedGatewayMetadata: MCPSelectionResolution['toolMetadata'] | null =
     null
 
+  const heldOriginalScope = p5ApiPreparedScope(mcpOriginalPreparation)
+  const heldOriginalGateways = p5ApiPreparedGatewayFrontier(mcpOriginalPreparation)
+  if (heldOriginalScope) {
+    // BEFORE either resolver: a context child cannot discover newly defaulted B.
+    selectedGateways = [...heldOriginalGateways!]
+    mcpToolSelections = [...heldOriginalScope.tools]
+  }
   try {
     const authorizedSelection = await resolveTurnMcpGatewaySelection({
       userId,
       agent,
       requestedGateways: selectedGateways,
-      authority: gatewayAuthority,
+      authority: heldOriginalScope ? { humanSelection: false, resumedScope: [...heldOriginalGateways!] } : gatewayAuthority,
     })
     const selectionResolution = await resolveMCPSelections({
       userId,
@@ -3216,9 +3197,7 @@ async function handleBatshitAgentStream({
       agentMetadata,
       selectedGateways: authorizedSelection,
       toolSelections: mcpToolSelections,
-      includeGatewayToolMap: isCliPrimaryAgentType(primaryAgentType),
-      // CLI runs use the managed helper bridge instead of direct native tool injection.
-      isCodexMode: isCliPrimaryAgentType(primaryAgentType),
+      mcpOriginalPreparation: heldOriginalScope && primaryAgentType === 'api' ? mcpOriginalPreparation : undefined,
     })
 
     selectedGateways = selectionResolution.resolvedGateways
@@ -3237,9 +3216,56 @@ async function handleBatshitAgentStream({
   }
 
 
+  if (primaryAgentType === 'api' && !groupContext) recordP5ResolvedApiScope(mcpOriginalPreparation, {
+    gateways: selectedGateways ?? [], tools: mcpToolSelections ?? [], authority: gatewayAuthority
+  })
+  const mcpApiPart = primaryAgentType === 'api' && !groupContext
+    ? bindP5ApiReplyPart(mcpOriginalPreparation, { replyId: messageId, version: approvalResumeStart?.version ?? 0 }) : undefined
+  if (mcpApiPart) await captureP5ApiOriginalStdioSources(mcpOriginalPreparation)
+  if (mcpApiPart) onP5ApiPart?.(mcpApiPart)
+  let mcpApiRun: P5ApiOriginalRun | undefined
+  recordP5ApiRequestView(mcpOriginalPreparation, { request: messageForCompilation, history: historyForCompilation })
+  if (mcpApiPart) {
+    const lineage = await captureP5ApiCanonicalLineage(mcpOriginalPreparation, mcpApiPart)
+    if (lineage) jevJuiceContinuedReply = buildContinuedReplySteps({ userId, sessionId, agent, globalZipSettings,
+      isGroupTurn: Boolean(groupContext), continued: await originalApiContinuationReplyTurn(lineage) })
+  }
+
+  // SA-137 (D1, D2, D7): an API Primary turn with live file reads on reads its open files once, at
+  // turn start, through the compile (never a preview). An approval resume reads nothing: it replays
+  // the paused call's own sealed snapshot, and refuses (409) one with a wrong shape or owner. A
+  // cleared, expired or unverifiable (earlier process) replay resumes static, and the turn keeps why
+  // (`replayUnavailable`) so it can say so; a paused record with no snapshot field resumes without
+  // live reads, as the paused call did.
+  const pausedLiveReplay = isApprovalResumeWithoutUserTurn ? (approvalResumePrior?.metadata as any)?.liveFileReadSnapshot : undefined
+  const pausedLiveReplayCheck = primaryAgentType === 'api' && pausedLiveReplay !== undefined
+    ? checkLiveFileReadReplay(pausedLiveReplay, { userId, sessionId, agentId, messageId })
+    : null
+  const liveFileReadTurn: LiveFileReadTurn | null = primaryAgentType !== 'api'
+    ? null
+    : pausedLiveReplayCheck
+      ? new LiveFileReadTurn({
+          userId, agentId, sessionId, messageId, executionBackend: 'local', signal: streamAbortSignal,
+          ...('replay' in pausedLiveReplayCheck ? { replay: pausedLiveReplayCheck.replay } : { replayUnavailable: pausedLiveReplayCheck.unavailable })
+        })
+      : isApprovalResumeWithoutUserTurn
+        ? null
+        : groupLiveFileReadTurn ?? (!continuesReply && refreshedFileReadsActiveFor(agent, userSettings?.global_zip_settings,
+            resolveNativeToolSettings(agent?.provider_specific_settings).executionBackend)
+          ? new LiveFileReadTurn({
+              userId, agentId, sessionId, messageId, signal: streamAbortSignal,
+              executionBackend: resolveNativeToolSettings(agent?.provider_specific_settings).executionBackend,
+              otherReaders: liveReadOtherReaders({ userId, sessionId })
+            })
+          : null)
+  if (liveFileReadTurn) onLiveFileReadTurn?.(liveFileReadTurn)
+  // SA-137 P4 (D10): this actual turn's receipt for the chat's zip badges: reserved now, prepared
+  // once the compile froze its snapshot, issued at the first model request.
+  const liveFileReadOutcome = liveFileReadTurn ? LiveFileReadOutcome.reserve({ userId, sessionId, agentId, messageId }) : null
+
   const databaseService = new DatabaseService(eventFetch)
 
-  const formattedInput = await databaseService.buildFormattedChatInput(
+  let formattedInput = await databaseService.buildFormattedChatInput(
     sessionId,
     historyForCompilation,
     agent,
@@ -3248,8 +3274,10 @@ async function handleBatshitAgentStream({
     userId,
     {
       fetch: eventFetch,
+      deferAgentSetup: primaryAgentType === 'api',
+      agentSetupSend: true,
       mcpGatewayScope: selectedGateways ?? [],
-      runtimeFlavor,
+      p5McpOwner: mcpApiPart ? mcpOriginalPreparation : undefined,
       // BL-322: a resume compiles the paused send's own project and files, which the browser
       // stored on its message; the click's metadata is the paused REPLY's.
       projectPath: pausedApprovalTurn
@@ -3264,6 +3292,8 @@ async function handleBatshitAgentStream({
           []),
       precompiledHistory,
       groupContext,
+      groupMemberRun: streamMetadata?.groupChat === true,
+      toolApprovalMode,
       voiceState,
       goonsEnabled:
         typeof metadata?.goonsEnabled === 'boolean'
@@ -3290,11 +3320,23 @@ async function handleBatshitAgentStream({
           ? 'note'
           : undefined,
       countsPendingUserMessage: countsNewUserMessage,
+      skillSessionReplayMessageIds: isApprovalResumeWithoutUserTurn && approvalResumePrior
+        ? new Set([messageId]) : undefined,
+      whiteboardMessageId: messageId,
+      ...(liveFileReadTurn ? { liveFileReadTurn } : {}),
+      ...(isApprovalResumeWithoutUserTurn && primaryAgentType === 'api'
+        ? { whiteboardContextSnapshot: readWhiteboardContextSnapshot(
+            (approvalResumePrior?.metadata as any)?.whiteboardContextSnapshot,
+            { userId, sessionId, agentId, messageId }) }
+        : {}),
     },
   )
 
   if (!formattedInput) {
-    throw new Error('Failed to build formatted chat input for API or CLI agent')
+    throw new Error('Failed to build formatted chat input for the agent')
+  }
+  if (liveFileReadOutcome && liveFileReadTurn?.snapshot) {
+    await liveFileReadOutcome.prepared(liveFileReadTurn.snapshot, liveFileReadTurn.replayUnavailable)
   }
 
   // BL-504: only a Clip the compiler marked an image, plus the compiled `image_url` parts; a PDF
@@ -3320,29 +3362,17 @@ async function handleBatshitAgentStream({
     metadata?.expiredToolApprovals ??
       batshitInput?.metadata?.expiredToolApprovals,
   )
-  /**
-   * SA-116 F-P3-2 — a control approval the user granted on a click that ALSO resumed an
-   * SDK-paused call. There is no new user message to carry it (the resume re-enters the
-   * run that paused), so it is appended here, already formatted by
-   * `buildControlApprovalInPlaceAddendum`.
-   */
-  const controlApprovalAddendum = (() => {
-    const raw =
-      metadata?.controlApprovalNotice ??
-      batshitInput?.metadata?.controlApprovalNotice
-    return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : null
-  })()
   const mergedSystemPromptAddendum = [
     systemPromptAddendum,
     interruptionAddendum,
     contextContinuationAddendum,
     toolApprovalTimeoutAddendum,
-    controlApprovalAddendum,
   ]
     .filter(Boolean)
     .join('\n\n')
 
-  let compiledMessages: any[] = []
+  const assembleCompiledMessages = () => {
+    const compiledMessages: any[] = []
 
   if (formattedInput.primarySystemPrompt || mergedSystemPromptAddendum) {
     const basePrompt = formattedInput.primarySystemPrompt ?? ''
@@ -3364,6 +3394,10 @@ async function handleBatshitAgentStream({
     }
   }
 
+    return compiledMessages
+  }
+  let compiledMessages = assembleCompiledMessages()
+
   const compileMetadataBase = formattedInput.structuredInput?.metadata || {}
   const compileMetadata = { ...compileMetadataBase }
 
@@ -3371,6 +3405,7 @@ async function handleBatshitAgentStream({
     throw new Error('Unable to compile chat messages for Batshit agent')
   }
 
+  const guardCompiledDataImages = () => {
   const dataImageInTextContext =
     findDataImageUrlInTextMessages(compiledMessages)
   if (dataImageInTextContext) {
@@ -3384,6 +3419,14 @@ async function handleBatshitAgentStream({
 
     const sanitizeResult = sanitizeDataImageUrlsInTextMessages(compiledMessages)
     if (sanitizeResult.redactions > 0) {
+      if (formattedInput.addressSources) {
+        formattedInput.addressSources = {
+          ...formattedInput.addressSources,
+          pieces: formattedInput.addressSources.pieces.map(piece => ({
+            ...piece, text: redactDataImageUrlsInText(piece.text).value
+          }))
+        }
+      }
       console.warn(
         `[send-routed] Redacted ${sanitizeResult.redactions} image data URL(s) from compiled text context.`,
       )
@@ -3398,6 +3441,9 @@ async function handleBatshitAgentStream({
       )
     }
   }
+
+  }
+  guardCompiledDataImages()
 
   const metadataForLogs =
     compileMetadata || metadata || batshitInput?.metadata || {}
@@ -3468,35 +3514,20 @@ async function handleBatshitAgentStream({
   // SA-120 P1 (DL-120-07): every Jev call this turn made becomes an Execution Viewer row.
   attachJevJuiceRecords(executionMetadata, jevJuiceTurn)
 
-  const primaryPresetId =
-    agentMetadata.primary_model_preset_id ??
-    agent.primary_model_preset_id ??
-    null
-  const primaryPreset = await loadRuntimeModelPreset(primaryPresetId, 'primary')
-  const primarySelection = resolveRuntimeModelSelection({
-    preset: primaryPreset,
-    presetId: primaryPresetId,
-    provider:
-      agentMetadata.primary_model_provider ?? agent.primary_model_provider,
-    modelId: agentMetadata.primary_model_name ?? agent.primary_model_name,
-    connection:
-      agentMetadata.primary_model_connection ??
-      agent.primary_model_connection ??
-      null,
-    capabilities:
-      agentMetadata.primary_model_capabilities ??
-      agent.primary_model_capabilities ??
-      null,
-    settings: (agentMetadata.provider_specific_settings ??
-      agent.provider_specific_settings ??
-      null) as Record<string, any> | null,
-  })
+  // The preset is read and the model resolved here, late, with the local reasoning snapshot.
+  const primaryPresetId = agentMetadata.primary_model_preset_id ?? agent.primary_model_preset_id ?? null
+  const primarySelectionArgs =
+    routedPrimarySelectionArgs(agent, primaryPresetId, await loadRuntimeModelPreset(primaryPresetId, 'primary'))
+  const primaryPreset = primarySelectionArgs.preset ?? null
+  const localReasoningSnapshot = primaryAgentType === 'api'
+    ? await captureAgentLocalReasoning(userId, primarySelectionArgs, agent.model_reasoning_overrides, streamAbortSignal) : undefined
+  const primarySelection = resolveRuntimeModelSelection({ ...primarySelectionArgs, localReasoning: localReasoningSnapshot?.contract })
   const providerSpecificSettings = primarySelection.settings
   const connectionInfo = primarySelection.connection
   if (isPlanSelection(connectionInfo)) {
     assertPlanSettings(providerSpecificSettings)
     const accountId = chatgptPlanAccountId(connectionInfo?.id)
-    if (!accountId || primaryAgentType !== 'api') throw createRoutedInputError('Choose this ChatGPT account on an API agent.', 'CHATGPT_PLAN_CONNECTION_INVALID', 409)
+    if (!accountId || primaryAgentType !== 'api') throw createRoutedInputError('Choose this ChatGPT account on an agent.', 'CHATGPT_PLAN_CONNECTION_INVALID', 409)
     const storedBinding = (approvalResumePrior?.metadata as any)?.providerMessageSource?.planBinding
     chatgptPlanLease = getChatgptPlanRuntime().acquire(userId, accountId, PLAN_AGENT, streamAbortSignal, isApprovalResumeWithoutUserTurn ? storedBinding ?? '' : undefined)
     const requestOwner = requestPlanOwners.get(request)
@@ -3508,47 +3539,27 @@ async function handleBatshitAgentStream({
     relayAbort({ from: chatgptPlanLease.signal, to: requestOwner.stop, reason: sourceAbortReason, until: requestOwner.listeners.signal })
     relayAbort({ from: chatgptPlanLease.signal, to: streamAbortController, reason: sourceAbortReason, until: turnListeners.signal })
   }
-  const connectionIdentifier =
-    connectionInfo?.id || connectionInfo?.service || null
-  const providerIdentifier = (primarySelection.provider ?? '')
-    .toLowerCase()
-    .trim()
-  const isCodexSelection =
-    CODEX_PROVIDER_IDS.has(providerIdentifier) ||
-    connectionIdentifier === CODEX_CONNECTION_ID
-  const isClaudeSelection =
-    CLAUDE_PROVIDER_IDS.has(providerIdentifier) ||
-    connectionIdentifier === CLAUDE_CONNECTION_ID
-  const isCliMode = isCliPrimaryAgentType(primaryAgentType)
-  const isCliProvider = isCliMode && (isCodexSelection || isClaudeSelection)
-  const isCodexProvider = isCliProvider && isCodexSelection
-  const isClaudeProvider = isCliProvider && isClaudeSelection
-  // BL-941 (R5): a Codex or Claude run's Tool Approval is bounded by the agent's record, like its
-  // mode and sandbox. An API agent keeps `toolApprovalMode` (the send's value first, then the
-  // record's), unchanged.
-  const runToolApprovalMode: ToolApprovalMode = isCliProvider
-    ? tighterToolApprovalMode(
-        metadata?.toolApprovalMode ?? metadata?.tool_approval_mode,
-        (agent as any)?.tool_approval_mode ?? (agent as any)?.toolApprovalMode,
-      )
-    : toolApprovalMode
+  const connectionIdentifier = primarySelection.connection?.id || primarySelection.connection?.service || null
+  const providerIdentifier = (primarySelection.provider ?? '').toLowerCase().trim()
   const primaryModelHint = (primarySelection.modelId ?? '')
     .toLowerCase()
     .trim()
-  const hasModelSelection = Boolean(
-    providerIdentifier || connectionIdentifier || primaryModelHint,
-  )
-  const isCodexModelHint =
-    isCodexSelection || primaryModelHint.includes('codex')
-  const isClaudeCliModelHint =
-    isClaudeSelection || primaryModelHint.includes('claude-cli')
-  const isCliModelHint = isCodexModelHint || isClaudeCliModelHint
+  // A CLI preset is named by its provider or connection, or by Claude Code's own `claude-cli`
+  // model id. An API model id that merely contains "codex" (an OpenAI model) is not one.
+  const cliPresetLanes = primaryCliRuntimeCandidates(providerIdentifier, connectionIdentifier)
+  const isCliModelHint =
+    cliPresetLanes.codex || cliPresetLanes.claude || primaryModelHint.includes('claude-cli')
 
-  if (isCliMode && hasModelSelection && !isCliModelHint) {
+  // SA-139 R4 and R5: the Claude Code CLI connection is gone, but a saved preset can still name
+  // it, so an agent that names one of its presets is refused here, never run on the API lane
+  // under a CLI id.
+  if (isCliModelHint) {
     return {
       response: json(
         {
-          error: 'CLI agents only support CLI model presets.',
+          error: cliPresetLanes.codex
+            ? 'Codex CLI presets were removed from Batshit. Pick another model for this agent.'
+            : CLAUDE_CLI_PRESET_REFUSAL,
           code: 'cli_mode_only',
         },
         { status: 400 },
@@ -3560,36 +3571,11 @@ async function handleBatshitAgentStream({
     }
   }
 
-  if (!isCliMode && isCliModelHint) {
-    return {
-      response: json(
-        {
-          error: 'CLI model presets are only available for CLI agents.',
-          code: 'cli_mode_only',
-        },
-        { status: 400 },
-      ),
-      messageId,
-      content: '',
-      metadata: {},
-      usage: undefined,
-    }
-  }
-
+  const { VercelAIBrain } = await import('$lib/server/services/vercelBrain')
   const nativeRuntime: {
     streamNativeMode: (request: NativeModeRequest) => Promise<any>
-  } = await (async () => {
-    if (isCodexProvider) {
-      const { CodexBridge } = await import('$lib/server/services/codexBridge')
-      return new CodexBridge()
-    }
-    if (isClaudeProvider) {
-      const { ClaudeBridge } = await import('$lib/server/services/claudeBridge')
-      return new ClaudeBridge()
-    }
-    const { VercelAIBrain } = await import('$lib/server/services/vercelBrain')
-    return new VercelAIBrain()
-  })()
+    prepareApiToolset?: (request: NativeModeRequest) => Promise<PreparedApiToolset>
+  } = new VercelAIBrain()
   const isN8NOnlyModel =
     (connectionIdentifier &&
       N8N_ONLY_CONNECTION_IDS.has(connectionIdentifier)) ||
@@ -3600,7 +3586,7 @@ async function handleBatshitAgentStream({
       response: json(
         {
           error:
-            'This model preset has no direct Batshit connection and cannot run on an API or CLI agent. Pick a different model, or use it from an n8n tool workflow.',
+            'This model preset has no direct Batshit connection and cannot run on an agent. Pick a different model, or use it from an n8n tool workflow.',
           code: 'model_not_directly_connectable',
         },
         { status: 400 },
@@ -3612,20 +3598,24 @@ async function handleBatshitAgentStream({
     }
   }
 
+  // BL-515: an agent that names a preset takes its values from the preset alone; the agent's
+  // `primary_model_*` copies are fallbacks only for a record that names no preset.
+  const primaryModelFallbacks = resolveAgentModelFallbacks({
+    preset: primaryPreset,
+    agent: agentMetadata,
+  })
   const runtimeSettings = buildRuntimeModelSettings({
+    localReasoning: localReasoningSnapshot?.contract,
+    localReasoningConnectionKey: localReasoningSnapshot?.connectionKey,
+    explicitReasoning: primarySelection.explicitReasoning,
     provider: primarySelection.provider,
-    modelId: primarySelection.modelId,
+    modelId: localReasoningSnapshot ? primarySelection.effectiveModelId ?? primarySelection.modelId : primarySelection.modelId,
     vercelId: null,
     connection: primarySelection.connection,
     contextWindow: primarySelection.contextWindow,
     capabilities: primarySelection.capabilities,
     settings: providerSpecificSettings as Record<string, ParameterValue> | null,
-    // BL-515: an agent that names a preset takes its values from the preset alone; the agent's
-    // `primary_model_*` copies are fallbacks only for a record that names no preset.
-    fallbacks: resolveAgentModelFallbacks({
-      preset: primaryPreset,
-      agent: agentMetadata,
-    }),
+    fallbacks: primaryModelFallbacks,
   })
   const primaryCapabilities = primarySelection.capabilities
   const primaryProviderId = primarySelection.provider
@@ -3668,78 +3658,18 @@ async function handleBatshitAgentStream({
     style: resolvedVoiceConfig.style ?? undefined,
   }
 
-  const runtimeProviderId = isCodexProvider
-    ? providerIdentifier && CODEX_PROVIDER_IDS.has(providerIdentifier)
-      ? providerIdentifier
-      : PRIMARY_CODEX_PROVIDER_ID
-    : isClaudeProvider
-      ? providerIdentifier && CLAUDE_PROVIDER_IDS.has(providerIdentifier)
-        ? providerIdentifier
-        : PRIMARY_CLAUDE_PROVIDER_ID
-      : providerIdentifier || null
   const showReasoning =
     typeof (agent as any)?.show_reasoning === 'boolean'
       ? Boolean((agent as any).show_reasoning)
       : true
-  // BL-941: the sent mode goes in as before; the agent's record is its upper bound.
-  const codexRuntimeSettings: CodexRunSettings | null = isCodexProvider
-    ? buildCodexRuntimeSettings(
-        (agent as any)?.codex_settings ?? providerSpecificSettings,
-        {
-          permissionMode: metadata?.codexPermissionMode,
-        },
-      )
-    : null
-  const claudeRuntimeSettings: ClaudeRunSettings | null = isClaudeProvider
-    ? buildClaudeRuntimeSettings(
-        (agent as any)?.claude_settings ?? providerSpecificSettings,
-        {
-          permissionMode: metadata?.claudePermissionMode,
-        },
-      )
-    : null
-  if (codexRuntimeSettings && agent?.id) {
-    codexRuntimeSettings.profileId = buildAgentProfileId(agent.id)
-  }
-  if (codexRuntimeSettings) {
-    codexRuntimeSettings.reasoningSummary = 'auto'
-    codexRuntimeSettings.modelSupportsReasoningSummaries = true
-  }
-  const mode4Style =
-    isCodexProvider || isClaudeProvider
-      ? (codexRuntimeSettings?.mode4Style ??
-        claudeRuntimeSettings?.mode4Style ??
-        MODE4_PRELAUNCH_STYLE)
-      : null
-  const shouldSimulateStreamingEffect = Boolean(
-    isCodexProvider && codexRuntimeSettings?.streamingEffect,
-  )
 
   const runtimeSnapshot: ExecutionRuntimeDetails = {
-    runtimeId: isCodexProvider
-      ? 'codex'
-      : isClaudeProvider
-        ? 'claude'
-        : 'vercel',
-    providerId: runtimeProviderId,
+    runtimeId: 'vercel',
+    providerId: providerIdentifier || null,
     connectionId: connectionIdentifier || null,
     modelName: null,
-    transport: isCodexProvider || isClaudeProvider ? null : 'vercel-sdk',
+    transport: 'vercel-sdk',
     status: 'pending',
-  }
-  let latestCliContext: import('$lib/utils/cliContextWindow').CliContextWindowReport | null = null
-  if (mode4Style) {
-    runtimeSnapshot.metadata = {
-      mode4Style,
-      mode4MemoryOwner: resolveMode4MemoryOwner(mode4Style),
-      providerSession: {
-        configScope:
-          codexRuntimeSettings?.configScope ??
-          claudeRuntimeSettings?.configScope ??
-          null,
-        historyPersistence: codexRuntimeSettings?.historyPersistence ?? null,
-      },
-    }
   }
 
   const resolvedModelIds = resolveModelIds({
@@ -3804,8 +3734,74 @@ async function handleBatshitAgentStream({
       sessionId,
       messageId,
       responses: toolApprovalResponse,
+      originalApiPending: mcpOriginalApiPending,
       mutate: chatgptPlanLease ? write => getChatgptPlanRuntime().mutate(chatgptPlanLease!, write) : undefined,
     })
+  }
+  await settleP5ApiApprovalResume(mcpOriginalPreparation, resolvedControlApprovals)
+  // The callbacks execute only inside the actual SDK native read. Both persistence sites
+  // share the routed reply's one reserved zip per SDK tool-call id.
+  const skillReadDelivery = createSkillReadDelivery({
+    actor: { userId, sessionId, agentId: agent.id, agentCreatedAt: agent.created_at }, messageId,
+    signal: streamAbortSignal,
+    previewContext: async (skillId, result) => {
+      if (!formattedInput.previewOpenSkillContext) throw new Error('The canonical skill context preview is unavailable. Nothing was delivered.')
+      return formattedInput.previewOpenSkillContext(skillId, result, messageId)
+    },
+    persist: async (step, beforeSkillReadPersist) => {
+      if (!step.toolCallId) throw new Error('The actual skill tool invocation is unavailable. Nothing was delivered.')
+      reserveToolZipIdForCall({ toolCallId: step.toolCallId, toolName: step.toolName })
+      const { adaptCoolToolsToZipSystem } = await import('$lib/server/coolToolZipAdapter')
+      // The stream's canonical step normalizer adds original invocation facts (for
+      // example the broker input). Use the SAME representation before early storage,
+      // so its later same-call replay verifies rather than rewriting a different shape.
+      const args = normalizeToolArgs(step.toolInput ?? step.toolArgs ?? {}, step.toolName)
+      const canonical = { ...step, toolInput: args, toolArgs: args,
+        toolResult: normalizeToolResult(step.toolResult, step.toolName, args) }
+      return adaptCoolToolsToZipSystem([canonical], sessionId, messageId, zipSettingsAgent || {}, globalZipSettings, {
+        reservedZipIdsByToolCallId: reservedToolZipIdsByCallId,
+        skillSessionActor: { userId, agentId: agent.id, agentCreatedAt: agent.created_at }, beforeSkillReadPersist
+      })
+    }
+  })
+  let preparedApiToolset: PreparedApiToolset | undefined
+  let apiToolFields: Omit<NativeModeRequest, 'messages'> | undefined
+  if (formattedInput.finalizeAgentSetup) {
+    if (!nativeRuntime.prepareApiToolset) throw new Error('The actual API tool registration owner is unavailable. Nothing was sent.')
+    apiToolFields = {
+      chatgptPlanLease, mcpOriginalPreparation: mcpApiPart ? mcpOriginalPreparation : undefined, mcpApiPart,
+      onP5ApiRun: run => { mcpApiRun = run },
+      sessionId, messageId, userId, agentId, skillReadDelivery,
+      model: effectiveModelId || 'claude-3-5-sonnet-20241022', connection: primarySelection.connection,
+      modelCapabilities: primaryCapabilities ?? null,
+      memoryControlsEnabled: resolveAgentMemoryEnabled(agent),
+      whiteboardControlsEnabled: formattedInput.structuredInput?.metadata?.whiteboardContext?.enabled === true,
+      whiteboardSettingsSnapshot: formattedInput.whiteboardContextSnapshot?.settings,
+      liveFileReadsEnabled: primaryAgentType === 'api' && resolveLiveFileReadsEnabled(agent, userSettings?.global_zip_settings),
+      refreshedFileReadsTurn: formattedInput.refreshedFileReadsTurn === true,
+      dmControlsEnabled: resolveAgentDmsEnabled(agent), scheduleControlsEnabled: resolveAgentDmsEnabled(agent),
+      judgeControlsEnabled: resolveAgentJevJudgeToolEnabled(agent), workersEnabled: resolveWorkersEnabled(agent),
+      controlApprovals: resolvedControlApprovals, groupMemberRun: streamMetadata?.groupChat === true,
+      providerSettings: providerSpecificSettings ?? null, toolsEnabled: primaryToolsEnabled,
+      projectPath: resolvedCompiledProjectPath ?? metadata?.projectPath ?? metadataForLogs?.projectPath ?? batshitInput?.metadata?.projectPath ?? null,
+      toolSelections: mcpToolSelections, selectedCliToolIds, selectedGateways,
+      preloadedGatewayTools: preloadedGatewayTools ?? undefined, preloadedGatewayMetadata: preloadedGatewayMetadata ?? undefined,
+      gatewayToolMap, assignedSubagents, defaultGateways, toolApprovalMode,
+      abortSignal: streamAbortSignal, claudePlanResumesHeldRun
+    }
+    preparedApiToolset = await nativeRuntime.prepareApiToolset({ ...apiToolFields, messages: [] })
+    if (!preparedApiToolset.apiUtilityScope) throw new Error('The actual API utility registration set is unavailable. Nothing was sent.')
+    formattedInput = await formattedInput.finalizeAgentSetup(preparedApiToolset.fingerprint, {
+      blocks: [], sources: [], brokerAvailable: preparedApiToolset.brokerAvailable,
+      toolsRegistered: preparedApiToolset.toolsRegistered, apiUtilityScope: preparedApiToolset.apiUtilityScope
+    })
+    compiledMessages = assembleCompiledMessages()
+    guardCompiledDataImages()
+    Object.assign(compileMetadata, formattedInput.structuredInput?.metadata ?? {})
+    executionMetadata.agentSetup = compileMetadata.agentSetup
+    executionMetadata.mergedSystemPromptLength = compileMetadata.mergedSystemPromptLength
+    executionMetadata.currentMessageLength = compileMetadata.currentMessageLength
+    attachJevJuiceRecords(executionMetadata, jevJuiceTurn)
   }
   const imageOriginCompiledPrefixCount = compiledMessages.length
   const imageOriginReplayUserSources = readUserInputSources((approvalResumePrior?.metadata as any)?.providerUserSources)
@@ -3861,39 +3857,7 @@ async function handleBatshitAgentStream({
       loadedContextWindow: effectiveContext.loadedContextWindow,
     })
   }
-  const cliRuntimeForBudget = isCodexProvider ? 'codex' : isClaudeProvider ? 'claude' : null
-  const cliModelForBudget = cliRuntimeForBudget
-    ? resolveEffectiveAgentCliModel(
-        cliRuntimeForBudget, agentMetadata, primarySelection.settings, primarySelection.modelId
-      ) : null
-  const cliCapForBudget = isClaudeProvider
-    ? claudeContextCappedByEnvironment(cliModelForBudget) : false
-  const priorCliContext = cliRuntimeForBudget
-    ? await readCliContextReport(sessionId, agentId, cliRuntimeForBudget)
-    : { report: null, warning: null, checkedAt: undefined }
-  const priorCliReport = priorCliContext.report
-  const cliBudgetSettingsKey = cliRuntimeForBudget
-    ? cliContextSettingsKey(cliRuntimeForBudget, agentMetadata, primarySelection.contextWindow,
-        primarySelection.settings, primarySelection.modelId) : null
-  const matchedCliReport = cliRuntimeForBudget ? matchingCliContextReport(priorCliReport, cliBudgetSettingsKey) : null
-  const matchingCliReport = matchedCliReport &&
-    (!isClaudeProvider || Boolean(matchedCliReport.disableClaude1M) === cliCapForBudget)
-      ? matchedCliReport : null
-  // Preserve matching historical evidence until this Claude run reports new
-  // evidence. Init for the identical concrete model must not downgrade it.
-  if (isClaudeProvider && matchingCliReport) {
-    latestCliContext = matchingCliReport
-    runtimeSnapshot.metadata = { ...(runtimeSnapshot.metadata ?? {}), cliContextWindow: matchingCliReport }
-  }
-  const promptBudgetContextLimit = priorCliContext.warning ? null : cliRuntimeForBudget
-    ? resolveCliContextWindow({
-        runtime: cliRuntimeForBudget,
-        model: cliModelForBudget,
-        presetContextWindow: primarySelection.contextWindow,
-        reported: matchingCliReport,
-        disableClaude1M: cliCapForBudget
-      }).contextWindow
-    : effectiveContext.contextLimit
+  const promptBudgetContextLimit = effectiveContext.contextLimit
   const promptBudgetAutoCompactTriggerTokens = resolveAutoCompactTriggerTokens(
     effectiveAutoCompactForPreflight,
     promptBudgetContextLimit,
@@ -3903,40 +3867,15 @@ async function handleBatshitAgentStream({
     contextLimit: promptBudgetContextLimit,
     reasoningModel: Boolean(primaryCapabilities?.reasoning),
   })
-  const [codexProjectInstructionTokens, codexProjectInstructionChars] =
-    isCodexProvider
-      ? await Promise.all([
-          estimateCodexProjectInstructionTokens({
-            agent: agent as Record<string, any>,
-            projectPath: resolvedCompiledProjectPath,
-          }),
-          estimateCodexProjectInstructionChars({
-            agent: agent as Record<string, any>,
-            projectPath: resolvedCompiledProjectPath,
-          }),
-        ])
-      : [0, 0]
   const promptBudget = buildPromptBudgetReport({
-    runtime: isCodexProvider ? 'codex' : isClaudeProvider ? 'claude' : 'vercel',
+    runtime: 'vercel',
     messages: compiledMessages,
-    images,
     contextLimit: promptBudgetContextLimit,
-    nativeOverheadTokens: isCodexProvider
-      ? CODEX_NATIVE_BASE_OVERHEAD_TOKENS + codexProjectInstructionTokens
-      : isClaudeProvider
-        ? CLI_WRAPPER_OVERHEAD_TOKENS
-        : 0,
     outputReserveTokens: promptBudgetOutputReserveTokens,
     autoCompactTriggerTokens: promptBudgetAutoCompactTriggerTokens,
-    extraRuntimeInputChars: codexProjectInstructionChars,
   })
   promptBudget.localContext = effectiveContext.evidence
   executionMetadata.promptBudget = promptBudget
-  promptBudget.contextWindowWarning = priorCliContext.warning
-  promptBudget.contextWindowCheckedAt = priorCliContext.checkedAt
-  if (priorCliContext.warning) {
-    promptBudget.contextWindowSettingsKey = cliBudgetSettingsKey
-  }
 
   if (!promptBudget.canSend) {
     throw createRoutedInputError(
@@ -3946,13 +3885,6 @@ async function handleBatshitAgentStream({
     )
   }
 
-  let runtimeEventLogBuffer: any[] | null = null
-  /**
-   * BL-1362: the Batshit Subagent and Worker results Claude Code's own helper model got (the
-   * adapter's accounting-only list, filled as the run streams). They count in this reply's
-   * `delegated` spend and nowhere else: never its text, steps, zips, cards, or read evidence.
-   */
-  let helperDelegatedSteps: unknown[] = []
   let runtimeSnapshotPersisted = false
 
   const persistRuntimeSnapshot = async (
@@ -3963,15 +3895,6 @@ async function handleBatshitAgentStream({
     runtimeSnapshotPersisted = true
     runtimeSnapshot.status = status
     runtimeSnapshot.error = errorMessage ?? null
-
-    if (runtimeEventLogBuffer) {
-      // SA-105 P3: the raw CLI transport trace is persisted, so it gets the same
-      // redaction the LLM captures get. An MCP tool result can now carry image
-      // bytes, and the P3 live probe found a delivered recall photo in a real
-      // execution log with every other boundary already clean.
-      runtimeSnapshot.eventLog = sanitizeRuntimeEventLogForCapture(runtimeEventLogBuffer)
-      runtimeSnapshot.eventCount = runtimeEventLogBuffer.length
-    }
 
     try {
       await executionViewerService.updateSnapshot(sessionId, messageId, {
@@ -4079,22 +4002,7 @@ async function handleBatshitAgentStream({
    * so (`restartedAfterLostConnection`), naming the program.
    */
   let answerRestartedAfterLostConnection = false
-  const restartedAnswerProgram = isCodexProvider ? 'Codex' : isClaudeProvider ? 'Claude Code' : 'The agent'
-  /**
-   * BL-941: the agent's record made this run tighter than the mode its send carried (a group
-   * member, an older window). The saved reply says so on every way it ends
-   * (`modeLimitedByAgentSettings`): the program, the sent mode, the mode that ran, and for Codex
-   * the sandbox that ran.
-   */
-  const modeLimitedByAgentSettings = codexRuntimeSettings?.modeLimitedByAgentSettings
-    ? {
-        program: restartedAnswerProgram,
-        ...codexRuntimeSettings.modeLimitedByAgentSettings,
-        sandbox: codexRuntimeSettings.sandbox,
-      }
-    : claudeRuntimeSettings?.modeLimitedByAgentSettings
-      ? { program: restartedAnswerProgram, ...claudeRuntimeSettings.modeLimitedByAgentSettings }
-      : null
+  const restartedAnswerProgram = 'The agent'
   /**
    * BL-775: forwards go one after another (`forwardChain`), so a slow one never lets a later event
    * be recorded before it. Each link settles when its forward answers or when it passes
@@ -4102,13 +4010,94 @@ async function handleBatshitAgentStream({
    * reply a GAP at once (the live copy stalled; the finalize saves its own copy, with the notice),
    * and the chain moves on without it: a later event, `end`, `complete`, and `error` included,
    * never waits for a stuck forward. A forward within its limit is waited for, in order.
+   *
+   * BL-871 (d): a forward past its limit also starts a STALL, which lasts until every forward that
+   * passed its limit has answered. During a stall no later forward is waited for at all, so a fully
+   * stalled `/api/sse` costs the reply one limit, not one limit per event, and a Stop never waits on
+   * it longer than that: the reply's live events (text, tool, reasoning, plan, zip activity) are not
+   * sent (one error line; a recorded one makes the reply a gap, so its own copy is saved, and `end`
+   * brings every tab the saved text), and an ordered event (`REPLY_ORDERED_EVENT_TYPES`: the
+   * terminal events and `steer_delivered`) goes to the ordered tail (`deliverOrderedEvent`) without
+   * being waited for.
    */
   let forwardChain: Promise<void> = Promise.resolve()
+  /** BL-871 (d): the forwards that passed their limit and have not answered yet (the stall). */
+  const stalledForwards = new Set<Promise<void>>()
+  let stallReported = false
+  /**
+   * BL-871 (d): the ordered events (`steer_delivered`, `end`, `error`, `complete`) reach `/api/sse`
+   * strictly in order: each is sent only once the one before it has answered, so `complete` never
+   * overtakes `end`, and during a stall the request does not wait for that. Bounded: an ordered event
+   * whose predecessor has not answered within `REPLY_ORDERED_FORWARD_GIVE_UP` is not sent, and no
+   * later one is.
+   */
+  let orderedChain: Promise<void> = Promise.resolve()
+  let orderedTailGaveUp = false
+  /** BL-871 (d): the tabs were told to read the reply again because its end was not sent. */
+  let terminalNotSentAnnounced = false
   /**
    * How many events of this reply the rebuild reads were forwarded. None (a Stop while the turn was
    * still being set up) means there was nothing to record, so a missing record is not a gap.
    */
   let sentRecordedForwards = 0
+
+  const deliverOrderedEvent = (
+    event: CanonicalStreamEvent,
+    recordsThisEvent: boolean,
+  ): Promise<void> => {
+    const previous = orderedChain
+    const delivery = (async () => {
+      if (
+        orderedTailGaveUp ||
+        !(await settlesWithin(previous, REPLY_ORDERED_FORWARD_GIVE_UP.ms, { unref: true }))
+      ) {
+        orderedTailGaveUp = true
+        console.error(
+          '[Send-Routed] BL-871: an ordered event was not sent, because the one before it was never answered by /api/sse (the order, end then complete, is kept)',
+          { sessionId, messageId, type: event.type, giveUpMs: REPLY_ORDERED_FORWARD_GIVE_UP.ms },
+        )
+        // A tab that never gets this reply's end shows it running until it reloads. The user
+        // channel does not go through the `/api/sse` POST, so it still tells every tab showing
+        // the chat to read the stored messages again; once, at the first terminal event not sent.
+        // `end` and the usual `error` are sent only after the reply's save; a Stop whose saves
+        // both failed sends `error` with `replyNotSaved` and nothing stored, and a re-read then
+        // would drop the words that tab still shows, so that one tells the tabs nothing.
+        if (
+          !terminalNotSentAnnounced &&
+          (event.type === 'end' || event.type === 'error' || event.type === 'complete') &&
+          (event as { metadata?: { replyNotSaved?: unknown } }).metadata?.replyNotSaved !== true
+        ) {
+          terminalNotSentAnnounced = true
+          try {
+            await publishUserEvent(userId, {
+              type: 'session_messages_changed',
+              sessionId,
+              reason: 'reply_end_not_delivered',
+            })
+          } catch (noticeError) {
+            console.error('[Send-Routed] BL-871: could not tell the tabs to read a reply whose end was not sent:', noticeError)
+          }
+        }
+        return
+      }
+      await deliverStreamEvent(event, recordsThisEvent)
+    })()
+    orderedChain = delivery
+    return delivery
+  }
+
+  /** BL-871 (d): a live event of a stalled reply, not sent. */
+  const skipLiveEventDuringStall = (event: CanonicalStreamEvent, recordsThisEvent: boolean) => {
+    if (recordsThisEvent && !replyRecordGap) {
+      replyRecordGap = `${event.type}: not sent while /api/sse did not answer`
+    }
+    if (stallReported) return
+    stallReported = true
+    console.error(
+      '[Send-Routed] BL-871: /api/sse has not answered a forward of this reply within its limit; the reply\'s live events are not sent until it answers (the reply is saved from its own copy, and its end brings every tab the saved text)',
+      { sessionId, messageId, firstSkipped: event.type },
+    )
+  }
 
   const forwardStreamEvent = async (event: CanonicalStreamEvent) => {
     if (!event?.type) {
@@ -4116,12 +4105,20 @@ async function handleBatshitAgentStream({
     }
     const recordsThisEvent = REPLY_RECORDED_EVENT_TYPES.has(event.type)
     if (recordsThisEvent) sentRecordedForwards += 1
+    const ordered = REPLY_ORDERED_EVENT_TYPES.has(event.type)
     const previous = forwardChain
     const link = (async () => {
       // `previous` settles by its own limit, and `deliverStreamEvent` settles every failure
       // itself, so a link never rejects and never waits past one forward's limit.
       await previous
-      const delivery = deliverStreamEvent(event, recordsThisEvent)
+      if (stalledForwards.size > 0) {
+        if (ordered) void deliverOrderedEvent(event, recordsThisEvent)
+        else skipLiveEventDuringStall(event, recordsThisEvent)
+        return
+      }
+      const delivery = ordered
+        ? deliverOrderedEvent(event, recordsThisEvent)
+        : deliverStreamEvent(event, recordsThisEvent)
       if (!(await settlesWithin(delivery, REPLY_EVENT_FORWARD_LIMIT.ms))) {
         console.error(
           '[Send-Routed] BL-775: an event forward passed its time limit; the reply is a gap and later events go on without it',
@@ -4130,6 +4127,17 @@ async function handleBatshitAgentStream({
         if (recordsThisEvent && !replyRecordGap) {
           replyRecordGap = `${event.type}: no answer within ${REPLY_EVENT_FORWARD_LIMIT.ms} ms`
         }
+        stalledForwards.add(delivery)
+        void delivery.then(() => {
+          stalledForwards.delete(delivery)
+          if (stalledForwards.size === 0 && stallReported) {
+            stallReported = false
+            console.warn('[Send-Routed] BL-871: /api/sse answered again; this reply\'s live events are sent again', {
+              sessionId,
+              messageId,
+            })
+          }
+        })
       }
     })()
     forwardChain = link
@@ -4199,6 +4207,12 @@ async function handleBatshitAgentStream({
   })
 
 
+  // SA-139 D6 (Faye's P3 Part 3 read, S1): a Claude plan reply's record says so, since only its card has a
+  // Claude Code run behind it. Not carried into a later part (`createApprovalResumeStart` keeps named keys).
+  const claudePlanReply = primaryAgentType === 'api' && isClaudePlanSelection(primarySelection.connection)
+  // Review A S1: the save merges metadata onto the stored record, so a later part of a reply that was a Claude plan
+  // reply says false; every other reply leaves the key out.
+  const claudePlanReplyMark = claudePlanReply ? { claudePlanReply: true } : (approvalResumePrior?.metadata as any)?.claudePlanReply === true ? { claudePlanReply: false } : {}
   const streamAdapter = new StreamEventAdapter({
     sessionId,
     forward: forwardStreamEvent,
@@ -4208,6 +4222,7 @@ async function handleBatshitAgentStream({
       agentDisplayName: agent.displayName ?? (agent as any).name ?? agent.id,
       ...(streamMetadata ?? {}),
       ...(approvalResumeStart ? { approvalResumeVersion: approvalResumeStart.version } : {}),
+      ...claudePlanReplyMark,
       imageOriginExpected: true,
       imageOriginExpectedVersion: imageOriginVersion,
       providerUserSources: imageOriginReplayUserSources,
@@ -4216,8 +4231,10 @@ async function handleBatshitAgentStream({
   })
   streamAdapter.setVoiceMetadata(voiceMetadata)
 
-  const preserveReasoning =
-    typeof (agent as any)?.preserve_reasoning === 'boolean'
+  const captureReasoning = primaryAgentType === 'api' || showReasoning
+  const preserveReasoning = primaryAgentType === 'api'
+    ? formattedInput.whiteboardContextSnapshot?.settings.preserveReasoning ?? resolveApiReasoningRetention(agent).preserveReasoning
+    : typeof (agent as any)?.preserve_reasoning === 'boolean'
       ? Boolean((agent as any).preserve_reasoning)
       : false
 
@@ -4242,6 +4259,9 @@ async function handleBatshitAgentStream({
     )
   }
 
+  // API whole-run authority is separate from raw per-call usage and freezes before failure writes.
+  let apiAggregateUsage: UsageLike | null = null
+  let apiFailureUsage: UsageLike | null | undefined
   const finishSummary: {
     text: string
     content: string
@@ -4249,7 +4269,6 @@ async function handleBatshitAgentStream({
     zipReferences: ZipReference[]
     metadata: Record<string, any>
     usage?: Record<string, any>
-    observedUsage?: ObservedUsage
   } = {
     text: '',
     content: '',
@@ -4259,6 +4278,15 @@ async function handleBatshitAgentStream({
   }
 
   let finalMessagePersisted = false
+  /**
+   * BL-869: what `end` carried for the reply: the text and metadata of the record the finalize
+   * saved (the server-owned record, BL-775), which every tab shows and a reload reads
+   * (`saveMessage` may still normalize the stored copy slightly, BL-875). A group round hands this
+   * to its later speakers, never the stream handler's own copy (`finishSummary`), which can differ
+   * (the stream path zipped an `<error>` block the own copy still holds as raw text, say).
+   */
+  let savedReply: { content: string; metadata: Record<string, any> } | null = null
+  let savedReplyFromRecord = false
   let finalizePromise: Promise<void> | null = null
   // BL-775: whether the reply's own text went through the batch `<error>` zip pass.
   let batchZipPassRan = false
@@ -4291,23 +4319,21 @@ async function handleBatshitAgentStream({
       const stored = await redis.get(`message:${sessionId}:${messageId}`)
       const savedText = typeof (stored as any)?.content === 'string' ? (stored as any).content : null
       if (savedText === null) throw new Error('the saved reply could not be read back')
-      const lane = isCodexProvider ? 'codex' : isClaudeProvider ? 'claude' : 'api'
       if (streamAbortSignal.aborted) imageOriginApiInput.poison()
-      const run = lane === 'api' ? imageOriginApiInput.run : imageOriginCliDelivery
       const record = decideReplyImageOrigins({
         messageId: messageId as string,
         version: imageOriginVersion,
-        lane,
+        lane: 'api',
         replyTexts: [savedText, endText],
         // Chat images render on the root page, not under this POST route. Use the renderer's
         // public origin contract; a private Docker service address never proves browser ownership.
         imageSourceContext: { baseUrl: new URL('/', request.url).href, serverUrls: [BROWSER_BATSHIT_SERVER_URL] },
-        compiled: lane === 'api' && !imageOriginApiInput.compiledObserved ? null : formattedInput.addressSources ?? null,
-        addenda: lane === 'api' && !imageOriginApiInput.compiledObserved ? [] : [mergedSystemPromptAddendum],
-        run,
+        compiled: !imageOriginApiInput.compiledObserved ? null : formattedInput.addressSources ?? null,
+        addenda: !imageOriginApiInput.compiledObserved ? [] : [mergedSystemPromptAddendum],
+        run: imageOriginApiInput.run,
         // API steer provenance comes from the actual converted prompt. A steer taken by
         // prepareStep but never dispatched must not gain provenance through the UI transcript.
-        steers: lane === 'api' ? [] : deliveredSteers,
+        steers: [],
         storedRecords: await loadImageOrigins(sessionId, { messageIds: Array.from(new Set(
           (formattedInput.addressSources?.pieces ?? []).flatMap((piece) =>
             piece.source === 'agent_words' && piece.messageId ? [piece.messageId] : []
@@ -4339,6 +4365,10 @@ async function handleBatshitAgentStream({
   // BL-239: set only when a reply that wrote something stopped at the output limit.
   let replyOutputLimitFailure: ReturnType<typeof outputLimitFailureMetadata> | null = null
   let onFinishResolved = false
+  // BL-2004: only a genuine managed API context error can opt into the already-ended SDK tail.
+  // This deadline covers callback settlement, queued-part consumption AND iterator close.
+  let contextErrorDrainDeadline: number | undefined
+  let contextErrorDrainAdmitted = false
   let resolveOnFinish: (() => void) | null = null
   let syncReasoningMetadata = () => {}
   const onFinishPromise = new Promise<void>((resolve) => {
@@ -4443,6 +4473,9 @@ async function handleBatshitAgentStream({
             ),
             projectPath: resolvedCompiledProjectPath,
             countsAsMessage: !isApprovalResumeWithoutUserTurn,
+            whiteboardAvailable: formattedInput.structuredInput?.metadata?.whiteboardContext?.enabled === true,
+            skillSessionErrors: finishSummary.zipReferences.flatMap((ref) => ref.skillSessionError ? [ref.skillSessionError] : []),
+            skillSessionChanged: finishSummary.zipReferences.some((ref) => ref.skillSessionChanged === true),
           })
         } catch (controlError) {
           // Last resort for an error outside every step. What ran before it is unknown, so the
@@ -4452,6 +4485,7 @@ async function handleBatshitAgentStream({
           const extraction = extractReplyControl(rawFinishedReply)
           const fallback = buildReplyControlMetadata(extraction, {
             toolNotesEnabled: resolveZipToolNotesEnabled(agent as any, globalZipSettings),
+            whiteboardAvailable: formattedInput.structuredInput?.metadata?.whiteboardContext?.enabled === true,
           })
           replyControl = {
             content: extraction.cleaned,
@@ -4465,7 +4499,7 @@ async function handleBatshitAgentStream({
                   `Batshit could not finish this reply's control step: ${
                     controlError instanceof Error ? controlError.message : String(controlError)
                   }`,
-                  'Part of it may have been applied. Check Current Zip State and your memories before you ask again.',
+                  'Part of it may have been applied. Check the Zip Index and your memories before you ask again.',
                 ),
               ],
             },
@@ -4493,10 +4527,8 @@ async function handleBatshitAgentStream({
               selectedGateways,
             }
       if (approvalResumeStart) endMetadataBase.approvalResumeVersion = approvalResumeStart.version
-      if (finishSummary.observedUsage) {
-        endMetadataBase.observedUsage = finishSummary.observedUsage
-        endMetadataBase.usage = null
-      }
+      Object.assign(endMetadataBase, claudePlanReplyMark)
+      if (context === 'error') endMetadataBase.usage = apiFailureUsage ?? null
       // SA-129 P2: what the reply-end step stored joins the SAME metadata `end` and the saved
       // record get; control errors from earlier writers are kept, never replaced.
       {
@@ -4592,12 +4624,9 @@ async function handleBatshitAgentStream({
       if (jevJuiceMessageMetadata) {
         endMetadataBase.jevJuice = jevJuiceMessageMetadata
       }
-      // BL-759, BL-941: every way the reply ends (finished, stopped, failed) keeps the notes.
+      // BL-759: every way the reply ends (finished, stopped, failed) keeps the note.
       if (answerRestartedAfterLostConnection) {
         endMetadataBase.restartedAfterLostConnection = { program: restartedAnswerProgram }
-      }
-      if (modeLimitedByAgentSettings) {
-        endMetadataBase.modeLimitedByAgentSettings = modeLimitedByAgentSettings
       }
       const sanitizedEndMetadata = sanitizePayloadForLogs(endMetadataBase)
       const sanitizedIntermediateSteps = sanitizePayloadForLogs(
@@ -4622,12 +4651,16 @@ async function handleBatshitAgentStream({
       // Every forward of this reply has answered or passed its own limit (a gap); from here a late
       // content or tool event is refused by `/api/sse`, so nothing lands after the rebuild.
       await forwardChain
-      // The words the zip detector still holds (an `<error>` block that never closed, or a lone
-      // start of its tag at the end) join the record NOW, while the reply is open: a closed reply
-      // refuses every content event, so written after the close they would be lost from the saved
-      // reply and from `end`. No await sits between the flush and the close.
-      flushHeldReplyText(sessionId, messageId)
-      closeReplyRecord(sessionId, messageId)
+      // The words the zip detector still holds (an `<error>` block that never closed, a lone start
+      // of its tag at the end, or a pair held after a stray backtick, BL-779) join the record NOW,
+      // while the reply is open: a closed reply refuses every content event, so written after the
+      // close they would be lost from the saved reply and from `end`. The flush settles them first:
+      // a held pair is zipped (the zip written, then its reference recorded), and that is its only
+      // await. Nothing else is awaited between the flush and the close.
+      await flushHeldReplyText(sessionId, messageId)
+      // BL-871 (a): closed with this part's version, so a late `start` of it (or of an older part)
+      // can no longer reopen the saved reply; only a newer approval resume can.
+      closeReplyRecord(sessionId, messageId, approvalResumeStart?.version ?? 0)
       let ownCopyReason: string | null = replyRecordGap
       if (!ownCopyReason) {
         try {
@@ -4637,7 +4670,7 @@ async function handleBatshitAgentStream({
             incomingZipReferences: serverZipReferences,
             intermediateSteps: sanitizedIntermediateSteps as any[],
             endContent: typeof sanitizedEndContent === 'string' ? sanitizedEndContent : '',
-            // send-routed serves only managed agents (API and CLI): tool cards are inline.
+            // send-routed serves only managed (API) agents: tool cards are inline.
             inlineCapable: true,
             replyControlFinalized: (sanitizedEndMetadata as any)?.[REPLY_CONTROL_FINALIZED_FLAG] === true,
             // A group speaker's own copy has its Goon cues, emotes and stage directions stripped;
@@ -4657,6 +4690,33 @@ async function handleBatshitAgentStream({
       const recordMetadata: Record<string, any> = streamAdapter.composeEventMetadata(
         sanitizedEndMetadata as Record<string, any>,
       )
+      if (primaryAgentType === 'api') {
+        recordMetadata.whiteboardContextSnapshot = approvalSummaryIsPending(recordMetadata.toolApprovals)
+          ? formattedInput.whiteboardContextSnapshot ?? null
+          : null
+        // SA-137 (D7): the paused call's own live-read snapshot rides the paused record (sealed, at
+        // most 1 MiB, never sent to a tab); any other end of a reply that had one clears it.
+        // A pause whose card names no bounded approval ids keeps none: its resume runs without live
+        // reads, as a pause past the cap does.
+        const pausedSnapshot = liveFileReadTurn?.snapshot
+        const pausedApprovalIds = pausedSnapshot && pausedSnapshot.copies.size > 0 && approvalSummaryIsPending(recordMetadata.toolApprovals)
+          ? liveReadReplayApprovalIds(recordMetadata.toolApprovals)
+          : null
+        if (pausedSnapshot && pausedSnapshot.copies.size > 0 && approvalSummaryIsPending(recordMetadata.toolApprovals) && !pausedApprovalIds) {
+          console.warn('[SA-137] A paused reply keeps no file snapshot: its card names more or longer approval ids than a snapshot holds; its resume runs without live reads.', { sessionId, messageId })
+        }
+        // A resume that had no usable snapshot keeps none for a later pause either (its copies were
+        // all static): null, never a sealed all-static replay that would carry its reason on.
+        if (pausedSnapshot && pausedApprovalIds && !liveFileReadTurn?.replayUnavailable) {
+          // Round 2: the reply's parts ride along (a continuation's resume never zips its earlier
+          // parts); a replay too large keeps its smaller copies, or none (null) if nothing fits.
+          recordMetadata.liveFileReadSnapshot = buildLiveFileReadReplay(
+            pausedSnapshot, { userId, sessionId, agentId, messageId }, liveFileReadReplayExpiry(recordMetadata.toolApprovals), pausedApprovalIds,
+            undefined, liveFileReadTurn ? [...liveFileReadTurn.replyMessageIds] : undefined)
+        } else if (liveFileReadTurn || (pausedLiveReplay !== undefined && pausedLiveReplay !== null)) {
+          recordMetadata.liveFileReadSnapshot = null
+        }
+      }
       recordMetadata.imageOriginExpected = true
       recordMetadata.imageOriginExpectedVersion = imageOriginVersion
       let recordContent: string
@@ -4695,19 +4755,22 @@ async function handleBatshitAgentStream({
           recordZipReferences.push(...processed.references)
         }
         recordContent = finishReplyEndContent(ownContent, recordZipReferences)
+        // A group speaker's own copy loses its leading group control block and its Goon cues, emote
+        // tags and stage directions, as the rebuild's text does (the stream path never records the
+        // control block, and `buildRecordedReplyEnd` strips the presentation controls). The own copy
+        // can be the SDK's finish text, which went through neither, so a reply that was only a cue
+        // was saved, and handed to the round's later speakers, as raw markup (BL-869).
+        if (streamMetadata?.groupChat === true) {
+          // Presentation controls first, as the stream's parser does (a cue written before the
+          // group block would otherwise keep the block from being the leading one).
+          recordContent = stripRepeatedLeadingGroupControlBlocks(
+            stripGroupChatPresentationControls(recordContent),
+          )
+        }
         recordSteps = sanitizedIntermediateSteps as any[]
         recordMetadata.zipIds = replyEndZipIds(recordContent, recordZipReferences)
         if (recordZipReferences.length > 0) recordMetadata.zipReferences = recordZipReferences
         if (!nothingWasStreamed) recordMetadata[REPLY_SAVED_FROM_OWN_COPY_KEY] = true
-      }
-
-      // BL-496, BL-775: the reply's Claude approval cards, as the server recorded them (answered,
-      // denied, or expired and why), joined by approval id with its other cards, while the
-      // registry still holds them. A tab used to carry them from `end` into its save; an unwatched
-      // Claude reply lost them.
-      const claudeCards = buildClaudeApprovalSummary(sessionId, messageId)
-      if (claudeCards) {
-        recordMetadata.toolApprovals = joinApprovalSummaries(recordMetadata.toolApprovals, claudeCards)
       }
 
       const providerMessageSource =
@@ -4754,10 +4817,18 @@ async function handleBatshitAgentStream({
       }
 
       try {
-        await redis.saveMessage(finalMessage)
+        await persistCanonicalReply(finalMessage, mcpOriginalPreparation, mcpApiPart)
         // The reply is stored: a later step that throws (a notice, `end`, the snapshot) must not
         // send it through the failure path's second finalize, a second save and a second `end`.
         finalMessagePersisted = true
+        // SA-137: a stored paused snapshot clears itself at its card's expiry (this pause only).
+        const storedLiveReplay = (finalMessage.metadata as any)?.liveFileReadSnapshot
+        if (storedLiveReplay && typeof storedLiveReplay === 'object') scheduleLiveFileReadReplayExpiry(storedLiveReplay)
+        savedReply = {
+          content: typeof finalMessage.content === 'string' ? finalMessage.content : '',
+          metadata: withoutServerReplayFields(finalMessage).metadata ?? {},
+        }
+        savedReplyFromRecord = !!recordedReply && !ownCopyReason
       } finally {
         // SA-129 P2: the reply-end step changed this chat's zip state (a hold, a release, a zip
         // action, the countdown); every tab showing the chat re-reads it. Told even when the save
@@ -4794,7 +4865,8 @@ async function handleBatshitAgentStream({
         content: finalMessage.content as string,
         intermediateSteps: (finalMessage.intermediateSteps as any[] | undefined) ?? [],
         zipReferences: recordZipReferences,
-        metadata: (finalMessage.metadata ?? {}) as Record<string, any>,
+        // The paused call's replay fields stay on the server (SA-137 D7; the whiteboard precedent).
+        metadata: (withoutServerReplayFields(finalMessage).metadata ?? {}) as Record<string, any>,
         savedRecord: true,
       })
 
@@ -4817,6 +4889,7 @@ async function handleBatshitAgentStream({
         await executionViewerService.updateSnapshot(sessionId, messageId, {
           reasoningPersistence: buildReasoningPersistenceEvidence({
             showReasoning,
+            captureReasoning,
             preserveReasoning,
             reasoningSummary:
               typeof (finalMessage.metadata as any)?.reasoningSummary === 'string'
@@ -4884,14 +4957,10 @@ async function handleBatshitAgentStream({
   let reasoningCaptured = ''
   const reasoningStreamSource = new ReasoningStreamSourceArbiter()
   let thinkingIndicatorEmitted = false
-  let planItems: PlanItem[] = []
-  let planSummary = ''
   syncReasoningMetadata = () => {
-    const visibleMetadata = showReasoning
+    const visibleMetadata = captureReasoning
       ? {
           ...(reasoningCaptured ? { reasoningSummary: reasoningCaptured } : {}),
-          ...(planSummary ? { planSummary } : {}),
-          ...(planItems.length > 0 ? { planItems } : {}),
         }
       : {}
     const interruptedReasoningRecovery =
@@ -4899,7 +4968,6 @@ async function handleBatshitAgentStream({
         ? buildInterruptedReasoningRecovery({
             agentId,
             reasoningSummary: reasoningCaptured,
-            planSummary,
           })
         : null
 
@@ -4920,6 +4988,9 @@ async function handleBatshitAgentStream({
   // the failure path can both be under way (the loop waits at most 2 s for the callback), and
   // the snapshot merge keeps both writers' rows, so whichever claims first writes them.
   const streamStepRecorder = createStreamStepRecorder()
+  // BL-1782: an API step that finished with no readable reason (the AI Gateway's older finish
+  // shape) while a tool call Batshit runs got no result, error or approval card fails by name.
+  const gatewayStreamFormatCheck = createGatewayStreamFormatCheck()
   const llmCaptureClaim = createLlmCaptureClaim()
   const streamedApprovalRequests = new Map<string, ToolApprovalEntry>()
   const streamedToolCallIds = new Set<string>()
@@ -5014,13 +5085,7 @@ async function handleBatshitAgentStream({
     const segmentId = options.segmentId ?? null
     streamedReply.append(safeContent, segmentId)
     streamedNonSteerContent = true
-    if (shouldSimulateStreamingEffect) {
-      await emitSimulatedChunks(safeContent, async (simulated) => {
-        await streamAdapter.emitChunk({ content: simulated, segmentId })
-      })
-    } else {
-      await streamAdapter.emitChunk({ content: safeContent, segmentId })
-    }
+    await streamAdapter.emitChunk({ content: safeContent, segmentId })
   }
 
   /**
@@ -5034,18 +5099,6 @@ async function handleBatshitAgentStream({
     for (const piece of pieces) {
       await emitTextChunk(piece.text, { segmentId: piece.segmentId })
     }
-  }
-
-  const emitPlanUpdate = async (raw: any) => {
-    const normalizedItems = normalizePlanItems(raw)
-    if (normalizedItems.length === 0) return
-    planItems = normalizedItems
-    planSummary = formatPlanSummary(normalizedItems)
-    await streamAdapter.emitPlanUpdate({
-      content: planSummary,
-      items: normalizedItems,
-      metadata: { source: 'codex', type: 'plan_update' },
-    })
   }
 
   const appendToolZipReference = (reference: string) => {
@@ -5457,7 +5510,7 @@ async function handleBatshitAgentStream({
   }
 
   const emitReasoningAppend = async (content: string) => {
-    if (!showReasoning) return
+    if (!captureReasoning) return
     if (!content) return
     await streamAdapter.emitThinking({
       content,
@@ -5469,7 +5522,7 @@ async function handleBatshitAgentStream({
   }
 
   const emitReasoningReplace = async (content: string) => {
-    if (!showReasoning) return
+    if (!captureReasoning) return
     await streamAdapter.emitThinking({
       content,
       metadata: {
@@ -5573,54 +5626,6 @@ async function handleBatshitAgentStream({
 
   type StreamRuntimeSettings = ReturnType<typeof buildRuntimeModelSettings>
 
-  // SA-093 P7: Batshit-measured wall-clock stream timings for the managed CLI
-  // lanes, whose fabricated streams carry no SDK performance data. Marks come
-  // from the canonical stream loop; the synthetic Codex "thinking" indicator
-  // is emitted outside that loop and never counts as first output.
-  const measuredStreamTiming = {
-    startedAt: null as number | null,
-    firstOutputAt: null as number | null,
-    toolActiveMs: 0,
-    toolWindowStartedAt: null as number | null,
-    activeToolCalls: 0,
-  }
-  const resetMeasuredStreamTiming = () => {
-    measuredStreamTiming.startedAt = Date.now()
-    measuredStreamTiming.firstOutputAt = null
-    measuredStreamTiming.toolActiveMs = 0
-    measuredStreamTiming.toolWindowStartedAt = null
-    measuredStreamTiming.activeToolCalls = 0
-  }
-  const markMeasuredFirstOutput = () => {
-    if (measuredStreamTiming.firstOutputAt === null) {
-      measuredStreamTiming.firstOutputAt = Date.now()
-    }
-  }
-  const markMeasuredToolCallStart = () => {
-    markMeasuredFirstOutput()
-    measuredStreamTiming.activeToolCalls += 1
-    if (measuredStreamTiming.activeToolCalls === 1) {
-      measuredStreamTiming.toolWindowStartedAt = Date.now()
-    }
-  }
-  const markMeasuredToolCallEnd = () => {
-    if (measuredStreamTiming.activeToolCalls <= 0) return
-    measuredStreamTiming.activeToolCalls -= 1
-    if (
-      measuredStreamTiming.activeToolCalls === 0 &&
-      measuredStreamTiming.toolWindowStartedAt !== null
-    ) {
-      measuredStreamTiming.toolActiveMs +=
-        Date.now() - measuredStreamTiming.toolWindowStartedAt
-      measuredStreamTiming.toolWindowStartedAt = null
-    }
-  }
-  const measuredToolActiveMsTotal = (at: number) =>
-    measuredStreamTiming.toolActiveMs +
-    (measuredStreamTiming.toolWindowStartedAt !== null
-      ? Math.max(0, at - measuredStreamTiming.toolWindowStartedAt)
-      : 0)
-
   const buildStreamRequest = (
     modelId: string,
     connection: NativeModeRequest['connection'],
@@ -5657,12 +5662,20 @@ async function handleBatshitAgentStream({
 
     return {
     chatgptPlanLease,
+    mcpOriginalPreparation: mcpApiPart ? mcpOriginalPreparation : undefined,
+    mcpApiPart,
+    onP5ApiRun: (run: P5ApiOriginalRun) => { mcpApiRun = run },
       sessionId,
     messageId,
     agentId,
-    agentSlug: agent.slug ?? null,
     // SA-104 P3: primary-agent sends of memory-enabled agents get the sys.memory.* refs.
     memoryControlsEnabled: resolveAgentMemoryEnabled(agent),
+    whiteboardControlsEnabled: formattedInput.structuredInput?.metadata?.whiteboardContext?.enabled === true,
+    whiteboardSettingsSnapshot: formattedInput.whiteboardContextSnapshot?.settings,
+    // SA-137: an API Primary with live file reads on proves its Bash reads for a later turn start.
+    liveFileReadsEnabled: primaryAgentType === 'api' && resolveLiveFileReadsEnabled(agent, userSettings?.global_zip_settings),
+    // The compile's own answer (the zip rules follow it): this turn runs Refreshed File Reads.
+    refreshedFileReadsTurn: formattedInput.refreshedFileReadsTurn === true,
     // SA-113 P2 (DL-113-03): the ONE place a primary send turns the sys.dm.* refs on.
     // The guidance block and the DCM roster follow the same rule, so an agent never gets
     // the tools without the instructions or the roster without the tools (DL-113-13).
@@ -5689,26 +5702,42 @@ async function handleBatshitAgentStream({
       : null,
     messages: streamMessages,
     imageOriginInput: { compiledPrefixCount: imageOriginCompiledPrefixCount, userSources: imageOriginReplayUserSources },
-    onApiModelInput: isCodexProvider || isClaudeProvider ? undefined : (input) => {
+    skillReadDelivery,
+    skillContextBudget: { contextLimit: promptBudgetContextLimit, outputReserveTokens: promptBudgetOutputReserveTokens },
+    refreshOpenSkills: formattedInput.refreshOpenSkills,
+    // SA-137 Round 2 follow-up (R2-4): when this turn refreshed another reader's copy, its sharing
+    // and that reader are checked once more right before the first request leaves, after every
+    // awaited setup; a revocation sends nothing (`LiveFileReadSharingChangedError`).
+    ...(liveFileReadTurn?.dispatchCheckPending
+      ? { modelDispatchGate: {
+          beforeRequest: () => liveFileReadTurn.beforeDispatch(),
+          requestSent: () => liveFileReadTurn.dispatchSent()
+        } }
+      : {}),
+    onApiModelInput: (input) => {
+      // A real provider request carries its prompt; a model that cannot be observed reports none.
+      if (input.promptMessages !== undefined) liveFileReadOutcome?.noteIssued()
       try { imageOriginApiInput.observe(input) } catch {
         imageOriginApiInput.poison()
         console.error('[Send-Routed] Picture input observation failed; its completeness stays unknown')
       }
     },
     model: modelId,
-    mode4Style: mode4Style ?? undefined,
     connection,
+    // SA-139 (D11): a Claude plan selection runs here as a Primary reply. Its raw-record sampling
+    // copies go to admission, which refuses them by name; the connection sends none (BL-515).
+    claudePlanConsumer: 'primary',
+    claudePlanSampling: primaryModelFallbacks ?? null,
+    // SA-139 D6: the reply's hold key version, and the run its approval click claimed.
+    claudePlanApprovalVersion: approvalResumeStart?.version ?? 0,
+    claudePlanResumesHeldRun,
+    claudePlanHeld: takeClaudePlanClaim(request),
     // SA-105 P2 (DL-105-06): the saved model's capabilities travel with the run so
     // the tool-result image lane uses the SAME vision rule as attached clips
     // rather than inventing a second one. Unknown stays allowed; a genuinely
     // text-only model then fails loudly through IMAGE_INPUT_UNSUPPORTED.
     modelCapabilities: capabilities ?? null,
     images: streamImages,
-    availableTools: selectedTools?.map((name: string) => ({
-      name,
-      description: `Tool: ${name}`,
-      schema: {},
-    })),
     maxToolRounds: 100,
     // SA-102 P1 (DL-102-01): blank means "do not send". A parameter the user
     // left empty is absent from the request body — no substituted default at
@@ -5732,14 +5761,6 @@ async function handleBatshitAgentStream({
     stopSequences: settings.standard.stopSequences,
     providerOptions,
     providerSettings: providerSettingsOverride ?? null,
-    codexSettings: codexRuntimeSettings ?? undefined,
-    claudeSettings: claudeRuntimeSettings ?? undefined,
-    cliContextSelection: isClaudeProvider ? {
-      model: cliModelForBudget,
-      presetContextWindow: primarySelection.contextWindow ?? null,
-      settingsKey: cliBudgetSettingsKey,
-      priorReport: matchingCliReport
-    } : undefined,
     toolsEnabled,
     projectPath:
       resolvedCompiledProjectPath ??
@@ -5755,25 +5776,10 @@ async function handleBatshitAgentStream({
     gatewayToolMap,
     assignedSubagents,
     defaultGateways,
-    toolApprovalMode: runToolApprovalMode,
+    toolApprovalMode,
     userId,
     abortSignal: streamAbortSignal,
-    simulateStreamingEffect: shouldSimulateStreamingEffect,
     taggedReasoningTagName,
-    onCliModelResult: isCodexProvider || isClaudeProvider
-      ? (delivery) => appendCliModelResult(imageOriginCliDelivery, delivery)
-      : undefined,
-    onCliContext: isCodexProvider || isClaudeProvider
-      ? (report) => {
-          latestCliContext = reportForCliSnapshot(
-            { ...report, reportedAt: Date.now() }, agentMetadata, primarySelection.contextWindow,
-            primarySelection.settings, primarySelection.modelId
-          )
-          runtimeSnapshot.metadata = {
-            ...(runtimeSnapshot.metadata ?? {}), cliContextWindow: latestCliContext
-          }
-        }
-      : undefined,
     onFinish: async ({
       text,
       steps,
@@ -5782,18 +5788,31 @@ async function handleBatshitAgentStream({
       reasoning,
       responseMessages,
       apiUserSources,
-      observedUsage,
     }) => {
-      // Keep evidence before awaited presentation work can fail; it is never billable usage.
-      if (isCodexProvider) finishSummary.observedUsage = readObservedUsage(observedUsage)
-      // SA-093 P7: stamp finish time immediately — the zip/EV work below can
-      // take real time and must not inflate measured stream timings.
-      const measuredFinishedAt = Date.now()
+      if (p5CanonicalReplySealed(mcpOriginalPreparation, messageId, mcpApiPart)) return
+      // A callback arriving after terminal failure cannot restore totals or rewrite its evidence.
+      if (p5CanonicalReplySealed(mcpOriginalPreparation, messageId, mcpApiPart)) return
+      if (apiFailureUsage !== undefined) return
+      if (contextErrorDrainDeadline !== undefined) {
+        resolveOnFinish?.()
+        return
+      }
+      // SDK7 may call onEnd with an error step and only the earlier calls' numeric totals.
+      // Leave all failure evidence to the consumer's recorder, before this callback can begin
+      // a snapshot read/write that outlives the terminal failure. Release the wait, not its claim.
+      // BL-1782: a step that left a Batshit-run tool call unrun is such a failure too (the loop
+      // fails it by name, and the SDK still calls onEnd as if the run had finished).
+      if (Array.isArray(steps) && steps.some((step: any) => step?.finishReason === 'error' || isGatewayStreamFormatStep(step))) {
+        resolveOnFinish?.()
+        return
+      }
       // SA-114 P1 (DL-114-04): idempotent, and the reason it is FIRST is ordering — the
       // finish path reads `streamedReply` a few lines down, and a steer delivered
       // at the final step boundary must already be in it. Forced: every step is over on
       // the SDK's side, so the consumed-step gate has nothing left to protect.
       await drainSteersIntoTranscript(true)
+      if (p5CanonicalReplySealed(mcpOriginalPreparation, messageId, mcpApiPart)) return
+      if (apiFailureUsage !== undefined) return
       const sanitizedFinishText = stripToolPartOnlyText(text)
 
       // SA-107 (DL-107-06/07): SDK usage stays authoritative; raw-chunk cache
@@ -5816,6 +5835,7 @@ async function handleBatshitAgentStream({
         ) ?? undefined
       lastStreamSteps = Array.isArray(steps) ? steps : []
       lastResolvedUsage = resolvedUsage ?? null
+      apiAggregateUsage = hasUsageValues(totalUsage || usage) ? resolvedUsage ?? null : null
 
       logger.debug('[Send-Routed] Stream finished', {
         sessionId,
@@ -5835,22 +5855,15 @@ async function handleBatshitAgentStream({
         streamedToolSteps.length > 0
           ? streamedToolSteps
           : parsed.intermediateSteps
-      const filteredSteps = Array.isArray(intermediateSteps)
-        ? intermediateSteps.filter(
-            (step) =>
-              !isPlanUpdateTool(
-                step?.toolName ??
-                  step?.tool ??
-                  step?.originalToolName ??
-                  step?.action?.tool,
-              ),
-          )
+      // A copy: the reply keeps its steps as they stood when the run finished.
+      const finishedSteps = Array.isArray(intermediateSteps)
+        ? [...intermediateSteps]
         : intermediateSteps
       const subagentEchoCandidates = [
         ...(Array.isArray(parsed.intermediateSteps)
           ? parsed.intermediateSteps
           : []),
-        ...(Array.isArray(filteredSteps) ? filteredSteps : []),
+        ...(Array.isArray(finishedSteps) ? finishedSteps : []),
       ]
       const normalizedFinishText = stripLeadingSubagentEchoText(
         sanitizedFinishText,
@@ -5859,11 +5872,10 @@ async function handleBatshitAgentStream({
 
       lastStreamText = normalizedFinishText || null
       finishSummary.text = normalizedFinishText
-      finishSummary.intermediateSteps = filteredSteps
-      const delegated = buildDelegatedExecutionSummary([
-        ...(Array.isArray(filteredSteps) ? filteredSteps : []),
-        ...helperDelegatedSteps,
-      ])
+      finishSummary.intermediateSteps = finishedSteps
+      const delegated = buildDelegatedExecutionSummary(
+        Array.isArray(finishedSteps) ? finishedSteps : [],
+      )
 
       // Safety: if a reasoning segment is still open, treat it as complete now.
       reasoningActive = false
@@ -5981,8 +5993,8 @@ async function handleBatshitAgentStream({
       const inlineZipRefs = inlineProcessed.references
 
       let coolToolZips: ZipReference[] = []
-      const pendingToolSteps = Array.isArray(filteredSteps)
-        ? filteredSteps.filter((step) => {
+      const pendingToolSteps = Array.isArray(finishedSteps)
+        ? finishedSteps.filter((step) => {
             const callId =
               typeof step?.toolCallId === 'string'
                 ? step.toolCallId
@@ -6004,6 +6016,7 @@ async function handleBatshitAgentStream({
           globalZipSettings,
           {
             reservedZipIdsByToolCallId: reservedToolZipIdsByCallId,
+                  skillSessionActor: { userId, agentId: agent.id, agentCreatedAt: agent.created_at },
           },
         )
       }
@@ -6038,6 +6051,8 @@ async function handleBatshitAgentStream({
         }
       }
 
+      if (p5CanonicalReplySealed(mcpOriginalPreparation, messageId, mcpApiPart)) return
+      if (apiFailureUsage !== undefined) return
       finishSummary.content = finalContent
       finishSummary.zipReferences = allZipRefs
       finishSummary.metadata = {
@@ -6045,7 +6060,6 @@ async function handleBatshitAgentStream({
         agentType: primaryAgentType,
         // SA-107: the chat strip reads this — same resolved value as finishSummary.usage.
         usage: resolvedUsage,
-        ...(finishSummary.observedUsage ? { observedUsage: finishSummary.observedUsage, usage: null } : {}),
         steps: steps?.length || 0,
         voice: voiceMetadata,
         selectedTools,
@@ -6114,28 +6128,11 @@ async function handleBatshitAgentStream({
       }
 
       finishSummary.usage = resolvedUsage
-      if (latestCliContext) {
-        finishSummary.metadata = { ...finishSummary.metadata, cliContextWindow: latestCliContext }
-      }
 
-      // SA-093 P7: persist per-send stream performance for the chat-bar strip.
-      // `API` uses the SDK's own measurements; the managed CLI lanes fall back
-      // to Batshit-measured wall-clock timings (DL-093-14 per-lane sources).
-      // Anything not measured stays absent so the strip renders honest unknowns.
+      // SA-093 P7: persist per-send stream performance for the chat-bar strip, from the SDK's own
+      // measurements. Anything not measured stays absent so the strip renders honest unknowns.
       const performanceMetadata =
-        buildMessagePerformanceFromSteps(Array.isArray(steps) ? steps : []) ??
-        (isCodexProvider || isClaudeProvider
-          ? buildMeasuredMessagePerformance({
-              startedAt: measuredStreamTiming.startedAt,
-              firstOutputAt: measuredStreamTiming.firstOutputAt,
-              finishedAt: measuredFinishedAt,
-              toolActiveMs: measuredToolActiveMsTotal(measuredFinishedAt),
-              outputTokens:
-                typeof resolvedUsage?.outputTokens === 'number'
-                  ? resolvedUsage.outputTokens
-                  : null,
-            })
-          : null)
+        buildMessagePerformanceFromSteps(Array.isArray(steps) ? steps : [])
       if (performanceMetadata) {
         finishSummary.metadata = {
           ...finishSummary.metadata,
@@ -6147,197 +6144,73 @@ async function handleBatshitAgentStream({
       resolveOnFinish?.()
 
       try {
-        if (isCodexProvider || isClaudeProvider) {
-          const {
-            buildCodexPromptFromMessages,
-            buildCodexPromptPackageFromMessages,
-          } =
-            await import('$lib/server/services/codexBridge')
-          const sanitizedStreamMessages = sanitizePayloadForLogs(streamMessages)
-          const sanitizedStreamImages = sanitizePayloadForLogs(streamImages)
-          const sanitizedToolSteps = sanitizePayloadForLogs(
-            Array.isArray(intermediateSteps) ? intermediateSteps : [],
-          )
-          const promptInput = {
-            messages: sanitizedStreamMessages as Array<{
-              role?: string
-              content: any
-              name?: string
-            }>,
-            images: sanitizedStreamImages as Array<{
-              url: string
-              alt?: string
-            }>,
-          }
-          const codexPromptPackage = isCodexProvider
-            ? buildCodexPromptPackageFromMessages(promptInput)
-            : null
-          const prompt =
-            codexPromptPackage?.prompt ??
-            buildCodexPromptFromMessages(promptInput)
+        // Claimed before anything here awaits: a failure path that runs while this callback
+        // is still busy then writes no second set of calls (BL-245 review).
+        const ownsLlmCapture = llmCaptureClaim.claim('finish')
+        const sanitizedSteps = sanitizePayloadForLogs(
+          Array.isArray(steps) ? steps : [],
+        )
+        const sanitizedToolSteps = sanitizePayloadForLogs(
+          Array.isArray(intermediateSteps) ? intermediateSteps : [],
+        )
+        const capture = buildVercelLlmCapture({
+          steps: sanitizedSteps as any[],
+          totalUsage: resolvedUsage ?? null,
+          finalText: typeof text === 'string' ? text : null,
+          providerId: connection?.service ?? requestProviderId ?? null,
+        })
 
-          const capture = isCodexProvider
-            ? buildCodexLlmCapture({
-                prompt,
-                developerInstructions:
-                  codexPromptPackage?.developerInstructions ?? null,
-                images: sanitizedStreamImages as Array<{
-                  url: string
-                  alt?: string
-                }>,
-                tools: preloadedGatewayTools ?? null,
-                toolMetadata: preloadedGatewayMetadata ?? null,
-                totalUsage: resolvedUsage ?? null,
-              })
-            : buildClaudeLlmCapture({
-                prompt,
-                images: sanitizedStreamImages as Array<{
-                  url: string
-                  alt?: string
-                }>,
-                tools: preloadedGatewayTools ?? null,
-                toolMetadata: preloadedGatewayMetadata ?? null,
-                totalUsage: resolvedUsage ?? null,
-              })
+        const toolCallsTotal = Array.isArray(steps)
+          ? steps.reduce((sum: number, step: any) => {
+              const count = Array.isArray(step?.toolCalls)
+                ? step.toolCalls.length
+                : 0
+              return sum + count
+            }, 0)
+          : intermediateSteps.length
 
-          const responseUsageSource = isCodexProvider ? 'codex' : 'claude'
-          const responseNotes = isCodexProvider
-            ? [
-                ...(finishSummary.observedUsage
-                  ? ['Codex reported the saved observations before this run ended. Its complete usage and cost remain unknown.']
-                  : ['Codex CLI totals are exact when the CLI reports usage, but per-step on-wire payload breakdown is unavailable.']),
-              ]
-            : [
-                'Claude Code CLI totals are exact when the CLI reports usage, but per-step on-wire payload breakdown is unavailable.',
-                ...(typeof resolvedUsage?.cachedInputTokens === 'number' ||
-                typeof resolvedUsage?.cacheCreationInputTokens === 'number'
-                  ? [
-                      'Claude prompt caching is active for this run. Input/Total include fresh input plus cache-read and cache-creation tokens.',
-                    ]
-                  : []),
-              ]
+        await executionViewerService.updateSnapshot(sessionId, messageId, withPriorRunAccounting({
+          ...(ownsLlmCapture
+            ? {
+                llmSummary: capture.llmSummary,
+                llmCalls: capture.llmCalls,
+                intermediateSteps: withPriorRunSteps(sanitizedToolSteps),
+              }
+            : {}),
+          delegated,
+          responseSummary: {
+            content: { value: finalContent, confidence: 'exact' },
+            usage: buildTokenUsage(
+              resolvedUsage ?? null,
+              'exact',
+              'provider',
+            ),
+            toolCallsCount: buildTokenStat(
+              toolCallsTotal,
+              'exact',
+              'vercel ai sdk',
+            ),
+          },
+        }))
 
-          await executionViewerService.updateSnapshot(sessionId, messageId, withPriorRunAccounting({
-            llmSummary: capture.llmSummary,
-            llmCalls: capture.llmCalls,
-            intermediateSteps: withPriorRunSteps(sanitizedToolSteps),
-            delegated,
-            responseSummary: {
-              content: { value: finalContent, confidence: 'exact' },
-              // BL-503 / BL-1361: this write is the CLI lanes' one evidence writer, and it also
-              // runs for a run that failed, was stopped, or was ended by the context guard (each
-              // adapter's `finally` makes the finish callback before the error reaches the catch).
-              // Its counts are `exact` only when the CLI reported them (a Claude error `result` can),
-              // else unknown.
-              usage: buildTokenUsage(
-                resolvedUsage ?? null,
-                reportedUsageConfidence(resolvedUsage ?? null),
-                responseUsageSource,
-              ),
-              toolCallsCount: buildTokenStat(
-                intermediateSteps.length,
-                intermediateSteps.length > 0 ? 'near' : 'exact',
-                responseUsageSource,
-              ),
-              notes: responseNotes,
-              ...(finishSummary.observedUsage ? { observedUsage: finishSummary.observedUsage } : {}),
-            },
-          }))
-
-          // SA-093 P4 (managed CLI lanes): opt-in batshit-compiled-boundary
-          // forensics. Uses the RAW compiled messages/images/tools — never the
-          // log-sanitized copies above, whose lossy redaction could collapse
-          // two different requests into one fingerprint.
-          if (isCacheForensicsEnabled()) {
-            const forensicRecord = buildCliCacheForensicsRecord({
-              runtime: isCodexProvider ? 'codex' : 'claude',
-              messages: Array.isArray(streamMessages) ? streamMessages : [],
-              images: Array.isArray(streamImages)
-                ? (streamImages as Array<{ url: string; alt?: string }>)
-                : [],
-              tools: preloadedGatewayTools ?? null,
-              usage: resolvedUsage ?? null,
-              agentId,
-              connectionId: connection?.id ?? connection?.service ?? null,
-              modelId: runtimeSnapshot.modelName ?? primaryModelId ?? null,
-              messageId,
-              experimentGroup: resolveCacheForensicsExperimentGroup(),
-            })
-            await attachCacheForensicsToSnapshot({
-              sessionId,
-              snapshotId: messageId,
-              records: [forensicRecord],
-            })
-          }
-        } else {
-          // Claimed before anything here awaits: a failure path that runs while this callback
-          // is still busy then writes no second set of calls (BL-245 review).
-          const ownsLlmCapture = llmCaptureClaim.claim('finish')
-          const sanitizedSteps = sanitizePayloadForLogs(
-            Array.isArray(steps) ? steps : [],
-          )
-          const sanitizedToolSteps = sanitizePayloadForLogs(
-            Array.isArray(intermediateSteps) ? intermediateSteps : [],
-          )
-          const capture = buildVercelLlmCapture({
-            steps: sanitizedSteps as any[],
-            totalUsage: resolvedUsage ?? null,
-            finalText: typeof text === 'string' ? text : null,
+        // SA-093 P4 (`API` lane): opt-in provider-request forensics. Uses the
+        // RAW steps (never log-sanitized copies — redaction is lossy and
+        // could collapse two different requests into one fingerprint).
+        if (isCacheForensicsEnabled()) {
+          const forensicRecords = buildApiCacheForensicsRecords({
+            steps: Array.isArray(steps) ? steps : [],
+            agentId,
+            connectionId: connection?.id ?? connection?.service ?? null,
             providerId: connection?.service ?? requestProviderId ?? null,
+            modelId: primaryModelId ?? null,
+            messageId,
+            experimentGroup: resolveCacheForensicsExperimentGroup(),
           })
-
-          const toolCallsTotal = Array.isArray(steps)
-            ? steps.reduce((sum: number, step: any) => {
-                const count = Array.isArray(step?.toolCalls)
-                  ? step.toolCalls.length
-                  : 0
-                return sum + count
-              }, 0)
-            : intermediateSteps.length
-
-          await executionViewerService.updateSnapshot(sessionId, messageId, withPriorRunAccounting({
-            ...(ownsLlmCapture
-              ? {
-                  llmSummary: capture.llmSummary,
-                  llmCalls: capture.llmCalls,
-                  intermediateSteps: withPriorRunSteps(sanitizedToolSteps),
-                }
-              : {}),
-            delegated,
-            responseSummary: {
-              content: { value: finalContent, confidence: 'exact' },
-              usage: buildTokenUsage(
-                resolvedUsage ?? null,
-                'exact',
-                'provider',
-              ),
-              toolCallsCount: buildTokenStat(
-                toolCallsTotal,
-                'exact',
-                'vercel ai sdk',
-              ),
-            },
-          }))
-
-          // SA-093 P4 (`API` lane): opt-in provider-request forensics. Uses the
-          // RAW steps (never log-sanitized copies — redaction is lossy and
-          // could collapse two different requests into one fingerprint).
-          if (isCacheForensicsEnabled()) {
-            const forensicRecords = buildApiCacheForensicsRecords({
-              steps: Array.isArray(steps) ? steps : [],
-              agentId,
-              connectionId: connection?.id ?? connection?.service ?? null,
-              providerId: connection?.service ?? requestProviderId ?? null,
-              modelId: primaryModelId ?? null,
-              messageId,
-              experimentGroup: resolveCacheForensicsExperimentGroup(),
-            })
-            await attachCacheForensicsToSnapshot({
-              sessionId,
-              snapshotId: messageId,
-              records: forensicRecords,
-            })
-          }
+          await attachCacheForensicsToSnapshot({
+            sessionId,
+            snapshotId: messageId,
+            records: forensicRecords,
+          })
         }
       } catch (viewerPatchError) {
         console.error(
@@ -6358,15 +6231,14 @@ async function handleBatshitAgentStream({
       // measured 2.06 s). Not `onFinishResolved`: `onFinish` did not run.
       resolveOnFinish?.()
     },
+    ...apiToolFields,
+    preparedApiToolset,
+    agentSetup: formattedInput.agentSetup,
     }
   }
 
   const primaryConnection = primarySelection.connection
-  const primaryModelId = isCodexProvider
-    ? 'codex/codex-cli'
-    : isClaudeProvider
-      ? 'claude/claude-cli'
-      : effectiveModelId || 'claude-3-5-sonnet-20241022'
+  const primaryModelId = effectiveModelId || 'claude-3-5-sonnet-20241022'
   // SA-102 P1 (DL-102-01): the agent-level primary_model_*
   // values are NOT applied a second time here. They already reach the request
   // as `fallbacks` on buildRuntimeModelSettings above, which is the one place
@@ -6398,8 +6270,8 @@ async function handleBatshitAgentStream({
   //
   // Everything above this point is setup: the compile, the model presets, the bridge
   // import, the Execution Viewer snapshot. On a large prompt that is 3–6 seconds on the
-  // API lane and 5–9 on Codex, and until now nothing looked at the abort signal during
-  // it. `registerStreamAbort` had not run yet, so a Stop landing in that window reached
+  // API lane, and until now nothing looked at the abort signal during it.
+  // `registerStreamAbort` had not run yet, so a Stop landing in that window reached
   // the interrupt route, found only the session-turn lock, answered `stale_turn_cleared`,
   // and the run carried on to a full answer (P0 spike #7 and #8).
   //
@@ -6476,29 +6348,12 @@ async function handleBatshitAgentStream({
    * steering may sit between them and `registerStreamAbort`. It is a pure function of
    * things already resolved, so it costs nothing to do it early.
    *
-   * This is the only place that knows all three inputs: the primary agent type, whether
-   * this is a group member's run, and — for a `cli` primary — which transport lane the
-   * bridge is about to take. `resolveCodexTransportLane` is the SAME function
-   * `CodexBridge.createRunner` calls moments later with the same `configScope`, which is
-   * what makes the promise the route gives the user and the channel the bridge actually
-   * opens one decision rather than two that can drift.
+   * This is the only place that knows both inputs: the primary agent type and whether this
+   * is a group member's run.
    */
   const steerVerdict = resolveSteerability({
     primaryAgentType,
     isGroupSession: Boolean(groupContext) || streamMetadata?.groupChat === true,
-    cli: isCliProvider
-      ? {
-          provider: isCodexProvider ? 'codex' : isClaudeProvider ? 'claude' : null,
-          configScope:
-            codexRuntimeSettings?.configScope ?? claudeRuntimeSettings?.configScope ?? null,
-          codexTransport: isCodexProvider
-            ? resolveCodexTransportLane(
-                { configScope: codexRuntimeSettings?.configScope ?? null },
-                process.env,
-              )
-            : null,
-        }
-      : null,
   })
 
   // BL-600: the round's first member to get here records the Clips its compile read; the round
@@ -6565,12 +6420,8 @@ async function handleBatshitAgentStream({
     }
   }
 
-  // BL-527: the Judge Juice lanes' writes ride the same accepted-send boundary, for every run whose
-  // compile ran them: a new user turn above, and also a managed CLI control-approval resume. That
-  // resume is a NEW turn (its user message is the approval) that spends no clip, countdown, or
-  // memory commit (`consumeSessionClips` is false, DL-116-08), but its compile opened what Jev
-  // chose and told the agent its notes, so the state must match the prompt. An API approval resume
-  // and a context continuation built no lane (`messageForCompilation` is empty).
+  // BL-527: Judge Juice writes ride the accepted-send boundary for a new user turn. An API
+  // approval resume and a context continuation built no lane (`messageForCompilation` is empty).
   //
   // SA-120 P5: the zip state the compile used becomes real here and nowhere earlier, on the
   // same accepted-send boundary (a send that never reached it opened nothing). Each write
@@ -6581,6 +6432,7 @@ async function handleBatshitAgentStream({
   if (jevJuiceSmartZip && messageForCompilation && !groupContext) {
     const opens = jevJuiceSmartZip.getOpens()
     if (opens.length > 0) {
+      const skippedSkillSources: Array<{ zipId: string; reason: string }> = []
       const stored = await writeInferredUnzips(
         sessionId,
         opens.map((open) => ({
@@ -6590,7 +6442,12 @@ async function handleBatshitAgentStream({
           probability: open.probability,
           durationMessages: open.durationMessages,
         })),
+        { onSkipped: (entry) => skippedSkillSources.push(entry) },
       )
+      if (skippedSkillSources.length) {
+        const row = [...jevJuiceTurn.records].reverse().find((entry) => entry.feature === 'smart_zip')
+        if (row) row.detail = [row.detail, ...skippedSkillSources.map((entry) => `${entry.zipId}: not opened (${entry.reason})`)].filter(Boolean).join('; ')
+      }
       jevJuiceTurn.zips.opened.push(
         ...opens
           .filter((open) => stored.includes(open.zipId))
@@ -6612,6 +6469,8 @@ async function handleBatshitAgentStream({
     if (told.length > 0) await markInferredRezipsTold(sessionId, told)
   }
 
+  if (messageForCompilation && !groupContext) await skillSessionTurn.markTold()
+
   // SA-120 P6: the notes about the previous reply were in this send's prompt, and the send was
   // accepted, so they are marked as told here and nowhere earlier (one turn, like
   // `control_errors`; a send that never reached this boundary told nobody).
@@ -6630,6 +6489,8 @@ async function handleBatshitAgentStream({
     steerable: steerVerdict.steerable,
     reason: steerVerdict.steerable ? null : steerVerdict.reason,
     lane: steerVerdict.steerable ? steerVerdict.lane : null,
+    // SA-139 BL-2358: on the Claude plan connection an agent DM reaches Claude as a hook note.
+    ...(primaryAgentType === 'api' && isClaudePlanSelection(primaryConnection) ? { dmSteerLimit: CLAUDE_PLAN_HOOK_NOTE_LIMIT } : {}),
   })
   steerRunRegistered = true
 
@@ -6719,6 +6580,7 @@ async function handleBatshitAgentStream({
     // A real failure uses terminal error cleanup; an expected Stop above uses complete so it never
     // draws a false provider-error banner.
     await persistFailedAssistantTurn({
+      mcpOriginalPreparation, mcpApiPart,
       sessionId,
       userId,
       agentId,
@@ -6801,7 +6663,6 @@ async function handleBatshitAgentStream({
       imageBaseUrl: primaryImageConfig.imageBaseUrl,
       preferRemoteUrl: !isLocalProviderId(primaryProviderIdForImages),
     })
-    resetMeasuredStreamTiming()
     streamResult = await nativeRuntime.streamNativeMode(
       buildStreamRequest(
         primaryModelId,
@@ -6818,6 +6679,14 @@ async function handleBatshitAgentStream({
   } catch (primaryError) {
     const terminalError = preserveAcquisitionFailureVersion(primaryError)
     await closeStartedAcquisitionFailure(terminalError)
+    // SA-139 D6 (Faye's P3 Part 3 read, S2): the click's answer was recorded Approved, but the run behind the
+    // card ended unused (the Claude model, effort or Thinking changed). The failed record's save merges its
+    // metadata onto the stored card and keeps answered entries (`redis.saveMessage`, `keepAnsweredApprovals`),
+    // so once it is saved the card's entries are marked "Expired: the reply ended" in every tab, never Approved.
+    if (approvalResumeStart && primaryError instanceof ClaudePlanRunError && primaryError.code === 'resume_changed') {
+      await markClaudePlanCardRunEnded({ sessionId, userId, messageId, eventFetch, request,
+        approvalIds: toolApprovalResponse.map((entry: any) => typeof entry?.approvalId === 'string' ? entry.approvalId.trim() : '').filter(Boolean) })
+    }
     clearStreamAbort(sessionId, messageId)
     throw terminalError
   }
@@ -6852,31 +6721,6 @@ async function handleBatshitAgentStream({
         runtimeInfo.connectionId ?? runtimeSnapshot.connectionId
       runtimeSnapshot.modelName =
         runtimeInfo.modelName ?? runtimeSnapshot.modelName
-    } else if (
-      (isCodexProvider || isClaudeProvider) &&
-      (result as any).__transport &&
-      !runtimeSnapshot.transport
-    ) {
-      const transportHint = (result as any).__transport
-      if (isCodexProvider) {
-        runtimeSnapshot.transport =
-          transportHint === 'sdk'
-            ? 'codex-sdk'
-            : transportHint === 'app-server'
-              ? 'codex-app-server'
-              : transportHint === 'exec'
-                ? 'codex-exec'
-            : transportHint === 'cli'
-              ? 'codex-cli'
-              : 'unknown'
-      } else if (isClaudeProvider) {
-        runtimeSnapshot.transport =
-          transportHint === 'sdk'
-            ? 'claude-sdk'
-            : transportHint === 'cli'
-              ? 'claude-cli'
-              : 'unknown'
-      }
     }
 
     try {
@@ -6888,39 +6732,6 @@ async function handleBatshitAgentStream({
         '[Send-Routed] Failed to persist resolved runtime details before streaming:',
         runtimePatchError,
       )
-    }
-
-    if (Array.isArray((result as any).__rawEvents)) {
-      runtimeEventLogBuffer = (result as any).__rawEvents
-    }
-    if (Array.isArray((result as any).__helperDelegatedSteps)) {
-      helperDelegatedSteps = (result as any).__helperDelegatedSteps
-    }
-
-    /**
-     * SA-114 P2 (DL-114-06, DL-114-08) — the managed CLI steer channel, if this run has one.
-     *
-     * Registered HERE and nowhere earlier, because the child process only exists once
-     * `streamNativeMode` has resolved. The API lane never sets `__steer`: its hook pulls at
-     * the next step instead, so the steer route finds no transport and simply leaves the
-     * entry waiting. A Codex run on the `exec` lane sets none either, which is the same
-     * refusal `steerVerdict` already gave the user before they could try.
-     */
-    const steerChannel = (result as any).__steer
-    const steerChannelLane = (result as any).__steerLane as SteerLane | null | undefined
-    if (
-      steerDeliveryEnabled &&
-      steerVerdict.steerable &&
-      typeof steerChannel === 'function' &&
-      (steerChannelLane === 'codex' || steerChannelLane === 'claude')
-    ) {
-      attachSteerTransport(sessionId, messageId, steerChannelLane, async (payload) => {
-        const answer = await steerChannel(payload)
-        // Codex answers `{accepted}`; Claude answers a boolean write result. Both mean the
-        // same thing here: did the transport TAKE it. Delivery is the echo, which arrives
-        // later as a synthetic `steer` chunk in this same stream.
-        return typeof answer === 'boolean' ? answer : Boolean(answer?.accepted)
-      })
     }
 
     detectToolSource =
@@ -6939,13 +6750,6 @@ async function handleBatshitAgentStream({
     pendingControlPieces = []
     controlsResolvedBySegment = null
     silentResponse = false
-
-    // Codex CLI can take a while before the first chunk; show a UI-only
-    // indicator until real reasoning/text/tool events arrive.
-    if (isCodexProvider) {
-      await ensureStartEmitted()
-      await emitThinkingIndicator()
-    }
 
     /**
      * BL-759: what follows the leading control block is the end of the buffer, so each piece keeps
@@ -6990,7 +6794,14 @@ async function handleBatshitAgentStream({
     }
 
     shouldBreakStream = false
-    for await (const chunk of result.stream) {
+    // BL-1959: a Stop during a running tool call still hands that call's result to this loop, so
+    // the stopped reply records it like any other (`lateToolResults.ts`). A tool still running 3 s
+    // after the Stop ends the stream early; the SDK then calls no `onAbort`, so that end releases
+    // the wait for `onFinish` the same way (`onFinishResolved` stays false: it did not run).
+    for await (const chunk of withToolResultsOnStop(result.stream, streamAbortSignal, {
+      onEarlyEnd: () => resolveOnFinish?.(),
+      contextErrorDrainDeadline: () => contextErrorDrainDeadline,
+    })) {
       // SA-114 P1 (DL-114-04): anything the transport handed to the model since the last
       // chunk is written into the transcript HERE, before this chunk is processed — which
       // is what places the marker after the tool results that preceded delivery and before
@@ -7002,9 +6813,16 @@ async function handleBatshitAgentStream({
       // even earlier. Counting consumed steps is what makes the position deterministic.
       await drainSteersIntoTranscript()
       streamStepRecorder.observe(chunk)
+      // BL-1782: the step's own `finish-step` is still recorded below; the loop then ends with
+      // this failure, as with an `error` part.
+      const streamFormatFailure = gatewayStreamFormatCheck?.observe(chunk) ?? null
+      if (streamFormatFailure) {
+        contextErrorDrainAdmitted = false
+        streamRuntimeError = streamFormatFailure
+        shouldBreakStream = true
+      }
       switch (chunk.type) {
         case 'text-delta': {
-          if ((chunk as any).text) markMeasuredFirstOutput()
           const textChunk = stripRepeatedLeadingGroupControls((chunk as any).text || '')
           // BL-759: a managed lane names the segment (the vendor message) of each text chunk.
           const textSegmentId =
@@ -7041,10 +6859,9 @@ async function handleBatshitAgentStream({
         }
         case 'text-retract': {
           // BL-759: a managed lane took back a message its vendor never finished and started
-          // again (Codex's app-server lane after a dropped response stream; the adapter hands the
-          // retract on right before the new attempt writes anything). Its words leave this
-          // request's own copy and the group control buffer, and `/api/sse` takes them out of the
-          // reply's record and tells every tab (`content_reset`). A forward that fails, or one that
+          // again (the adapter hands the retract on right before the new attempt writes
+          // anything). Its words leave this request's own copy and the group control buffer, and
+          // `/api/sse` takes them out of the reply's record and tells every tab (`content_reset`). A forward that fails, or one that
           // `/api/sse` answers without success (it could not take the words back exactly), makes
           // the reply a gap: the finalize then saves this copy, already without them.
           const retractedSegmentId =
@@ -7081,7 +6898,6 @@ async function handleBatshitAgentStream({
         case 'reasoning': {
           // OpenAI reasoning summaries stream via `part.type === 'reasoning'`
           // with `textDelta` (Vercel AI SDK).
-          markMeasuredFirstOutput()
           const handledAsIndicator = await handleReasoningIndicator()
           const delta =
             (chunk as any).textDelta ??
@@ -7111,7 +6927,6 @@ async function handleBatshitAgentStream({
         }
         case 'reasoning-start':
         case 'reasoning_start': {
-          markMeasuredFirstOutput()
           const initial = (chunk as any).text || (chunk as any).content || ''
           const handledAsIndicator = await handleReasoningIndicator()
           if (handledAsIndicator) {
@@ -7180,17 +6995,13 @@ async function handleBatshitAgentStream({
           await ensureStartEmitted()
           if (!content) break
 
-          // Codex emits full reasoning content on each update. Stream as replace events.
+          // A managed lane's `thinking` update carries the whole reasoning so far. Stream as
+          // replace events.
           await replaceReasoningSnapshot(content, Boolean(thinkingChunk?.final))
           break
         }
         case 'tool-call': {
           await flushRawReasoningFallback()
-          // BL-1358: a Codex plan is shown, so it is output, but it is not a tool window. Its call
-          // comes when the plan starts and its results at each update, while real tool calls run
-          // in between, so counting it opened and closed real calls' windows.
-          if (isPlanUpdateTool((chunk as any).toolName)) markMeasuredFirstOutput()
-          else markMeasuredToolCallStart()
           if (controlsMode === 'listening') {
             silentResponse = true
             shouldBreakStream = true
@@ -7201,7 +7012,7 @@ async function handleBatshitAgentStream({
           await ensureReasoningSegmentBoundary()
           const toolCall = chunk as any
           const rawArgs = toolCall.input ?? toolCall.args ?? {}
-          const args = normalizeToolArgs(rawArgs)
+          const args = normalizeToolArgs(rawArgs, toolCall.toolName)
           const nativeBashMapping = resolveNativeBashMapping({
             toolName: toolCall.toolName,
             args,
@@ -7214,10 +7025,6 @@ async function handleBatshitAgentStream({
           const resolvedToolCallId =
             resolveToolCallIdFromEvent(toolCall) ||
             `tool_${Date.now()}_${crypto.randomUUID().replace(/-/g, '').slice(0, 10)}`
-          if (isPlanUpdateTool(toolCall.toolName)) {
-            await emitPlanUpdate(rawArgs)
-            break
-          }
           if (isImageToolName(toolCall.toolName)) {
             logger.debug('[Send-Routed] Image tool call', {
               sessionId,
@@ -7366,8 +7173,6 @@ async function handleBatshitAgentStream({
         // and the call gets its zip, step, and Execution Viewer row saying why it failed.
         case 'tool-error':
         case 'tool-result': {
-          // BL-1358: a plan result closes no window (see the `tool-call` case).
-          if (!isPlanUpdateTool((chunk as any).toolName)) markMeasuredToolCallEnd()
           if (controlsMode === 'listening') {
             silentResponse = true
             shouldBreakStream = true
@@ -7376,36 +7181,17 @@ async function handleBatshitAgentStream({
           await flushPendingControlText()
           await ensureStartEmitted()
           await ensureReasoningSegmentBoundary()
+          // BL-610: a `dynamic` result (the API lane's Subagent and workflow tools are the SDK's
+          // `dynamicTool`s) goes through this same path. It was skipped here, so a Subagent call
+          // that succeeded kept its card open, and the page held back every later word, until the
+          // reply ended; with an ordinary tool in the same reply it also lost its step, zip, and
+          // spend, because the finish then reads only the steps streamed here.
           const toolResult =
             chunk.type === 'tool-error'
               ? toolErrorAsFailedToolResult(chunk as any)
               : (chunk as any)
-          if (toolResult?.dynamic) {
-            if (isImageToolName(toolResult.toolName)) {
-              logger.debug('[Send-Routed] Image tool-result skipped (dynamic)', {
-                sessionId,
-                messageId,
-                toolName: toolResult.toolName,
-                toolCallId: toolResult.toolCallId,
-              })
-            }
-            break
-          }
           const rawArgs = toolResult.input ?? toolResult.args ?? {}
-          const args = normalizeToolArgs(rawArgs)
-          if (isPlanUpdateTool(toolResult.toolName)) {
-            if (chunk.type === 'tool-error') break
-            const planPayload =
-              toolResult.output ??
-              toolResult.result ??
-              toolResult.data ??
-              toolResult.content ??
-              toolResult.items ??
-              rawArgs ??
-              args
-            await emitPlanUpdate(planPayload)
-            break
-          }
+          const args = normalizeToolArgs(rawArgs, toolResult.toolName)
           let resultPayload = normalizeToolResult(
             toolResult.output ??
               toolResult.result ??
@@ -7452,10 +7238,11 @@ async function handleBatshitAgentStream({
           /**
            * SA-116 DL-116-07 — a control pause that arrived as a tool RESULT.
            *
-           * This is the ONE loop every lane feeds, which is why the CLI lanes' card lives
-           * here rather than in a bridge: the managed Codex/Claude helper's call has already
-           * been made by the time the gate refuses it, so the refusal comes back as an
-           * ordinary tool result rather than as an SDK `tool-approval-request`. Registering
+           * This is the ONE loop every lane feeds, which is why a non-API lane's card lives
+           * here rather than in a bridge: a helper's call has already been made by the time
+           * the gate refuses it, so the refusal comes back as an ordinary tool result rather
+           * than as an SDK `tool-approval-request` (the Claude Code CLI Primary made these
+           * until SA-139 R4 removed it). Registering
            * it in the same map the SDK pause uses means the finish path persists
            * `metadata.toolApprovals` identically — with no tab open too, because the finish
            * path runs regardless of listeners (AMD-113-01).
@@ -7695,6 +7482,7 @@ async function handleBatshitAgentStream({
                 globalZipSettings,
                 {
                   reservedZipIdsByToolCallId: reservedToolZipIdsByCallId,
+                  skillSessionActor: { userId, agentId: agent.id, agentCreatedAt: agent.created_at },
                 },
               )
 
@@ -7728,8 +7516,8 @@ async function handleBatshitAgentStream({
             // This copy is the Execution Viewer's row, the saved message's step, and the `end`
             // event's. The lane's own error (Claude Code's `is_error`, which the zip step above
             // already carries) wins; otherwise the result's, by the stored zip's rules. Both were
-            // once overwritten here by the raw result's flag, so a failed Claude or Codex command
-            // was a Success row (fp65h).
+            // once overwritten here by the raw result's flag, so a failed CLI command was a
+            // Success row (fp65h).
             const laneError = [toolResult.metadata?.error, toolResultEvent.metadata?.error].find(
               (value): value is string => typeof value === 'string' && value.trim().length > 0,
             )
@@ -7805,37 +7593,48 @@ async function handleBatshitAgentStream({
           }
           streamRuntimeError = normalizedError
           shouldBreakStream = true
-          break
-        }
-        case 'steer': {
-          /**
-           * SA-114 P2 — a managed CLI told us the model has the user's mid-reply words.
-           *
-           * This is the CLI half of F-P1-3, and it is deliberately the mirror image of the
-           * API lane's gate rather than a copy of it. The API lane holds a delivered steer
-           * until the loop has consumed the `finish-step` of the step it was read after,
-           * because the SDK runs AHEAD of this loop and "which chunk is in hand" proves
-           * nothing about where the step boundary sits. A CLI stream has no `finish-step`
-           * chunks at all — there is no count for such a gate to consume — but it does not
-           * need one: the echo arrives IN the stream, 2-6 ms after the tool result that
-           * preceded delivery, so its position in the stream IS the position the marker
-           * belongs at. Marking delivered here and draining unbounded puts it exactly there.
-           * Marking it in the adapter with a step the gate could never reach would instead
-           * leave it waiting for the forced finish drain and land it at the very end.
-           */
-          const steerChunk = chunk as any
-          const steerIds = Array.isArray(steerChunk.steerIds) ? steerChunk.steerIds : []
-          const echoLane: SteerLane =
-            steerChunk.lane === 'codex' || steerChunk.lane === 'claude'
-              ? steerChunk.lane
-              : 'api'
-          if (steerDeliveryEnabled && steerIds.length > 0) {
-            confirmSteerDelivery(sessionId, messageId, {
-              steerIds,
-              step: finishedStepsConsumed,
-              lane: echoLane,
-            })
-            await drainSteersIntoTranscript(true)
+          if (contextErrorDrainDeadline === undefined && mcpApiRun && mcpApiPart &&
+            !streamAbortSignal.aborted && isContextExhaustedStreamFailure(normalizedError) && p5ApiManagedMcpActive(mcpApiRun)) {
+            const deadline = performance.now() + CONTEXT_ERROR_DRAIN_WAIT_MS
+            contextErrorDrainDeadline = deadline
+            assertP5ApiRunCurrent(mcpApiRun)
+            const owner = await import('$lib/server/services/vercelBrain')
+            if (owner.readP5ApiStreamSettlement(mcpApiRun)?.finishKnown !== true) {
+              // Do not pull to obtain quiescence: pulling the SDK can issue another provider/tool
+              // step. Its existing GLOBAL callback can settle independently of this queued copy.
+              let timer: ReturnType<typeof setTimeout> | undefined
+              let stopped: (() => void) | undefined
+              try {
+                await Promise.race([
+                  onFinishPromise,
+                  new Promise<void>((resolve) => {
+                    // As onEarlyEnd does for Stop, release only the later wait notification.
+                    // onFinishResolved/global finish/consumed remain actual owner facts.
+                    stopped = () => { resolveOnFinish?.(); resolve() }
+                    timer = setTimeout(stopped, Math.max(0, deadline - performance.now()))
+                    if (streamAbortSignal.aborted) stopped()
+                    else streamAbortSignal.addEventListener('abort', stopped, { once: true })
+                  }),
+                ])
+                // request.onFinish releases the promise before the Brain's awaited callback
+                // records its global finish. This yields no SDK read or new source of authority.
+                await Promise.resolve()
+              } finally {
+                if (timer) clearTimeout(timer)
+                if (stopped) streamAbortSignal.removeEventListener('abort', stopped)
+              }
+            }
+            if (!streamAbortSignal.aborted && performance.now() < deadline &&
+              owner.readP5ApiStreamSettlement(mcpApiRun)?.finishKnown === true) {
+              assertP5ApiRunCurrent(mcpApiRun)
+              // Installed SDK global flush runs only after terminal close, past every recursive
+              // streamStep dispatch. This admits queued tail reads, NOT a consumed/save receipt.
+              contextErrorDrainAdmitted = true
+              shouldBreakStream = false
+            }
+          } else {
+            // A second stream error is not a terminal certificate for the first one.
+            contextErrorDrainAdmitted = false
           }
           break
         }
@@ -7854,6 +7653,12 @@ async function handleBatshitAgentStream({
           await ensureReasoningSegmentBoundary()
           const finishChunk = chunk as any
           streamFinishReason = finishChunk.finishReason ?? null
+          // A drained error tail records the actual finish but never publishes partial totals as
+          // an aggregate bill. The failure recorder below still owns null usage and the partial.
+          if (contextErrorDrainDeadline !== undefined) {
+            shouldBreakStream = true
+            break
+          }
           const usage = withHonestLocalCacheUsage(
             finishChunk.totalUsage || finishChunk.usage || rawUsageFromStream,
             streamLocalCacheReporting,
@@ -7894,6 +7699,19 @@ async function handleBatshitAgentStream({
         onFinishPromise,
         new Promise<void>((resolve) => setTimeout(resolve, 2000)),
       ])
+    }
+
+    // Only this real consumer observes all contributing output/usage and the actual finish callback.
+    // A timeout of the callback wait is not known consumed work. Late facts stay in their owners.
+    if (mcpApiRun && streamFinishReason !== null && contextErrorDrainDeadline === undefined && onFinishResolved) {
+      const owner = await import('$lib/server/services/vercelBrain')
+      owner.observeP5ApiConsumedStream(result)
+    } else if (mcpApiRun && mcpApiPart && streamFinishReason !== null && contextErrorDrainAdmitted &&
+      contextErrorDrainDeadline !== undefined && !streamAbortSignal.aborted && performance.now() < contextErrorDrainDeadline) {
+      const owner = await import('$lib/server/services/vercelBrain')
+      assertP5ApiRunCurrent(mcpApiRun)
+      if (!streamAbortSignal.aborted && performance.now() < contextErrorDrainDeadline &&
+        owner.readP5ApiStreamSettlement(mcpApiRun)?.finishKnown === true) owner.observeP5ApiConsumedStream(result)
     }
 
     // A stopped stream is interrupted, whatever else it ended with (`streamStop.ts`). The SDK can
@@ -7941,13 +7759,13 @@ async function handleBatshitAgentStream({
             agentId: agentId || null,
             sessionId,
             messageId,
-            approvals,
+            approvals, p5ApiRun: mcpApiRun, abortSignal: streamAbortSignal,
           })
         : approvals
 
     if (toolApprovalRequests.length > 0) {
       const approvalSummary: ToolApprovalSummary = {
-        mode: runToolApprovalMode,
+        mode: toolApprovalMode,
         approvals: await withControlRecords(toolApprovalRequests),
         source: 'vercel',
       }
@@ -7966,7 +7784,7 @@ async function handleBatshitAgentStream({
       if (pendingStreamedApprovals.length > 0) {
         const approvals = await withControlRecords(pendingStreamedApprovals)
         const approvalSummary: ToolApprovalSummary = {
-          mode: runToolApprovalMode,
+          mode: toolApprovalMode,
           approvals,
           source: resolveApprovalSummarySource(approvals),
         }
@@ -7994,66 +7812,64 @@ async function handleBatshitAgentStream({
         finishSummary.usage = fallbackUsage
       }
 
-      if (!isCliProvider) {
-        try {
-          const sanitizedToolSteps = sanitizePayloadForLogs(
-            Array.isArray(finishSummary.intermediateSteps)
-              ? finishSummary.intermediateSteps
-              : [],
-          )
-          const capture = buildVercelLlmCapture({
-            steps: lastStreamSteps ?? [],
-            totalUsage: fallbackUsage ?? null,
-            finalText: lastStreamText,
-            providerId:
-              primaryConnection?.service ??
-              primaryProviderId ??
-              null,
-          })
+      try {
+        const sanitizedToolSteps = sanitizePayloadForLogs(
+          Array.isArray(finishSummary.intermediateSteps)
+            ? finishSummary.intermediateSteps
+            : [],
+        )
+        const capture = buildVercelLlmCapture({
+          steps: lastStreamSteps ?? [],
+          totalUsage: fallbackUsage ?? null,
+          finalText: lastStreamText,
+          providerId:
+            primaryConnection?.service ??
+            primaryProviderId ??
+            null,
+        })
 
-          const stepsForCount = Array.isArray(lastStreamSteps)
-            ? lastStreamSteps
-            : streamedToolSteps
-          const toolCallsTotal = stepsForCount.reduce(
-            (sum: number, step: any) => {
-              const count = Array.isArray(step?.toolCalls)
-                ? step.toolCalls.length
-                : 0
-              return sum + count
-            },
-            0,
-          )
+        const stepsForCount = Array.isArray(lastStreamSteps)
+          ? lastStreamSteps
+          : streamedToolSteps
+        const toolCallsTotal = stepsForCount.reduce(
+          (sum: number, step: any) => {
+            const count = Array.isArray(step?.toolCalls)
+              ? step.toolCalls.length
+              : 0
+            return sum + count
+          },
+          0,
+        )
 
-          await executionViewerService.updateSnapshot(sessionId, messageId, withPriorRunAccounting({
-            llmSummary: capture.llmSummary,
-            llmCalls: capture.llmCalls,
-            intermediateSteps: withPriorRunSteps(sanitizedToolSteps),
-            responseSummary: {
-              content: {
-                value: finishSummary.content || finishSummary.text || '',
-                confidence: 'exact',
-              },
-              usage: buildTokenUsage(
-                fallbackUsage ?? null,
-                'near',
-                'raw-chunk',
-              ),
-              toolCallsCount: buildTokenStat(
-                toolCallsTotal,
-                'exact',
-                'vercel ai sdk',
-              ),
-              notes: [
-                'Usage totals sourced from raw stream chunk (provider did not return usage in the finish event).',
-              ],
+        await executionViewerService.updateSnapshot(sessionId, messageId, withPriorRunAccounting({
+          llmSummary: capture.llmSummary,
+          llmCalls: capture.llmCalls,
+          intermediateSteps: withPriorRunSteps(sanitizedToolSteps),
+          responseSummary: {
+            content: {
+              value: finishSummary.content || finishSummary.text || '',
+              confidence: 'exact',
             },
-          }))
-        } catch (viewerPatchError) {
-          console.error(
-            '[Send-Routed] Failed to backfill execution snapshot usage from raw chunk:',
-            viewerPatchError,
-          )
-        }
+            usage: buildTokenUsage(
+              fallbackUsage ?? null,
+              'near',
+              'raw-chunk',
+            ),
+            toolCallsCount: buildTokenStat(
+              toolCallsTotal,
+              'exact',
+              'vercel ai sdk',
+            ),
+            notes: [
+              'Usage totals sourced from raw stream chunk (provider did not return usage in the finish event).',
+            ],
+          },
+        }))
+      } catch (viewerPatchError) {
+        console.error(
+          '[Send-Routed] Failed to backfill execution snapshot usage from raw chunk:',
+          viewerPatchError,
+        )
       }
     }
 
@@ -8094,6 +7910,7 @@ async function handleBatshitAgentStream({
           describeOutputLimitStop({
             outputTokens: lastStepOutputTokens ?? outputTokens ?? null,
             wroteReply: false,
+            claudePlan: Boolean(streamResult?.__claudePlanModel),
           }),
           OUTPUT_LIMIT_ERROR_CODE,
           502,
@@ -8109,6 +7926,8 @@ async function handleBatshitAgentStream({
         502,
       )
     }
+
+    if (mcpApiRun && p5ApiRunMustPause(mcpApiRun)) holdP5ApiToolImages(mcpApiRun)
 
     if (silentResponse) {
       await emitThinkingIndicatorStop()
@@ -8126,7 +7945,7 @@ async function handleBatshitAgentStream({
       // failed turn of its own kind, with its words and tool work kept.
       if (isOutputLimitFinish(streamFinishReason)) {
         replyOutputLimitFailure = outputLimitFailureMetadata(
-          describeOutputLimitStop({ outputTokens: lastStepOutputTokens, wroteReply: true }),
+          describeOutputLimitStop({ outputTokens: lastStepOutputTokens, wroteReply: true, claudePlan: Boolean(streamResult?.__claudePlanModel) }),
         )
       }
       await finalizeAssistantMessage('postStream')
@@ -8160,7 +7979,8 @@ async function handleBatshitAgentStream({
       !silentResponse &&
       !replyAwaitsApproval &&
       !replyOutputLimitFailure &&
-      (afterReplySmartZip || afterReplyCheck)
+      !(mcpApiRun && p5ApiRunMustPause(mcpApiRun)) &&
+      (afterReplySmartZip || afterReplyCheck || resolveAgentJevSkillSessionsEnabled(agent))
     ) {
       // The reply as the model wrote it: the after-reply check asks whether it tried a memory
       // save, which the stored (cleaned) text no longer shows (SA-129 P2).
@@ -8169,6 +7989,11 @@ async function handleBatshitAgentStream({
         .map((reference) => reference?.zipId)
         .filter((zipId): zipId is string => typeof zipId === 'string' && zipId.length > 0)
       const earlierParts = jevJuiceContinuedReply?.earlierParts ?? []
+      // BL-775: SDK/raw finish text can omit earlier streamed prose or name different tool
+      // marks. Skill completion uses only the confirmed canonical saved receipt, never an
+      // own-copy fallback whose stream gap makes whole-reply evidence uncertain.
+      const skillSavedReply = savedReply as { content: string; metadata: Record<string, any> } | null
+      const skillSavedReplyComplete = savedReplyFromRecord && !!skillSavedReply && skillSavedReply.metadata[REPLY_SAVED_FROM_OWN_COPY_KEY] !== true
       const smartZipStep = afterReplySmartZip
         ? afterReplySmartZip.runPostTurn({ messageId, reply: finishedReply, newZipIds, earlierParts })
         : Promise.resolve([])
@@ -8188,7 +8013,18 @@ async function handleBatshitAgentStream({
             appendRowsAfter: smartZipStep,
           })
         : Promise.resolve(null)
-      await Promise.all([smartZipStep, postTurnCheckStep])
+      const skillSessionStep = resolveAgentJevSkillSessionsEnabled(agent)
+        ? skillSessionTurn.runPostTurn({
+            messageId,
+            lineageComplete: skillSavedReplyComplete && (!(isApprovalResumeWithoutUserTurn || isContextContinuationRun) || !!jevJuiceContinuedReply?.skillSessionContext),
+            request: jevJuiceContinuedReply?.skillSessionContext?.request ?? (typeof messageForCompilation === 'string' ? messageForCompilation : ''),
+            reply: skillSavedReply?.content ?? '', earlierParts,
+            recentUserIntent: historyForCompilation.filter((entry) => entry.role === 'user' && typeof entry.content === 'string').map((entry) => String(entry.content)),
+            toolSteps: streamedToolSteps.length > 0 ? streamedToolSteps : Array.isArray(finishSummary.intermediateSteps) ? finishSummary.intermediateSteps : [],
+            origin: getWakeRun(sessionId) || (currentMessageFrom ?? resolveCurrentMessageFrom({ metadata })) === 'batshit'
+              ? 'wake' : jevJuiceContinuedReply?.skillSessionContext ? 'trusted_resume' : 'user',
+          }) : Promise.resolve()
+      await Promise.all([smartZipStep, postTurnCheckStep, skillSessionStep])
     }
 
     const response = json({
@@ -8207,6 +8043,8 @@ async function handleBatshitAgentStream({
       metadata: finishSummary.metadata ?? {},
       usage: finishSummary.usage ?? streamAdapter.getUsage(),
       awaitsApproval: replyAwaitsApproval,
+      ...(mcpApiRun && p5ApiRunMustPause(mcpApiRun) && !replyAwaitsApproval ? { p5ManagementPause: true as const } : {}),
+      savedReply: silentResponse ? null : savedReply,
     }
   } catch (error: any) {
     const isAbortError = isStopError(error, [streamAbortSignal, request.signal])
@@ -8220,60 +8058,67 @@ async function handleBatshitAgentStream({
       console.error('[Send-Routed] Batshit agent streaming error:', error)
     }
 
+    // Freeze before any await: a later SDK callback cannot turn unknown failed-call usage into
+    // a whole bill. Completed-call evidence stays with the existing EV recorder/claim owner.
+    if (apiFailureUsage === undefined) {
+      apiFailureUsage = resolveFailedApiUsage({
+        aggregateUsage: apiAggregateUsage,
+        steps: streamStepRecorder.steps(isAbortError ? 'interrupted' : 'error'),
+        finishReason: streamFinishReason,
+      }) ?? null
+    }
+
     // BL-245: the model calls this run made, and its tool steps, as the stream showed them. The
-    // SDK's finish, which writes them for a finished run, never comes for a run that failed or
-    // was stopped mid-stream, and the snapshot kept none: a user could not see what a failed
-    // reply cost or did. A call that never finished has its usage unknown, never zero, and the
-    // run's total is unknown too. API lane only: the CLI lanes' calls are not steps. Written
-    // only if the finish callback has not claimed the calls (it may still be busy writing them).
-    if (!isCliProvider) {
-      const recordedSteps = streamStepRecorder.steps(isAbortError ? 'interrupted' : 'error')
-      if (recordedSteps.length > 0 && llmCaptureClaim.claim('failure')) {
-        try {
-          const capture = buildVercelLlmCapture({
-            steps: sanitizePayloadForLogs(recordedSteps) as any[],
-            totalUsage: null,
-            finalText: null,
-            providerId:
-              primaryConnection?.service ??
-              primaryProviderId ??
-              null,
-          })
-          const sanitizedToolSteps = sanitizePayloadForLogs(streamedToolSteps)
-          await executionViewerService.updateSnapshot(sessionId, messageId, withPriorRunAccounting({
-            llmCalls: capture.llmCalls,
-            llmSummary: capture.llmSummary,
-            intermediateSteps: withPriorRunSteps(sanitizedToolSteps),
-            // BL-525: a resume that failed or was stopped after it called the model has an unknown
-            // half, so the message's usage is unknown too; left alone, the paused half's summary
-            // (which the Token Panel reads first) would stand for the whole message, exact.
-            ...(approvalResumePriorSnapshot?.responseSummary
-              ? {
-                  responseSummary: {
-                    content: { value: '', confidence: 'exact' as const },
-                    usage: buildTokenUsage(null, 'estimated'),
-                    toolCallsCount: buildTokenStat(null, 'estimated'),
-                  },
-                }
-              : {}),
-          }))
-        } catch (captureError) {
-          console.error(
-            '[Send-Routed] Failed to keep the model calls of a failed run in its execution snapshot:',
-            captureError,
-          )
-        }
+    // SDK's finish may never arrive on failure/Stop, and an API error-step callback is deliberately
+    // refused before enrichment/claim so this recorder owns its evidence. Historically the snapshot
+    // kept none, hiding work and spend. An unfinished call and its run total have unknown usage,
+    // never zero. Written only if the finish callback has not claimed the calls (it may still be
+    // busy writing them).
+    const recordedSteps = streamStepRecorder.steps(isAbortError ? 'interrupted' : 'error')
+    if (recordedSteps.length > 0 && llmCaptureClaim.claim('failure')) {
+      try {
+        const capture = buildVercelLlmCapture({
+          steps: sanitizePayloadForLogs(recordedSteps) as any[],
+          totalUsage: null,
+          finalText: null,
+          providerId:
+            primaryConnection?.service ??
+            primaryProviderId ??
+            null,
+        })
+        const sanitizedToolSteps = sanitizePayloadForLogs(streamedToolSteps)
+        await executionViewerService.updateSnapshot(sessionId, messageId, withPriorRunAccounting({
+          llmCalls: capture.llmCalls,
+          llmSummary: capture.llmSummary,
+          intermediateSteps: withPriorRunSteps(sanitizedToolSteps),
+          // BL-525: a resume that failed or was stopped after it called the model has an unknown
+          // half, so the message's usage is unknown too; left alone, the paused half's summary
+          // (which the Token Panel reads first) would stand for the whole message, exact.
+          ...(approvalResumePriorSnapshot?.responseSummary
+            ? {
+                responseSummary: {
+                  content: { value: '', confidence: 'exact' as const },
+                  usage: buildTokenUsage(null, 'estimated'),
+                  toolCallsCount: buildTokenStat(null, 'estimated'),
+                },
+              }
+            : {}),
+        }))
+      } catch (captureError) {
+        console.error(
+          '[Send-Routed] Failed to keep the model calls of a failed run in its execution snapshot:',
+          captureError,
+        )
       }
     }
 
-    // BL-525: the finish callback is the only writer of `delegated`, and it never comes for a run
-    // that failed or was stopped mid-stream, so a Subagent or Worker that ran (and was billed)
-    // before the failure or the Stop was missing from the Token Panel's delegated spend. Built
-    // here from the tool steps the stream showed, on every lane, for the snapshot and for the
-    // record the Stop and failure paths below save.
+    // BL-525: when a finish callback did not complete (an API error-step callback is refused,
+    // and a failure/Stop may receive none), retain delegated spend from consumed tool steps.
+    // Historically a billed Subagent/Worker before failure was missing from the Token Panel.
+    // Built here for the snapshot and the record the Stop/failure paths save.
     const failedRunDelegated = onFinishResolved
       ? null
-      : buildDelegatedExecutionSummary([...streamedToolSteps, ...helperDelegatedSteps])
+      : buildDelegatedExecutionSummary([...streamedToolSteps])
     if (failedRunDelegated) {
       try {
         await executionViewerService.updateSnapshot(
@@ -8291,6 +8136,7 @@ async function handleBatshitAgentStream({
 
     const normalizedErrorMessage =
       error instanceof Error ? error.message : String(error ?? 'Unknown error')
+    const incompleteToolCallFailure = classifyIncompleteToolCallStreamFailure(error)
     const localImageFailure = classifyLocalImageUrlRuntimeFailure({
       errorMessage: normalizedErrorMessage,
       providerId: providerIdentifier || null,
@@ -8304,6 +8150,7 @@ async function handleBatshitAgentStream({
     const surfacedErrorMessage =
       localImageFailure?.userMessage ??
       imageInputFailure?.userMessage ??
+      incompleteToolCallFailure?.userMessage ??
       normalizedErrorMessage
     // A provider error chunk's own code counts too (BL-245 review): its sentence alone can say
     // nothing the classifier knows while its code says `context_length_exceeded`.
@@ -8393,49 +8240,43 @@ async function handleBatshitAgentStream({
         messageId,
         content: finishSummary.content || finishSummary.text || '',
         metadata: finishSummary.metadata ?? {},
-        usage: finishSummary.usage ?? undefined,
+        usage: apiFailureUsage ?? undefined,
+        savedReply,
       }
     }
 
-    const errorStatus = getFailureStatus(error)
+    const errorStatus = incompleteToolCallFailure?.status ?? getFailureStatus(error)
     const errorCode =
       localImageFailure?.code ??
       imageInputFailure?.code ??
+      incompleteToolCallFailure?.code ??
       getFailureCode(error) ??
       null
-    const failureUsage =
-      finishSummary.usage ??
-      lastResolvedUsage ??
-      rawUsageFromStream ??
-      null
+    const failureUsage = apiFailureUsage ?? null
     const failureRuntimeMetadata = {
       ...(approvalResumeStart ? { approvalResumeVersion: approvalResumeStart.version } : {}),
       provider: providerIdentifier || null,
       connection: connectionIdentifier || null,
       model: effectiveModelId || null,
-      runtimeId: isCodexProvider
-        ? 'codex'
-        : isClaudeProvider
-          ? 'claude'
-          : 'api',
+      runtimeId: 'api',
       agentType: primaryAgentType,
       voice: voiceMetadata,
       selectedTools,
       selectedGateways,
-      ...(hasUsageValues(failureUsage) ? { usage: failureUsage } : {}),
+      // Keep the fixed SDK diagnostic through the POST's repeated empty-failure save too.
+      ...(incompleteToolCallFailure ? { error_details: normalizedErrorMessage } : {}),
+      usage: failureUsage,
       ...(isApprovalResumeWithoutUserTurn && !hasUsageValues(failureUsage) ? { usage: null } : {}),
-      ...(finishSummary.observedUsage ? { observedUsage: finishSummary.observedUsage, usage: null } : {}),
       // BL-239: both failure writers below spread this, so an output-limit stop keeps its kind
       // on the partial record and on the empty one alike.
       ...(errorCode === OUTPUT_LIMIT_ERROR_CODE ? { failure_kind: OUTPUT_LIMIT_FAILURE_KIND } : {}),
-      // BL-958 (c), BL-941: the empty record keeps the reply's notes too, not only the finalize.
+      // BL-958 (c): the empty record keeps the reply's note too, not only the finalize.
       ...(answerRestartedAfterLostConnection
         ? { restartedAfterLostConnection: { program: restartedAnswerProgram } }
         : {}),
-      ...(modeLimitedByAgentSettings ? { modeLimitedByAgentSettings } : {}),
     }
 
-    const joinedFailureAccounting = isApprovalResumeWithoutUserTurn && approvalResumePrior
+    const joinedFailureAccounting: Record<string, any> = isApprovalResumeWithoutUserTurn && approvalResumePrior
       ? mergeResumedMetadata(approvalResumePrior.metadata, failureRuntimeMetadata)
       : failureRuntimeMetadata
     // Carry only usage accounting to the POST's repeated failure save. Reply-end keys
@@ -8460,7 +8301,7 @@ async function handleBatshitAgentStream({
         : null
     const hasPartialStreamedWork =
       Boolean(streamedReply.toString().trim()) ||
-      Boolean(showReasoning && (reasoningCaptured.trim() || planSummary.trim())) ||
+      Boolean(captureReasoning && reasoningCaptured.trim()) ||
       streamedToolZipReferences.length > 0 ||
       Boolean(finishSummary.content) ||
       Boolean(finishSummary.text) ||
@@ -8519,6 +8360,7 @@ async function handleBatshitAgentStream({
     // the failed record.
     if (!partialWorkPersisted) {
       await persistFailedAssistantTurn({
+        mcpOriginalPreparation, mcpApiPart,
         sessionId,
         userId,
         agentId,
@@ -8548,6 +8390,9 @@ async function handleBatshitAgentStream({
           provider: providerIdentifier || null,
           connection: connectionIdentifier || null,
           model: effectiveModelId || null,
+          ...(incompleteToolCallFailure ? { code: incompleteToolCallFailure.code } : {}),
+          // BL-1782: the Gateway's tool call that could not run is named, like BL-1569's.
+          ...(errorCode === GATEWAY_STREAM_FORMAT_ERROR_CODE ? { code: errorCode } : {}),
           ...(localImageFailure || imageInputFailure
             ? { code: (localImageFailure ?? imageInputFailure)?.code }
             : {}),
@@ -8560,7 +8405,7 @@ async function handleBatshitAgentStream({
       )
     }
 
-    if (errorCode === 'PROVIDER_EMPTY_RESPONSE' || errorCode === OUTPUT_LIMIT_ERROR_CODE) {
+    if (incompleteToolCallFailure || errorCode === 'PROVIDER_EMPTY_RESPONSE' || errorCode === OUTPUT_LIMIT_ERROR_CODE || errorCode === GATEWAY_STREAM_FORMAT_ERROR_CODE) {
       await persistRuntimeSnapshot('failed', normalizedErrorMessage)
       return {
         response: json(
@@ -8581,7 +8426,9 @@ async function handleBatshitAgentStream({
       }
     }
 
-    if (error instanceof Error && error.message?.includes('API key')) {
+    // A Claude plan run's failure keeps its own words (review B N1): Claude Code's text may name an API
+    // key, but the connection has no provider key to configure.
+    if (error instanceof Error && !(error instanceof ClaudePlanRunError) && error.message?.includes('API key')) {
       await persistRuntimeSnapshot('failed', normalizedErrorMessage)
       // SA-102 P5 (DL-102-09): a local program refusing a key is a different
       // problem from a missing cloud provider key, and the generic message sent
@@ -8593,7 +8440,7 @@ async function handleBatshitAgentStream({
       )
       const apiKeyErrorMessage = localProgram
         ? `${localProgram.label} refused the request because of its API key. Add or correct the key for ${localProgram.label} under Settings -> API Keys -> Local AI, or turn its key check off in ${localProgram.label}.`
-        : 'AI provider API key not configured for API or CLI agents'
+        : 'AI provider API key not configured for this agent'
       return {
         response: json(
         { error: apiKeyErrorMessage },
@@ -8652,11 +8499,11 @@ async function handleBatshitAgentStream({
     return {
       response: json(
         {
-          error: chatgptPlanHttpStatus(error) !== null ? surfacedErrorMessage : 'Failed to stream response',
+          error: planHttpStatus(error) !== null ? surfacedErrorMessage : 'Failed to stream response',
           details: surfacedErrorMessage,
-          ...(chatgptPlanHttpStatus(error) !== null && errorCode ? { code: errorCode } : {}),
+          ...(planHttpStatus(error) !== null && errorCode ? { code: errorCode } : {}),
         },
-        { status: chatgptPlanHttpStatus(error) ?? 500 },
+        { status: planHttpStatus(error) ?? 500 },
       ),
       messageId,
       content: '',
@@ -8668,9 +8515,11 @@ async function handleBatshitAgentStream({
   } finally {
     // BL-246: take back every abort relay first, so nothing outside keeps this scope alive.
     turnListeners.abort()
+    // SA-139 (D10): the reply's Claude plan run ends with its request, also when the loop above
+    // stopped reading early; a run that finished normally is left to exit by itself.
+    streamResult?.__claudePlanModel?.endReply()
     zipDetection.deleteSessionBuffers(sessionId)
-    // SA-114 P2: the run's steerability verdict and its CLI channel die with the turn that
-    // owned them. Scoped by message id, like every other cleanup in this file, so a request
+    // SA-114 P2: the run's steerability verdict dies with the turn that owned it. Scoped by message id, like every other cleanup in this file, so a request
     // unwinding late cannot remove a newer turn's registration.
     if (steerRunRegistered) clearSteerRun(sessionId, messageId)
     clearStreamAbort(sessionId, messageId)
@@ -8816,13 +8665,15 @@ async function handleGroupChatStream({
       }
     }
 
+    // SA-139 R4 (D14): a member of a retired Primary type (`cli`, `n8n`) cannot run, so it is not
+    // a speaker.
     const eligibleAgents = groupAgents.filter((row) =>
-      isManagedPrimaryAgentType(normalizePrimaryAgentType(row)),
+      isApiPrimaryAgentType(normalizePrimaryAgentType(row)),
     )
 
     if (eligibleAgents.length < 2) {
       return json(
-        { error: 'Group chat requires at least 2 API or CLI agents.' },
+        { error: 'Group chat requires at least 2 agents.' },
         { status: 400 },
       )
     }
@@ -9226,13 +9077,15 @@ async function handleGroupChatStream({
       // BL-965: the round read its members when it began; each speaker's record is read again
       // when its turn starts, so a member made tighter during the round (Settings, the chat bar)
       // runs with its record as it is now. A member deleted during the round (or that can no
-      // longer be read, or is no longer an API or CLI agent) does not run: its turn is saved as a
-      // failed reply that says so, nothing is counted, and no event follows.
+      // longer be read, or is now of a retired Primary type, SA-139 R4) does not run: its turn is
+      // saved as a failed reply that says so, nothing is counted, and no event follows.
       const agentRow = await readAgentRecordForTurn(userId, selected.agent.id)
-      if (!agentRow || !isManagedPrimaryAgentType(normalizePrimaryAgentType(agentRow))) {
+      const retiredSpeaker = agentRow ? retiredPrimaryAgentRefusal(agentRow) : null
+      if (!agentRow || retiredSpeaker) {
         console.warn('[GroupChat] A speaker was deleted or changed during the round; it does not run.', {
           sessionId,
           agentId: selected.agent.id,
+          ...(retiredSpeaker ? { code: retiredSpeaker.code } : {}),
         })
         if (jevOutcome && !groupCallAlreadyRecorded) {
           await recordSkippedGroupFollowup(sessionId, event.sourceMessageId ?? null, jevOutcome.record)
@@ -9244,10 +9097,12 @@ async function handleGroupChatStream({
           userId,
           agentId: selected.agent.id,
           messageId: failedSpeakerMessageId,
-          message: `${selected.agentName} was deleted or changed before its turn in this round, so it did not answer.`,
+          message: retiredSpeaker
+            ? `${selected.agentName} did not answer. ${retiredSpeaker.error} ${retiredSpeaker.details}`
+            : `${selected.agentName} was deleted or changed before its turn in this round, so it did not answer.`,
           noStreamEvent: true,
-          code: 'AGENT_NOT_FOUND',
-          status: 404,
+          code: retiredSpeaker ? retiredSpeaker.code : 'AGENT_NOT_FOUND',
+          status: retiredSpeaker ? 409 : 404,
           metadata: {
             agentType: normalizePrimaryAgentType(selected.agent),
             groupChat: true,
@@ -9346,6 +9201,26 @@ async function handleGroupChatStream({
         currentAgentId: agentRow.id,
       }
 
+      // SA-137 (D1) and Round 2: an API speaker with Refreshed File Reads on (and available) reads its
+      // open files once, its own and what group sharing shows it; the one snapshot serves its
+      // precompiled history and its own compile (groups have no approval cards).
+      const speakerLiveFileReadTurn =
+        refreshedFileReadsActiveFor(agentRow, userSettings?.global_zip_settings,
+          resolveNativeToolSettings(agentRow?.provider_specific_settings).executionBackend)
+          ? new LiveFileReadTurn({
+              userId,
+              agentId: agentRow.id,
+              sessionId,
+              messageId: selectedMessageId,
+              signal: groupAbortController.signal,
+              executionBackend: resolveNativeToolSettings(agentRow?.provider_specific_settings).executionBackend,
+              otherReaders: liveReadOtherReaders({ userId, sessionId }),
+              ...(typeof perAgentMetadata?.projectPath === 'string' && perAgentMetadata.projectPath.trim()
+                ? { projectPath: perAgentMetadata.projectPath }
+                : {})
+            })
+          : null
+
       const databaseService = new DatabaseService(eventFetch)
       const sharedHistory = await databaseService.prepareGroupHistory(
         sessionId,
@@ -9359,6 +9234,7 @@ async function handleGroupChatStream({
             currentAgentId: agentRow.id,
             sharedTools: groupSharedTools,
           },
+          ...(speakerLiveFileReadTurn ? { liveFileReadTurn: speakerLiveFileReadTurn } : {}),
         },
       )
       const sharedZipSettings =
@@ -9377,6 +9253,7 @@ async function handleGroupChatStream({
         abortSignal: groupAbortController.signal,
         globalZipSettings: sharedZipSettings,
         precompiledHistory: sharedHistory,
+        liveFileReadTurn: speakerLiveFileReadTurn,
         streamMetadata,
         systemPromptAddendum,
         groupContext,
@@ -9397,8 +9274,14 @@ async function handleGroupChatStream({
 
       try {
         const result = await streamPromise
-        const groupContent = stripGroupChatPresentationControls(result?.content ?? '')
-        if (groupContent.trim()) {
+        // BL-869: later speakers read this reply as `end` carried it to every tab (the record the
+        // finalize saved, BL-775), with the metadata whose `zipIds` trust its zips. The stream
+        // handler's own copy (`result.content`) can differ from it. That text is already a group
+        // reply's (the rebuild and the own-copy save both strip the group markup), so it is used
+        // as it is.
+        const savedSpeakerReply = result?.savedReply ?? null
+        const groupContent = savedSpeakerReply?.content ?? ''
+        if (savedSpeakerReply && groupContent.trim()) {
           assistantHistory.push({
             id: result.messageId,
             session_id: sessionId,
@@ -9410,7 +9293,7 @@ async function handleGroupChatStream({
             role: 'assistant',
             content: groupContent,
             created_at: new Date().toISOString(),
-            metadata: result.metadata,
+            metadata: savedSpeakerReply.metadata,
           })
 
           if (isFollowupEvent) {
@@ -9583,6 +9466,8 @@ async function handleSendRoutedRequest(
   // Queued bubble on screen for a send that was already over (BL-202).
   let queuedNoticeSent: Promise<void> | null = null
   const planOwner: RequestPlanOwner = { leases: new Set(), listeners: new AbortController() }
+  let originalLookup: P5OriginalLookup | undefined
+  let originalPreparation: P5OriginalPreparation | undefined
   requestPlanOwners.set(request, planOwner)
   try {
     const body = await request.json()
@@ -9614,17 +9499,26 @@ async function handleSendRoutedRequest(
     if (!resolvedUserId) {
       return json({ error: 'Unauthorized' }, { status: 401 })
     }
+    // Internal/service userId claims are not this feature's original human-task
+    // producer. Their existing ordinary send behavior remains unchanged.
+    const p5AuthenticatedHuman = Boolean(locals.user?.id) && !internalRequest && !request.headers.has('x-batshit-agent-token')
 
     const approvalResponse = normalizeToolApprovalResponses(
       metadata?.toolApprovalResponse ?? metadata?.tool_approval_response,
     )
     const hasApprovalResponse = approvalResponse.length > 0
     let approvalResponseForStream = approvalResponse
+    const hasRetirementRequest = metadata != null && Object.hasOwn(metadata, 'retireSavedApprovalId')
+    const retiredApprovalId = typeof metadata?.retireSavedApprovalId === 'string' ? metadata.retireSavedApprovalId.trim() : ''
+    if (hasRetirementRequest && (!p5AuthenticatedHuman || !retiredApprovalId || retiredApprovalId.length > 256 ||
+      hasApprovalResponse || (typeof content === 'string' ? content.trim().length > 0 : content != null))) {
+      return json({ error: 'Invalid retired approval request.', code: 'invalid_retired_approval' }, { status: 400 })
+    }
 
     // BL-713: Send now on a message waiting in the chat's line names it by id (`userMessageId`);
     // its bubble may show no words (a Clip alone), so it needs none of its own.
     const waitingSendNowRequest = body?.waitingSendNow === true
-    if ((!content && !hasApprovalResponse && !waitingSendNowRequest) || !sessionId || !agentId) {
+    if ((!content && !hasApprovalResponse && !hasRetirementRequest && !waitingSendNowRequest) || !sessionId || !agentId) {
       return json(
         {
           error:
@@ -9636,7 +9530,9 @@ async function handleSendRoutedRequest(
 
     // Get the agent to verify ownership and get agentType
     // Use Redis directly instead of DatabaseService to avoid circular API calls
+    originalLookup = p5AuthenticatedHuman ? captureP5OriginalLookup({ userId: resolvedUserId, agentId, signal: request.signal }) : undefined
     const agents = await redis.getAgents(resolvedUserId)
+    if (!p5OriginalLookupCurrent(originalLookup)) originalLookup = undefined
     const firstReadAgent = agents.find((a) => a.id === agentId)
 
     if (!firstReadAgent) {
@@ -9666,23 +9562,18 @@ async function handleSendRoutedRequest(
     // Resolve the primary-agent type from the request override, else the stored record.
     const finalAgentType = normalizePrimaryAgentType(agent, agentType)
 
-    // SA-106 DL-106-03: the `n8n` primary-agent type is retired. Any send that resolves
-    // to it fails loudly here — before the session-turn lock, clip consumption, memory
-    // commit, or any compile — so a stray record can never half-run. Both the resolved
-    // type AND the stored record are checked: `agentType` arrives from the request body
-    // and outranks the record (primaryAgentType.ts), so checking only the resolved value
-    // would let a client override its way past the guard on a retired agent.
-    if (
-      isN8nPrimaryAgentType(finalAgentType) ||
-      isN8nPrimaryAgentType(normalizePrimaryAgentType(agent))
-    ) {
+    // SA-106 DL-106-03, SA-139 R4 (D14): the `n8n` and `cli` Primary types are retired. Any
+    // send that resolves to one fails loudly here — before the session-turn lock, clip
+    // consumption, memory commit, or any compile — so a stray record can never half-run. Both
+    // the request's type AND the stored record are checked: `agentType` arrives from the
+    // request body and outranks the record (primaryAgentType.ts), so checking only the resolved
+    // value would let a client override its way past the guard on a retired agent, and a request
+    // cannot ask for a retired type on a live one. Every later turn of this request (queued,
+    // woken, resumed, a continuation, a group speaker) is refused again by the run itself.
+    const retired = retiredPrimaryAgentRefusal(agent, agentType)
+    if (retired) {
       return json(
-        {
-          error: 'The n8n Primary Agent type was removed from Batshit.',
-          code: 'primary_agent_type_retired',
-          details:
-            'This agent uses the retired n8n Primary Agent type. Delete this agent and create an API or CLI agent instead. n8n is still fully supported as a tool platform: n8n tool workflows and n8n Workflow Subagents are unchanged.',
-        },
+        { error: retired.error, code: retired.code, details: retired.details },
         { status: 409 },
       )
     }
@@ -9699,13 +9590,14 @@ async function handleSendRoutedRequest(
     // woken turn landed in THIS chat. Keyed on the DM's own `delivery.sessionId`, NOT on the
     // session carrying an origin: a "One at a time" wake lands in a chat the user started,
     // which has no origin (F-P5b-1). Only a DM-enabled agent's sends pay the one inbox
-    // read. `metadata.wake` marks the wake primitive's own POST, which is the one send here
+    // read. This reads the saved Agent DMs switch, not the rule: a reply the user sends while
+    // Fabric & Utilities is off still answers the items waiting on them. `metadata.wake` marks the wake primitive's own POST, which is the one send here
     // that is NOT the user.
     //
     // Fire-and-forget with its own catch: a badge that failed to clear must never be able to
     // fail the send it was reporting on.
     const sendingAgent = agents.find((candidate) => candidate.id === agentId)
-    if (!metadata?.wake && sendingAgent && resolveAgentDmsEnabled(sendingAgent)) {
+    if (!hasRetirementRequest && !metadata?.wake && sendingAgent && readAgentDmsSwitch(sendingAgent)) {
       void clearNeedsUserForHumanReply(agentId, sessionId).catch((error) => {
         console.warn('[Agent DMs] Could not clear a "needs you" stamp after a user reply:', error)
       })
@@ -9783,7 +9675,7 @@ async function handleSendRoutedRequest(
     const approvalClick = isApprovalClick({
       approvalResponseCount: approvalResponse.length,
       content,
-    })
+    }) || hasRetirementRequest
     const gatewayAuthority: TurnMcpGatewayAuthority = {
       humanSelection: Boolean(locals.user?.id) && !internalRequest &&
         !request.headers.has('x-batshit-agent-token') && !approvalClick,
@@ -9813,7 +9705,16 @@ async function handleSendRoutedRequest(
     const groupRunnerSession = Boolean(
       groupConfig && Array.isArray(groupConfig.agent_ids) && groupConfig.agent_ids.length >= 2,
     )
-    if (refusesGroupApprovalClick({ groupSession: groupRunnerSession, approvalClick })) {
+    let verifiedGroupRetirement = false
+    if (groupRunnerSession && hasRetirementRequest && typeof requestedMessageId === 'string' && requestedMessageId.trim()) {
+      const card = await readStoredAssistantRecord(sessionId, requestedMessageId.trim()) as any
+      const cardMetadata = card?.metadata as Record<string, any> | undefined
+      const entries = cardMetadata?.toolApprovals?.approvals
+      verifiedGroupRetirement = card?.session_id === sessionId && card?.user_id === resolvedUserId && Array.isArray(entries) &&
+        entries.some((entry: any) => typeof entry?.approvalId === 'string' && entry.approvalId.trim() === retiredApprovalId &&
+          isRetiredSavedApproval(entry, cardMetadata?.toolApprovals?.source, cardMetadata))
+    }
+    if (refusesGroupApprovalClick({ groupSession: groupRunnerSession, approvalClick: approvalClick && !verifiedGroupRetirement })) {
       return json(GROUP_APPROVAL_CLICK_REFUSAL, { status: 409 })
     }
     // BL-4 (the line, below): only the page's own ordinary send may wait in it. BL-713: Send now
@@ -9965,6 +9866,8 @@ async function handleSendRoutedRequest(
                     sessionId,
                     userId: resolvedUserId,
                     userMessageId: namedUserMessageId,
+                    reason: handover.reason,
+                    sendFacts: pickSendFacts(metadata),
                     entry: handover.entry,
                     forwardSessionEvent,
                   })
@@ -10033,6 +9936,8 @@ async function handleSendRoutedRequest(
                 sessionId,
                 userId: resolvedUserId,
                 userMessageId: namedUserMessageId,
+                reason: handover.reason,
+                sendFacts: pickSendFacts(metadata),
                 entry: handover.entry,
                 forwardSessionEvent,
                 after: keptNotice,
@@ -10109,12 +10014,24 @@ async function handleSendRoutedRequest(
     // here and its request lets go of the browser's connection; everything below runs as it
     // always did, and its final answer is kept for the tab (`respondAsyncSend.ts`).
     acceptTurn?.({ sessionId, userId: resolvedUserId })
+    // SA-139 D6: any turn but this chat's approval click ends a Claude plan run held at a card here, as
+    // Stop in the gap does (BL-455): the person chose to go on without the card.
+    // A woken turn or a schedule is not the person's choice, so it leaves the card waiting (review B S2); a voice
+    // turn or a share follow-up, though sent by the server, is the person's own message (review B delta N1).
+    if (!approvalClick && !(internalRequest && typeof requestedMessageId === 'string' && isWokenTurnMessage(sessionId, requestedMessageId.trim()))) {
+      void endHeldClaudePlanRuns({ sessionId }, 'A new message was sent in this chat, so the reply waiting at its approval card ended.')
+        .catch(error => console.error('[Send-Routed] SA-139: could not end a held Claude plan run', { sessionId, error }))
+    }
     // BL-713: how this request ends, for the chat's line, told to the registry in the same step
     // that frees the lock (the `finally`). The message of a pending approval card this request's
     // last run stopped at (from the run's own finish, never read back from Redis), and whether
     // this click's answer was recorded.
     let endedAtApprovalCardMessageId: string | null = null
     let clickAnswerRecorded = false
+    let retiredCardClosed = false
+    let originalApiPending: Awaited<ReturnType<typeof pendingP5ApiApproval>>
+    let originalAnswer: Awaited<ReturnType<typeof answerApprovalsOnce>> | undefined
+    let originalResumed = false
     let requestStopped = false
     // Set once this click told the tabs the hold ended (after the re-read under the lock).
     let holdEndForwarded = false
@@ -10124,7 +10041,8 @@ async function handleSendRoutedRequest(
       // and ended its mark while this request waited, so it is read again under the lock; from
       // here on a delete waits for this request (`sessionDeleteTurnStop.ts`). The `finally`
       // below lets the lock go.
-      if (!(await redis.getSession(sessionId))) {
+      const ownedSessionUnderLock = await redis.getSession(sessionId)
+      if (!ownedSessionUnderLock) {
         return sessionDeletedResponse()
       }
       // The pre-run sweep removes this chat's sandboxes even while a command runs in one. A
@@ -10164,6 +10082,7 @@ async function handleSendRoutedRequest(
       // the send waited bounds it (BL-941); a deleted agent runs nothing. A send that did not
       // wait reads the same record.
       const agentUnderLock = await readAgentRecordForTurn(resolvedUserId, agentId)
+      if (!p5OriginalLookupCurrent(originalLookup)) originalLookup = undefined
       if (!agentUnderLock) {
         if (queuedUserMessageId) {
           // A send the line handed the chat: every tab's "Queued" bubble becomes its "Not sent"
@@ -10184,6 +10103,8 @@ async function handleSendRoutedRequest(
             sessionId,
             userId: resolvedUserId,
             userMessageId: keptUserMessageId,
+            reason: 'agent_deleted',
+            sendFacts: pickSendFacts(metadata),
             entry: sessionTurnRegistration.entry,
             forwardSessionEvent,
             after: keptNotice,
@@ -10193,6 +10114,9 @@ async function handleSendRoutedRequest(
         return json({ error: 'Agent not found' }, { status: 404 })
       }
       agent = agentUnderLock
+      originalPreparation = prepareP5OriginalTask(originalLookup, {
+        sessionId, session: ownedSessionUnderLock, agent, turn: sessionTurnRegistration.entry
+      })
 
       // BL-713: this click answers the card the chat's line held for; the sends waiting there now
       // wait for this click's reply, like any turn's, so the tabs stop saying they wait for the card.
@@ -10299,9 +10223,52 @@ async function handleSendRoutedRequest(
       }> = []
 
       if (
-        isManagedPrimaryAgentType(finalAgentType) &&
-        (hasApprovalResponse || hasUserTurnContent)
+        isApiPrimaryAgentType(finalAgentType) &&
+        (hasApprovalResponse || hasRetirementRequest || hasUserTurnContent)
       ) {
+        if ((hasApprovalResponse || hasRetirementRequest) && typeof requestedMessageId === 'string' && requestedMessageId.trim()) {
+          // The stored card, not request metadata, identifies its lane. A retired control
+          // card cannot be answered as an SDK pause or start a replacement turn.
+          const card = await readStoredAssistantRecord(sessionId, requestedMessageId.trim())
+          const entries = (card?.metadata as any)?.toolApprovals?.approvals
+          const answeredIds = new Set(hasRetirementRequest ? [retiredApprovalId] : approvalResponse.map((entry) =>
+            typeof entry.approvalId === 'string' ? entry.approvalId.trim() : '').filter(Boolean))
+          const cardMetadata = (card?.metadata ?? {}) as Record<string, any>
+          const clickedRetired = Array.isArray(entries) && entries.some((entry: any) =>
+            answeredIds.has(typeof entry?.approvalId === 'string' ? entry.approvalId.trim() : '') &&
+            isRetiredSavedApproval(entry, cardMetadata.toolApprovals?.source, cardMetadata))
+          if (hasRetirementRequest || clickedRetired || Array.isArray(entries) && entries.some((entry: any) =>
+            answeredIds.has(typeof entry?.approvalId === 'string' ? entry.approvalId.trim() : '') &&
+            entry?.control && entry.control.lane !== 'api')) {
+            const retired = clickedRetired ? await retireSavedCliApprovals({ userId: resolvedUserId, sessionId,
+              messageId: requestedMessageId.trim(), approvalIds: [...answeredIds], signal: turnStopSignal })
+              : null
+            if (retired) {
+              for (const id of retired.controlApprovalIds) {
+                try { await markApprovalExpired(id, { userId: resolvedUserId, sessionId, lane: 'cli' }) }
+                catch (error) { console.warn('[Send-Routed] Could not expire a retired approval record:', error) }
+              }
+              // A mixed card keeps its live entries and holds. Do not record any part of
+              // this click or run an SDK call; the remaining card can be answered afresh.
+              if (!retired.hasPending) {
+                retiredCardClosed = true
+              }
+              try {
+                const latest = await redis.execute(client => client.json.get(`message:${sessionId}:${requestedMessageId.trim()}`))
+                if (latest) await eventFetch(new URL('/api/sse', request.url).toString(), {
+                  method: 'POST', headers: { 'Content-Type': 'application/json', 'x-internal-sse-forward': '1', ...internalServiceHeaders() },
+                  body: JSON.stringify({ type: 'complete_message', sessionId, message: withoutServerReplayFields(latest as any) })
+                })
+              } catch (error) { console.warn('[Send-Routed] Could not forward the retired approval state:', error) }
+              await publishUserEvent(resolvedUserId, { type: 'session_messages_changed', sessionId, reason: 'approval_settled' })
+              if ((!retired.hasPending || hasRetirementRequest) && !hasUserTurnContent) return json({ success: true,
+                approvalResume: 'denied', reason: 'retired', retiredApprovalIds: retired.retiredApprovalIds, stillPending: retired.hasPending })
+            }
+            return json({ error: 'This approval belongs to a retired agent run and cannot be resumed.',
+              code: 'approval_run_retired', ...(retired ? { retiredApprovalIds: retired.retiredApprovalIds } : {}) }, { status: 409 })
+          }
+        }
+        if (hasRetirementRequest) return json({ error: 'The saved retired approval was not found.', code: 'approval_run_retired' }, { status: 409 })
         let persistedMessages: ChatMessage[] = []
         try {
           // The newest 300, where the cards are: `getMessages` reads the FIRST 300, so on a
@@ -10317,18 +10284,21 @@ async function handleSendRoutedRequest(
           )
         }
 
-        const approvalHistoryMessages = buildApprovalHistoryMessages(
-          turnMessages,
+        const approvalState = await sweepApprovalState({
+          userId: resolvedUserId,
+          sessionId,
           persistedMessages,
-        )
-        const approvalState = analyzeApprovalState(approvalHistoryMessages)
+          requestMessages: turnMessages,
+          cardMessageId: hasApprovalResponse ? requestedMessageId : undefined,
+          signal: turnStopSignal,
+        })
         approvalTimeoutNotices = approvalState.newlyExpired
 
         /**
          * SA-116 P2 — a card that timed out retires its consent record with it.
          *
-         * The card expires after three minutes; the record lives 24 hours so the CLI lanes
-         * can answer it later (DL-116-06). Leaving an API-lane record `pending` after its
+         * The card expires after three minutes; the record lives 24 hours for audit. Leaving
+         * an API-lane record `pending` after its
          * card expired would let a much later retry of the same call find it through
          * `findApprovedMatch` — except it never can, because a pending record is not an
          * approved one. Marking it `expired` is about honesty in the record and the audit,
@@ -10344,28 +10314,6 @@ async function handleSendRoutedRequest(
               approvalId: notice.controlApprovalId,
               error,
             })
-          }
-        }
-
-        if (approvalState.updates.length > 0) {
-          for (const update of approvalState.updates) {
-            try {
-              await redis.updateMessage(
-                update.messageId,
-                sessionId,
-                { metadata: update.metadata },
-                resolvedUserId,
-              )
-            } catch (error) {
-              console.warn(
-                '[Send-Routed] Failed to persist expired approval metadata update',
-                {
-                  sessionId,
-                  messageId: update.messageId,
-                  error,
-                },
-              )
-            }
           }
         }
 
@@ -10453,6 +10401,41 @@ async function handleSendRoutedRequest(
           // a click naming an answered approval is refused (`approvalAnswerRecord.ts`).
           let approvalPlanLease: PlanLease | undefined
           let approvalAnswer: Awaited<ReturnType<typeof answerApprovalsOnce>>
+          // SA-139 D6 (Ashe M2; review B M1, S1): on a Claude plan reply, decide under the click's lock and
+          // before anything is recorded what this click meets: a duplicate (refused by the answer record, no
+          // claim), the held run that waits for exactly these cards (claimed here, before any write or the
+          // SDK's replay), or no run (answered as not run, nothing runs, no other Claude Code process starts).
+          // Faye's P3 Part 3 read, S1: the card's own reply says whether a Claude Code run is behind it.
+          let claudePlanClick: ClaudePlanClick | null = null
+          if (typeof requestedMessageId === 'string' && requestedMessageId.trim()) {
+            const clickPreset = await loadRuntimeModelPreset(agent.primary_model_preset_id, 'primary')
+            const clickSelection = resolveRuntimeModelSelection({ preset: clickPreset, presetId: agent.primary_model_preset_id, connection: agent.primary_model_connection ?? null })
+            const cardRecord = await redis.execute(async client => client.json.get(`message:${sessionId}:${requestedMessageId.trim()}`))
+            claudePlanClick = planClaudePlanClick({ record: cardRecord, responses: approvalResponseForStream, sessionId, messageId: requestedMessageId,
+              current: normalizePrimaryAgentType(agent) === 'api' && isClaudePlanSelection(clickSelection.connection) })
+            // A Claude plan reply's card, the agent now on another connection (review A M1): the run held for it can
+            // never be used, so it ends now rather than at its deadline.
+            if (claudePlanClick?.kind === 'gone' && claudePlanClick.why === 'switched_away') {
+              void endHeldClaudePlanRuns({ sessionId }, CLAUDE_PLAN_SWITCHED_AWAY_REASON)
+                .catch(error => console.warn('[Send-Routed] SA-139: could not end a held Claude plan run the agent moved away from', { sessionId, error }))
+            }
+            // Claimed here, under the click's lock and before any write (review B delta N2): a run whose
+            // card's clock ran out meanwhile is gone, never a 409.
+            if (claudePlanClick?.kind === 'live') {
+              const claim = claimHeldClaudePlanRun(claudePlanClick.key, { userId: resolvedUserId, agentId: agent.id }, claudePlanClick.toolCallIds)
+              if (claim) requestClaudePlanClaims.set(request, claim)
+              else claudePlanClick = { kind: 'gone', why: 'run_ended' }
+            }
+            if (claudePlanClick?.kind === 'gone') {
+              const reason = claudePlanGoneReason(claudePlanClick.why)
+              // A denial keeps its own reason (review A N2: the page's Deny of an expired card says it expired).
+              approvalResponseForStream = approvalResponseForStream.map(entry => ({ ...entry, approved: false,
+                reason: entry.approved === false && typeof entry.reason === 'string' && entry.reason ? entry.reason : reason }))
+            }
+          }
+          originalApiPending = p5AuthenticatedHuman ? await pendingP5ApiApproval({ userId: resolvedUserId,
+            sessionId, session: ownedSessionUnderLock, agent, turn: sessionTurnRegistration.entry,
+            messageId: requestedMessageId, responses: approvalResponseForStream }) : undefined
           approvalAnswer = await answerApprovalsOnce({
             userId: resolvedUserId,
             sessionId,
@@ -10463,7 +10446,7 @@ async function handleSendRoutedRequest(
               const selection = resolveRuntimeModelSelection({ preset, presetId: agent.primary_model_preset_id, connection: agent.primary_model_connection ?? null })
               if (isPlanSelection(selection.connection)) {
                 const accountId = chatgptPlanAccountId(selection.connection?.id)
-                if (!accountId || normalizePrimaryAgentType(agent) !== 'api') throw createRoutedInputError('Choose this ChatGPT account on an API agent.', 'CHATGPT_PLAN_CONNECTION_INVALID', 409)
+                if (!accountId || normalizePrimaryAgentType(agent) !== 'api') throw createRoutedInputError('Choose this ChatGPT account on an agent.', 'CHATGPT_PLAN_CONNECTION_INVALID', 409)
                 const storedBinding = (record.metadata as any)?.providerMessageSource?.planBinding
                 approvalPlanLease = getChatgptPlanRuntime().acquire(resolvedUserId, accountId, PLAN_AGENT, turnStopSignal ?? undefined, storedBinding ?? '')
                 const owner = requestPlanOwners.get(request)
@@ -10475,7 +10458,10 @@ async function handleSendRoutedRequest(
             },
             mutate: write => approvalPlanLease ? getChatgptPlanRuntime().mutate(approvalPlanLease, write) : write(),
           })
+          originalAnswer = approvalAnswer
           if (!approvalAnswer.ok) {
+            // SA-139 D6: an answer that was not recorded runs nothing; a run its click claimed ends.
+            takeClaudePlanClaim(request)?.run.stop()
             if (approvalAnswer.reason === 'already_answered') {
               return json(
                 {
@@ -10514,6 +10500,31 @@ async function handleSendRoutedRequest(
               request,
             })
           }
+          // SA-139 D6 (review B S1): no Claude Code run waits for this card any more. Its answer is
+          // recorded as not run ("the run ended"), the words held for it and its steers say so, and no
+          // turn starts: another Claude Code process may not take the ended run's place.
+          if (claudePlanClick?.kind === 'gone') {
+            if (cardMessageId && !expiryOnlyAnswer) {
+              await markHeldMessageCardExpired({ sessionId, userId: resolvedUserId, cardMessageId, eventFetch, request })
+            }
+            if (cardMessageId) {
+              await markApprovalCardWithoutAnswer({ sessionId, userId: resolvedUserId, cardMessageId, eventFetch, request, reason: 'approval_expired' })
+                .catch(error => console.warn('[Send-Routed] SA-139: could not mark a gone Claude plan card', { sessionId, error }))
+            }
+            // The card reads "Expired: the reply ended" in every tab, not the answer the person sent.
+            if (typeof requestedMessageId === 'string' && requestedMessageId.trim()) {
+              await markClaudePlanCardRunEnded({ sessionId, userId: resolvedUserId, messageId: requestedMessageId.trim(),
+                approvalIds: approvalResponseForStream.map(entry => typeof entry.approvalId === 'string' ? entry.approvalId.trim() : '').filter(Boolean),
+                eventFetch, request })
+            }
+            return json({
+              success: true,
+              approvalResume: 'denied',
+              deniedCount: approvalResponseForStream.length,
+              reason: `claude_plan_${claudePlanClick.why}`,
+              details: claudePlanGoneReason(claudePlanClick.why),
+            })
+          }
         }
       }
 
@@ -10532,7 +10543,7 @@ async function handleSendRoutedRequest(
       })()
 
       const metadataForStream =
-        isManagedPrimaryAgentType(finalAgentType)
+        isApiPrimaryAgentType(finalAgentType)
           ? {
               ...(metadata && typeof metadata === 'object' ? metadata : {}),
               ...(hasApprovalResponse
@@ -10560,6 +10571,7 @@ async function handleSendRoutedRequest(
               resolvedUserId,
               resolvedVoiceConfig.provider,
               userSettings?.voice_settings,
+              resolvedVoiceConfig.model,
             )
           : []
         return {
@@ -10571,7 +10583,7 @@ async function handleSendRoutedRequest(
         }
       }
       const resolvedVoiceState =
-        isManagedPrimaryAgentType(finalAgentType)
+        isApiPrimaryAgentType(finalAgentType)
           ? await resolveVoiceStateFor(
               (metadataForStream ?? metadata) as Record<string, any> | null | undefined,
             )
@@ -10614,22 +10626,9 @@ async function handleSendRoutedRequest(
           ? followUpTurnMetadata({ ...(await resolveFollowUpSendFacts()), ...ownSendFacts }, steerIds)
           : followUpTurnMetadata(metadataForStream, steerIds)
 
-      /**
-       * SA-116 P3 (DL-116-08) — Approve on a lane that cannot be resumed in place.
-       *
-       * The API lane re-executes the very SDK call the user paused. A managed Codex or
-       * Claude run has nothing left to un-pause: the helper's refusal already came back, the
-       * agent already spoke about it, and the turn already ended. So the click starts an
-       * ORDINARY next turn whose first message says what was approved, and the agent's retry
-       * finds the `approved` record waiting for it. That works after any delay and with no
-       * tab open, which a blocking wait inside the helper could never do.
-       *
-       * `planControlApprovalResumeTurn` returns null for a normal API-lane click, so nothing
-       * below this point changes for the lane P2 shipped.
-       */
       // Post-click preparation belongs to the answered card until an actual successor run
       // takes ownership. A failed strict read is visible through the same failure writer.
-      type ManagedRun = { messageId: string | undefined; inPlaceResume: boolean; steerIds?: string[] }
+      type ManagedRun = { apiPart?: P5ApiReplyPart; messageId: string | undefined; inPlaceResume: boolean; steerIds?: string[] }
       let runInProgress: ManagedRun | null = clickAnswerRecorded && cardMessageId
         ? { messageId: cardMessageId, inPlaceResume: true } : null
       let lastRun: ManagedRun = runInProgress ?? { messageId: undefined, inPlaceResume: false }
@@ -10640,84 +10639,14 @@ async function handleSendRoutedRequest(
         runInProgress = null
       }
       try {
-      let controlApprovalResumeContent: string | null = null
-      let controlApprovalResumeIds: string[] = []
-      let controlApprovalInPlaceAddendum: string | null = null
-      // BL-455: a CLI-lane Deny with words held for its card runs them as this request's turn.
-      let heldAnswerAfterDeny: Awaited<ReturnType<typeof readHeldMessageToAnswer>> = null
-      if (hasApprovalResponse && isManagedPrimaryAgentType(finalAgentType)) {
-        const resumePlan = await planControlApprovalResumeTurn({
-          userId: resolvedUserId,
-          sessionId,
-          messageId: requestedMessageId,
-          responses: approvalResponseForStream,
-        })
-        if (resumePlan?.mode === 'in-place') {
-          /**
-           * F-P3-2 — one click answered a card the SDK resume owns AND one it does not.
-           *
-           * The in-place resume wins, because only it can re-execute the call the SDK
-           * paused. The card is therefore NOT cleared here: `resolveApprovalResumeGrants`
-           * still has to read it off the persisted message when the run starts, and that
-           * run's finish path clears the whole summary afterwards. The other record was
-           * already decided by the planner, so nothing is lost; it travels into the
-           * resumed model's request as an addendum, the same way a tool-approval timeout
-           * does, and the model's retry spends it.
-           */
-          await settleControlApprovalCard({
-            userId: resolvedUserId,
-            sessionId,
-            messageId: resumePlan.cardMessageId || (requestedMessageId ?? ''),
-            denied: resumePlan.denied,
-            clearCard: false,
-          })
-          controlApprovalInPlaceAddendum =
-            buildControlApprovalInPlaceAddendum(resumePlan)
-        } else if (resumePlan) {
-          // Clear the spent card first. It is done whether or not a turn follows, because a
-          // denial must not leave a button the user can press again — and the denial's
-          // one-turn `control_errors` line is written in the same act.
-          await settleControlApprovalCard({
-            userId: resolvedUserId,
-            sessionId,
-            messageId: resumePlan.cardMessageId || (requestedMessageId ?? ''),
-            denied: resumePlan.denied,
-          })
-
-          if (resumePlan.approved.length === 0) {
-            // Deny starts NO turn (DL-116-08). The agent is told on its next typed turn
-            // through the DCM line just written; starting a turn to say "no" would spend
-            // the user's money to tell an agent something it will read anyway.
-            //
-            // BL-455: unless the user already typed that next turn. Words typed while the reply
-            // ran are held for this card, and with no resume on this lane there is nothing else
-            // to wait for: they are answered now, as their own turn, and that turn reads the
-            // denial's DCM line.
-            heldAnswerAfterDeny = answeredCardMessageId
-              ? await readHeldMessageToAnswer({
-                  sessionId,
-                  cardMessageId: resumePlan.cardMessageId || answeredCardMessageId,
-                })
-              : null
-            if (!heldAnswerAfterDeny) {
-              if (clickAnswerRecorded && cardMessageId) await markApprovalCardWithoutAnswer({
-                sessionId, userId: resolvedUserId, cardMessageId, eventFetch, request,
-                reason: expiryOnlyAnswer ? 'approval_expired' : 'approval_denied' })
-              return json({
-                success: true,
-                approvalResume: 'denied',
-                deniedCount: resumePlan.denied.length,
-              })
-            }
-          } else {
-            controlApprovalResumeContent = buildControlApprovalResumeContent(resumePlan.approved)
-            controlApprovalResumeIds = resumePlan.approved.map((item) => item.recordId)
-          }
-        }
+      if (hasApprovalResponse && isApiPrimaryAgentType(finalAgentType) && originalApiPending && originalAnswer?.ok) {
+        const resumed = prepareP5ApiApprovalResume({ userId: resolvedUserId, sessionId, session: ownedSessionUnderLock, agent,
+          turn: sessionTurnRegistration.entry, signal: request.signal, pending: originalApiPending, answer: originalAnswer })
+        retireP5OriginalPreparation(originalPreparation); originalPreparation = resumed; originalResumed = true
       }
 
-      // API and CLI agents use the managed streaming path.
-      if (isManagedPrimaryAgentType(finalAgentType)) {
+      // API agents use the managed streaming path.
+      if (isApiPrimaryAgentType(finalAgentType)) {
         const hasGroupConfig = Boolean(
           groupConfig &&
           Array.isArray(groupConfig.agent_ids) &&
@@ -10767,143 +10696,20 @@ async function handleSendRoutedRequest(
             ? cardMetadata.steers.filter((entry: any) => entry?.source !== 'dm').map((entry: any) => entry.steerId) : []
           trustedFirstRunSteerIds = [...new Set([
             ...(Array.isArray(promotedIds) ? promotedIds : []), ...deliveredIds,
-            ...(controlApprovalResumeContent !== null ? await readHeldSteerIds({ sessionId, cardMessageId }) : []),
           ].filter((id): id is string => typeof id === 'string'))]
         }
 
-        if (controlApprovalResumeContent !== null) {
-          // The user message first, so the two ids read in the order they appear in the
-          // chat. Then a NEW assistant id, because `requestedMessageId` names the message
-          // the card was ON — reusing it would overwrite the turn the user just approved.
-          const resumeUserMessageId = await generateMessageId(sessionId)
-          const resumeAssistantMessageId = await generateMessageId(sessionId)
-          if (!resumeAssistantMessageId) {
-            // No successor exists yet: the existing answered-card failure owner
-            // must record this refusal for its delivered/promoted Voice ids too.
-            throw new Error('Could not start the approval resume turn.')
-          }
-          const now = new Date().toISOString()
-          const resumeUserMessage = {
-            id: resumeUserMessageId ?? `msg_${crypto.randomUUID()}`,
-            session_id: sessionId,
-            user_id: resolvedUserId,
-            agent_id: agentId,
-            role: 'user' as const,
-            status: 'complete',
-            content: controlApprovalResumeContent,
-            created_at: now,
-            metadata: {
-              // DL-116-08: NO `metadata.wake`. This is a typed-style user turn, which is
-              // what lets `clearNeedsUserForHumanReply` clear a woken chat's *Needs you*
-              // and what makes the woken-turn gate read the chat as human from here on.
-              approvalResume: { approvalIds: controlApprovalResumeIds },
-            },
-          }
-
-          try {
-            await redis.saveMessage(resumeUserMessage as any)
-          } catch (error) {
-            console.error(
-              '[SA-116] Could not persist the approval resume message:',
-              error,
-            )
-            throw error
-          }
-
-          // Show it in the chat the same way a woken turn's message appears. No top-level
-          // messageId: the replay buffer is keyed on the ASSISTANT id.
-          try {
-            await eventFetch(new URL('/api/sse', request.url).toString(), {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'x-internal-sse-forward': '1',
-                ...internalServiceHeaders(),
-              },
-              body: JSON.stringify({
-                type: 'user_message',
-                sessionId,
-                message: resumeUserMessage,
-              }),
-            })
-          } catch (error) {
-            console.warn(
-              '[SA-116] Could not forward the approval resume message to SSE:',
-              error,
-            )
-          }
-
-          managedAssistantMessageId = resumeAssistantMessageId
-          managedContent = controlApprovalResumeContent
-          // History re-read from Redis so the turn sees the cleared card and the message
-          // just written, rather than the browser's copy from before the click.
-          try {
-            managedMessages = await redis.getRecentMessages(sessionId, 300)
-          } catch (error) {
-            console.error(
-              '[SA-116] Could not reload history for an approval resume turn:',
-              error,
-            )
-            throw error
-          }
-          const {
-            toolApprovalResponse: _resumeApprovals,
-            tool_approval_response: _resumeApprovalsSnake,
-            expiredToolApprovals: _resumeExpired,
-            ...restResumeMetadata
-          } = (metadataForStream ?? {}) as Record<string, any>
-          managedMetadata = {
-            ...restResumeMetadata,
-            approvalResume: { approvalIds: controlApprovalResumeIds },
-          }
-        }
-
-        let firstRunVoiceState = resolvedVoiceState
-        if (heldAnswerAfterDeny) {
-          // BL-455: a CLI Deny whose card held the user's words. They are this request's turn, an
-          // ordinary accepted send in a promotion's shape: a new assistant id, the history re-read
-          // from Redis, the send's own facts, and none of the click's approval keys.
-          trustedFirstRunSteerIds = [...new Set([...trustedFirstRunSteerIds, ...heldAnswerAfterDeny.steerIds])]
-          managedAssistantMessageId = heldAnswerAfterDeny.assistantMessageId
-          managedContent = heldAnswerAfterDeny.content
-          managedMessages = heldAnswerAfterDeny.history
-          managedMetadata = await buildFollowUpMetadata(
-            heldAnswerAfterDeny.steerIds,
-            heldAnswerAfterDeny.sendFacts,
-          )
-          firstRunVoiceState = await resolveVoiceStateFor(managedMetadata)
-        }
-
-        // An API-lane approval resume writes into the message the card was ON — this
-        // request's own `messageId`. The same rule the stream handler applies
-        // (`isApprovalResumeWithoutUserTurn`); a CLI control resume above is a NEW turn, and so
-        // is the held message a CLI Deny answers.
-        const managedRunIsInPlaceApprovalResume =
-          heldAnswerAfterDeny === null &&
-          isInPlaceApprovalResume({
-            approvalResponseCount: approvalResponseForStream.length,
-            content,
-            controlResumeContent: controlApprovalResumeContent,
-          })
+        // The API approval resume writes into the message the card was on.
+        const managedRunIsInPlaceApprovalResume = isInPlaceApprovalResume({
+          approvalResponseCount: approvalResponseForStream.length,
+          content,
+        })
 
         // The API in-place resume recompiles BEFORE the card, so its full browser history
         // cannot claim the words after it. Only an ordinary/new run actually includes them.
         if (!managedRunIsInPlaceApprovalResume) {
           trustedFirstRunSteerIds = [...new Set([...trustedFirstRunSteerIds,
             ...await readHeldSteerIdsForHistory(sessionId, managedMessages)])]
-        }
-
-        if (controlApprovalInPlaceAddendum) {
-          // F-P3-2: the decision the click made off the SDK's lane, carried into the run
-          // the SDK is about to resume. It rides the same channel the tool-approval
-          // timeout notice does — a metadata field the compiler turns into a system-prompt
-          // addendum — so nothing about the resume itself changes.
-          managedMetadata = {
-            ...(managedMetadata && typeof managedMetadata === 'object'
-              ? managedMetadata
-              : {}),
-            controlApprovalNotice: controlApprovalInPlaceAddendum,
-          }
         }
 
         // BL-523: the run in progress, which is where a failure of THIS request is written. The
@@ -10919,6 +10725,17 @@ async function handleSendRoutedRequest(
         runInProgress = { messageId: managedAssistantMessageId,
           inPlaceResume: managedRunIsInPlaceApprovalResume, steerIds: trustedFirstRunSteerIds }
         lastRun = runInProgress
+        const firstRunOwner = runInProgress
+          // A completed HTTP/approval boundary cannot revive the previous task
+          // or reset its management counter. A real held NEW user turn is distinct.
+          if (approvalClick && !originalResumed) {
+            if (p5OriginalRequestForPreparation(originalPreparation)) await sealP5OriginalPreparation(originalPreparation)
+            retireP5OriginalPreparation(originalPreparation)
+            originalPreparation = undefined
+          }
+          // SA-137 Round 2 (review M1): the turn this reply's first run makes, which a context
+          // continuation reuses (the same reply under a new id: no new read, no early zip).
+          const replyLiveTurn: { turn: LiveFileReadTurn | null } = { turn: null }
           let streamResult = await handleBatshitAgentStream({
             content: managedContent,
             sessionId,
@@ -10930,7 +10747,7 @@ async function handleSendRoutedRequest(
             streamMetadata: trustedFirstRunSteerIds.length > 0 ? { steerPromoted: { steerIds: trustedFirstRunSteerIds } } : undefined,
             batshitInput,
             globalZipSettings,
-            voiceState: firstRunVoiceState,
+            voiceState: resolvedVoiceState,
             userSettings,
             userId: resolvedUserId,
             eventFetch,
@@ -10938,12 +10755,15 @@ async function handleSendRoutedRequest(
             gatewayAuthority,
             turnStopSignal,
             sessionRecord: session,
-            // DL-116-08: parity with the API lane's approval resume, which commits
-            // nothing — the clips and the memory linger belong to the turn the user
-            // approved, not to the click that unblocked it.
-            consumeSessionClips: controlApprovalResumeContent === null,
+            mcpOriginalPreparation: originalPreparation,
+            onP5ApiPart(part) { firstRunOwner.apiPart = part },
+            onLiveFileReadTurn(turn) { replyLiveTurn.turn = turn },
+            mcpOriginalApiPending: originalApiPending,
           })
           runFinished(streamResult)
+          // BL-921: the first run's own reply. A context continuation below replaces
+          // `streamResult`; the answer to held words is the reply they got, its first half.
+          const firstRunReplyId = streamResult.messageId
 
           // Auto-continue after mid-run context-window exhaustion: the failed
           // run's partial message (content + tool zips) is already finalized in
@@ -10952,16 +10772,18 @@ async function handleSendRoutedRequest(
           // Bounded by MAX_CONTEXT_CONTINUATIONS per user request; single-agent
           // managed sends only (group chat keeps its own turn semantics).
           let continuationAttempt = 0
-          while (
-            streamResult.contextExhausted === true &&
-            streamResult.failureHandled === true &&
-            continuationAttempt < MAX_CONTEXT_CONTINUATIONS &&
-            request.signal?.aborted !== true
-          ) {
-            continuationAttempt++
+          while (request.signal?.aborted !== true && !requestStopped) {
+            // SAME actual outer loop and preparation. A paused SDK predicate is
+            // only restrictive; the real canonical/physical owners admit this.
+            const prerequisite = originalPreparation && streamResult.p5ManagementPause && streamResult.response.ok
+              ? await takeP5ApiVerifiedContinuation(originalPreparation) : undefined
+            const contextContinuation = streamResult.p5ManagementPause !== true && streamResult.contextExhausted === true && streamResult.failureHandled === true && continuationAttempt < MAX_CONTEXT_CONTINUATIONS
+            if (!prerequisite && !contextContinuation) break
+            await assertP5ApiFreshSegment(originalPreparation)
+            if (contextContinuation && !prerequisite) continuationAttempt++
             const previousMessageId = streamResult.messageId
             logger.debug(
-              '[Send-Routed] Auto-continuing after context-window exhaustion',
+              '[Send-Routed] Continuing the same original task',
               {
                 sessionId,
                 agentId,
@@ -10999,6 +10821,8 @@ async function handleSendRoutedRequest(
               break
             }
             refileUndeliveredSteers(sessionId, previousMessageId, continuationMessageId)
+            // SA-137 Round 2 (review M1): the continuation is the same reply, so its turn is the reply's.
+            replyLiveTurn.turn?.continueAs(continuationMessageId)
 
             const baseContinuationMetadata = (() => {
               if (!metadataForStream || typeof metadataForStream !== 'object') {
@@ -11015,6 +10839,7 @@ async function handleSendRoutedRequest(
             })()
 
             runInProgress = { messageId: continuationMessageId, inPlaceResume: false }
+            const continuationRunOwner = runInProgress
             // BL-965: this turn starts after the last one ended: the record as it is now.
             agent = await readAgentRecordForFollowUpTurn(resolvedUserId, agentId)
             streamResult = await handleBatshitAgentStream({
@@ -11026,11 +10851,11 @@ async function handleSendRoutedRequest(
               messages: persistedHistory,
               metadata: {
                 ...baseContinuationMetadata,
-                contextContinuation: {
+                ...(!prerequisite ? { contextContinuation: {
                   attempt: continuationAttempt,
                   maxAttempts: MAX_CONTEXT_CONTINUATIONS,
                   previousMessageId,
-                },
+                } } : {}),
               },
               batshitInput,
               globalZipSettings,
@@ -11042,15 +10867,55 @@ async function handleSendRoutedRequest(
               gatewayAuthority,
               turnStopSignal,
               consumeSessionClips: false,
+              mcpOriginalPreparation: originalPreparation,
+              onP5ApiPart(part) { continuationRunOwner.apiPart = part },
+              ...(replyLiveTurn.turn ? { liveFileReadTurn: replyLiveTurn.turn } : {}),
+              continuesReply: true,
             })
             runFinished(streamResult)
           }
+
+          // Seal the actual old segment before a promoted NEW user task. Physical
+          // custody remains until the real save/child/preparation owners settle.
+          if (p5OriginalRequestForPreparation(originalPreparation)) await sealP5OriginalPreparation(originalPreparation)
+          // All context children of this original task have ended. A promoted
+          // user turn below must get a new pre-lookup cut and separate counter0.
+          retireP5OriginalPreparation(originalPreparation)
 
           if (answeredCardMessageId && !streamResult.awaitsApproval && !streamResult.response.ok &&
             !isSessionTurnHeldByAnother(sessionId, sessionTurnId)) {
             await markHeldMessageUnanswered({ sessionId, userId: resolvedUserId, cardMessageId: answeredCardMessageId,
               reason: streamResult.response.status === 499 ? 'stopped' : 'reply_failed', eventFetch, request })
           }
+
+          // BL-921: a run that answered held words saved its answer at the end of the chat, after
+          // the sends the chat's line kept at the same card; those move behind the answer (its
+          // last half too, after a context continuation). Only after an answer that ended ok
+          // (saved, `end` published) and at no new card, and only while this request still holds
+          // the chat (`moveUnansweredBehindHeldAnswer`).
+          const moveUnansweredBehindAnswer = async (heldMessageId: string, answerMessageId: string) => {
+            if (!streamResult.response.ok || streamResult.awaitsApproval === true) return
+            if (getActiveSessionTurn(sessionId)?.turnId !== sessionTurnId) return
+            await moveUnansweredBehindHeldAnswer({
+              sessionId,
+              userId: resolvedUserId,
+              heldMessageId,
+              answerMessageId,
+              eventFetch,
+              request,
+            })
+          }
+          // Send now on held words is an ordinary send naming the held message.
+          const firstRunHeldMessageId =
+            (!approvalClick && namedUserMessageId &&
+            readWaitsForApproval(
+              (savedUserMessage ??
+                (await redis.execute((client) => client.json.get(`message:${sessionId}:${namedUserMessageId}`))) as any)
+                ?.metadata,
+            )
+              ? namedUserMessageId
+              : null)
+          if (firstRunHeldMessageId) await moveUnansweredBehindAnswer(firstRunHeldMessageId, firstRunReplyId)
 
           // SA-114 P1 (DL-114-07) — an undelivered steer becomes the next turn.
           //
@@ -11065,9 +10930,8 @@ async function handleSendRoutedRequest(
           // linger committed once, no `metadata.wake` (a human typed it, so a woken chat
           // reads as human from here on).
           let steerPromotions = 0
-          // BL-455: an Approve or Deny click answers the message held for its card (below), once. A
-          // CLI Deny that ran the held message as its first turn has answered it already.
-          let heldAnswerChecked = heldAnswerAfterDeny !== null
+          // An approval click answers the message held for its card below, once.
+          let heldAnswerChecked = false
           while (steerPromotions < MAX_STEER_PROMOTIONS) {
             const interrupted =
               streamResult.response.status === 499 ||
@@ -11118,6 +10982,8 @@ async function handleSendRoutedRequest(
             }
 
             let nextTurn: {
+              /** BL-921: the held message this turn answers (a promotion answers none). */
+              heldMessageId?: string
               content: string
               assistantMessageId: string
               history: ChatMessage[]
@@ -11187,10 +11053,15 @@ async function handleSendRoutedRequest(
             // The user's words, run as their send ran: no `wake` or `source` from the run before, and
             // in a click's request the paused send's facts, not the card's (`buildFollowUpMetadata`).
             runInProgress = { messageId: nextTurn.assistantMessageId, inPlaceResume: false, steerIds: nextTurn.steerIds }
+            const promotedRunOwner = runInProgress
             pendingPromotionIds = []
             const nextMetadata = await buildFollowUpMetadata(nextTurn.steerIds, nextTurn.sendFacts)
             // BL-965: this turn starts after the last one ended: the record as it is now.
+            originalLookup = p5AuthenticatedHuman ? captureP5OriginalLookup({ userId: resolvedUserId, agentId, signal: request.signal }) : undefined
             agent = await readAgentRecordForFollowUpTurn(resolvedUserId, agentId)
+            originalPreparation = prepareP5OriginalTask(originalLookup, {
+              sessionId, session: ownedSessionUnderLock, agent, turn: sessionTurnRegistration.entry
+            })
             streamResult = await handleBatshitAgentStream({
               content: nextTurn.content,
               sessionId,
@@ -11210,8 +11081,12 @@ async function handleSendRoutedRequest(
               gatewayAuthority,
               turnStopSignal,
               sessionRecord: session,
+              mcpOriginalPreparation: originalPreparation,
+              onP5ApiPart(part) { promotedRunOwner.apiPart = part },
             })
             runFinished(streamResult)
+            retireP5OriginalPreparation(originalPreparation)
+            if (nextTurn.heldMessageId) await moveUnansweredBehindAnswer(nextTurn.heldMessageId, nextTurn.assistantMessageId)
           }
 
           // The bound above is a safety net, not a product limit — but if it ever fires,
@@ -11272,6 +11147,8 @@ async function handleSendRoutedRequest(
               streamResult.response,
             )
             await persistFailedAssistantTurn({
+              mcpOriginalPreparation: lastRun.apiPart ? originalPreparation : undefined,
+              mcpApiPart: lastRun.apiPart,
               sessionId,
               userId: resolvedUserId,
               agentId,
@@ -11310,6 +11187,8 @@ async function handleSendRoutedRequest(
             failuresSavedBeforeThrow.has(streamError)
           if (!isAbortError && !failureAlreadySaved) {
             await persistFailedAssistantTurn({
+              mcpOriginalPreparation: runInProgress?.apiPart ? originalPreparation : undefined,
+              mcpApiPart: runInProgress?.apiPart,
               sessionId,
               userId: resolvedUserId,
               agentId,
@@ -11346,6 +11225,9 @@ async function handleSendRoutedRequest(
           throw streamError
         }
     } finally {
+      // Authority retirement precedes awaited cleanup and is independent of
+      // clearStreamAbort or any child's Redis credential revoke/physical close.
+      retireP5OriginalPreparation(originalPreparation)
       // The run-end sweep removes this chat's sandboxes even while a command runs in one,
       // because it assumes the chat's run is over. That is true while this request still has
       // the chat (or nobody does). If another turn holds it now — this lock was taken as an
@@ -11418,15 +11300,25 @@ async function handleSendRoutedRequest(
 	      // BL-713: and it says how it ended, so a line of waiting sends holds at a card this
 	      // request stopped at (never a turn beside the card), keeps its sends after the page's own
 	      // Deny of an expired card, or goes on after the user's click, in the same step.
+	      // SA-139 D6: a run this click claimed but no stream took (the reply failed before its
+	      // model was built) ends here; one the stream took is its model's to end.
+	      takeClaudePlanClaim(request)?.run.stop()
 	      releaseSessionTurn(sessionId, sessionTurnId, {
 	        approvalCardMessageId: endedAtApprovalCardMessageId,
 	        answeredApproval:
-	          approvalClick && clickAnswerRecorded ? { expiryOnly: expiryOnlyAnswer } : null,
+	          approvalClick && (clickAnswerRecorded || retiredCardClosed) ? { expiryOnly: expiryOnlyAnswer || retiredCardClosed } : null,
 	      })
 	      const cardHold = getQueueCardHold(sessionId)
-	      // A hold this request's last run started, or the one a refused click put back after it
-	      // told the tabs the hold had ended.
-	      if (cardHold && (cardHold.messageId === endedAtApprovalCardMessageId || holdEndForwarded)) {
+	      // A hold this request's last run started, the one a refused click put back after it told
+	      // the tabs the hold had ended, or (BL-903 b) one that stood through this click on ANOTHER
+	      // card (its registration ended no hold): the tabs heard no hold while it held the chat
+	      // (`/api/sse` sends none then). `/api/sse` sends the line's own state, so a repeat is harmless.
+	      if (
+	        cardHold &&
+	        (cardHold.messageId === endedAtApprovalCardMessageId ||
+	          holdEndForwarded ||
+	          sessionTurnRegistration.endedCardHold === false)
+	      ) {
 	        // Every tab: the waiting sends wait for the user's answer to this card.
 	        await forwardQueuedSendEvent(request, {
 	          type: 'queued_send_hold',
@@ -11441,7 +11333,7 @@ async function handleSendRoutedRequest(
     const details = error instanceof Error ? error.message : String(error)
     const code =
       typeof (error as any)?.code === 'string' ? (error as any).code : null
-    const errorMessage = status >= 500 ? 'Failed to send message' : details
+    const errorMessage = status >= 500 && code !== 'retired_approval_unconfirmed' ? 'Failed to send message' : details
 
     return json(
       {
@@ -11452,6 +11344,8 @@ async function handleSendRoutedRequest(
       { status },
     )
   } finally {
+    retireP5OriginalPreparation(originalPreparation)
+    if (p5OriginalRequestForPreparation(originalPreparation)) await sealP5OriginalPreparation(originalPreparation)
     // Bounded: the forward has its own time limit (`forwardQueuedSendEvent`), and never throws.
     try { if (queuedNoticeSent) await queuedNoticeSent }
     finally {

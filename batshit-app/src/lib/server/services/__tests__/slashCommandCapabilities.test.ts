@@ -8,31 +8,39 @@ const redisMocks = vi.hoisted(() => ({
 vi.mock('$lib/server/redis', () => ({
   redis: {
     keys: redisMocks.keys,
+    execute: (callback: any) => callback({ keys: redisMocks.keys }),
     json: {
       get: redisMocks.jsonGet
     }
   }
 }))
 
+vi.mock('../systemSlashCommands', () => ({ ensureSystemSlashCommands: vi.fn(), assertBuiltinCommandCatalogue: vi.fn() }))
+vi.mock('../agentPlugins', () => ({ builtinPluginSkill: () => undefined, listAgentPlugins: async () => [], projectPluginCommand: async (_user: string, command: unknown) => command }))
+
 import {
   buildSkillsCommandsDcmLines,
   getEnabledAgentSlashCapabilities,
+  listAllSlashCapabilities,
   resolveSkillAccessForActor
 } from '../slashCommandCapabilities'
 import { splitFrontmatter } from '../skillFrontmatter'
+import { ensureSystemSlashCommands, assertBuiltinCommandCatalogue } from '../systemSlashCommands'
+
+beforeEach(() => { vi.mocked(ensureSystemSlashCommands).mockReset().mockResolvedValue(undefined) })
 
 function skillCommand(overrides: Record<string, unknown>) {
   return {
-    id: 'artifact-creator',
-    name: 'artifact-creator',
+    id: 'sample-creator',
+    name: 'sample-creator',
     displayName: 'Artifact Creator',
     type: 'skill',
     is_active: true,
     is_system: true,
     can_be_attached_to_agents: true,
     can_be_invoked_in_chat: true,
-    invocation_pattern: '/artifact-creator',
-    skill_id: 'artifact_creator',
+    invocation_pattern: '/sample-creator',
+    skill_id: 'sample_creator',
     enabled_for_all_agents: false,
     enabled_agent_ids: [],
     ...overrides
@@ -46,31 +54,74 @@ function seedCommands(commands: Array<Record<string, unknown>>) {
   )
 }
 
-describe('slashCommandCapabilities', () => {
+describe('independent slashCommandCapabilities (grouped built-ins use agentPlugins.redis.test)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
 
+  it('reads both capability catalogs without entering bootstrap or mutation-conflict admission', async () => {
+    seedCommands([skillCommand({ enabled_for_all_agents: true })])
+    vi.mocked(ensureSystemSlashCommands).mockImplementation(() => { throw new Error('SLASH_COMMAND_CONFLICT: catalogue entered mutation admission') })
+    expect(await getEnabledAgentSlashCapabilities('user-1', 'agent-1')).toHaveLength(1)
+    expect(await listAllSlashCapabilities('user-1')).toHaveLength(1)
+    expect(ensureSystemSlashCommands).not.toHaveBeenCalled()
+    expect(assertBuiltinCommandCatalogue).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([3, 10, 25])('keeps all %s enabled skills with full identities and bounded single-line descriptions', async count => {
+    seedCommands([
+      ...Array.from({ length: count }, (_, i) => skillCommand({ id: `catalog-${i}`, name: `catalog-${i}`,
+        displayName: `Catalog ${String(i).padStart(2, '0')}`, invocation_pattern: `/catalog-${i}`, skill_id: `catalog_skill_${i}`,
+        enabled_agent_ids: ['agent-1'], description: 'A long skill description.\n'.repeat(30) })),
+      skillCommand({ id: 'not-enabled', name: 'not-enabled', skill_id: 'not_enabled', enabled_agent_ids: ['another-agent'] })
+    ])
+    const capabilities = await getEnabledAgentSlashCapabilities('user-1', 'agent-1')
+    expect(capabilities).toHaveLength(count)
+    const lines = buildSkillsCommandsDcmLines(capabilities)
+    const entries = lines.filter(line => /^- \/catalog-/.test(line))
+    expect(entries).toHaveLength(count)
+    for (let i = 0; i < count; i++) {
+      const line = entries.find(entry => entry.startsWith(`- /catalog-${i} |`))!
+      expect(line).toContain(`skillId=catalog_skill_${i}`)
+      expect(line).not.toContain('\n')
+      const description = line.split(' — ')[1]
+      expect(description.length).toBeLessThanOrEqual(240)
+      expect(description.endsWith('…')).toBe(true)
+    }
+    expect(lines.join('\n')).not.toContain('not_enabled')
+  })
+
+  it('omits both the catalog and usage when no skill or prompt is enabled', () => {
+    expect(buildSkillsCommandsDcmLines([])).toEqual([])
+  })
+
+  it('offers the live API skill call and ref in catalog guidance', () => {
+    const capabilities = [{ id: 'one', name: 'one', displayName: 'One', type: 'skill' as const, invocation: '/one', isSystem: false, skillId: 'one' }]
+    const api = buildSkillsCommandsDcmLines(capabilities).join('\n')
+    expect(api).toContain('native_batshit_tool_use with ref="batshit:sys.skill.use"')
+    expect(api).not.toContain('native_skill')
+  })
+
   it('includes chat-invocable global system skills alongside agent-enabled commands', async () => {
     redisMocks.keys.mockResolvedValue([
-      'slash_command:user-1:voice-engine-installer',
+      'slash_command:user-1:sample-installer',
       'slash_command:user-1:agent-browser',
       'slash_command:user-1:disabled-skill'
     ])
 
     redisMocks.jsonGet.mockImplementation(async (key: string) => {
-      if (key.endsWith('voice-engine-installer')) {
+      if (key.endsWith('sample-installer')) {
         return {
-          id: 'voice-engine-installer',
-          name: 'voice-engine-installer',
+          id: 'sample-installer',
+          name: 'sample-installer',
           displayName: 'TTS/STT Engine Installer',
           type: 'skill',
           is_active: true,
           is_system: true,
           can_be_attached_to_agents: false,
           can_be_invoked_in_chat: true,
-          invocation_pattern: '/voice-engine-installer',
-          skill_id: 'voice_engine_installer',
+          invocation_pattern: '/sample-installer',
+          skill_id: 'sample_installer',
           description: 'Canonical speech setup'
         }
       }
@@ -110,9 +161,9 @@ describe('slashCommandCapabilities', () => {
 
     expect(capabilities).toEqual([
       expect.objectContaining({
-        id: 'voice-engine-installer',
-        invocation: '/voice-engine-installer',
-        skillId: 'voice_engine_installer',
+        id: 'sample-installer',
+        invocation: '/sample-installer',
+        skillId: 'sample_installer',
         isSystem: true
       }),
       expect.objectContaining({
@@ -125,15 +176,15 @@ describe('slashCommandCapabilities', () => {
 
     const dcmLines = buildSkillsCommandsDcmLines(capabilities)
     expect(dcmLines).toContain(
-      '- /voice-engine-installer | skill | skillId=voice_engine_installer — Canonical speech setup'
+      '- /sample-installer | skill | skillId=sample_installer — Canonical speech setup'
     )
     expect(dcmLines).toContain('- /agent-browser | skill | skillId=agent_browser')
     expect(dcmLines).toContain(
-      '- An enabled skill is permission to use that skill when it clearly matches the user\'s request. You may proactively invoke any listed skill by calling native_skill with its listed skillId and action="invoke"; the user does not need to type the slash command first. Use judgment; skip skills for simple requests that do not need the skill workflow.'
+      '- An enabled skill is permission to use that skill when it clearly matches the user\'s request. You may proactively invoke any listed skill by calling native_batshit_tool_use with ref="batshit:sys.skill.use" and input containing its listed skillId and action="invoke"; the user does not need to type the slash command first. Use judgment; skip skills for simple requests that do not need the skill workflow.'
     )
     // BL-75: the list is also the limit, and the agent is told so.
     expect(dcmLines).toContain(
-      '- Only skills enabled for you can be loaded: native_skill refuses any other skill. If the user wants a skill that is not listed here, tell them to turn it on for you in Settings -> Agents -> Access, or for every agent in Settings -> Skills & Prompts.'
+      '- Plugin skills share the plugin’s access setting in Settings -> Plugins & shit -> Plugins. Only skills enabled for you can be loaded: native_batshit_tool_use with ref="batshit:sys.skill.use" refuses any other skill. If the user wants a skill that is not listed here, tell them to turn it on for you in Settings -> Agents -> Access, or for every agent in Settings -> Plugins & shit.'
     )
   })
 
@@ -246,17 +297,17 @@ describe('resolveSkillAccessForActor (BL-75)', () => {
   it('lets an agent load a skill that is on for it, and returns the normalized id', async () => {
     seedCommands([skillCommand({ enabled_agent_ids: ['agent-1'] })])
 
-    const result = await resolveSkillAccessForActor('user-1', '  Artifact-Creator ', agent)
+    const result = await resolveSkillAccessForActor('user-1', '  Sample-Creator ', agent)
 
     expect(result).toEqual(
-      expect.objectContaining({ ok: true, skillId: 'artifact_creator' })
+      expect.objectContaining({ ok: true, skillId: 'sample_creator' })
     )
   })
 
   it('lets every agent load a skill that is on for all agents', async () => {
     seedCommands([skillCommand({ enabled_for_all_agents: true })])
 
-    const result = await resolveSkillAccessForActor('user-1', 'artifact_creator', {
+    const result = await resolveSkillAccessForActor('user-1', 'sample_creator', {
       kind: 'agent',
       agentId: 'agent-99'
     })
@@ -267,26 +318,26 @@ describe('resolveSkillAccessForActor (BL-75)', () => {
   it('refuses a skill that is off for this agent and says where to turn it on', async () => {
     seedCommands([skillCommand({ enabled_agent_ids: ['agent-2'] })])
 
-    const result = await resolveSkillAccessForActor('user-1', 'artifact_creator', agent)
+    const result = await resolveSkillAccessForActor('user-1', 'sample_creator', agent)
 
     expect(result).toEqual({
       ok: false,
       code: 'SKILL_NOT_ENABLED',
-      skillId: 'artifact_creator',
-      message: expect.stringContaining('Skill "Artifact Creator" (artifact_creator) is not enabled for this agent')
+      skillId: 'sample_creator',
+      message: expect.stringContaining('Skill "Artifact Creator" (sample_creator) is not enabled for this agent')
     })
     if (!result.ok) {
       expect(result.message).toContain('Settings -> Agents -> Access')
-      expect(result.message).toContain('Settings -> Skills & Prompts')
+      expect(result.message).toContain('Settings -> Plugins & shit')
     }
   })
 
   it('refuses a skill whose command is switched off or not chat-invocable', async () => {
     seedCommands([skillCommand({ enabled_for_all_agents: true, is_active: false })])
-    expect((await resolveSkillAccessForActor('user-1', 'artifact_creator', agent)).ok).toBe(false)
+    expect((await resolveSkillAccessForActor('user-1', 'sample_creator', agent)).ok).toBe(false)
 
     seedCommands([skillCommand({ enabled_for_all_agents: true, can_be_invoked_in_chat: false })])
-    expect((await resolveSkillAccessForActor('user-1', 'artifact_creator', agent)).ok).toBe(false)
+    expect((await resolveSkillAccessForActor('user-1', 'sample_creator', agent)).ok).toBe(false)
   })
 
   it('keeps the legacy rule the list uses: a command with no access field is on', async () => {
@@ -294,19 +345,19 @@ describe('resolveSkillAccessForActor (BL-75)', () => {
     delete (legacy as Record<string, unknown>).enabled_agent_ids
     seedCommands([legacy])
 
-    expect((await resolveSkillAccessForActor('user-1', 'artifact_creator', agent)).ok).toBe(true)
+    expect((await resolveSkillAccessForActor('user-1', 'sample_creator', agent)).ok).toBe(true)
   })
 
   it('allows a skill when any one of its commands is on for the agent', async () => {
     seedCommands([
-      skillCommand({ id: 'artifact-creator-off', enabled_agent_ids: [] }),
-      skillCommand({ id: 'artifact-creator-on', enabled_agent_ids: ['agent-1'] })
+      skillCommand({ id: 'sample-creator-off', enabled_agent_ids: [] }),
+      skillCommand({ id: 'sample-creator-on', enabled_agent_ids: ['agent-1'] })
     ])
 
-    const result = await resolveSkillAccessForActor('user-1', 'artifact_creator', agent)
+    const result = await resolveSkillAccessForActor('user-1', 'sample_creator', agent)
 
     expect(result).toEqual(
-      expect.objectContaining({ ok: true, command: expect.objectContaining({ id: 'artifact-creator-on' }) })
+      expect.objectContaining({ ok: true, command: expect.objectContaining({ id: 'sample-creator-on' }) })
     )
   })
 
@@ -315,17 +366,17 @@ describe('resolveSkillAccessForActor (BL-75)', () => {
       skillCommand({ id: 'prompt-twin', type: 'prompt', enabled_for_all_agents: true })
     ])
 
-    const result = await resolveSkillAccessForActor('user-1', 'artifact_creator', agent)
+    const result = await resolveSkillAccessForActor('user-1', 'sample_creator', agent)
 
     expect(result).toEqual(
-      expect.objectContaining({ ok: false, code: 'SKILL_NOT_LISTED', skillId: 'artifact_creator' })
+      expect.objectContaining({ ok: false, code: 'SKILL_NOT_LISTED', skillId: 'sample_creator' })
     )
   })
 
   it('checks a subagent against its own list, not its parent agent', async () => {
     seedCommands([skillCommand({ enabled_agent_ids: ['agent-1'] })])
 
-    const result = await resolveSkillAccessForActor('user-1', 'artifact_creator', {
+    const result = await resolveSkillAccessForActor('user-1', 'sample_creator', {
       kind: 'agent',
       agentId: 'research_bot',
       delegated: true
@@ -338,7 +389,7 @@ describe('resolveSkillAccessForActor (BL-75)', () => {
   it('refuses a caller with no agent identity without reading any command', async () => {
     seedCommands([skillCommand({ enabled_for_all_agents: true })])
 
-    const result = await resolveSkillAccessForActor('user-1', 'artifact_creator', {
+    const result = await resolveSkillAccessForActor('user-1', 'sample_creator', {
       kind: 'none',
       lane: 'service'
     })
@@ -346,4 +397,24 @@ describe('resolveSkillAccessForActor (BL-75)', () => {
     expect(result).toEqual(expect.objectContaining({ ok: false, code: 'AGENT_IDENTITY_REQUIRED' }))
     expect(redisMocks.keys).not.toHaveBeenCalled()
   })
+
+  it.each([[' A-B ', 'A-B'], [7, '7'], [{ toString: 'A-B' }, 'A-B'], ['bad\ud800', 'bad�']])('never turns malformed saved %j into another load/DCM identity %s (BL1614)', async (saved, actorId) => {
+    const row = skillCommand({ enabled_agent_ids: [saved, 'bystander'] })
+    seedCommands([row])
+    expect((await resolveSkillAccessForActor('user-1', 'sample_creator', { kind: 'agent', agentId: actorId })).ok).toBe(false)
+    expect(await getEnabledAgentSlashCapabilities('user-1', actorId)).toEqual([])
+    expect((await resolveSkillAccessForActor('user-1', 'sample_creator', { kind: 'agent', agentId: 'bystander' })).ok).toBe(true)
+    expect(row.enabled_agent_ids).toEqual([saved, 'bystander'])
+  })
+
+  it('keeps exact A-B/a_b distinct and preserves a legitimate legacy reference for both loads and DCM', async () => {
+    seedCommands([skillCommand({ enabled_agent_ids: ['A-B', 'odd.id'] })])
+    for (const id of ['A-B', 'odd.id']) {
+      expect((await resolveSkillAccessForActor('user-1', 'sample_creator', { kind: 'agent', agentId: id })).ok).toBe(true)
+      expect(await getEnabledAgentSlashCapabilities('user-1', id)).toHaveLength(1)
+    }
+    expect((await resolveSkillAccessForActor('user-1', 'sample_creator', { kind: 'agent', agentId: 'a_b' })).ok).toBe(false)
+    expect(await getEnabledAgentSlashCapabilities('user-1', 'a_b')).toEqual([])
+  })
+
 })

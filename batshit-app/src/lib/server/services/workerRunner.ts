@@ -7,12 +7,15 @@
  * worker (borrowing the parent's model and tool scope) or a fresh copy of one of the
  * user's own named subagents. Josh's #2: "It's just a little quick subsession."
  *
- * One batch tool per lane calls this module — `native_spawn_workers` on the API lane,
- * `spawn_workers` through the managed CLI bridge — so the 3/3/9 caps, the validation, and
- * the result shape live in ONE place regardless of how Codex or Claude schedule MCP calls.
+ * One batch tool calls this module, the API Primary's `native_spawn_workers` (SA-139 R4 removed
+ * the CLI Primary's `spawn_workers`), so the caps (6 per call, 6 at a time since the delegation
+ * limits, 2026-10-24), the validation, and the result shape live in ONE place. Every Worker runs
+ * on the API lane (SA-139 R5 removed the CLI Subagent, and with it the CLI Worker). A Worker runs
+ * under the same limits rule as a Subagent: none by default, the stall guard always, and a `base`
+ * clone's Subagent's own time and tool-step limits (its record is copied whole).
  *
- * What a worker never touches (Faye's P4 design note): `subagent_sessions:`,
- * `subagent_thread:`, and the same-subagent run lock. Parallel is the point and a worker
+ * What a worker never touches (Faye's P4 design note): `subagent_sessions:` and the
+ * same-subagent run lock. Parallel is the point and a worker
  * has no thread, so the runner is entered with a `none` thread plan.
  */
 
@@ -33,12 +36,12 @@ import {
 } from '$lib/utils/delegationCapabilities'
 import {
   canonicalizeSubagentRecord,
-  isWorkflowBackedSubagentType,
+  isRetiredSubagentType,
   normalizeSubagentType,
+  retiredSubagentTypeMessage,
 } from '$lib/utils/subagentType'
 import { normalizeSubagentSlugValue, resolveSubagentSlug } from '$lib/utils/subagentSlug'
 import { executeManagedSubagent } from '$lib/server/services/subagentRunner'
-import type { CodexDelegatedAccounting } from './observedUsage'
 import { reserveWorkerRuns, type WorkerTurnKey } from '$lib/server/services/workerTurnBudget'
 
 /** One worker as the model asks for it (DL-111-09). */
@@ -56,8 +59,6 @@ export type WorkerRunRecord = {
   status: DelegatedRunStatus
   output: string
   usage: DelegatedUsage | null
-  observedUsage?: CodexDelegatedAccounting['observedUsage']
-  observedUsageUnavailable?: 'invalid'
   modelId: string | null
   provider: string | null
   durationMs: number
@@ -82,29 +83,21 @@ export type SpawnWorkersSuccess = {
 export type SpawnWorkersResult = SpawnWorkersRefusal | SpawnWorkersSuccess
 
 /**
- * Everything a worker inherits from the turn that spawned it. The API lane fills this from
- * the brain's already-resolved run context; the managed CLI lane fills it from the parent
- * agent record inside `/api/subagents/managed-execute`.
+ * Everything a worker inherits from the turn that spawned it, filled from the API brain's
+ * already-resolved run context.
  */
 export type WorkerParentContext = {
   userId: string
   sessionId: string
   parentAgentId: string
-  /** The parent turn's message id — the key the 9-per-turn cap counts against. */
+  /** The parent turn's message id — the key the six-at-a-time cap counts against. */
   parentMessageId: string | null
   projectPath: string | null
   /** The runtime family a built-in worker inherits (DL-111-10). */
-  lane: 'api' | 'cli'
-  /** API lane: the parent's resolved runtime model and connection. */
+  lane: 'api'
+  /** The parent's resolved runtime model and connection. */
   parentModelId?: string | null
   parentConnection?: ModelConnectionInfo | null
-  /** CLI lane: the parent agent's own model fields, resolved the same way a CLI Subagent's are. */
-  cliModelFields?: Partial<
-    Pick<
-      SubagentRow,
-      'primary_model_provider' | 'primary_model_name' | 'model' | 'codex_settings' | 'claude_settings'
-    >
-  > | null
   providerSettings: Record<string, any> | null
   selectedGateways: string[] | null
   toolSelections: MCPToolSelections | null
@@ -286,18 +279,11 @@ function buildWorkerRecord(args: {
     ...(parent.toolSelections ? { defaultMCPToolSelections: parent.toolSelections } : {}),
     ...(parent.selectedCliToolIds ? { defaultTools: parent.selectedCliToolIds } : {}),
     ...(parent.dcmDisplaySettings ? { dcmDisplaySettings: parent.dcmDisplaySettings } : {}),
-    subagentType: parent.lane === 'cli' ? 'cli' : 'api',
+    subagentType: 'api',
   }
 
-  if (parent.lane === 'cli') {
-    return {
-      ...shared,
-      ...(parent.cliModelFields ?? {}),
-    }
-  }
-
-  // API lane: model fields left blank on purpose, so `resolveSubagentModelId` inherits the
-  // parent's runtime model and `runApiSubagent` passes the parent's connection with it.
+  // Model fields left blank on purpose, so `resolveSubagentModelId` inherits the parent's
+  // runtime model and `runApiSubagent` passes the parent's connection with it.
   return shared
 }
 
@@ -316,13 +302,13 @@ export async function spawnWorkers(params: SpawnWorkersParams): Promise<SpawnWor
     )
   }
 
-  // DL-111-09: the 9-per-turn cap counts against the parent TURN, so a run Batshit cannot
-  // attribute to a turn is refused rather than given a quietly unlimited budget.
+  // The six-at-a-time cap counts against the parent TURN, so a run Batshit cannot attribute
+  // to a turn is refused rather than given a quietly unlimited budget.
   const parentMessageId = readTrimmed(parent.parentMessageId)
   if (!parentMessageId) {
     return refuse(
       'invalid_context',
-      'Batshit could not identify the parent turn this worker batch belongs to, so its per-turn limit cannot be enforced. Do the work yourself and report this.'
+      'Batshit could not identify the parent turn this worker batch belongs to, so its limit of workers at a time cannot be enforced. Do the work yourself and report this.'
     )
   }
 
@@ -340,7 +326,11 @@ export async function spawnWorkers(params: SpawnWorkersParams): Promise<SpawnWor
     }
     const match = assigned.find((record) => matchesBaseReference(record, reference)) ?? null
     if (!match) {
-      const available = assigned.map((record) => resolveSubagentSlug(record))
+      // A record of a removed type stays matchable (for the readable refusal below) but is never
+      // offered as a base (SA-139 R2 and R5, D14).
+      const available = assigned
+        .filter((record) => !isRetiredSubagentType(normalizeSubagentType(record, record.subagentType)))
+        .map((record) => resolveSubagentSlug(record))
       return refuse(
         'unknown_base',
         `Worker ${index + 1} asked to clone \`${reference}\`, which is not one of this agent's assigned subagents. ${
@@ -350,10 +340,12 @@ export async function spawnWorkers(params: SpawnWorkersParams): Promise<SpawnWor
         }`
       )
     }
-    if (isWorkflowBackedSubagentType(normalizeSubagentType(match, match.subagentType))) {
+    if (isRetiredSubagentType(normalizeSubagentType(match, match.subagentType))) {
+      // SA-139 R2/R5 (D14): a removed Subagent type (n8n, or the CLI Subagent) is never cloned
+      // into a Worker; refused here, before any Worker run is reserved.
       return refuse(
         'unsupported_base',
-        `Worker ${index + 1} asked to clone \`${reference}\`, an n8n Workflow Subagent. n8n owns that workflow's runtime and memory, so it cannot be copied into a worker. Call it as a subagent instead, or omit \`base\`.`
+        `Worker ${index + 1} asked to clone \`${reference}\`. ${retiredSubagentTypeMessage({ ...match, displayName: match.displayName ?? reference })} Omit \`base\` to use the built-in worker.`
       )
     }
     baseRecords.push(match)
@@ -369,7 +361,9 @@ export async function spawnWorkers(params: SpawnWorkersParams): Promise<SpawnWor
     return refuse(reservation.code, reservation.message)
   }
 
+  // A worker's slug keeps its position in the batch; it names no folder, thread or lock.
   const parentAgentSlug = normalizeSubagentSlugValue(parent.parentAgentId, 'agent')
+  const delegationSlugs = specs.map((_, index) => `worker_${parentAgentSlug}_${index + 1}`)
 
   try {
     const workers = await Promise.all(
@@ -395,10 +389,7 @@ export async function spawnWorkers(params: SpawnWorkersParams): Promise<SpawnWor
             delegationKind: 'worker',
             workerRole: spec.role,
             workerBaseLabel: baseRecord?.displayName ?? null,
-            // One profile slot per position in the batch, scoped to this parent agent:
-            // managed CLI profile files are written non-atomically, so two concurrent
-            // workers must never share a profile path.
-            delegationSlug: `worker_${parentAgentSlug}_${index + 1}`,
+            delegationSlug: delegationSlugs[index],
             abortSignal: parent.abortSignal,
           })
 
@@ -410,15 +401,13 @@ export async function spawnWorkers(params: SpawnWorkersParams): Promise<SpawnWor
             status: result.status,
             output: result.output,
             usage: result.usage,
-            ...(result.observedUsage ? { observedUsage: result.observedUsage } : {}),
-            ...(result.observedUsageUnavailable ? { observedUsageUnavailable: result.observedUsageUnavailable } : {}),
             modelId: result.modelId,
             provider: result.provider,
             durationMs: result.durationMs,
           }
         } catch (error) {
-          // A throw here is a setup failure (no model, bad CLI target). Report it as this
-          // worker's failed result so the batch's other workers still come back.
+          // A throw here is a setup failure. Report it as this worker's failed result so the
+          // batch's other workers still come back.
           return {
             index,
             name,

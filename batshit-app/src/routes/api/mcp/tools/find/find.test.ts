@@ -108,40 +108,6 @@ describe('POST /api/mcp/tools/find', () => {
     expect(body.results?.[0]?.toolName).toBe('postgres_query')
   })
 
-  it('passes the credential gateway ceiling separately from a narrowing body filter', async () => {
-    resolveNativeToolUser.mockResolvedValue({
-      userId: 'josh', auth: 'agent', agentId: 'agent_1', mcpGatewayScope: ['gw_agent']
-    })
-    const response = await routeModule.POST({
-      request: new Request('http://localhost/api/mcp/tools/find', {
-        method: 'POST',
-        body: JSON.stringify({ query: 'postgres', selectedGateways: ['gw_other'], mcpGatewayScope: ['gw_other'] })
-      }),
-      locals: {}
-    } as any)
-    expect(response.status).toBe(200)
-    expect(resolveDynamicMcpGatewayScope).toHaveBeenCalledWith({
-      userId: 'josh', agentId: 'agent_1', mcpGatewayScope: ['gw_agent'], selectedGateways: ['gw_other']
-    })
-  })
-
-  it('refuses an unoffered delegated find before scope resolution or discovery', async () => {
-    resolveNativeToolUser.mockResolvedValue({
-      userId: 'josh', auth: 'agent', agentId: 'subagent_cli_1', delegated: true,
-      delegatedAllowedControlIds: [], mcpGatewayScope: ['gw_agent']
-    })
-    const response = await routeModule.POST({
-      request: new Request('http://localhost/api/mcp/tools/find', {
-        method: 'POST', body: JSON.stringify({ query: 'postgres', selectedGateways: ['gw_agent'] })
-      }),
-      locals: {}
-    } as any)
-    expect(response.status).toBe(403)
-    expect((await response.json()).code).toBe('CONTROL_NOT_ALLOWED')
-    expect(resolveDynamicMcpGatewayScope).not.toHaveBeenCalled()
-    expect(loadToolsForUser).not.toHaveBeenCalled()
-  })
-
   // BL-687: see the matching execute test.
   it('refuses a Portable Skill Token whose families grant no dynamic MCP control', async () => {
     resolveNativeToolUser.mockResolvedValue({
@@ -198,45 +164,6 @@ describe('POST /api/mcp/tools/find', () => {
     expect(resolveDynamicMcpGatewayScope).toHaveBeenCalledWith({
       userId: 'josh', agentId: 'agent_1', selectedGateways: undefined
     })
-  })
-
-  it('passes an empty ceiling for an older agent credential without a snapshot', async () => {
-    resolveNativeToolUser.mockResolvedValue({ userId: 'josh', auth: 'agent', agentId: 'agent_1' })
-    await routeModule.POST({
-      request: new Request('http://localhost/api/mcp/tools/find', {
-        method: 'POST', body: JSON.stringify({ query: 'postgres', selectedGateways: ['gw_other'] })
-      }),
-      locals: {}
-    } as any)
-    expect(resolveDynamicMcpGatewayScope).toHaveBeenCalledWith({
-      userId: 'josh', agentId: 'agent_1', mcpGatewayScope: [], selectedGateways: ['gw_other']
-    })
-  })
-
-  it.each([
-    ['group', { groups: { 'gw_agent::database': 'hidden' }, tools: {} }],
-    ['tool', { groups: {}, tools: { 'gw_agent::postgres.query': 'hidden' } }]
-  ])('keeps the stored hidden %s undiscoverable when an agent forges display settings', async (_kind, hidden) => {
-    resolveNativeToolUser.mockResolvedValue({
-      userId: 'josh', auth: 'agent', agentId: 'agent_1', mcpGatewayScope: ['gw_agent']
-    })
-    redisGet.mockResolvedValue({ dcmDisplaySettings: { version: 1, ...hidden } })
-    const post = async (dcmDisplaySettings?: object) => {
-      const response = await routeModule.POST({
-        request: new Request('http://localhost/api/mcp/tools/find', {
-          method: 'POST', body: JSON.stringify({ query: 'postgres', ...(dcmDisplaySettings ? { dcmDisplaySettings } : {}) })
-        }),
-        locals: {}
-      } as any)
-      expect(response.status).toBe(200)
-      return await response.json()
-    }
-    expect((await post()).results).toEqual([])
-    expect((await post({ version: 1, groups: {}, tools: {} })).results).toEqual([])
-    expect(redisGet).toHaveBeenCalledWith('agent:agent_1')
-
-    redisGet.mockResolvedValue({ dcmDisplaySettings: { version: 1, groups: {}, tools: {} } })
-    expect((await post()).results.map((item: any) => item.toolName)).toContain('postgres_query')
   })
 
   it('still accepts a signed-in settings preview display override', async () => {

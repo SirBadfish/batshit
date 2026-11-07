@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   __resetStreamAbortRegistryForTests,
+  abandonQueuedSessionTurn,
   beginSessionDelete,
   cancelQueuedSessionTurnsOfDeletedChat,
   clearSessionTurn,
@@ -297,6 +298,39 @@ describe('the chat’s line at an approval card (BL-713)', () => {
     expect(overflow.endedCardHold).toBe(false)
     expect(getQueueCardHold('chat')?.messageId).toBe('msg-card')
     expect(await settledNow(b.outcome)).toBeNull()
+  })
+
+  // BL-903 (d): a hold is for a send that will still run. When the last such send leaves the line
+  // before its turn (its request returned early or threw: `abandonQueuedSessionTurn`) while a kept
+  // send (here one over the cap) still stands in it, the hold has nothing left to hold, and keeping
+  // it hid the kept send's words until the 15-minute bound.
+  it('drops the hold when the last send that would run leaves the line: a kept send moves at once (BL-903 d)', async () => {
+    vi.useFakeTimers()
+    const holder = registerHolder()
+    const b = queue('msg-b')
+    const overflow = queueSessionTurn('chat', { kind: 'single', messageId: 'msg-f-reply', userMessageId: 'msg-f', keep: 'overflow' })
+    stopAtCard(holder)
+    expect(getQueueCardHold('chat')?.messageId).toBe('msg-card')
+
+    abandonQueuedSessionTurn('chat', b)
+
+    expect(getQueueCardHold('chat')).toBeNull()
+    await vi.advanceTimersByTimeAsync(QUEUED_SESSION_TURN_BACKSTOP_MS)
+    expect(await settledNow(overflow.outcome)).toMatchObject({ kind: 'keep', reason: 'overflow' })
+  })
+
+  it('keeps the hold while a send that will run is still waiting after another leaves (BL-903 d)', async () => {
+    vi.useFakeTimers()
+    const holder = registerHolder()
+    const b = queue('msg-b')
+    const c = queue('msg-c')
+    stopAtCard(holder)
+
+    abandonQueuedSessionTurn('chat', b)
+
+    expect(getQueueCardHold('chat')?.messageId).toBe('msg-card')
+    await vi.advanceTimersByTimeAsync(QUEUED_SESSION_TURN_BACKSTOP_MS * 2)
+    expect(await settledNow(c.outcome)).toBeNull()
   })
 
   // BL-906 (a): the lock can go before its request lets go (the interrupt route's clear of a

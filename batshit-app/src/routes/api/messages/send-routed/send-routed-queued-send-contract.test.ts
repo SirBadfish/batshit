@@ -175,7 +175,13 @@ describe('send-routed: a send that meets another turn waits in the line (BL-4)',
       '\n      let turnMessages: any[] = (Array.isArray(messages) ? messages : []).filter(\n        (message: any) =>\n          !(typeof message?.id === \'string\' && isUserMessageQueued(sessionId, message.id)),\n      )\n'
     )
     // And every read of the request's history after the lock reads the turn's history instead.
-    expect(source).toContain('\n          turnMessages,\n          persistedMessages,\n')
+    // Approval expiry uses only saved records as authority; the filtered request history
+    // supplies discovery hints to that owner, never the raw browser history.
+    const sweepStart = source.indexOf('\n        const approvalState = await sweepApprovalState({\n')
+    expect(sweepStart).toBeGreaterThan(-1)
+    const sweep = source.slice(sweepStart, source.indexOf('\n        })', sweepStart))
+    expect(sweep).toContain('\n          requestMessages: turnMessages,\n')
+    expect(sweep).not.toMatch(/requestMessages:\s*messages\b/)
     expect(source).toContain('\n            messages: turnMessages,\n            metadata: metadataForStream,\n')
     expect(source).toContain('\n        let managedMessages: any[] = turnMessages\n')
   })

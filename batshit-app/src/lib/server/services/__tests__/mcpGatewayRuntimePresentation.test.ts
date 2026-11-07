@@ -206,3 +206,26 @@ describe('mcpGatewayRuntimePresentation', () => {
     })
   })
 })
+
+
+describe('human source staleness data belongs to the original read, before runtime decoration/redaction', () => {
+  it('pairs the same original source across runtime URLs without publishing legacy secret material', async () => {
+    const presenter = await import('../mcpGatewayRuntimePresentation')
+    const { captureSettingsLifecycle } = await import('../appActions/settings/lifecycle')
+    const { humanGatewaySourceRevision } = await import('../mcpGatewayService')
+    const stored = { id: 'source-cut', name: 'Source', type: 'docker-catalog' as const, enabled: true, created_at: 'source-incarnation',
+      url: 'http://localhost:9999/mcp', metadata: { authToken: 'synthetic-private-source-only', dockerProfile: 'default' } }
+    const lifecycle = captureSettingsLifecycle(['mcp_gateways:presented-user'])
+    const expected = humanGatewaySourceRevision('presented-user', stored, lifecycle)
+    dynamicPrivateEnv.env.BATSHIT_CONTAINERIZED = '1'
+    const browser = presenter.presentMcpGatewayForBrowser(stored, 'presented-user', lifecycle)
+    expect(browser.sourceRevision).toBe(expected)
+    expect(browser.url).not.toBe(stored.url)
+    expect(browser.metadata).not.toHaveProperty('authToken')
+    expect(JSON.stringify(browser)).not.toContain('synthetic-private-source-only')
+    expect(stored.metadata.authToken).toBe('synthetic-private-source-only')
+    delete dynamicPrivateEnv.env.BATSHIT_CONTAINERIZED
+    expect(presenter.presentMcpGatewayForBrowser(stored, 'presented-user', lifecycle).sourceRevision).toBe(expected)
+    expect(presenter.presentMcpGatewayForBrowser({ ...stored, url: 'http://localhost:9998/mcp' }, 'presented-user', lifecycle).sourceRevision).not.toBe(expected)
+  })
+})

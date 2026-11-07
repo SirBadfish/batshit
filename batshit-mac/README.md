@@ -12,6 +12,7 @@ This package stays separate from `batshit-app` and `batshit-server`: Electron ow
 - Standard Electron sandboxed renderers and hidden helper app bundles.
 - Context isolation on, Node integration off, web security on, and navigation limited to the packaged startup shell plus explicit Batshit loopback origins.
 - One visible app instance; a second launch focuses the existing window.
+- No title bar on the main window: Batshit's dark top bar runs to the window edge and keeps the macOS window buttons (see "Window title bar").
 - One optional Desktop Goon companion window: exact authenticated route, isolated role-scoped preload/state port, transparent frameless policy, no microphone permission, and deterministic return-to-main lifecycle.
 - Runtime Doctor starts the packaged SvelteKit app, batshit-server, streamable MCP helper, and Mac-owned Redis before opening the real UI.
 - The runtime/data contract remains under `~/Library/Application Support/Batshit`, `~/Library/Logs/Batshit`, and `~/Library/Caches/Batshit` unless an isolated test lane supplies overrides. A test package keeps `Batshit-<Label>` folders of its own, even when Finder or the Dock opens it without its lane launcher.
@@ -79,6 +80,43 @@ right-click menu with `Inspect Element` (which opens the tools on the exact elem
 pointer), `Reload`, and `Reapply Custom CSS` when a custom stylesheet exists. The handler is attached
 only when the opt-in above resolved true, so an ordinary install keeps Electron's no-menu default.
 
+## Window title bar
+
+The main window hides the macOS title bar and keeps the red, yellow and green buttons, the way many
+Mac apps do. `resolveMainWindowTitleBarPolicy` in `src-electron/main-window-policy.mjs` sets
+`titleBarStyle: 'hidden'` with a `titleBarOverlay` 45px tall, which is the app's top bar height
+(`--app-header-height` in `batshit-app/src/app.css`), so macOS centres the buttons in that bar. The
+two values must change together.
+
+The overlay also gives the page the buttons' area through the CSS `env(titlebar-area-x)`,
+`env(titlebar-area-height)` values: 78px and 45px while the buttons show. They are unset in full
+screen, where the buttons hide, and in every ordinary browser, so the same `batshit-app` in Docker
+or a browser tab never moves. The policy also hands the main preload `--batshit-title-bar=hidden`;
+the preload marks `<html data-batshit-mac-titlebar="hidden">` as soon as the parser creates `<html>`,
+before the page's own scripts run, and the app's layout changes key on that mark:
+
+- Sidebar open: the logo row moves right of the buttons and centres in the bar.
+- Sidebar closed: the top bar runs over the rail and holds the buttons, the logo and the
+  open-sidebar tab; the rail starts under the bar.
+- Settings: in the wide layout its title moves right of the buttons and is the drag handle while
+  Settings is open; at medium widths the empty top of its icon rail is the handle; the narrow
+  layout (below 768px) has a centred title that clears the buttons and no handle.
+- Full screen: the buttons hide, the mark stays, and the spacing that made room for the buttons
+  falls back to the ordinary spacing (with the sidebar closed, the logo and tab stay in the bar).
+- Page zoom (View menu): `env()` follows the zoom, so the logo never slides under the buttons, but
+  the bar's height zooms while the buttons do not, so they sit a few pixels off its centre.
+
+Without a title bar the window moves only by its drag area. `.app-window-drag-strip`, the first
+element of the app layout, covers the top bar, and every control or overlay that can sit over it is
+marked `no-drag` in one block of `app.css` ("Mac app window without a title bar"). Electron applies
+those boxes in document order and a drag area swallows clicks, so a new control in the top bar must
+join that list (Fragility Map, "Mac Window Top Bar"). The startup screen (`frontend/`) has its own
+drag strip, starts below the buttons, and keeps its buttons clickable when it scrolls under the
+strip.
+
+Only the main window changes. The Desktop Goon and Desktop Controls windows are frameless and keep
+their own drag rules.
+
 ## Main window size and position
 
 The main window remembers its size, position, and maximized state between launches in
@@ -91,7 +129,9 @@ the size it will restore to.
 Saved bounds are never trusted, because displays are disconnected, resized, and rearranged between
 runs. The window is clamped to the `minWidth`/`minHeight` policy so both persistent rails plus the
 480px chat column always survive, shrunk to fit a smaller work area, and pulled back until a
-reachable strip of its title bar is on screen. Without that last step a window saved on a
+reachable strip of its top bar is on screen. With no title bar the top bar's right end can be all
+buttons, so a restored window never hangs off the left edge: its window buttons and logo, the part
+of the bar that always drags, stay on screen. Without that last step a window saved on a
 second display would open off-screen and could not be moved back without deleting the state file.
 
 Window geometry is cosmetic, so an unusable or corrupt state file is reported to the log and then
@@ -184,6 +224,6 @@ Release signing requires Apple Developer Program membership, a valid Developer I
 
 ## Packaging boundaries
 
-The package build uses an immutable `app.asar`, Electron fuse hardening, a custom packaged-shell protocol, microphone/speech privacy descriptions, Batshit's managed Node/Redis/OpenSSL/FFmpeg runtimes, trusted Goon assets, and the runtime package audit. It requires a C11-capable `cc` on the Mac and compiles the anchored project reader from the copied C source into `Contents/Resources/runtime/batshit-app/scripts/` before signing. The package audit checks its source hash, executable mode, arm64/macOS 14 portability, and signature; the runtime fingerprint includes the binary so a changed reader restarts the app service. It fails if Electron's framework/helpers, the runtime payload, portability contract, privacy metadata, or trusted asset inventories are incomplete.
+The package build uses an immutable `app.asar`, Electron fuse hardening, a custom packaged-shell protocol, microphone/speech privacy descriptions, Batshit's managed Node/Redis/OpenSSL/FFmpeg runtimes, trusted Goon assets, and the runtime package audit. It requires a C11-capable `cc` on the Mac and compiles the anchored project reader (with its BL-2006 writer mode for managed patches) from the copied C source into `Contents/Resources/runtime/batshit-app/scripts/` before signing. The package audit checks its source hash, executable mode, arm64/macOS 14 portability, and signature; the runtime fingerprint includes the binary so a changed reader restarts the app service. It fails if Electron's framework/helpers, the runtime payload, portability contract, privacy metadata, or trusted asset inventories are incomplete.
 
 Electron replaces only the desktop shell. Docker, source-checkout Native BS, the SvelteKit application, batshit-server, backup/restore, and Mac runtime data formats do not change.

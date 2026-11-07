@@ -18,11 +18,12 @@ import path from 'node:path'
 import { unzipSync, zipSync } from 'fflate/node'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const testHome = vi.hoisted(() => ({ current: '' }))
+const testHome = vi.hoisted(() => ({ current: '', previous: process.env.BATSHIT_HOME_DIR }))
 vi.mock('node:os', async (importOriginal) => {
   const real = await importOriginal<typeof import('node:os')>()
   const nodePath = await import('node:path')
   if (!testHome.current) testHome.current = nodePath.join(real.tmpdir(), `batshit-partial-reader-home-${process.pid}-${Date.now()}`)
+  process.env.BATSHIT_HOME_DIR = nodePath.join(testHome.current, '.batshit')
   const homedir = () => testHome.current
   return { ...real, homedir, default: { ...real, homedir } }
 })
@@ -52,6 +53,8 @@ beforeAll(() => {
 })
 
 afterAll(async () => {
+  if (testHome.previous === undefined) delete process.env.BATSHIT_HOME_DIR
+  else process.env.BATSHIT_HOME_DIR = testHome.previous
   await fs.rm(testHome.current, { recursive: true, force: true })
 })
 
@@ -114,7 +117,7 @@ async function exportPartial() {
   await seedUpload('upload:avatars:a.jpg', 'avatars/a.jpg')
   await seedUpload('upload:avatars:agent:a.jpg', 'avatars/a.jpg')
   await seedUpload('upload:documents:b.txt', 'documents/b.txt')
-  await redis.json.set(`user:${USER}:settings`, '$', { theme: 'dark' })
+  await redis.json.set(`user:${USER}:settings`, '$', { user_id: USER, theme: 'dark' })
   const check = await auditBackupUploadFiles(USER)
   const acknowledged = check.problems.map(({ key, relativePath, fingerprint }) => ({ key, relativePath, fingerprint }))
   const response = (await EXPORT({

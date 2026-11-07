@@ -133,6 +133,7 @@ describe.runIf(memorySearchLaneActive())('memory tool ops (dedicated Redis 8 db0
       name: 'Plain Agent',
       memory_enabled: false
     } as never)
+    await redis.createSession({ id: SESSION, user_id: USER, agent_id: AGENT, name: 'Memory tools fixture' })
   })
 
   describe('enablement gate (server-side belt and suspenders)', () => {
@@ -473,7 +474,7 @@ describe.runIf(memorySearchLaneActive())('memory tool ops (dedicated Redis 8 db0
       expect((await getMemory(agentId, older.saved.id))?.is_superseded).toBe('n')
     })
 
-    it('deletes explicitly and reports a missing id loudly', async () => {
+    it('retains the original trash state on repeat delete and reports a truly missing id loudly', async () => {
       const agentId = await freshAgent()
       const saved = await saveMemoryOp(toolContext({ agentId }), {
         lane: 'ltm',
@@ -481,8 +482,14 @@ describe.runIf(memorySearchLaneActive())('memory tool ops (dedicated Redis 8 db0
       })
       const deleted = await deleteMemoryOp(toolContext({ agentId }), { memoryId: saved.saved.id })
       expect(deleted.deleted).toBe(true)
+      const originalTrash = await getMemory(agentId, saved.saved.id)
+      expect(originalTrash).toMatchObject({
+        content: 'temporary memory', deleted_at: expect.any(String), deleted_ts: expect.any(Number)
+      })
+      expect((await deleteMemoryOp(toolContext({ agentId }), { memoryId: saved.saved.id })).deleted).toBe(true)
+      expect(await getMemory(agentId, saved.saved.id)).toEqual(originalTrash)
       await expect(
-        deleteMemoryOp(toolContext({ agentId }), { memoryId: saved.saved.id })
+        deleteMemoryOp(toolContext({ agentId }), { memoryId: 'mem_genuinely_missing' })
       ).rejects.toThrow(/not found/)
     })
   })
@@ -524,7 +531,7 @@ describe.runIf(memorySearchLaneActive())('memory tool ops (dedicated Redis 8 db0
       const agentId = await freshAgent()
       await expect(
         recallMemoriesOp(toolContext({ agentId }), { memoryIds: ['mem_ghost'] })
-      ).rejects.toThrow(/not found/)
+      ).rejects.toThrow('Memory "mem_ghost" is unavailable, deleted or expired; nothing was queued.')
       await expect(
         recallMemoriesOp(toolContext({ agentId, sessionId: null }), { memoryIds: ['mem_x'] })
       ).rejects.toThrow(/session context/)

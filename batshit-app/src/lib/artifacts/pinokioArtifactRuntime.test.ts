@@ -52,7 +52,7 @@ function addPageListener(listener: (event: MessageEvent) => void) {
 }
 
 /** Plays Batshit's page: answers each start request the artifact posts. */
-function answerStartRequests(answer: Record<string, unknown>) {
+function answerStartRequests(answer: Record<string, unknown> | Record<string, unknown>[]) {
   const requests: any[] = []
   addPageListener((event) => {
     if (event.data?.type !== 'batshit:pinokio:start-request') return
@@ -60,7 +60,8 @@ function answerStartRequests(answer: Record<string, unknown>) {
     window.dispatchEvent(
       new MessageEvent('message', {
         source: window,
-        data: { type: 'batshit:pinokio:start-result', artifactId: ARTIFACT_ID, requestId: event.data.requestId, ...answer }
+        data: { type: 'batshit:pinokio:start-result', artifactId: ARTIFACT_ID, requestId: event.data.requestId,
+          ...(Array.isArray(answer) ? answer[Math.min(requests.length - 1, answer.length - 1)] : answer) }
       })
     )
   })
@@ -182,5 +183,81 @@ describe('Start with Pinokio inside the artifact', () => {
     const response = await pending
     expect(response.status).toBe(200)
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual(['/api/artifacts/pinokio/system_stats', '/api/artifacts/pinokio/system_stats'])
+  })
+
+  it.each([
+    { ok: true, ready: true, alreadyRunning: true },
+    { ok: true, endpointReady: true, nativeControlOutcome: 'blocked' },
+    { ok: true, endpointReady: true, nativeControlOutcome: 'cancelled' },
+    { ok: true, endpointReady: true, observationEnded: 'cancelled' },
+    { ok: true, endpointReady: true, observationEnded: 'timeout' },
+    { ok: true, endpointReady: true, launchState: 'pending' },
+    { ok: true, endpointReady: true, launchState: 'unknown' }
+  ])('keeps a remote non-ready or ended outcome visible without replay: %j', async (outcome) => {
+    const fetcher = vi.fn().mockResolvedValueOnce(ndjson(OFFLINE))
+    vi.stubGlobal('fetch', fetcher)
+    const batshit = installArtifactApi()
+    const requests = answerStartRequests({ ...outcome, machineId: 'remote', message: 'The start outcome is not ready.' })
+    const run = batshit.complete('Run', {})
+    await waitFor(() => document.querySelector('[data-batshit-pinokio="start"]'))
+    ;(document.querySelector('[data-batshit-pinokio="start"]') as HTMLButtonElement).click()
+    await waitFor(() => document.querySelector('.batshit-pinokio-offline')?.textContent?.includes('not ready'))
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(requests).toHaveLength(1)
+    expect(document.querySelector('[data-batshit-pinokio="start"]')?.textContent).toBe('Try Again')
+    ;(document.querySelector('[data-batshit-pinokio="dismiss"]') as HTMLButtonElement).click()
+    await run
+  })
+
+  it('replays a remote recipe only after the page confirms endpointReady', async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(ndjson(OFFLINE)).mockResolvedValueOnce(ndjson(DONE))
+    vi.stubGlobal('fetch', fetcher)
+    const batshit = installArtifactApi()
+    answerStartRequests({ ok: true, machineId: 'remote', endpointReady: true })
+    const run = batshit.complete('Run', {})
+    await waitFor(() => document.querySelector('[data-batshit-pinokio="start"]'))
+    ;(document.querySelector('[data-batshit-pinokio="start"]') as HTMLButtonElement).click()
+    expect((await run).text).toBe('Generated 1 image')
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['unknown', 'pending'])('does not resend a %s start after a normal recipe retry or a later offline call', async (launchState) => {
+    const batshit = installArtifactApi()
+    const requests = answerStartRequests({ ok: false, startEffect: 'not_sent', launchState, message: 'Unconfirmed start outcome.' })
+    const first = batshit.pinokio.offerStart({ title: 'OCR', state: 'offline' })
+    ;(document.querySelector('[data-batshit-pinokio="start"]') as HTMLButtonElement).click()
+    await waitFor(() => document.querySelector('.batshit-pinokio-offline')?.textContent?.includes('Unconfirmed start'))
+    ;(document.querySelector('[data-batshit-pinokio="start"]') as HTMLButtonElement).click()
+    expect(await first).toBe(true)
+    batshit.pinokio.afterRun()
+    const second = batshit.pinokio.offerStart({ title: 'OCR', state: 'offline' })
+    expect(document.querySelector('.batshit-pinokio-offline')?.textContent).toContain('Unconfirmed start outcome.')
+    expect(document.querySelector('.batshit-pinokio-offline')?.textContent).not.toContain('still starting')
+    expect(document.querySelector('[data-batshit-pinokio="start"]')?.textContent).toBe('Try Again')
+    ;(document.querySelector('[data-batshit-pinokio="start"]') as HTMLButtonElement).click()
+    expect(await second).toBe(true)
+    expect(requests).toHaveLength(1)
+  })
+
+  it('offers a fresh page preview and confirmation only after another click for a proven no-send refusal', async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(ndjson(OFFLINE)).mockResolvedValueOnce(ndjson(DONE))
+    vi.stubGlobal('fetch', fetcher)
+    const batshit = installArtifactApi()
+    const requests = answerStartRequests([
+      { ok: false, machineId: 'remote', startEffect: 'not_sent', message: 'The saved binding changed. Confirm its fresh preview.' },
+      { ok: true, machineId: 'remote', endpointReady: true }
+    ])
+    const run = batshit.complete('Run', {})
+    await waitFor(() => document.querySelector('[data-batshit-pinokio="start"]'))
+    ;(document.querySelector('[data-batshit-pinokio="start"]') as HTMLButtonElement).click()
+    await waitFor(() => document.querySelector('.batshit-pinokio-offline')?.textContent?.includes('saved binding changed'))
+    expect(document.querySelector('[data-batshit-pinokio="start"]')?.textContent).toBe('Start with Pinokio')
+    expect(requests).toHaveLength(1)
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    ;(document.querySelector('[data-batshit-pinokio="start"]') as HTMLButtonElement).click()
+    expect((await run).text).toBe('Generated 1 image')
+    expect(requests).toHaveLength(2)
+    expect(requests[1].requestId).not.toBe(requests[0].requestId)
+    expect(fetcher).toHaveBeenCalledTimes(2)
   })
 })

@@ -8,6 +8,8 @@ import {
   DM_STEER_FALLBACKS,
   isDeliverableNow,
   resolveDmSteerFallback,
+  agentDmsOffHint,
+  readAgentDmsSwitch,
   resolveAgentDmsEnabled,
   resolveAgentWakeEnabled,
   resolveDmSenderAllowed,
@@ -183,6 +185,37 @@ describe('the Agent DMs gate (DL-113-01)', () => {
   it('ignores a non-boolean value rather than treating it as truthy', () => {
     expect(resolveAgentDmsEnabled({ dms_enabled: 'yes' })).toBe(false)
     expect(resolveAgentDmsEnabled({ dms_enabled: 1 })).toBe(false)
+  })
+
+  // Josh, 2026-10-24: the DM and schedule tools are Fabric controls, so DMs need it too.
+  it('is off while Fabric & Utilities is off, and keeps the saved switch', () => {
+    const fabricOff = { nativeTools: { batshitToolsEnabled: false } }
+    const agent = { dms_enabled: true, provider_specific_settings: fabricOff }
+    expect(resolveAgentDmsEnabled(agent)).toBe(false)
+    expect(readAgentDmsSwitch(agent)).toBe(true)
+    expect(agentDmsOffHint(agent)).toBe(
+      'Agent DMs need Fabric & Utilities: turn it on for that agent in Agent Settings.'
+    )
+
+    // Fabric & Utilities defaults on, and the legacy flat key counts the same way.
+    expect(resolveAgentDmsEnabled({ dms_enabled: true, provider_specific_settings: {} })).toBe(true)
+    expect(
+      resolveAgentDmsEnabled({
+        dms_enabled: true,
+        provider_specific_settings: { nativeTools: { batshitToolsEnabled: true } }
+      })
+    ).toBe(true)
+    expect(
+      resolveAgentDmsEnabled({
+        dms_enabled: true,
+        provider_specific_settings: { nativeBatshitToolsEnabled: 'off' }
+      })
+    ).toBe(false)
+
+    // With the DM switch itself off, the hint names that switch.
+    const switchOff = { dms_enabled: false, provider_specific_settings: fabricOff }
+    expect(readAgentDmsSwitch(switchOff)).toBe(false)
+    expect(agentDmsOffHint(switchOff)).toBe('Turn on Agent DMs for that agent in Agent Settings.')
   })
 })
 

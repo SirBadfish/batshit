@@ -13,7 +13,7 @@ There's a second, less obvious lever: **provider prompt caching rewards stable, 
 
 ## The layered context model
 
-Batshit assembles an `API` Primary Agent request from most stable to most volatile, on purpose:
+Batshit assembles a Primary Agent request from most stable to most volatile, on purpose:
 
 1. **Stable setup first** — the base agent prompt, agent and user policies, the compact native-tool guidance, and the deterministic native tool schemas. These don't change from one of your messages to the next.
 2. **Semi-stable next** — agent settings, project context, and the conversation history so far.
@@ -25,24 +25,28 @@ Putting the churn at the end means everything in front of it can stay reusable. 
 
 Before any provider caching enters the picture, Batshit already shrinks what it sends:
 
-- **Plain text, one simple tag per message.** Your conversation reaches the model as plain text, with each message inside its own tag: `<user>` for you, `<assistant>` for the agent's own earlier replies, `<agent name="…">` for any other agent in the chat, and `<note>` for Batshit's own entries, such as a summary of older messages or a DM that woke the agent. The first message of each day carries its date and time, and your newest message carries the current time. Batshit adds nothing else to the messages: no message IDs, session IDs, or model settings. If a message or a web page contains text that looks like one of these tags, Batshit disarms it (its `<` becomes `&lt;`), so it can't pretend to be you. The **Compiled Messages** section of the [Execution Viewer](../chat/execution-viewer.md) shows the result for recent runs.
+- **Plain text, one simple tag per message.** Your conversation reaches the model as plain text, with each message inside its own tag: `<user>` for you, `<assistant>` for the agent's own earlier replies, `<agent name="…">` for any other agent in the chat, and `<note>` for Batshit's own entries, such as a summary of older messages or a DM that woke the agent. The first message of each day carries its date and time, and your newest message carries the current time inside a `<current_message>` tag. Batshit adds nothing else to the messages: no message IDs, session IDs, or model settings. If a message or a web page contains text that looks like one of these tags, Batshit disarms it (its `<` becomes `&lt;`), so it can't pretend to be you. The **Compiled Messages** section of the [Execution Viewer](../chat/execution-viewer.md) shows the result for recent runs.
 - **Zips.** Large tool output and long results are compressed to small references; the model only carries the full content when it's actually needed. See [Zips](../tools/zips.md).
 - **Clips.** Files and images are stored once and referenced, and images reach the model as structured image input — never as raw bytes pasted into prompt text. See [Clips](../clips/overview.md).
 - **Dynamic Tool Search.** Only a small, stable set of native tools is described in every request. Every other tool — MCP, CLI Tools, Artifacts, Fabric — is discovered on demand through a search-and-use contract, so thousands of tokens of tool schemas don't ride along on every message. See [Tools](../tools/overview.md).
+
+**Agent Setup** keeps stable tool hints and the enabled Skills catalog for an agent in a chat. Current change notes keep it informed when capabilities change. Batshit refreshes setup when needed; provider caching still depends on the provider and does not guarantee a saving. Settings changes apply to the next message, and every tool call checks current access.
+
+[Dynamic Schema Hints](../admin/overview.md#dynamic-schema-hints) controls scalable hints, separately from fixed features and Skills. **Preview Agent Setup Tools** shows estimated tokens, not billed usage.
 
 These are why a Batshit request is already smaller and steadier before caching does anything.
 
 ## Provider caching builds on the stable prefix
 
-Once the front of a request is genuinely stable, providers that support prompt caching can reuse it. Batshit makes `API` Primary Agent requests cache-friendly by default and adds the right provider-specific decoration at the transport edge — you don't hand-fill provider fields:
+Once the front of a request is genuinely stable, providers that support prompt caching can reuse it. Batshit makes Primary Agent requests cache-friendly by default and adds the right provider-specific decoration at the transport edge — you don't hand-fill provider fields:
 
-- **OpenAI** caches automatically on recent models. Batshit attaches a stable cache key so repeated sends route to the same cached prefix.
-- **Anthropic** uses an explicit cache marker. Batshit places it on the stable system block, so the first eligible send writes the cache and later sends read it. When one reply takes several tool steps, Batshit also turns on Anthropic's moving cache point from the second step on, so each step reads the step before it from the cache. API Subagents and Workers on their parent's model get it too.
+- **OpenAI** caches automatically on recent models. Batshit attaches a stable cache key so repeated sends route to the same cached prefix. On a direct OpenAI connection with GPT-5.6 or later, Batshit also sends the chat's earlier turns as separate blocks and marks the latest two, so each new turn reads the earlier conversation from the cache instead of writing it again.
+- **Anthropic** uses explicit cache markers. Batshit places one on the stable system block, so the first eligible send writes the cache and later sends read it. On a direct Anthropic connection, and on OpenRouter with a Claude model, Batshit also sends the chat's earlier turns as separate blocks with a marker after the latest one, so each new turn reads the earlier conversation from the cache and pays the cache-write price only for what is new. When a reply calls tools, Batshit also turns on Anthropic's moving cache point from the first step: the first step writes the message that starts the reply, and each later step reads the step before it from the cache. A reply with no tool call pays that one small cache write without reading it back. Subagents and Workers on their parent's model get it too.
 - **Gemini** caches implicitly on recent models once the stable prefix is large enough. Batshit keeps the prefix in the right order and reads the cache-hit counts back into its own usage numbers.
-- **OpenRouter** keeps a conversation on the same provider endpoint (sticky routing) and passes per-message cache markers where the underlying provider needs them.
+- **OpenRouter** keeps a conversation on the same provider endpoint (sticky routing) and passes per-message cache markers where the underlying provider needs them. For an OpenAI GPT-5.6 or later model on OpenRouter, Batshit also sends the chat's earlier turns as separate blocks and marks the latest two, as on a direct OpenAI connection.
 - **Vercel AI Gateway** can cache automatically; Batshit turns that on for gateway-routed models and leaves implicit-cache providers alone.
 
-Gemini deserves one extra note: Batshit intentionally does **not** use Google's explicit `cachedContent` API for normal API agents right now. Google's explicit cache is a named, mostly frozen resource that must be created ahead of time, and current Google behavior rejects a `cachedContent` request if the live model call also sends system instructions, tools, or tool config. Batshit API agents normally keep tools enabled, so using that API would mean building a special Google-only transport that moves tool declarations into the cached resource without breaking tool execution. Until Google improves that contract, Batshit uses Gemini's implicit caching and shows whatever cache-token evidence Google reports.
+Gemini deserves one extra note: Batshit intentionally does **not** use Google's explicit `cachedContent` API for normal agents right now. Google's explicit cache is a named, mostly frozen resource that must be created ahead of time, and current Google behavior rejects a `cachedContent` request if the live model call also sends system instructions, tools, or tool config. Batshit agents normally keep tools enabled, so using that API would mean building a special Google-only transport that moves tool declarations into the cached resource without breaking tool execution. Until Google improves that contract, Batshit uses Gemini's implicit caching and shows whatever cache-token evidence Google reports.
 
 Existing per-model cache settings still work as advanced overrides, but the default path is cache-friendly without manual setup.
 

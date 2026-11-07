@@ -9,6 +9,8 @@
  * the Codex MCP wrappers (`{ arguments }` in, `{ content: [{ type: 'text', text }], structured_content,
  * input }` out) from `coolToolZipAdapter.test.ts` and `toolActivityContract.test.ts`, the mapped
  * read from `toolActivityContract.test.ts`, and the zip fetches from `zip-fetch-steps.ts`.
+ * SA-139 R1 removed the Codex CLI lane; its wrapper shapes stay here as the saved steps of old
+ * chats, which must still render and normalize.
  */
 import type { ToolOperationKind } from '$lib/utils/toolActivityContract'
 import { claudeDirectZipFetchStep, codexDirectZipFetchStep } from './zip-fetch-steps'

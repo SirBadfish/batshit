@@ -151,7 +151,7 @@ describe('settleSubagentRunWork (BL-287)', () => {
   it('reads the exit from the process itself when a bridge took its listeners away', async () => {
     const cli = await startCli(50)
     const exited = waitForProcessExit(cli)
-    // `claudeBridge` and the Codex exec lane call this in their cleanup.
+    // The Claude plan run calls this in its cleanup (the retired CLI lanes did too).
     cli.removeAllListeners()
     cli.kill('SIGTERM')
 

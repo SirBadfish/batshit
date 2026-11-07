@@ -31,7 +31,7 @@
   let previewGenerationHost: HTMLDivElement | null = null
   let previewGenerationEngine: PreviewGenerationEngine | null = null
   let previewGenerationEnginePromise: Promise<PreviewGenerationEngine> | null = null
-  let previewGenerationLoadedGoonUrl = ''
+  let previewGenerationLoadedTargetKey = ''
   let previewGenerationDisposeTimer: ReturnType<typeof setTimeout> | null = null
 
   function clearPreviewGenerationDisposeTimer() {
@@ -50,7 +50,7 @@
       previewGenerationEngine?.dispose()
       previewGenerationEngine = null
       previewGenerationEnginePromise = null
-      previewGenerationLoadedGoonUrl = ''
+      previewGenerationLoadedTargetKey = ''
       previewGenerationHost?.remove()
       previewGenerationHost = null
     }, 5000)
@@ -71,7 +71,7 @@
     return host
   }
 
-  async function ensureSharedPreviewGenerationEngine(target: MotionPreviewTarget) {
+  async function ensureSharedPreviewGenerationEngine(target: MotionPreviewTarget, targetIdentity: string) {
     clearPreviewGenerationDisposeTimer()
 
     if (!previewGenerationEnginePromise) {
@@ -89,7 +89,7 @@
         previewGenerationEngine?.dispose()
         previewGenerationEngine = null
         previewGenerationEnginePromise = null
-        previewGenerationLoadedGoonUrl = ''
+        previewGenerationLoadedTargetKey = ''
         previewGenerationHost?.remove()
         previewGenerationHost = null
         throw error
@@ -101,33 +101,27 @@
     if (!targetKey) {
       throw new Error('Preview Goon is missing its model file')
     }
-    if (previewGenerationLoadedGoonUrl !== targetKey) {
+    if (previewGenerationLoadedTargetKey !== targetIdentity) {
+      previewGenerationLoadedTargetKey = ''
       if (target.kind === 'custom') {
-        const avatar = await loadAvatarIntoEngine(engine, target.goon)
-        if (avatar.role === 'cancelled') return null
+        const result = await loadAvatarIntoEngine(engine, target.goon)
+        if (result.role === 'cancelled') return null
       } else if (target.kind === 'custom-url') {
         const goonLoadToken = engine.beginGoonLoad()
         try {
-          const manifest = await loadCustomAvatarManifest({
-            url: target.manifestUrl,
-            filename: target.manifestUrl.split('/').pop() || 'avatar.json'
-          })
+          const manifest = await loadCustomAvatarManifest({ url: target.manifestUrl, filename: target.manifestUrl.split('/').pop() || 'avatar.json' })
           if (!engine.isCurrentGoonLoad(goonLoadToken)) return null
           await engine.loadCustomGoon(target.modelUrl, manifest, {}, goonLoadToken)
           if (!engine.isCurrentGoonLoad(goonLoadToken)) return null
-        } finally {
-          engine.finishGoonLoad(goonLoadToken)
-        }
+        } finally { engine.finishGoonLoad(goonLoadToken) }
       } else {
         const goonLoadToken = engine.beginGoonLoad()
         try {
           await engine.loadGoon(target.url, null, goonLoadToken)
           if (!engine.isCurrentGoonLoad(goonLoadToken)) return null
-        } finally {
-          engine.finishGoonLoad(goonLoadToken)
-        }
+        } finally { engine.finishGoonLoad(goonLoadToken) }
       }
-      previewGenerationLoadedGoonUrl = targetKey
+      previewGenerationLoadedTargetKey = targetIdentity
     }
     return engine
   }
@@ -174,6 +168,7 @@
     tryBeginGoonMotionPreviewGeneration
   } from '$lib/stores/goonMotionPreviewGeneration'
   import { sanitizeGoonAnimationName } from '$lib/goons/animationLoadPlan'
+  import { sha256Hex } from '$lib/utils/sha256'
   import type { GoonFileRef } from '$lib/types/goons'
 
   const previewThumbWidth = 120
@@ -209,6 +204,9 @@
   let error = $state<string | null>(null)
   let previewVideoUrl = $state('')
   let previewVideoFilename = $state('')
+  let failedAttempt = $state<{ key: string; version: number } | null>(null)
+  let observedInputKey: string | null = null
+  let inputVersion = 0
   let observer: IntersectionObserver | null = null
   let destroyed = false
   const shouldWarmPreview = $derived(containerOpen && warmOnOpen)
@@ -220,6 +218,7 @@
       previewVideoUrl = nextUrl
       previewVideoFilename = nextFilename
       error = null
+      failedAttempt = null
     } else if (!nextUrl && previewVideoFilename === nextFilename) {
       previewVideoUrl = ''
       previewVideoFilename = ''
@@ -302,19 +301,75 @@
 
   const previewTargetKey = $derived.by(() => resolveMotionPreviewTargetKey(previewTarget))
 
-  async function buildPreviewVideoFile() {
-    if (!previewTarget || !previewTargetKey || !animationFile?.url || !animationFile.filename) {
+  // Match the target inputs consumed by loadAvatarIntoEngine. A recreated
+  // wrapper object is not a new attempt; changed target state is.
+  const previewTargetIdentity = $derived.by(() => {
+    if (!previewTarget) return ''
+    try {
+      if (previewTarget.kind === 'vrm') return sha256Hex(JSON.stringify(['vrm', previewTarget.url]))
+      if (previewTarget.kind === 'custom-url') {
+        return sha256Hex(JSON.stringify(['custom-url', previewTarget.modelUrl, previewTarget.manifestUrl]))
+      }
+      const goon = previewTarget.goon
+      return sha256Hex(JSON.stringify(['custom', {
+        id: goon.id, user_id: goon.user_id, kind: goon.kind, sourceProfile: goon.sourceProfile,
+        customAvatar: goon.customAvatar, recipe: goon.recipe,
+        vrm: goon.files?.vrm, vrmPending: goon.files?.vrmPending, guidedAvatar: goon.guidedAvatar,
+        socketEyeContact: goon.defaults?.socketEyeContact,
+        appearanceDials: goon.appearanceDials, facialArtwork: goon.facialArtwork,
+        eyeAppearance: goon.eyeAppearance, oralAppearance: goon.oralAppearance,
+        lipArtwork: goon.lipArtwork, lipArtworkPresence: goon.lipArtworkPresence,
+        nailSurface: goon.nailSurface, nailSurfacePresence: goon.nailSurfacePresence,
+        skinAppearance: goon.skinAppearance,
+        skinMaterialArtwork: goon.skinMaterialArtwork
+      }]))
+    } catch {
+      return ''
+    }
+  })
+
+  const previewInputIdentity = $derived.by(() => {
+    if (!previewTargetIdentity || !animationFile?.url) return ''
+    try {
+      return sha256Hex(JSON.stringify([previewTargetIdentity, animationFile.url,
+        animationFile.filename, animationFile.originalName, animationFile.size,
+        animationFile.uploadedAt, animationFile.motionMeta, animationName]))
+    } catch {
+      return ''
+    }
+  })
+
+  function observePreviewInput(key: string) {
+    if (observedInputKey !== key) {
+      observedInputKey = key
+      inputVersion += 1
+      failedAttempt = null
+      error = null
+    }
+    return inputVersion
+  }
+
+  async function buildPreviewVideoFile(
+    target: MotionPreviewTarget,
+    targetIdentity: string,
+    file: GoonFileRef,
+    name: string,
+    canContinue: () => boolean
+  ) {
+    if (!resolveMotionPreviewTargetKey(target) || !file.url || !file.filename) {
       throw new Error(previewUnavailableReason || 'Preview source is missing')
     }
 
-    const engine = await ensureSharedPreviewGenerationEngine(previewTarget)
+    const engine = await ensureSharedPreviewGenerationEngine(target, targetIdentity)
+    if (!canContinue()) return null
     if (!engine) return null
-    await engine.syncAnimations([animationFile])
+    await engine.syncAnimations([file])
+    if (!canContinue()) return null
     engine.setGoonVisible(true)
 
     const availableNames = engine.getAnimationNames()
     const nameToPlay =
-      (animationName && availableNames.includes(animationName) && animationName) ||
+      (name && availableNames.includes(name) && name) ||
       availableNames[0] ||
       ''
 
@@ -322,8 +377,13 @@
       throw new Error('No preview animation available')
     }
 
-    engine.previewLoopAnimation(nameToPlay)
+    const started = engine.previewLoopAnimation(nameToPlay)
+    if (!canContinue()) return null
+    if (!started) {
+      throw new Error('Motion preview is unavailable for this Goon.')
+    }
     await waitForAnimationWarmup()
+    if (!canContinue()) return null
 
     const canvas = engine.getCanvasElement()
     if (!canvas) {
@@ -331,40 +391,59 @@
     }
 
     const { blob, mimeType } = await recordPreviewBlob(canvas)
+    if (!canContinue()) return null
     const extension = mimeType.includes('mp4') ? '.mp4' : '.webm'
     const previewFile = new File(
       [blob],
-      `${sanitizePreviewBaseName(animationFile.originalName || animationFile.filename || animationName)}${extension}`,
+      `${sanitizePreviewBaseName(file.originalName || file.filename || name)}${extension}`,
       { type: mimeType }
     )
 
-    const { previewVideo } = await uploadGoonAnimationPreview(animationFile.filename, previewFile)
+    const { previewVideo } = await uploadGoonAnimationPreview(file.filename, previewFile)
     return previewVideo
   }
 
-  async function ensurePreviewVideo() {
+  async function generatePreviewVideo(refresh: boolean) {
     syncPreviewVideoFromRecord()
-    if (previewVideoUrl || generating || (!visible && !shouldWarmPreview) || !animationFile?.url) {
-      return
-    }
-    if (!previewTargetKey) {
+    const key = previewInputIdentity
+    const version = observePreviewInput(key)
+    const target = previewTarget
+    const file = animationFile
+    if (generating || !file?.url || (refresh && !file.filename)) return
+    if (!refresh && (previewVideoUrl || (!visible && !shouldWarmPreview) ||
+      (failedAttempt?.key === key && failedAttempt.version === version))) return
+    if (!target || !previewTargetKey || !previewTargetIdentity || !key) {
       error = previewUnavailableReason || 'Preview Goon unavailable'
       return
     }
     if (!tryBeginGoonMotionPreviewGeneration()) return
 
-    const previewKey = `${previewTargetKey}::${animationFile.url}::${animationFile.filename || animationName}`
+    const targetIdentity = previewTargetIdentity
+    const name = animationName
     generating = true
     loading = true
     error = null
+    if (refresh) {
+      failedAttempt = null
+      previewVideoUrl = ''
+      previewVideoFilename = ''
+    }
+    const isCurrent = () => !destroyed && observePreviewInput(previewInputIdentity) === version && previewInputIdentity === key
+    const canContinue = () => isCurrent() && (refresh || !previewVideoUrl)
 
     try {
-      const previewVideo = await getQueuedPreviewGeneration(previewKey, async () => {
-        if (destroyed || (!visible && !shouldWarmPreview) || previewVideoUrl) {
-          return null
-        }
-        return await buildPreviewVideoFile()
+      const capturedTarget = $state.snapshot(target)
+      const capturedFile = $state.snapshot(file)
+      const previewVideo = await getQueuedPreviewGeneration(`${key}${refresh ? '::refresh' : ''}`, async () => {
+        if (!canContinue() || (refresh ? !visible : !visible && !shouldWarmPreview)) return null
+        const generated = await buildPreviewVideoFile(capturedTarget, targetIdentity, capturedFile, name, canContinue)
+        // An upload already issued by the original owner can still satisfy
+        // another current subscriber to this exact shared input.
+        if (generated?.url) return generated
+        if (!canContinue()) return null
+        throw new Error('Preview unavailable')
       })
+      if (!canContinue()) return
       if (!previewVideo?.url) {
         syncPreviewVideoFromRecord()
         return
@@ -372,8 +451,12 @@
       previewVideoUrl = previewVideo.url
       previewVideoFilename = previewVideo.filename
       error = null
+      failedAttempt = null
     } catch (err) {
-      error = err instanceof Error ? err.message : 'Preview unavailable'
+      if (canContinue()) {
+        failedAttempt = { key, version }
+        error = err instanceof Error ? err.message : 'Preview unavailable'
+      }
     } finally {
       endGoonMotionPreviewGeneration()
       generating = false
@@ -381,43 +464,12 @@
     }
   }
 
+  async function ensurePreviewVideo() {
+    await generatePreviewVideo(false)
+  }
+
   async function regeneratePreviewVideo() {
-    syncPreviewVideoFromRecord()
-    if (generating || !animationFile?.url || !animationFile?.filename) return
-    if (!previewTargetKey) {
-      error = previewUnavailableReason || 'Preview Goon unavailable'
-      return
-    }
-    if (!tryBeginGoonMotionPreviewGeneration()) return
-
-    generating = true
-    loading = true
-    error = null
-    previewVideoUrl = ''
-    previewVideoFilename = ''
-
-    try {
-      const previewKey = `${previewTargetKey}::${animationFile.url}::${animationFile.filename || animationName}::refresh`
-      const previewVideo = await getQueuedPreviewGeneration(previewKey, async () => {
-        if (destroyed || !visible) {
-          return null
-        }
-        return await buildPreviewVideoFile()
-      })
-      if (!previewVideo?.url) {
-        syncPreviewVideoFromRecord()
-        return
-      }
-      previewVideoUrl = previewVideo.url
-      previewVideoFilename = previewVideo.filename
-      error = null
-    } catch (err) {
-      error = err instanceof Error ? err.message : 'Preview unavailable'
-    } finally {
-      endGoonMotionPreviewGeneration()
-      generating = false
-      loading = false
-    }
+    await generatePreviewVideo(true)
   }
 
   function handleSelect() {
@@ -494,11 +546,14 @@
 
   $effect(() => {
     const pendingGenerationCount = $goonMotionPreviewGenerationCount
+    const key = previewInputIdentity
+    const version = observePreviewInput(key)
     if (!visible) {
       videoEl?.pause()
       return
     }
     if (!previewVideoUrl) {
+      if (failedAttempt?.key === key && failedAttempt.version === version) return
       const previewGenerationCapacityReached =
         pendingGenerationCount >= GOON_MOTION_PREVIEW_GENERATION_LIMIT
       if (previewGenerationCapacityReached && !generating) {

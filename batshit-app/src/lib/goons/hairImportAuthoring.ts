@@ -140,6 +140,9 @@ export type HairImportAuthoringInput = {
   reviewedAppearanceState: AppearanceDialValueState | null;
   scalp: {
     rootBounds: Bounds;
+    /** Source-bound scalp vertices; excludes nearby face and neck surfaces. */
+    rootVertexIndices?: number[];
+    rootSelectionNotice?: string;
     transferBounds: Bounds;
     rootSeedFraction: number;
     maximumRootDistance: number;
@@ -269,6 +272,7 @@ type ClumpPlan = {
   meshIndex: number;
   primitive: SemanticJsonRecord;
   positions: Float64Array;
+  normals: Float32Array | null;
   indices: number[];
   nearestBody: NearestBody[];
   tipRatios: Float32Array;
@@ -461,7 +465,7 @@ function evaluationMatrix(
 }
 
 function transformPositions(
-  values: Float32Array,
+  values: Float32Array | Float64Array,
   transform: THREE.Matrix4,
 ): Float64Array {
   const output = new Float64Array(values.length);
@@ -1691,6 +1695,9 @@ function appendAuthoredGeometry(
       positionMinimum,
       positionMaximum,
     );
+    if (plan.normals) {
+      attributes.NORMAL = append(asBytes(plan.normals), 5126, plan.normals.length / 3, "VEC3", 34962);
+    }
     mesh.extras = {
       ...(mesh.extras && typeof mesh.extras === "object" ? mesh.extras : {}),
       targetNames: names,
@@ -2240,17 +2247,33 @@ export async function authorHairImportProposal(
     bodyReviewedMesh.positions,
     evaluationMatrix(reviewedEvaluation, bodyNodeIndex, "reviewed body"),
   );
-  const rootCandidates: number[] = [];
+  // The cage identifies source scalp vertices; their reviewed positions move
+  // with the body. Testing the moved body against the neutral box selects
+  // unrelated anatomy when a shape changes height or head proportions.
+  const declaredRootVertices = input.scalp.rootVertexIndices;
+  const bodyVertexCount = bodyNeutral.length / 3;
+  if (
+    declaredRootVertices !== undefined &&
+    (!Array.isArray(declaredRootVertices) ||
+      declaredRootVertices.length < 4 ||
+      new Set(declaredRootVertices).size !== declaredRootVertices.length ||
+      declaredRootVertices.some(
+        (vertex) => !Number.isInteger(vertex) || vertex < 0 || vertex >= bodyVertexCount,
+      ))
+  ) {
+    block("SPARSE_SCALP", "source scalp vertices must identify at least four unique valid Recipe body vertices");
+  }
+  const rootCandidates: number[] = declaredRootVertices ? [...declaredRootVertices] : [];
   const transferCandidates: number[] = [];
   for (let vertex = 0; vertex < bodyNeutral.length / 3; vertex += 1) {
-    if (inBounds(bodyReviewed, vertex, rootBounds)) rootCandidates.push(vertex);
-    if (inBounds(bodyReviewed, vertex, transferBounds))
+    if (!declaredRootVertices && inBounds(bodyNeutral, vertex, rootBounds)) rootCandidates.push(vertex);
+    if (inBounds(bodyNeutral, vertex, transferBounds))
       transferCandidates.push(vertex);
   }
   if (rootCandidates.length < 4 || transferCandidates.length < 4) {
     block(
       "SPARSE_SCALP",
-      "reviewed scalp bounds contain fewer than four Recipe body vertices",
+      "neutral scalp bounds contain fewer than four Recipe body vertices",
     );
   }
   const rootNeighborIndex = new BodyNeighborIndex(bodyReviewed, rootCandidates);
@@ -2263,6 +2286,15 @@ export async function authorHairImportProposal(
     headNodeIndex,
     "head",
   ).multiply(authoredRootMatrix);
+  const reviewedAttachment = evaluationMatrix(
+    reviewedEvaluation,
+    headNodeIndex,
+    "reviewed head",
+  ).multiply(authoredRootMatrix);
+  const reviewedHairFromRoot = matrix(
+    reviewedAttachment.toArray(),
+    "reviewed Hair attachment",
+  ).invert();
   const plans: ClumpPlan[] = [];
   for (const { node, index: nodeIndex } of meshNodes) {
     const rawName = stableText(node.name, `Hair node ${nodeIndex}.name`);
@@ -2294,8 +2326,11 @@ export async function authorHairImportProposal(
       rootDistances[vertex] = rootMatch.distance;
       nearest.push(transferMatch.transfer);
     }
+    // The fit controls author avatar-root coordinates. Store geometry in the
+    // attachment frame so the reviewed head transform is applied exactly once.
+    const localPositions = transformPositions(decoded.positions, reviewedHairFromRoot);
     const topologyResult = topology(
-      decoded.positions,
+      localPositions,
       decoded.indices,
       rootDistances,
       rootSeedFraction,
@@ -2311,7 +2346,7 @@ export async function authorHairImportProposal(
       );
     }
     const pivotVector = averageVertices(
-      decoded.positions,
+      localPositions,
       topologyResult.rootIndices,
     );
     const tipCandidates = Array.from(topologyResult.ratios)
@@ -2322,16 +2357,16 @@ export async function authorHairImportProposal(
         const rightOffset = right.vertex * 3;
         const leftDistance = pivotVector.distanceTo(
           new THREE.Vector3(
-            decoded.positions[leftOffset],
-            decoded.positions[leftOffset + 1],
-            decoded.positions[leftOffset + 2],
+            localPositions[leftOffset],
+            localPositions[leftOffset + 1],
+            localPositions[leftOffset + 2],
           ),
         );
         const rightDistance = pivotVector.distanceTo(
           new THREE.Vector3(
-            decoded.positions[rightOffset],
-            decoded.positions[rightOffset + 1],
-            decoded.positions[rightOffset + 2],
+            localPositions[rightOffset],
+            localPositions[rightOffset + 1],
+            localPositions[rightOffset + 2],
           ),
         );
         return rightDistance - leftDistance || left.vertex - right.vertex;
@@ -2341,9 +2376,9 @@ export async function authorHairImportProposal(
       block("AMBIGUOUS_TIP", `clump ${review.id} has no stable tip candidate`);
     const tipOffset = tipIndex * 3;
     const tipVector = new THREE.Vector3(
-      decoded.positions[tipOffset],
-      decoded.positions[tipOffset + 1],
-      decoded.positions[tipOffset + 2],
+      localPositions[tipOffset],
+      localPositions[tipOffset + 1],
+      localPositions[tipOffset + 2],
     );
     const length = pivotVector.distanceTo(tipVector);
     if (
@@ -2355,12 +2390,25 @@ export async function authorHairImportProposal(
         `clump ${review.id} proposed length is outside 5 mm to 2 m`,
       );
     }
+    const normalAccessor = (decoded.primitive.attributes as SemanticJsonRecord).NORMAL;
+    let normals: Float32Array | null = null;
+    if (normalAccessor !== undefined) {
+      const sourceNormals = decodeSemanticGlbAccessor(hair, normalAccessor).values;
+      normals = new Float32Array(sourceNormals.length);
+      const normalMatrix = new THREE.Matrix3().getNormalMatrix(reviewedHairFromRoot);
+      const direction = new THREE.Vector3();
+      for (let offset = 0; offset < normals.length; offset += 3) {
+        direction.fromArray(sourceNormals, offset).applyNormalMatrix(normalMatrix);
+        direction.toArray(normals, offset);
+      }
+    }
     const plan: ClumpPlan = {
       review,
       nodeIndex,
       meshIndex: decoded.meshIndex,
       primitive: decoded.primitive,
-      positions: decoded.positions,
+      positions: localPositions,
+      normals,
       indices: decoded.indices,
       nearestBody: nearest,
       tipRatios: topologyResult.ratios,
@@ -2670,7 +2718,11 @@ export async function authorHairImportProposal(
           ? "medium"
           : "review-carefully",
     blockingReasons: [],
+    ...(input.scalp.rootSelectionNotice
+      ? { rootSelectionNotice: input.scalp.rootSelectionNotice }
+      : {}),
     summary: [
+      ...(input.scalp.rootSelectionNotice ? [input.scalp.rootSelectionNotice] : []),
       `${plans.length} reviewed mesh ${plans.length === 1 ? "clump has" : "clumps have"} real scalp-transferred Appearance morphs.`,
       `Roots remain anchored through ${round(anchoredLength * 100, 2)}% of each topology path before motion ramps toward the tips.`,
       `${input.colliders.length} reviewed body ${input.colliders.length === 1 ? "collider is" : "colliders are"} bound by manifest node role/name.`,

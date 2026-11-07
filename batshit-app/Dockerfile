@@ -14,6 +14,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 COPY batshit-app ./
+# App SSR bundles this canonical shared guard from the sibling source tree.
+COPY batshit-server/server/src/utils/macCustodyPaths.cjs ../batshit-server/server/src/utils/macCustodyPaths.cjs
 COPY docs/batshit_System_Prompts ../docs/batshit_System_Prompts
 ENV BATSHIT_SVELTE_ADAPTER=node
 RUN node scripts/build-anchored-project-reader.mjs \

@@ -1,15 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { env } from '$env/dynamic/private'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
-import {
-  AGENT_RUN_CREDENTIAL_HEADER,
-  mintRunCredential
-} from '$lib/server/services/agentRunCredentials'
-import { POST } from './+server'
+import { nativeToolService } from '$lib/server/services/nativeTools'
 
-// The route, run-credential verifier, zip service, and Redis records are all real here.
-// This pins the actor/chat boundary that route tests with mocked auth cannot establish.
+// The live in-process Fetch Zip owner, zip service, and Redis records are real here.
 useRedisTestServer()
 
 const USER = 'fetch-owner'
@@ -26,45 +20,11 @@ const LEGACY_ZIP = 'cool_tool_1790000000000_cccc'
 const WEB_ZIP = 'cool_tool_1790000000000_dddd'
 const HIDDEN_RAW = 'tool_raw_1790000000000_eeee'
 
-function request(
-  token: string,
-  zipId: string,
-  body: Record<string, unknown> = {},
-  headers: Record<string, string> = {}
-) {
-  return {
-    request: new Request('http://localhost/api/native-tools/fetch-zip', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(token ? { [AGENT_RUN_CREDENTIAL_HEADER]: token } : {}),
-        ...headers
-      },
-      body: JSON.stringify({ zipId, ...body })
-    }),
-    locals: {}
-  } as any
+function run(agentId: string, sessionId: string, messageId = REPLY_A) {
+  return { userId: USER, agentId, sessionId, messageId, actorType: 'in-process' as const }
 }
-
-async function run(agentId: string, sessionId: string, messageId = REPLY_A) {
-  return (await mintRunCredential({
-    userId: USER,
-    agentId,
-    sessionId,
-    messageId,
-    runtime: 'codex',
-    fetchZipAllowed: true
-  })).token
-}
-
-async function fetch(
-  token: string,
-  zipId: string,
-  body: Record<string, unknown> = {},
-  headers: Record<string, string> = {}
-) {
-  const response = await POST(request(token, zipId, body, headers))
-  return { status: response.status, body: await response.json() as Record<string, any> }
+async function fetch(context: ReturnType<typeof run>, zipId: string) {
+  return { status: 200, body: await nativeToolService.nativeFetchZip({ ...context, zipId }) }
 }
 
 async function seed() {
@@ -94,8 +54,8 @@ async function zip(id: string, content: string, metadata: Record<string, unknown
 }
 
 const describeRealRedis = process.env.VITEST_USE_REAL_REDIS === 'true' ? describe : describe.skip
-describeRealRedis('real Redis model Fetch Zip route authorization', () => {
-  it('uses the credential chat and user, never body ownership claims', async () => {
+describeRealRedis('real Redis API model Fetch Zip authorization', () => {
+  it('uses the server-owned chat and user scope', async () => {
     await seed()
     await zip(OWN_ZIP, 'OWN_CHAT_SECRET', { userId: USER, sessionId: CHAT })
     await zip(FOREIGN_ZIP, 'FOREIGN_USER_SECRET', {
@@ -108,49 +68,17 @@ describeRealRedis('real Redis model Fetch Zip route authorization', () => {
     expect(own.status).toBe(200)
     expect(own.body).toMatchObject({ found: true, content: 'OWN_CHAT_SECRET' })
 
-    const crossChat = await fetch(otherChatRun, OWN_ZIP, {
-      userId: USER, sessionId: CHAT, agentId: AGENT_A,
-      messageId: REPLY_A, fetchZipAllowed: true
-    })
+    const crossChat = await fetch(otherChatRun, OWN_ZIP)
     expect(crossChat.status).toBe(200)
     expect(crossChat.body).toMatchObject({ found: false, reason: 'Zip belongs to a different chat.' })
     expect(JSON.stringify(crossChat.body)).not.toContain('OWN_CHAT_SECRET')
 
-    const foreign = await fetch(ownRun, FOREIGN_ZIP, {
-      userId: FOREIGN_USER, sessionId: 'fetch-foreign-chat'
-    })
+    const foreign = await fetch(ownRun, FOREIGN_ZIP)
     expect(foreign.status).toBe(200)
     expect(foreign.body.found).toBe(false)
     expect(JSON.stringify(foreign.body)).not.toContain('FOREIGN_USER_SECRET')
 
-    const disabled = (await mintRunCredential({
-      userId: USER, agentId: AGENT_A, sessionId: CHAT,
-      runtime: 'codex', fetchZipAllowed: false
-    })).token
-    const forgedPermission = await fetch(disabled, OWN_ZIP, { fetchZipAllowed: true })
-    expect(forgedPermission.status).toBe(403)
-    expect(JSON.stringify(forgedPermission.body)).not.toContain('OWN_CHAT_SECRET')
 
-    const previousServiceToken = (env as Record<string, string | undefined>).BATSHIT_TOKEN
-    const serviceToken = 'fetch-route-service-token-0123456789abcdef'
-    ;(env as Record<string, string | undefined>).BATSHIT_TOKEN = serviceToken
-    try {
-      const service = await fetch('', OWN_ZIP, {
-        userId: USER, sessionId: CHAT, agentId: AGENT_A,
-        fetchZipAllowed: true
-      }, {
-        'x-batshit-service-token': serviceToken,
-        'x-batshit-user-id': USER
-      })
-      expect(service.status).toBe(403)
-      expect(JSON.stringify(service.body)).not.toContain('OWN_CHAT_SECRET')
-    } finally {
-      if (previousServiceToken === undefined) {
-        delete (env as Record<string, string | undefined>).BATSHIT_TOKEN
-      } else {
-        ;(env as Record<string, string | undefined>).BATSHIT_TOKEN = previousServiceToken
-      }
-    }
   })
 
   it('requires a trusted saved link before an old user-only zip crosses into a chat', async () => {
@@ -169,9 +97,7 @@ describeRealRedis('real Redis model Fetch Zip route authorization', () => {
     expect(linkedLegacy, JSON.stringify(linkedLegacy)).toMatchObject({
       found: true, content: 'LEGACY_SECRET'
     })
-    expect((await fetch(otherChatRun, LEGACY_ZIP, {
-      sessionId: CHAT, agentId: AGENT_A
-    })).body.found).toBe(false)
+    expect((await fetch(otherChatRun, LEGACY_ZIP)).body.found).toBe(false)
   })
 
   it('shares only configured saved group tools, and keeps hidden raw with its author', async () => {
@@ -188,7 +114,7 @@ describeRealRedis('real Redis model Fetch Zip route authorization', () => {
     const other = await run(AGENT_B, GROUP_CHAT, 'fetch-reply-b')
     const authorResult = (await fetch(author, WEB_ZIP)).body
     expect(authorResult.found, JSON.stringify(authorResult)).toBe(true)
-    expect((await fetch(other, WEB_ZIP, { agentId: AGENT_A })).body.found).toBe(false)
+    expect((await fetch(other, WEB_ZIP)).body.found).toBe(false)
 
     await redis.createGroup({
       id: 'fetch-group', user_id: USER, name: 'Fetch group',
@@ -203,9 +129,7 @@ describeRealRedis('real Redis model Fetch Zip route authorization', () => {
       agentId: AGENT_A, retainedForSizeGuard: true, toolName: 'web_search'
     }, 'tool_raw')
     expect((await fetch(author, HIDDEN_RAW)).body.found).toBe(true)
-    const denied = await fetch(other, HIDDEN_RAW, {
-      agentId: AGENT_A, messageId: REPLY_A, shared_tools: ['web_search']
-    })
+    const denied = await fetch(other, HIDDEN_RAW)
     expect(denied.body.found).toBe(false)
     expect(JSON.stringify(denied.body)).not.toContain('HIDDEN_RAW_SECRET')
   })

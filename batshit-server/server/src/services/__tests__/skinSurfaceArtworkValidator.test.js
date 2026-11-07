@@ -1,4 +1,5 @@
 const sharp = require('sharp');
+const { createHash } = require('node:crypto');
 const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
@@ -15,6 +16,7 @@ function input(buffer, map = 'baseColor', overrides = {}) {
     buffer,
     map,
     definitionSha256: DEFINITION_SHA256,
+    targetCanvas: { width: 4096, height: 4096 },
     provenance: JSON.stringify({
       sourceKind: 'user-authored',
       author: 'Josh',
@@ -81,6 +83,40 @@ describe('skinSurfaceArtworkValidator', () => {
       channels: 4,
       depth: 'uchar'
     });
+  }, 30000);
+
+  it.each([2048, 4096])('prepares a %s Base Color source for a 2048 Goon canvas', async (sourceSize) => {
+    const source = await sharp({
+      create: { width: sourceSize, height: sourceSize, channels: 4,
+        background: { r: 120, g: 90, b: 75, alpha: 0.5 } }
+    }).png().toBuffer();
+    const before = Buffer.from(source);
+    const prepared = await prepareSkinSurfaceArtworkUpload(input(source, 'baseColor', {
+      targetCanvas: { width: 2048, height: 2048 }
+    }));
+    expect(source.equals(before)).toBe(true);
+    expect(prepared.artwork.canvas).toEqual({ width: 2048, height: 2048, colorSpace: 'srgb', flipY: false, encoding: 'rgba8' });
+    expect(prepared.preparation.validation).toMatchObject({ sourceWidth: sourceSize, sourceHeight: sourceSize, resized: sourceSize === 4096 });
+    expect(await sharp(prepared.buffer).metadata()).toMatchObject({ width: 2048, height: 2048, channels: 4, depth: 'uchar' });
+    expect(prepared.preparation.sourceSha256).toBe(createHash('sha256').update(source).digest('hex'));
+    expect(prepared.artwork.sha256).toBe(createHash('sha256').update(prepared.buffer).digest('hex'));
+    const pixel = await sharp(prepared.buffer).extract({ left: 0, top: 0, width: 1, height: 1 }).raw().toBuffer();
+    expect(pixel[3]).toBeGreaterThanOrEqual(127);
+    expect(pixel[3]).toBeLessThanOrEqual(129);
+  }, 30000);
+
+  it('refuses unsupported Base Color target sizes and does not upscale a smaller source', async () => {
+    const source = await sharp({ create: { width: 2048, height: 2048, channels: 3,
+      background: { r: 120, g: 90, b: 75 } } }).png().toBuffer();
+    await expect(prepareSkinSurfaceArtworkUpload(input(source, 'baseColor', {
+      targetCanvas: { width: 1024, height: 1024 }
+    }))).rejects.toThrow(/target canvas is unsupported/);
+    await expect(prepareSkinSurfaceArtworkUpload(input(source, 'baseColor', {
+      targetCanvas: { width: 4096, height: 4096 }
+    }))).rejects.toThrow(/4096x4096 PNG/);
+    await expect(prepareSkinSurfaceArtworkUpload(input(source, 'baseColor', {
+      targetCanvas: { width: 2048, height: 4096 }
+    }))).rejects.toThrow(/target canvas is unsupported/);
   }, 30000);
 
   it('renormalizes an OpenGL Normal and stores RGB8 with no alpha', async () => {

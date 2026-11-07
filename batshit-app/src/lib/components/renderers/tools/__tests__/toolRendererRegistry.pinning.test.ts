@@ -11,6 +11,7 @@ import { getToolRenderer } from '../toolRendererRegistry'
 import { normalizeCompactTool } from '$lib/utils/toolActivityContract'
 import { CLI_HELPER_MCP_SERVER_NAME } from '$lib/utils/cliHelperToolNames'
 import { CLI_HELPER_STEP_CASES, LEGACY_CLI_HELPER_SERVER } from '$lib/test-utils/cli-helper-steps'
+import { API_UTILITY_CONTROL_IDS } from '$lib/utils/apiUtilityControls'
 
 const load = async (importer: Promise<any>) => (await importer).default
 
@@ -18,6 +19,7 @@ const renderers = {
   generic: () => load(import('../generic/GenericToolRenderer.svelte')),
   genericMcp: () => load(import('../generic/GenericMCPRenderer.svelte')),
   readFile: () => load(import('../file/ReadFileRenderer.svelte')),
+  webSearch: () => load(import('../web/WebSearchRenderer.svelte')),
   bash: () => load(import('../command/BashRenderer.svelte')),
   toolFind: () => load(import('../generic/ToolFindRenderer.svelte')),
   subagent: () => load(import('../subagent/CallSubagentRenderer.svelte')),
@@ -39,6 +41,37 @@ beforeAll(async () => {
 }, 120_000)
 
 describe('getToolRenderer — priority short-circuits', () => {
+  it.each([
+    ['webSearch', 'web_search', { query: 'one' }, { success: true, results: [] }, {}],
+    ['workers', 'workers', { workers: [{ task: 'one' }] }, { kind: 'workers', success: true, workers: [{ status: 'partial', output: 'Work so far', usage: null }] }, {}],
+    ['skill', 'skill_read', { action: 'read', skillId: 'notes' }, { success: true, action: 'read', content: 'Read me' }, {}],
+    ['subagent', 'subagent', { subagentId: 'model-guess', chatInput: 'one' }, { kind: 'subagent', success: false, status: 'failed', output: 'Could not start', usage: null },
+      { isSubagent: true, subagentId: 'saved-child', subagentName: 'Saved Helper', subagentType: 'api' }]
+  ] as const)('routes canonical API %s through its preserved semantic renderer', async (kind, operationKind, input, raw, metadata) => {
+    const target = API_UTILITY_CONTROL_IDS[kind]
+    const normalized = normalizeCompactTool({
+      toolName: 'native_batshit_tool_use', toolArgs: { ref: `batshit:${target}`, input },
+      toolResult: { success: raw.success, controlId: target, ref: `batshit:${target}`, family: 'batshit', target,
+        operationKind, rendererFamily: operationKind, result: raw, ...metadata }
+    })
+    const expected = kind === 'skill' ? renderers.readFile : kind === 'webSearch' ? renderers.webSearch : renderers[kind]
+    expect(await getToolRenderer('native_batshit_tool_use', normalized as any)).toBe(await expected())
+  })
+
+  it('does not select a utility renderer for a gateway lookalike or a refusal without a callback result', async () => {
+    const target = API_UTILITY_CONTROL_IDS.webSearch
+    for (const input of [
+      { toolName: 'mcp.foreign.native_batshit_tool_use', toolArgs: { ref: `batshit:${target}`, input: {} },
+        toolResult: { success: true, family: 'batshit', target, controlId: target, ref: `batshit:${target}`, operationKind: 'web_search', rendererFamily: 'web_search', result: { success: true, results: [] } } },
+      { toolName: 'native_batshit_tool_use', toolArgs: { ref: `batshit:${target}`, input: {} },
+        toolResult: { success: false, family: 'batshit', target, controlId: target, ref: `batshit:${target}`, operationKind: 'web_search', rendererFamily: 'web_search', error: { code: 'CONTROL_NOT_ALLOWED' } } }
+    ]) {
+      const normalized = normalizeCompactTool(input)
+      expect(normalized.rendererFamily).toBe('generic_tool')
+      expect(await getToolRenderer(input.toolName, normalized as any)).toBe(await renderers.generic())
+    }
+  })
+
   it('falls back to the generic renderer when toolData is missing', async () => {
     expect(await getToolRenderer('anything', null)).toBe(await renderers.generic())
   })

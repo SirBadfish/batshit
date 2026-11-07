@@ -5,9 +5,9 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { guardCutNotice } from '$lib/test-utils/guard-cut-notice'
-import { adaptCoolToolsToZipSystem, hasSubagentToolSettings, getDefaultSubagentSettings } from '../coolToolZipAdapter'
+import { adaptCoolToolsToZipSystem, hasSubagentToolSettings, getDefaultSubagentSettings, refreshedReadTranscript } from '../coolToolZipAdapter'
 import { createZipFromContent } from '../zipService'
-import { buildCoolToolAiContent, shouldPreferRawSidecarForAiExpansion } from '$lib/utils/coolToolAiContent'
+import { buildCoolToolAiContent, buildCoolToolAiContentWithSources, parseCoolToolPayload, shouldPreferRawSidecarForAiExpansion } from '$lib/utils/coolToolAiContent'
 import type { AgentRow } from '$lib/types/database'
 import { calculateZipActivation } from '$lib/utils/zipActivation'
 import { describeToolResultFiles } from '$lib/utils/zipDeadCopies'
@@ -26,20 +26,8 @@ import {
   PRESENT_FILE_PATH,
   apiFailedReadStep,
   apiNativeBashResult,
-  apiShellStep,
-  claudeBashEvents,
-  claudeFailedBashEvents,
-  cliStepForZip,
-  codexCommandEvents,
-  codexFileChangeEvents
+  apiShellStep
 } from '$lib/test-utils/shell-command-steps'
-import { CodexEventAdapter } from '$lib/server/services/codexEventAdapter'
-import {
-  CAPTURED_UPDATE_AND_RENAME,
-  CODEX_PROJECT,
-  appServerFileChangeEvents
-} from '$lib/test-utils/codex-app-server-file-changes'
-import { ClaudeEventAdapter } from '$lib/server/services/claudeEventAdapter'
 import { isFailedToolFact } from '$lib/server/services/postTurnCheck.jev'
 import { normalizeToolArgs } from '$lib/server/services/sseToolNormalization'
 import { buildHydratedCoolToolStep } from '$lib/components/chat/coolToolHydration'
@@ -49,6 +37,7 @@ import {
   renameHelperServer
 } from '$lib/test-utils/cli-helper-steps'
 import { CLI_HELPER_MCP_SERVER_NAME } from '$lib/utils/cliHelperToolNames'
+import { API_UTILITY_CONTROL_IDS } from '$lib/utils/apiUtilityControls'
 
 // Mock the zipService
 vi.mock('../zipService', () => ({
@@ -128,6 +117,164 @@ describe('CoolToolZipAdapter', () => {
     vi.clearAllMocks()
   })
 
+  describe('canonical API utility broker persistence', () => {
+    const settings = {
+      buffer_size_web_search: 5, zip_threshold_web_search: 61,
+      buffer_size_workers: 4, zip_threshold_workers: 71,
+      buffer_size_skill_read: 7, zip_threshold_skill_read: 81,
+      buffer_size_subagent: 6, zip_threshold_subagent: 91
+    }
+    async function storeUtility(kind: keyof typeof API_UTILITY_CONTROL_IDS, args: Record<string, unknown>, raw: Record<string, unknown>, operationKind: string, extra: Record<string, unknown> = {}) {
+      const target = API_UTILITY_CONTROL_IDS[kind]
+      const callId = `api-utility-${kind}`
+      const toolArgs = normalizeToolArgs({ ref: `batshit:${target}`, input: args }, 'native_batshit_tool_use')
+      expect(toolArgs.ref).toBe(`batshit:${target}`)
+      expect(toolArgs.input).toEqual(args)
+      const step = { toolName: 'native_batshit_tool_use', toolSource: 'native-tool', toolProvider: 'batshit-server',
+        toolCallId: callId, toolArgs,
+        toolResult: { success: raw.success !== false, ref: `batshit:${target}`, family: 'batshit', target, controlId: target,
+          operationKind, rendererFamily: operationKind, result: raw, ...extra } }
+      const refs = await adaptCoolToolsToZipSystem([step, { ...step }], sessionId, messageId, settings, undefined, {
+        reservedZipIdsByToolCallId: new Map([[callId, `zip-${kind}-reserved`]])
+      })
+      const calls = vi.mocked(createZipFromContent).mock.calls
+      const main = calls.filter(call => call[1] === 'cool_tool')
+      const sidecar = calls.filter(call => call[1] === 'tool_raw')
+      expect(main).toHaveLength(1)
+      expect(refs).toHaveLength(1)
+      expect(refs[0].zipId).toBe(`zip-${kind}-reserved`)
+      expect((main[0][5] as any).zipId).toBe(`zip-${kind}-reserved`)
+      const payload = JSON.parse(main[0][0])
+      expect(payload.toolCallId).toBe(callId)
+      expect(payload.originalToolName).toBe('native_batshit_tool_use')
+      expect(payload.operationKind).toBe(operationKind)
+      expect(sidecar).toHaveLength(1)
+      expect(JSON.parse(sidecar[0][0]).toolResult.result).toEqual(raw)
+      expect(payload.rawSidecar.status).toBe('stored')
+      const hydrated = buildHydratedCoolToolStep(payload)
+      expect(hydrated.toolCallId).toBe(callId)
+      expect(hydrated.rendererFamily).toBe(operationKind)
+      return { payload, metadata: main[0][4] as any, hydrated }
+    }
+
+    it('retains Web Search settings, raw results and one main zip for duplicate SDK lifecycle events', async () => {
+      const raw = { success: true, query: 'one', provider: 'exa', results: Array.from({ length: 12 }, (_, index) => ({
+        title: `Result ${index}`, url: `https://example.test/${index}`, snippet: 'Search detail '.repeat(60)
+      })) }
+      const { payload, metadata } = await storeUtility('webSearch', { query: 'one', maxResults: 12, ref: 'mcp:nested-model-guess' }, raw, 'web_search')
+      expect(metadata.bufferSize).toBe(5)
+      expect(metadata.threshold).toBe(61)
+      expect(payload.toolResult.query).toBe('one')
+      expect(payload.toolResult.results).toHaveLength(8)
+    })
+
+    it('keeps failed/partial Worker siblings and usage without inventing child IDs', async () => {
+      const raw = { kind: 'workers', success: true, requested: 2, completed: 0, workers: [
+        { name: 'Worker 1', status: 'partial', output: 'Work so far', usage: { inputTokens: 10 }, modelId: 'saved-model', provider: 'saved-provider' },
+        { name: 'Worker 2', status: 'failed', output: 'Could not start', usage: null, modelId: null, provider: null }
+      ] }
+      const { payload, metadata } = await storeUtility('workers', { workers: [{ task: 'one' }, { task: 'two' }] }, raw, 'workers')
+      expect(metadata.bufferSize).toBe(4)
+      expect(metadata.threshold).toBe(71)
+      expect(payload.toolResult).toMatchObject({ kind: 'workers', requested: 2, completed: 0 })
+      expect(payload.toolResult.workers.map((worker: any) => worker.status)).toEqual(['partial', 'failed'])
+      expect(payload.toolResult.workers[0].usage).toEqual({ inputTokens: 10 })
+      expect(payload.toolResult.workers.every((worker: any) => !Object.hasOwn(worker, 'id'))).toBe(true)
+    })
+
+    it('ignores retired Skill Read settings while keeping partial-read continuation through storage and hydration', async () => {
+      const raw = { success: true, action: 'read', skillId: 'notes', skillName: 'Notes', path: 'references/one.md',
+        content: 'A reference line\n'.repeat(100), offset: 100, nextOffset: 1800, readMore: 'Read the next window.' }
+      const { payload, metadata, hydrated } = await storeUtility('skill', { skillId: 'notes', action: 'read', path: 'references/one.md', offset: 100 }, raw, 'skill_read')
+      expect(metadata.bufferSize).toBe(0)
+      expect(metadata.threshold).toBe(0)
+      expect(payload.toolArgs.skillId).toBe('notes')
+      expect(hydrated.toolResult.content).toContain('A reference line')
+    })
+
+    it('BL-2250: projects valid-shaped saved raw API Skill text with a structured current continuation and unchanged source bytes', async () => {
+      const literal = 'Documentation example: call native_skill again with old fields.\n'
+      const content = (literal + 'x\n'.repeat(30_000)).slice(0, 30_000)
+      const raw = { success: true, action: 'read', skillId: 'notes', skillName: 'Notes', path: 'references/one.md',
+        content, offset: 100, returnedChars: 30_000, originalChars: 100_000, nextOffset: 30_100,
+        contentTruncated: true, readMore: 'Retired pointer: call native_skill again with old fields.', warnings: ['Keep this reference warning.'] }
+      const originalRaw = JSON.stringify(raw)
+      const { payload } = await storeUtility('skill', { skillId: 'notes', action: 'read', path: 'references/one.md', offset: 100, maxChars: 30_000 }, raw, 'skill_read')
+      expect(shouldPreferRawSidecarForAiExpansion(payload)).toBe(true)
+      const call = vi.mocked(createZipFromContent).mock.calls.find(call => call[1] === 'tool_raw')!
+      const savedBytes = call[0]
+      const saved = parseCoolToolPayload(savedBytes)!
+      expect(saved).toMatchObject({ originalToolName: 'native_batshit_tool_use', toolProvider: 'batshit-server', toolSource: 'native-tool' })
+      const expansion = buildCoolToolAiContentWithSources(payload.rawSidecar.zipId, { content: savedBytes }, saved)
+      expect(expansion.text).toContain(content)
+      expect(expansion.text).toContain('Showing characters 101 to 30,100 of 100,000.')
+      expect(expansion.text).toContain('call native_batshit_tool_use with ref "batshit:sys.skill.use" and input {"skillId":"notes","action":"read","path":"references/one.md","offset":30100}')
+      expect(expansion.text).toContain('Keep this reference warning.')
+      expect(expansion.text).not.toContain('Retired pointer:')
+      expect(expansion.parts.filter(part => part.source === 'tool_result').map(part => part.text).join('')).toContain(content)
+      expect(JSON.stringify(raw)).toBe(originalRaw)
+      expect(JSON.stringify(saved)).toBe(savedBytes)
+      expect(saved.toolResult.result.readMore).toBe(raw.readMore)
+      expect(saved.toolResult.result).toMatchObject({ contentTruncated: true, offset: 100, returnedChars: 30_000, originalChars: 100_000, nextOffset: 30_100 })
+      const foreign = { ...saved, toolProvider: 'mcp', toolSource: 'mcp-gateway' }
+      const generic = buildCoolToolAiContent('foreign', { content: JSON.stringify(foreign) }, foreign)
+      expect(generic).toContain('Result:\n```json')
+      expect(generic).not.toContain('To read on, call native_batshit_tool_use')
+      const direct = { ...saved, toolName: 'native_skill', originalToolName: 'native_skill',
+        toolArgs: { skillId: 'notes', action: 'read', path: 'references/one.md' }, toolResult: raw }
+      expect(buildCoolToolAiContent('direct', { content: JSON.stringify(direct) }, direct)).toContain(raw.readMore)
+    })
+
+    it('BL-2250: an uncut partial Skill window still selects saved RAW and preserves its current continuation and warnings', async () => {
+      const content = 'Short reference: native_skill is a literal example.\n'
+      const raw = { success: true, action: 'read', skillId: 'notes', skillName: 'Notes', path: 'references/one.md',
+        content, offset: 0, returnedChars: content.length, originalChars: 1000, nextOffset: content.length,
+        contentTruncated: true, readMore: 'Retired short pointer: call native_skill again.', warnings: ['Short window warning.'] }
+      const { payload } = await storeUtility('skill', { skillId: 'notes', action: 'read', path: 'references/one.md' }, raw, 'skill_read')
+      expect(payload.storage.truncated).toBe(false)
+      expect(payload.toolResult.contentTruncated).toBe(false)
+      expect(shouldPreferRawSidecarForAiExpansion(payload)).toBe(true)
+      const bytes = vi.mocked(createZipFromContent).mock.calls.find(call => call[1] === 'tool_raw')![0]
+      const saved = parseCoolToolPayload(bytes)!
+      const view = buildCoolToolAiContent('short-raw', { content: bytes }, saved)
+      expect(view).toContain(content)
+      expect(view).toContain(`"offset":${content.length}`)
+      expect(view).toContain('call native_batshit_tool_use with ref "batshit:sys.skill.use"')
+      expect(view).toContain('Short window warning.')
+      expect(view).not.toContain('Retired short pointer:')
+      expect(JSON.stringify(saved)).toBe(bytes)
+    })
+
+    it('BL-2250: an uncut invoked Skill selects saved RAW so reference facts and warnings survive history projection', async () => {
+      const raw = { success: true, action: 'invoke', skill: { id: 'notes', name: 'Notes', references: ['references/one.md'], scripts: ['scripts/one.sh'] },
+        skillMarkdown: '# Notes\nLiteral native_skill examples stay intact.', warnings: ['Invoke warning.'] }
+      const { payload } = await storeUtility('skill', { skillId: 'notes', action: 'invoke' }, raw, 'skill_read')
+      expect(payload.storage.truncated).toBe(false)
+      expect(shouldPreferRawSidecarForAiExpansion(payload)).toBe(true)
+      const bytes = vi.mocked(createZipFromContent).mock.calls.find(call => call[1] === 'tool_raw')![0]
+      const view = buildCoolToolAiContent('invoke-raw', { content: bytes }, parseCoolToolPayload(bytes))
+      expect(view).toContain(raw.skillMarkdown)
+      expect(view).toContain('references/one.md')
+      expect(view).toContain('scripts/one.sh')
+      expect(view).toContain('Invoke warning.')
+      expect(view).not.toContain('"family": "batshit"')
+    })
+
+    it.each(['partial', 'failed'] as const)('retains captured Subagent identity, nested tools, thread and %s outcome rather than the model selector', async status => {
+      const steps = [{ toolCallId: 'child-tool', toolName: 'read_file', toolResult: { content: 'Nested result' } }]
+      const raw = { kind: 'subagent', success: status !== 'failed', status, thread: 'resumed', output: 'Work so far',
+        usage: { inputTokens: 10, outputTokens: 4 }, subagentName: 'Saved Helper', subagentType: 'api', intermediateSteps: steps }
+      const { payload, metadata, hydrated } = await storeUtility('subagent', { subagentId: 'model-guess', chatInput: 'one', thread: 'resume' }, raw,
+        'subagent', { isSubagent: true, subagentId: 'saved-child', subagentName: 'Saved Helper', subagentType: 'api' })
+      expect(metadata.bufferSize).toBe(6)
+      expect(metadata.threshold).toBe(91)
+      expect(payload.subagentId).toBe('saved-child')
+      expect(hydrated.subagentId).toBe('saved-child')
+      expect(payload.toolResult).toMatchObject({ status, thread: 'resumed', usage: { inputTokens: 10, outputTokens: 4 } })
+      expect(payload.toolResult.intermediateSteps).toEqual(steps)
+    })
+  })
+
   describe('adaptCoolToolsToZipSystem', () => {
     // 4.4-UNIT-001: Transform simple tool result to zip reference
     it('should transform simple tool result to zip reference', async () => {
@@ -181,9 +328,10 @@ describe('CoolToolZipAdapter', () => {
       expect(mixed[0].zipId).toContain('cool_tool')
     })
 
-    // F-P4-7 (2026-09-17): the managed Codex lane nests the helper call under `arguments`.
-    // Step shape captured from the SA-120 P4 live proof, where this search WAS zipped.
-    it('skips zip creation for managed Codex helper memory steps (ref under `arguments`)', async () => {
+    // F-P4-7 (2026-09-17): the managed Codex lane nested the helper call under `arguments`.
+    // Step shape captured from the SA-120 P4 live proof, where this search WAS zipped. SA-139 R1
+    // removed that lane; a saved step of this shape (an old chat's history) is handled the same.
+    it('skips zip creation for saved managed Codex helper memory steps (ref under `arguments`)', async () => {
       const codexHelperStep = (ref: string, input: Record<string, unknown>, toolCallId: string) => ({
         toolName: 'mcp.batshit_gateway_jev_p4_codex-mode4-controls.batshit_tool_use',
         originalToolName: 'mcp.batshit_gateway_jev_p4_codex-mode4-controls.batshit_tool_use',
@@ -1022,7 +1170,7 @@ describe('CoolToolZipAdapter', () => {
       expect(parsed.toolResult.files[1].name).toBe('bar/')
     })
 
-    it('coerces non-string content safely for Codex outputs', async () => {
+    it('coerces non-string content safely for saved Codex outputs (history)', async () => {
       const codexStep = {
         toolName: 'batshit_server_read_file',
         toolArgs: { path: '/docs/example.md' },
@@ -1328,7 +1476,7 @@ describe('CoolToolZipAdapter', () => {
       expect(fromContent).toMatchObject({ toolName: 'fetch_zip', autoZip: true, shouldCompress: true })
     })
 
-    it('stores a managed Codex direct-helper zip fetch as fetch_zip', async () => {
+    it('stores a saved managed Codex direct-helper zip fetch as fetch_zip (history)', async () => {
       await adaptCoolToolsToZipSystem([codexDirectZipFetchStep()], sessionId, messageId, {})
 
       const mainCall = vi.mocked(createZipFromContent).mock.calls.find((call) => call[1] === 'cool_tool')
@@ -1402,7 +1550,7 @@ describe('CoolToolZipAdapter', () => {
 
     // BL-678: the cut notice's words inside an ordinary MCP text (a doc that quotes one, a search
     // of Batshit's code) made the adapter and the card treat the result as a guard cut.
-    it('stores a Codex MCP text that quotes the cut notice mid-text like any other text', async () => {
+    it('stores a saved Codex MCP text that quotes the cut notice mid-text like any other text (history)', async () => {
       const store = async (text: string) => {
         vi.mocked(createZipFromContent).mockClear()
         await adaptCoolToolsToZipSystem([{
@@ -1475,6 +1623,16 @@ describe('CoolToolZipAdapter', () => {
       expect(card.toolResult.content.length).toBeLessThan(modelText.length / 4)
       expect(metadata.promptTokens).toBeGreaterThanOrEqual(Math.ceil(modelText.length / 4))
       expect(metadata.tokenBasis).toBe('model_facing_mcp_text')
+    })
+
+    it.each([['sys.judge.ask', 'Ask Judge Juice'], ['sys.mcp.dynamic.find', 'Dynamic Tool Search'], ['sys.mcp.dynamic.use', 'MCP Tool']])('stores and reloads utility %s with exact display metadata', async (id, title) => {
+      const step = { toolName: 'native_batshit_tool_use', toolArgs: { ref: `batshit:${id}`, input: {} }, toolResult: { success: true, family: 'batshit', target: id, result: {} } }
+      await adaptCoolToolsToZipSystem([step], sessionId, messageId, { buffer_size_all_other_tools: 0, zip_threshold_all_other_tools: 0 })
+      const call = vi.mocked(createZipFromContent).mock.calls.find((item) => item[1] === 'cool_tool')
+      const card = JSON.parse(call![0] as string)
+      expect(card).toMatchObject({ displayToolName: title, operationKind: 'fabric_use', rendererFamily: 'generic_tool' })
+      expect((call as any)[4]).toMatchObject({ displayToolName: title, operationKind: 'fabric_use', rendererFamily: 'generic_tool' })
+      expect(buildHydratedCoolToolStep(card)).toMatchObject({ displayToolName: title, operationKind: 'fabric_use', rendererFamily: 'generic_tool' })
     })
 
     it('stores brokered artifact create controls as artifact write renderer payloads', async () => {
@@ -1871,42 +2029,23 @@ describe('CoolToolZipAdapter', () => {
   })
 })
 
-// F-P6-5 (2026-09-17): on the managed Codex lane `cat` on a missing file exited 1, and the stored
-// read said nothing about it (`read_file: <path> - 2 lines`, no status, the error text as the file's
+// F-P6-5 (2026-09-17): on a managed CLI lane `cat` on a missing file exited 1, and the stored read
+// said nothing about it (`read_file: <path> - 2 lines`, no status, the error text as the file's
 // content): the read shaping kept the text and dropped the exit code. The follow-up found the same
-// gap in every file action a shell command becomes (write, edit, listing, search, a Codex patch, a
-// command Codex reports failed with no exit code). Each case runs the lane's own event adapter, or
-// the API lane's live step, then this adapter, then the description zipService really writes.
+// gap in every file action a shell command becomes (write, edit, listing, search). Each case runs
+// the lane's own event adapter, or the API lane's live step, then this adapter, then the
+// description zipService really writes.
+// SA-139 R5: the managed Claude Code lane's cases in the F-P6-5 suites went with the Claude Code
+// CLI Subagent (its event adapter was their only producer). A rule that holds on every lane now
+// runs on the API lane; a rule of that lane's own output went with it.
 describe('a shell command stored as a file action keeps its failure (F-P6-5)', () => {
   const sessionId = 'session-shell-read'
   const messageId = 'msg-shell-read'
-  const request: any = {
-    sessionId,
-    messageId,
-    agentId: 'agent-shell-read',
-    userId: 'user-shell-read',
-    model: 'cli',
-    messages: [{ role: 'user', content: 'Read the file' }],
-    availableTools: [],
-    maxToolRounds: 1
-  }
   const DIR = '/tmp/batshit-example'
 
   beforeEach(() => {
     vi.mocked(createZipFromContent).mockClear()
   })
-
-  async function toolResultChunk(adapter: CodexEventAdapter | ClaudeEventAdapter, events: any[]) {
-    async function* stream() {
-      yield* events
-    }
-    let found: any = null
-    for await (const chunk of adapter.stream(stream() as any)) {
-      if ((chunk as any).type === 'tool-result') found = chunk
-    }
-    expect(found).toBeTruthy()
-    return found
-  }
 
   async function storeStep(step: Record<string, any>) {
     await adaptCoolToolsToZipSystem([step], sessionId, messageId, {})
@@ -1933,145 +2072,15 @@ describe('a shell command stored as a file action keeps its failure (F-P6-5)', (
     }
   }
 
-  async function storeCodexCommand(options: Parameters<typeof codexCommandEvents>[0]) {
-    const adapter = new CodexEventAdapter({ request, transport: 'cli' })
-    const chunk = await toolResultChunk(adapter, codexCommandEvents(options))
-    return storeStep(cliStepForZip(chunk, adapter.getToolMetadataResolver(), sessionId))
-  }
-
-  async function storeCodexPatch(options: Parameters<typeof codexFileChangeEvents>[0]) {
-    const adapter = new CodexEventAdapter({ request, transport: 'cli' })
-    const chunk = await toolResultChunk(adapter, codexFileChangeEvents(options))
-    return storeStep(cliStepForZip(chunk, adapter.getToolMetadataResolver(), sessionId))
-  }
-
   describe('reads', () => {
-    it('stores a Codex `cat` that exited 1 as a failed read, with its exit code', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_failed_cat',
-        command: MISSING_FILE_COMMAND,
-        output: MISSING_FILE_ERROR,
-        exitCode: 1,
-        status: 'failed'
-      })
-
-      expect(stored.description).toBe(`read_file: ${MISSING_FILE_PATH} - exit 1 - 1 line`)
-      expect(stored.metadata).toMatchObject({
-        operationKind: 'read_file',
-        zipDescriptionLabel: 'read_file',
-        zipDescriptionTarget: MISSING_FILE_PATH,
-        zipDescriptionStatus: 'exit 1'
-      })
-      expect(stored.payload).toMatchObject({
-        operationKind: 'read_file',
-        rendererFamily: 'read_file',
-        toolResult: {
-          filePath: MISSING_FILE_PATH,
-          content: MISSING_FILE_ERROR.trimEnd(),
-          exitCode: 1
-        }
-      })
-      expect(stored.aiView).toBe(
-        `Tool result: read_file\nPath: ${MISSING_FILE_PATH}\nExit code: 1\nLines: 1\nChars/bytes: 64\n` +
-          `Content:\n\`\`\`plaintext\n${MISSING_FILE_ERROR.trimEnd()}\n\`\`\``
-      )
-      expect(stored.failed).toBe(true)
-    })
-
     // BL-678: the ledger took the notice's words anywhere in a read for a cut, so this whole
     // read never superseded an older copy and could not be held.
-    it('stores a Codex `cat` of a file that quotes the cut notice as a whole read', async () => {
+    it('stores an API `cat` of a file that quotes the cut notice as a whole read', async () => {
       const quoted = `# Size guard\n${guardCutNotice(4_000)}\nThat line is quoted from the guard.\n`
-      const stored = await storeCodexCommand({
-        id: 'call_quoted_notice_cat', command: PRESENT_FILE_COMMAND, output: quoted, exitCode: 0, status: 'completed'
-      })
+      const stored = await storeStep(apiShellStep({ id: 'toolu_quoted_notice_cat', command: PRESENT_FILE_COMMAND, stdout: quoted, exitCode: 0 }))
       expect(stored.payload.toolResult.content).toBe(quoted.trimEnd())
       expect(describeToolResultFiles({ operationKind: stored.metadata.operationKind, payload: stored.payload }, { projectPath: DIR }))
         .toEqual({ kind: 'read', files: new Map([['notes.md', 'whole']]) })
-    })
-
-    it('keeps a successful Codex `cat` exactly as it was stored before', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_present_cat',
-        command: PRESENT_FILE_COMMAND,
-        output: PRESENT_FILE_CONTENT,
-        exitCode: 0,
-        status: 'completed'
-      })
-
-      expect(stored.description).toBe(`read_file: ${PRESENT_FILE_PATH} - 4 lines`)
-      expect(stored.metadata).not.toHaveProperty('zipDescriptionStatus')
-      expect(stored.payload.error).toBeUndefined()
-      expect(stored.payload.toolResult).toEqual({
-        filePath: PRESENT_FILE_PATH,
-        path: PRESENT_FILE_PATH,
-        content: PRESENT_FILE_CONTENT.trimEnd(),
-        lineCount: 4,
-        size: 34,
-        language: 'markdown',
-        contentTruncated: false,
-        contentOmitted: false,
-        contentChars: 34
-      })
-      expect(stored.aiView).toBe(
-        `Tool result: read_file\nPath: ${PRESENT_FILE_PATH}\nLines: 4\nChars/bytes: 34\n` +
-          `Content:\n\`\`\`markdown\n${PRESENT_FILE_CONTENT.trimEnd()}\n\`\`\``
-      )
-      expect(stored.failed).toBe(false)
-    })
-
-    // The app-server lane maps a declined or cancelled command to `failed` with no exit code: the
-    // failure is kept as a reason, and no exit code is ever derived from Codex's `status` word.
-    it('stores a Codex read that failed with no exit code as an error, not as JSON', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_no_exit_cat',
-        command: MISSING_FILE_COMMAND,
-        output: '',
-        status: 'failed'
-      })
-
-      expect(stored.description).toBe(`read_file: ${MISSING_FILE_PATH} - error - 0 lines`)
-      expect(stored.payload.error).toBe('Codex reported this command as failed and gave no exit code.')
-      expect(stored.payload.toolResult).not.toHaveProperty('exitCode')
-      expect(stored.payload.toolResult.content).toBe('')
-      expect(stored.aiView).toContain(
-        'Error:\n```text\nCodex reported this command as failed and gave no exit code.\n```'
-      )
-      expect(stored.failed).toBe(true)
-    })
-
-    it('does not call a read that ends in a search with no match a failure', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_cat_grep',
-        command: `cat ${PRESENT_FILE_PATH} | grep zzz`,
-        output: 'nothing\n',
-        exitCode: 1,
-        status: 'failed'
-      })
-
-      expect(stored.payload.operationKind).toBe('read_file')
-      expect(stored.payload.toolResult).not.toHaveProperty('exitCode')
-      expect(stored.metadata).not.toHaveProperty('zipDescriptionStatus')
-      expect(stored.failed).toBe(false)
-    })
-
-    it('already stored a failed managed Claude `cat` as an error (no gap on that lane)', async () => {
-      const adapter = new ClaudeEventAdapter({ request, transport: 'cli' })
-      const chunk = await toolResultChunk(adapter, claudeFailedBashEvents('toolu_failed_cat'))
-      const stored = await storeStep(cliStepForZip(chunk, adapter.getToolMetadataResolver(), sessionId))
-
-      expect(chunk.toolName).toBe('batshit_server_read_file')
-      expect(stored.description).toBe(`read_file: ${MISSING_FILE_PATH} - error - 1 line`)
-      expect(stored.metadata.zipDescriptionStatus).toBe('error')
-      expect(stored.payload.error).toBe(`Error: Exit code 1\n${MISSING_FILE_ERROR.trimEnd()}`)
-      // The follow-up gave this lane the number Claude keeps inside its text, so the content is
-      // what `cat` printed and the exit code is a number like every other lane's.
-      expect(stored.payload.toolResult).toMatchObject({
-        content: MISSING_FILE_ERROR.trimEnd(),
-        exitCode: 1
-      })
-      expect(stored.payload.toolResult.content).not.toContain('Exit code 1')
-      expect(stored.failed).toBe(true)
     })
 
     // The API lane's empty stdout once made the read's "content" the whole native bash result:
@@ -2108,113 +2117,19 @@ describe('a shell command stored as a file action keeps its failure (F-P6-5)', (
   })
 
   describe('writes, edits, and patches', () => {
-    // Whether the adapter reads a failed write back is pinned in codexEventAdapter.test.ts.
-    it('stores a Codex write that exited 1 as a failed write', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_failed_write',
-        command: 'echo hi > /nope/dir/out.txt',
-        output: 'zsh: no such file or directory: /nope/dir/out.txt\n',
-        exitCode: 1,
-        status: 'failed'
-      })
-
-      expect(stored.description).toBe('write_file: /nope/dir/out.txt - exit 1 - 1 line')
-      expect(stored.payload.toolResult).toMatchObject({
-        filePath: '/nope/dir/out.txt',
-        exitCode: 1,
-        commandOutput: 'zsh: no such file or directory: /nope/dir/out.txt'
-      })
-      expect(JSON.stringify(stored.payload)).not.toContain('content unavailable')
-      expect(stored.aiView).toBe(
-        'Tool result: write_file\nPath: /nope/dir/out.txt\nExit code: 1\n' +
-          'Output:\n```text\nzsh: no such file or directory: /nope/dir/out.txt\n```'
-      )
-      expect(stored.failed).toBe(true)
-    })
-
     it('never stores what a failed write printed as the content it wrote', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_failed_generated_write',
+      const stored = await storeStep(apiShellStep({
+        id: 'toolu_failed_generated_write',
         command: 'node gen.js > /nope/dir/out.txt',
-        output: 'zsh: no such file or directory: /nope/dir/out.txt\n',
-        exitCode: 1,
-        status: 'failed'
-      })
+        stderr: 'zsh: no such file or directory: /nope/dir/out.txt\n',
+        exitCode: 1
+      }))
 
       expect(stored.payload.operationKind).toBe('write_file')
       expect(stored.payload.toolResult.content).toBe('')
       expect(stored.payload.toolResult.commandOutput).toBe('zsh: no such file or directory: /nope/dir/out.txt')
     })
 
-    it('keeps a successful Codex write exactly as it was stored before', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_present_write',
-        command: `echo hi > ${DIR}/out.txt`,
-        output: '',
-        exitCode: 0,
-        status: 'completed'
-      })
-
-      expect(stored.description).toBe(`write_file: ${DIR}/out.txt - 1 line`)
-      expect(stored.payload.toolResult).toEqual({
-        filePath: `${DIR}/out.txt`,
-        path: `${DIR}/out.txt`,
-        content: 'hi',
-        lineCount: 1,
-        size: 2,
-        language: 'plaintext',
-        contentTruncated: false,
-        contentOmitted: false,
-        contentChars: 2
-      })
-      expect(stored.aiView).toBe(
-        `Tool result: write_file\nPath: ${DIR}/out.txt\nLines: 1\nChars/bytes: 2\nWritten content:\n\`\`\`plaintext\nhi\n\`\`\``
-      )
-    })
-
-    it('stores a Codex in-place edit that exited 1 without claiming it updated the file', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_failed_edit',
-        command: 'sed -i s/a/b/ /nope/missing.txt',
-        output: 'sed: /nope/missing.txt: No such file or directory\n',
-        exitCode: 1,
-        status: 'failed'
-      })
-
-      expect(stored.description).toMatch(/^edit_file: \/nope\/missing\.txt - exit 1 - /)
-      expect(stored.payload.toolResult).toMatchObject({
-        diff: '',
-        exitCode: 1,
-        commandOutput: 'sed: /nope/missing.txt: No such file or directory'
-      })
-      expect(JSON.stringify(stored.payload)).not.toContain('Updated /nope/missing.txt')
-      expect(stored.aiView).toBe(
-        'Tool result: edit_file\nPath: /nope/missing.txt\nExit code: 1\n' +
-          'Output:\n```text\nsed: /nope/missing.txt: No such file or directory\n```'
-      )
-      expect(stored.failed).toBe(true)
-    })
-
-    it('stores a Codex patch that failed as an edit that was not applied', async () => {
-      const stored = await storeCodexPatch({
-        id: 'patch_failed',
-        changes: [{ path: `${DIR}/notes.md`, kind: 'update' }],
-        status: 'failed'
-      })
-
-      // The size is the diff's, and a patch that failed applied nothing (item 3).
-      expect(stored.description).toBe(`edit_file: ${DIR}/notes.md - error - 0 lines`)
-      expect(stored.payload.error).toBe('Codex reported that this patch failed.')
-      expect(stored.payload.toolResult.diff).toBe('')
-      expect(stored.aiView).toBe(
-        `Tool result: edit_file\nPath: ${DIR}/notes.md\nError:\n\`\`\`text\nCodex reported that this patch failed.\n\`\`\``
-      )
-      expect(stored.failed).toBe(true)
-    })
-
-    // `nativeBashExecute` reads the edit target just before and just after a clean run and reports
-    // their diff. The rebuild in `normalizeToolStep` once dropped the copies it sent then, so every
-    // API edit without a patch was stored as "Diff unavailable" (found in F-P6-5's round).
     describe("an API in-place edit's diff", () => {
       const edited = PRESENT_FILE_CONTENT.replace('First', 'Last')
       const apiEdit = (command: string, before: string, after: string) =>
@@ -2294,23 +2209,6 @@ describe('a shell command stored as a file action keeps its failure (F-P6-5)', (
       })
     })
 
-    // Every Codex native patch crashed the adapter (`kind.toLowerCase is not a function`) once the
-    // app server described a change's kind as an object; it also sends each file's own diff.
-    it('stores a real Codex native patch with Codex\'s own diff', async () => {
-      const adapter = new CodexEventAdapter({ request: { ...request, projectPath: CODEX_PROJECT }, transport: 'cli' })
-      const chunk = await toolResultChunk(adapter, appServerFileChangeEvents(CAPTURED_UPDATE_AND_RENAME))
-      const stored = await storeStep(cliStepForZip(chunk, adapter.getToolMetadataResolver(), sessionId))
-      const diff =
-        'diff --git a/notes.md b/notes.md\n--- a/notes.md\n+++ b/notes.md\n@@ -2,3 +2,3 @@\n \n' +
-        '-First line.\n+Last line.\n Second line.\n' +
-        'diff --git a/old-name.txt b/new-name.txt\nrename from old-name.txt\nrename to new-name.txt'
-
-      expect(stored.description).toBe(`edit_file: ${CODEX_PROJECT}/notes.md - 11 lines`)
-      expect(stored.payload.toolResult).toMatchObject({ filePath: `${CODEX_PROJECT}/notes.md`, diff })
-      expect(stored.aiView).toContain(`Diff:\n\`\`\`diff\n${diff}\n\`\`\``)
-      expect(stored.failed).toBe(false)
-    })
-
     it('keeps the API lane at `error` for a failed write and now keeps what it printed', async () => {
       const stored = await storeStep(
         apiShellStep({
@@ -2334,101 +2232,21 @@ describe('a shell command stored as a file action keeps its failure (F-P6-5)', (
   })
 
   describe('listings and searches', () => {
-    it('stores a Codex listing that exited 1 with no entries, never its error line', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_failed_ls',
-        command: 'ls /nope',
-        output: 'ls: /nope: No such file or directory\n',
-        exitCode: 1,
-        status: 'failed'
-      })
-
-      expect(stored.description).toBe('list_files: /nope - exit 1 - 0 entries')
-      expect(stored.payload.toolResult).toMatchObject({
-        files: [],
-        totalItems: 0,
-        exitCode: 1,
-        commandOutput: 'ls: /nope: No such file or directory'
-      })
-      expect(stored.aiView).toBe(
-        'Tool result: list_files\nPath: /nope\nExit code: 1\nItems: 0\nFiles:\n(none)\n' +
-          'Output:\n```text\nls: /nope: No such file or directory\n```'
-      )
-      expect(stored.failed).toBe(true)
-    })
-
     it('keeps the real entries of a `find` that hit an error, and drops its error lines', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_partial_find',
+      const stored = await storeStep(apiShellStep({
+        id: 'toolu_partial_find',
         command: `find ${DIR} -name "*.md"`,
-        output: `${DIR}/notes.md\nfind: ${DIR}/private: Permission denied\n`,
-        exitCode: 1,
-        status: 'failed'
-      })
+        stdout: `${DIR}/notes.md\n`,
+        stderr: `find: ${DIR}/private: Permission denied\n`,
+        exitCode: 1
+      }))
 
-      expect(stored.description).toBe(`list_files: ${DIR} - exit 1 - 1 entry`)
+      expect(stored.description).toBe(`list_files: ${DIR} - error - 1 entry`)
       expect(stored.payload.toolResult.files.map((entry: any) => entry.path)).toEqual([`${DIR}/notes.md`])
     })
 
-    it('keeps a successful Codex listing exactly as it was stored before', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_present_ls',
-        command: `ls ${DIR}`,
-        output: 'notes.md\nout.txt\n',
-        exitCode: 0,
-        status: 'completed'
-      })
-
-      expect(stored.description).toBe(`list_files: ${DIR} - 2 entries`)
-      expect(stored.payload.toolResult).toEqual({
-        files: [
-          { path: 'notes.md', name: 'notes.md', type: 'unknown' },
-          { path: 'out.txt', name: 'out.txt', type: 'unknown' }
-        ],
-        totalFiles: 0,
-        totalDirectories: 0,
-        totalUnknownItems: 2,
-        totalItems: 2
-      })
-      expect(stored.aiView).toBe(`Tool result: list_files\nPath: ${DIR}\nItems: 2\nFiles:\n- notes.md\n- out.txt`)
-    })
-
-    it.each([
-      { label: 'a search with no match', command: `rg zzz ${DIR}`, lane: 'search_files' },
-      { label: 'a grep with no match', command: `grep -rn zzz ${DIR}`, lane: 'search_files' },
-      { label: 'an `rg --files` listing with nothing in it', command: 'rg --files /tmp/empty-dir', lane: 'list_files' }
-    ])('does not call exit 1 from $label a failure', async ({ command, lane }) => {
-      const stored = await storeCodexCommand({ id: 'call_no_match', command, output: '', exitCode: 1, status: 'failed' })
-
-      expect(stored.payload.operationKind).toBe(lane)
-      expect(stored.payload.toolResult).not.toHaveProperty('exitCode')
-      expect(stored.metadata).not.toHaveProperty('zipDescriptionStatus')
-      expect(stored.failed).toBe(false)
-    })
-
-    it('stores a search that hit an error with its exit code', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_search_error',
-        command: 'rg zzz /nope',
-        output: 'rg: /nope: No such file or directory (os error 2)\n',
-        exitCode: 2,
-        status: 'failed'
-      })
-
-      expect(stored.description).toBe('search_files: "zzz" - exit 2 - 1 line')
-      expect(stored.payload.toolResult.exitCode).toBe(2)
-      expect(stored.failed).toBe(true)
-    })
   })
 
-  it('stores a Codex command that failed with no exit code as an error, with the reason as stderr', async () => {
-    const stored = await storeCodexCommand({ id: 'call_no_exit_bash', command: 'node -e "1"', output: '', status: 'failed' })
-
-    expect(stored.description).toBe('bash: node -e "1" - error - 1 line')
-    expect(stored.payload.toolResult).not.toHaveProperty('exitCode')
-    expect(stored.payload.toolResult.stderr).toBe('Codex reported this command as failed and gave no exit code.')
-    expect(stored.failed).toBe(true)
-  })
 })
 
 describe('Data Transformation', () => {
@@ -2715,34 +2533,11 @@ describe('Data Transformation', () => {
 describe('the F-P6-5 follow-up found-in-passing defects', () => {
   const sessionId = 'session-shell-followup'
   const messageId = 'msg-shell-followup'
-  const request: any = {
-    sessionId,
-    messageId,
-    agentId: 'agent-shell-followup',
-    userId: 'user-shell-followup',
-    model: 'cli',
-    messages: [{ role: 'user', content: 'Do it' }],
-    availableTools: [],
-    maxToolRounds: 1
-  }
   const DIR = '/tmp/batshit-example'
-  const NO_OUTPUT = '(Bash completed with no output)'
 
   beforeEach(() => {
     vi.mocked(createZipFromContent).mockClear()
   })
-
-  async function toolResultChunk(adapter: CodexEventAdapter | ClaudeEventAdapter, events: any[]) {
-    async function* stream() {
-      yield* events
-    }
-    let found: any = null
-    for await (const chunk of adapter.stream(stream() as any)) {
-      if ((chunk as any).type === 'tool-result') found = chunk
-    }
-    expect(found).toBeTruthy()
-    return found
-  }
 
   async function storeStep(step: Record<string, any>) {
     // One test can store several steps; each must read its own zip, not the test's first one.
@@ -2768,43 +2563,9 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
     }
   }
 
-  async function storeCodexCommand(options: Parameters<typeof codexCommandEvents>[0]) {
-    const adapter = new CodexEventAdapter({ request, transport: 'cli' })
-    const chunk = await toolResultChunk(adapter, codexCommandEvents(options))
-    return storeStep(cliStepForZip(chunk, adapter.getToolMetadataResolver(), sessionId))
-  }
-
-  async function storeCodexPatch(options: Parameters<typeof codexFileChangeEvents>[0]) {
-    const adapter = new CodexEventAdapter({ request, transport: 'cli' })
-    const chunk = await toolResultChunk(adapter, codexFileChangeEvents(options))
-    return storeStep(cliStepForZip(chunk, adapter.getToolMetadataResolver(), sessionId))
-  }
-
-  async function storeClaudeBash(options: {
-    command: string
-    isError?: boolean
-    content: string
-    toolUseResult: unknown
-  }) {
-    const adapter = new ClaudeEventAdapter({ request, transport: 'cli' })
-    const chunk = await toolResultChunk(
-      adapter,
-      claudeBashEvents({ id: 'toolu_followup', ...options, isError: options.isError === true })
-    )
-    return storeStep(cliStepForZip(chunk, adapter.getToolMetadataResolver(), sessionId))
-  }
-
-  function claudeFailure(command: string, output: string, exitCode = 1) {
-    const text = output ? `Exit code ${exitCode}\n${output}` : `Exit code ${exitCode}`
-    return { command, isError: true, content: text, toolUseResult: `Error: ${text}` }
-  }
-
-  function claudeSuccess(command: string, stdout: string) {
-    return {
-      command,
-      content: stdout || NO_OUTPUT,
-      toolUseResult: { stdout, stderr: '', interrupted: false, isImage: false, noOutputExpected: false }
-    }
+  /** One API native bash call that printed `stdout` and `stderr` and exited `exitCode`. */
+  function storeApiCommand(options: { command: string; stdout?: string; stderr?: string; exitCode: number }) {
+    return storeStep(apiShellStep({ id: 'toolu_api_followup', ...options }, sessionId))
   }
 
   // Item 1 — the API lane's native bash calls every non-zero exit a failure, so a search that
@@ -2814,7 +2575,7 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
       { label: 'a search', command: `rg zzz ${DIR}`, kind: 'search_files' },
       { label: 'a grep', command: `grep -rn zzz ${DIR}`, kind: 'search_files' },
       { label: 'an `rg --files` listing', command: 'rg --files /tmp/empty-dir', kind: 'list_files' },
-      { label: 'a read piped into a search', command: `cat ${DIR}/notes.md | grep zzz`, kind: 'read_file' }
+      { label: 'a read piped into a search', command: `cat ${DIR}/notes.md | grep zzz`, kind: 'search_files' }
     ])('stores $label with no match as a success on the API lane', async ({ command, kind }) => {
       const stored = await storeStep(apiShellStep({ id: 'toolu_api_no_match', command, exitCode: 1 }, sessionId))
 
@@ -2824,32 +2585,16 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
       expect(stored.failed).toBe(false)
     })
 
-    it.each([
-      { label: 'a search', command: `rg zzz ${DIR}`, kind: 'search_files' },
-      { label: 'an `rg --files` listing', command: 'rg --files /tmp/empty-dir', kind: 'list_files' }
-    ])('stores $label with no match as a success on the managed Claude lane', async ({ command, kind }) => {
-      const stored = await storeClaudeBash(claudeFailure(command, ''))
-
-      expect(stored.payload.operationKind).toBe(kind)
-      expect(stored.payload.error).toBeUndefined()
-      expect(stored.metadata).not.toHaveProperty('zipDescriptionStatus')
-      expect(stored.failed).toBe(false)
-    })
-
-    it('still stores a real search error as a failure on both lanes', async () => {
+    it('still stores a real search error as a failure', async () => {
       const api = await storeStep(
         apiShellStep(
           { id: 'toolu_api_search_error', command: 'rg zzz /nope', stderr: 'rg: /nope: No such file\n', exitCode: 2 },
           sessionId
         )
       )
-      const claude = await storeClaudeBash(claudeFailure('rg zzz /nope', 'rg: /nope: No such file', 2))
 
       expect(api.metadata.zipDescriptionStatus).toBe('error')
       expect(api.failed).toBe(true)
-      expect(claude.metadata.zipDescriptionStatus).toBe('error')
-      expect(claude.payload.toolResult.exitCode).toBe(2)
-      expect(claude.failed).toBe(true)
     })
 
     it('still stores a search that timed out as a failure', async () => {
@@ -2863,22 +2608,6 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
 
   // Item 2 — a read whose command printed nothing stored the whole native result as JSON.
   describe('a read that printed nothing read nothing (item 2)', () => {
-    it('stores an empty Codex read as empty, not as its own result object', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_empty_cat',
-        command: `cat ${DIR}/empty.txt`,
-        output: '',
-        exitCode: 0,
-        status: 'completed'
-      })
-
-      expect(stored.description).toBe(`read_file: ${DIR}/empty.txt - 0 lines`)
-      expect(stored.payload.toolResult.content).toBe('')
-      expect(stored.aiView).toBe(
-        `Tool result: read_file\nPath: ${DIR}/empty.txt\nLines: 0\nChars/bytes: 0\nContent:\n\`\`\`plaintext\n\n\`\`\``
-      )
-    })
-
     it('stores an empty API read as empty, not as 31 lines of JSON', async () => {
       const stored = await storeStep(
         apiShellStep({ id: 'toolu_api_empty_read', command: `cat ${DIR}/empty.txt`, exitCode: 0 }, sessionId)
@@ -2887,14 +2616,6 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
       expect(stored.description).toBe(`read_file: ${DIR}/empty.txt - 0 lines`)
       expect(stored.payload.toolResult.content).toBe('')
       expect(JSON.stringify(stored.payload.toolResult)).not.toContain('sandboxName')
-    })
-
-    it('stores an empty managed Claude read as empty, never its "no output" note', async () => {
-      const stored = await storeClaudeBash(claudeSuccess(`cat ${DIR}/empty.txt`, ''))
-
-      expect(stored.description).toBe(`read_file: ${DIR}/empty.txt - 0 lines`)
-      expect(stored.payload.toolResult.content).toBe('')
-      expect(JSON.stringify(stored.payload)).not.toContain(NO_OUTPUT)
     })
 
     it('stores an empty file a read tool returned as empty', async () => {
@@ -2929,71 +2650,25 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
     })
 
     it('counts a command that printed nothing as nothing', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_silent_bash',
-        command: `mkdir -p ${DIR}/new`,
-        output: '',
-        exitCode: 0,
-        status: 'completed'
-      })
+      const stored = await storeApiCommand({ command: `mkdir -p ${DIR}/new`, exitCode: 0 })
 
       expect(stored.description).toBe(`bash: mkdir -p ${DIR}/new - exit 0 - 0 lines`)
     })
 
     it('counts a search by its matching lines', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_search_match',
-        command: `rg -n First ${DIR}`,
-        output: `${DIR}/notes.md:3:First line.\n`,
-        exitCode: 0,
-        status: 'completed'
-      })
+      const stored = await storeApiCommand({ command: `rg -n First ${DIR}`, stdout: `${DIR}/notes.md:3:First line.\n`, exitCode: 0 })
 
       expect(stored.description).toBe('search_files: "First" - 1 line')
       expect(stored.payload.toolResult.totalMatches).toBe(1)
     })
   })
 
-  // Item 4 — Codex reports a native patch's targets as a list of objects, and a delete or rename
-  // was rendered as an Edit File card whose "diff" was the JSON of that list.
-  describe('a Codex delete or rename is a command, not an edit (item 4)', () => {
-    it.each([
-      {
-        label: 'a delete',
-        changes: [{ path: `${DIR}/old.md`, kind: 'delete' as const }],
-        command: `rm ${DIR}/old.md`
-      },
-      {
-        label: 'a rename',
-        changes: [{ path: `${DIR}/a.md`, kind: 'rename' as any, to: `${DIR}/b.md` } as any],
-        command: `mv ${DIR}/a.md ${DIR}/b.md`
-      }
-    ])('stores $label as its command', async ({ changes, command }) => {
-      const stored = await storeCodexPatch({ id: 'patch_change', changes, status: 'completed' })
-
-      expect(stored.payload.operationKind).toBe('bash')
-      expect(stored.payload.toolResult.command).toBe(command)
-      expect(stored.description).toBe(`bash: ${command} - 0 lines`)
-      expect(JSON.stringify(stored.payload)).not.toContain('"kind"')
-      expect(stored.aiView).toContain(`Command: ${command}`)
-    })
-
-    it('keeps a Codex update an edit', async () => {
-      const stored = await storeCodexPatch({
-        id: 'patch_update',
-        changes: [{ path: `${DIR}/notes.md`, kind: 'update' }],
-        status: 'completed'
-      })
-
-      expect(stored.payload.operationKind).toBe('edit_file')
-    })
-  })
-
-  // Item 5 — Claude Code frames a failed Bash call as `Exit code N\n<output>`, and the framing
-  // line and the command's own error lines were parsed as file entries.
-  describe('a failed managed Claude listing has no entries it did not list (item 5)', () => {
+  // Item 5 — a failed listing or edit has no entries or change it did not make. (The managed
+  // Claude lane's own framing, `Exit code N\n<output>`, and the bfs diagnostics of its `find` went
+  // with that lane in SA-139 R5.)
+  describe('a failed listing has no entries it did not list (item 5)', () => {
     it('stores a failed `ls` with no entries and what it printed', async () => {
-      const stored = await storeClaudeBash(claudeFailure('ls /nope', 'ls: /nope: No such file or directory'))
+      const stored = await storeApiCommand({ command: 'ls /nope', stderr: 'ls: /nope: No such file or directory\n', exitCode: 1 })
 
       expect(stored.description).toBe('list_files: /nope - error - 0 entries')
       expect(stored.payload.toolResult).toMatchObject({
@@ -3005,41 +2680,8 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
       expect(stored.failed).toBe(true)
     })
 
-    it("drops the bfs diagnostic Claude Code's `find` prints, and keeps the real entry", async () => {
-      const stored = await storeClaudeBash(
-        claudeFailure(
-          `find ${DIR} /nope -name "*.md"`,
-          `${DIR}/notes.md\nbfs: error: /nope: No such file or directory.`
-        )
-      )
-
-      expect(stored.payload.toolResult.files.map((entry: any) => entry.path)).toEqual([`${DIR}/notes.md`])
-      expect(JSON.stringify(stored.payload.toolResult.files)).not.toContain('bfs:')
-      expect(stored.payload.toolResult.commandOutput).toContain('bfs: error:')
-    })
-
-    // Live on 2026-09-18: Claude Code reported a `find` that hit a permission error as a SUCCESS
-    // (`is_error: false`, bfs's line in the output), so a failure-gated strip left it as an entry.
-    it.each([
-      { label: 'the managed Claude lane', lane: 'claude' as const },
-      { label: 'the Codex lane', lane: 'codex' as const }
-    ])('drops a listing diagnostic on $label even when the lane called it a success', async ({ lane }) => {
-      const command = `find ${DIR} -name "*.md"`
-      const output = `bfs: error: ${DIR}/private: Permission denied.\n${DIR}/notes.md`
-      const stored =
-        lane === 'claude'
-          ? await storeClaudeBash(claudeSuccess(command, output))
-          : await storeCodexCommand({ id: 'call_find_ok', command, output: `${output}\n`, exitCode: 0, status: 'completed' })
-
-      expect(stored.payload.toolResult.files.map((entry: any) => entry.path)).toEqual([`${DIR}/notes.md`])
-      expect(stored.payload.error).toBeUndefined()
-      expect(stored.payload.toolResult).not.toHaveProperty('commandOutput')
-    })
-
-    it('never claims a failed managed Claude edit updated the file', async () => {
-      const stored = await storeClaudeBash(
-        claudeFailure("sed -i '' s/a/b/ /nope/x.md", 'sed: /nope/x.md: No such file or directory')
-      )
+    it('never claims a failed edit updated the file', async () => {
+      const stored = await storeApiCommand({ command: "sed -i '' s/a/b/ /nope/x.md", stderr: 'sed: /nope/x.md: No such file or directory\n', exitCode: 1 })
 
       expect(stored.payload.operationKind).toBe('edit_file')
       expect(stored.payload.toolResult.diff).toBe('')
@@ -3056,20 +2698,7 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
     const OUTPUT = `${DIR}:\nnotes.md\nout.txt\n\n/tmp/other:\nb.md\n`
     const ENTRIES = [`${DIR}/notes.md`, `${DIR}/out.txt`, '/tmp/other/b.md']
 
-    it('stores each entry under the directory that listed it on the Codex lane', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_ls_multi',
-        command: `ls ${DIR} /tmp/other`,
-        output: OUTPUT,
-        exitCode: 0,
-        status: 'completed'
-      })
-
-      expect(stored.description).toBe(`list_files: ${DIR} - 3 entries`)
-      expect(stored.payload.toolResult.files.map((entry: any) => entry.path)).toEqual(ENTRIES)
-    })
-
-    it('stores the same entries on the API lane', async () => {
+    it('stores each entry under the directory that listed it on the API lane', async () => {
       const stored = await storeStep(
         apiShellStep({ id: 'toolu_api_ls_multi', command: `ls ${DIR} /tmp/other`, stdout: OUTPUT, exitCode: 0 }, sessionId)
       )
@@ -3077,36 +2706,23 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
       expect(stored.payload.toolResult.files.map((entry: any) => entry.path)).toEqual(ENTRIES)
     })
 
-    it('stores the same entries on the managed Claude lane', async () => {
-      const stored = await storeClaudeBash(claudeSuccess(`ls ${DIR} /tmp/other`, OUTPUT.trimEnd()))
-
-      expect(stored.payload.toolResult.files.map((entry: any) => entry.path)).toEqual(ENTRIES)
-    })
-
     it('keeps the entries a partly failed multi-directory listing did list', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_ls_multi_partial',
+      const stored = await storeApiCommand({
         command: `ls ${DIR} /nope`,
-        output: `ls: /nope: No such file or directory\n${DIR}:\nnotes.md\nout.txt\n`,
-        exitCode: 1,
-        status: 'failed'
+        stdout: `${DIR}:\nnotes.md\nout.txt\n`,
+        stderr: 'ls: /nope: No such file or directory\n',
+        exitCode: 1
       })
 
       expect(stored.payload.toolResult.files.map((entry: any) => entry.path)).toEqual([
         `${DIR}/notes.md`,
         `${DIR}/out.txt`
       ])
-      expect(stored.metadata.zipDescriptionStatus).toBe('exit 1')
+      expect(stored.metadata.zipDescriptionStatus).toBe('error')
     })
 
     it('leaves a lone listing bare, even when a file is named like a header', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_ls_colon',
-        command: `ls ${DIR}`,
-        output: 'weird:\nnotes.md\n',
-        exitCode: 0,
-        status: 'completed'
-      })
+      const stored = await storeApiCommand({ command: `ls ${DIR}`, stdout: 'weird:\nnotes.md\n', exitCode: 0 })
 
       expect(stored.payload.toolResult.files.map((entry: any) => entry.path)).toEqual(['weird:', 'notes.md'])
     })
@@ -3159,52 +2775,7 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
       expect(stored.payload.toolResult.commandOutput).toBe(`${MATCH}\n${GREP_MISSING}`)
     })
 
-    it('keeps the error line after the matches on the lanes that merge their streams', async () => {
-      const codex = await storeCodexCommand({
-        id: 'call_search_partial',
-        command: `grep -rn First ${DIR} /nope`,
-        output: `${MATCH}\n${GREP_MISSING}\n`,
-        exitCode: 2,
-        status: 'failed'
-      })
-      const claude = await storeClaudeBash(claudeFailure(`grep -rn First ${DIR} /nope`, `${MATCH}\n${GREP_MISSING}`, 2))
-
-      for (const stored of [codex, claude]) {
-        expect(stored.payload.toolResult.results.map((entry: any) => entry.path)).toEqual([`${DIR}/notes.md`])
-        expect(stored.payload.toolResult.commandOutput).toBe(`${MATCH}\n${GREP_MISSING}`)
-      }
-    })
-
-    it('stores an error those lanes already stored as the output only once', async () => {
-      const codex = await storeCodexCommand({
-        id: 'call_search_missing',
-        command: 'grep -rn zzz /nope',
-        output: `${GREP_MISSING}\n`,
-        exitCode: 2,
-        status: 'failed'
-      })
-      const claude = await storeClaudeBash(claudeFailure('grep -rn zzz /nope', GREP_MISSING, 2))
-
-      for (const stored of [codex, claude]) {
-        expect(stored.payload.toolResult).toEqual({
-          query: 'zzz',
-          output: GREP_MISSING,
-          stdout: GREP_MISSING,
-          truncated: false,
-          exitCode: 2
-        })
-      }
-    })
-
     it('never stores a files-only search error line as a matching file', async () => {
-      const codex = await storeCodexCommand({
-        id: 'call_search_files_only_missing',
-        command: 'grep -rl zzz /nope',
-        output: `${GREP_MISSING}\n`,
-        exitCode: 2,
-        status: 'failed'
-      })
-      const claude = await storeClaudeBash(claudeFailure('grep -rl zzz /nope', GREP_MISSING, 2))
       const api = await storeStep(
         apiShellStep(
           { id: 'toolu_api_files_only_missing', command: 'grep -rl zzz /nope', stderr: `${GREP_MISSING}\n`, exitCode: 2 },
@@ -3212,42 +2783,28 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
         )
       )
 
-      for (const stored of [codex, claude]) {
-        expect(stored.payload.toolResult).not.toHaveProperty('results')
-        expect(stored.payload.toolResult.output).toBe(GREP_MISSING)
-      }
       expect(api.payload.toolResult).not.toHaveProperty('results')
       expect(api.payload.toolResult.commandOutput).toBe(GREP_MISSING)
     })
 
     it('keeps the files a files-only search found before it failed, and not its error line', async () => {
-      const stored = await storeCodexCommand({
-        id: 'call_search_files_only_partial',
+      const stored = await storeApiCommand({
         command: `grep -rl First ${DIR} /nope`,
-        output: `${DIR}/notes.md\n${GREP_MISSING}\n`,
-        exitCode: 2,
-        status: 'failed'
+        stdout: `${DIR}/notes.md\n`,
+        stderr: `${GREP_MISSING}\n`,
+        exitCode: 2
       })
 
-      expect(stored.description).toBe('search_files: "First" - exit 2 - 1 line')
+      expect(stored.description).toBe('search_files: "First" - error - 1 line')
       expect(stored.payload.toolResult.results.map((entry: any) => entry.path)).toEqual([`${DIR}/notes.md`])
       expect(stored.payload.toolResult.commandOutput).toBe(`${DIR}/notes.md\n${GREP_MISSING}`)
     })
 
     it('keeps a search that matched nothing exactly as before', async () => {
       const api = await storeStep(apiShellStep({ id: 'toolu_api_search_none', command: `grep -rn zzz ${DIR}`, exitCode: 1 }, sessionId))
-      const codex = await storeCodexCommand({
-        id: 'call_search_none',
-        command: `grep -rn zzz ${DIR}`,
-        output: '',
-        exitCode: 1,
-        status: 'failed'
-      })
 
-      for (const stored of [api, codex]) {
-        expect(stored.payload.toolResult).toEqual({ query: 'zzz', output: '', stdout: '', truncated: false })
-        expect(stored.failed).toBe(false)
-      }
+      expect(api.payload.toolResult).toEqual({ query: 'zzz', output: '', stdout: '', truncated: false })
+      expect(api.failed).toBe(false)
     })
 
     it('keeps nothing a search that never ran did not print', async () => {
@@ -3269,12 +2826,11 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
     })
   })
 
-  // Bug sweep item 4 (2026-09-18): Claude Code refuses some commands before they run and answers
-  // with `is_error` and its own words, no `Exit code N` (the texts below are its real ones). Those
-  // words were stored as the command's output: a List Files entry, a read's content, a command's
-  // stdout. The API lane stores its own refusal (a blocked command) as a failure with no output, and
-  // the Claude lane now stores its refusal the same way.
-  describe('a command Claude Code refused is stored like a command the API lane refused (item 4)', () => {
+  // Bug sweep item 4 (2026-09-18): a refused command's words were stored as its output: a List
+  // Files entry, a read's content, a command's stdout. The API lane stores its own refusal (a
+  // blocked command) as a failure with no output. (The managed Claude lane, whose Claude Code
+  // refusals were stored the same way, went in SA-139 R5; the refusal texts below are its real ones.)
+  describe('a refused command is stored as a failure with no output (item 4)', () => {
     function apiRefused(command: string, reason: string) {
       const step = apiShellStep({ id: 'toolu_api_refused', command, exitCode: 0 }, sessionId)
       return {
@@ -3289,12 +2845,6 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
         }
       }
     }
-    // The API lane's refusal says it was a policy block; Claude's words say what they say.
-    const withoutBlocked = (value: Record<string, any>) => {
-      const { blocked: _blocked, ...rest } = value
-      return rest
-    }
-
     it.each([
       {
         lane: 'list_files',
@@ -3327,63 +2877,37 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
         text: 'This command requires approval',
         description: `write_file: ${DIR}/out.txt - error - 0 lines`
       }
-    ])('stores a refused $lane with no output, as the API lane stores its own', async ({ lane, command, text, description }) => {
-      const claude = await storeClaudeBash({ command, isError: true, content: text, toolUseResult: `Error: ${text}` })
+    ])('stores a refused $lane with no output', async ({ lane, command, text, description }) => {
       const api = await storeStep(apiRefused(command, `Error: ${text}`))
 
-      expect(claude.payload.operationKind).toBe(lane)
-      expect(withoutBlocked(claude.payload.toolResult)).toEqual(withoutBlocked(api.payload.toolResult))
-      expect(claude.description).toBe(api.description)
-      expect(claude.description).toBe(description)
-      expect(claude.payload.error).toBe(`Error: ${text}`)
-      expect(JSON.stringify(claude.payload.toolResult)).not.toContain(text)
-      expect(claude.failed).toBe(true)
+      expect(api.payload.operationKind).toBe(lane)
+      expect(api.description).toBe(description)
+      expect(api.payload.error).toBe(`Error: ${text}`)
+      expect(JSON.stringify(api.payload.toolResult)).not.toContain(text)
+      expect(api.failed).toBe(true)
     })
 
     it('stores a refused plain command with the reason as stderr and no exit code (F-P5-1)', async () => {
       const reason =
         'Blocked: sleep 45 followed by: npm test. To wait for a condition, use Monitor with an until-loop.'
       const command = 'sleep 45; npm test'
-      const claude = await storeClaudeBash({
-        command,
-        isError: true,
-        content: `<tool_use_error>${reason}</tool_use_error>`,
-        toolUseResult: `Error: ${reason}`
-      })
       const api = await storeStep(apiRefused(command, `Error: ${reason}`))
 
-      expect(claude.payload.operationKind).toBe('bash')
-      expect(claude.payload.toolResult).toMatchObject({ stdout: '', stderr: `Error: ${reason}`, command })
-      expect(claude.payload.toolResult).not.toHaveProperty('exitCode')
-      expect(claude.payload.toolResult).toEqual(api.payload.toolResult)
-      expect(claude.description).toBe(api.description)
-      expect(claude.aiView).not.toContain('Exit code')
-      expect(claude.failed).toBe(true)
+      expect(api.payload.operationKind).toBe('bash')
+      expect(api.payload.toolResult).toMatchObject({ stdout: '', stderr: `Error: ${reason}`, command })
+      expect(api.payload.toolResult).not.toHaveProperty('exitCode')
+      expect(api.aiView).not.toContain('Exit code')
+      expect(api.failed).toBe(true)
     })
   })
 
-  // Bug sweep, item 4's sibling (2026-09-18): Claude Code's own file tools fail with `is_error` and
-  // their own words (the real texts, with the home path replaced). The words were stored as the file:
-  // a failed Read's content, and a failed Edit claimed `Updated <path>`. Each is now stored the way
-  // batshit-server's own file tools store a failure (`builtInService.js`: `{ success: false, error }`).
-  describe("a failed call of Claude Code's own file tool is stored as a failure (item 4's sibling)", () => {
+  // Bug sweep, item 4's sibling (2026-09-18): a failed file tool's words were stored as the file: a
+  // failed Read's content, and a failed Edit claimed `Updated <path>`. A failure is stored the way
+  // batshit-server's own file tools store one (`builtInService.js`: `{ success: false, error }`).
+  // (Claude Code's own file tools, which the managed Claude lane stored the same way, went with
+  // that lane in SA-139 R5; the failure texts below are theirs.)
+  describe("a failed file tool call is stored as a failure (item 4's sibling)", () => {
     const PATH = `${DIR}/notes.md`
-
-    async function storeClaudeTool(name: string, input: Record<string, any>, blockText: string, text: string) {
-      const adapter = new ClaudeEventAdapter({ request, transport: 'cli' })
-      const chunk = await toolResultChunk(adapter, [
-        { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_file_tool', name, input }] } },
-        {
-          type: 'user',
-          tool_use_result: `Error: ${text}`,
-          message: {
-            role: 'user',
-            content: [{ type: 'tool_result', tool_use_id: 'toolu_file_tool', content: blockText, is_error: true }]
-          }
-        }
-      ])
-      return storeStep(cliStepForZip(chunk, adapter.getToolMetadataResolver(), sessionId))
-    }
 
     function storeServerFailure(toolName: string, tool: string, args: Record<string, any>, error: string) {
       return storeStep({
@@ -3398,30 +2922,21 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
     it.each([
       'File does not exist. Note: your current working directory is /Users/example/batshit.',
       'File content (38059 tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.'
-    ])('stores a failed Read with no content, as a failed server read: %s', async (text) => {
-      const claude = await storeClaudeTool('Read', { file_path: PATH }, text, text)
+    ])('stores a failed server read with no content: %s', async (text) => {
       const server = await storeServerFailure('batshit_server_read_file', 'read_file', { filePath: PATH }, `Error: ${text}`)
 
-      expect(claude.description).toBe(`read_file: ${PATH} - error - 0 lines`)
-      expect(claude.payload.toolResult.content).toBe('')
-      expect(claude.payload.error).toBe(`Error: ${text}`)
-      expect(claude.payload.toolResult).toEqual(server.payload.toolResult)
-      expect(claude.description).toBe(server.description)
-      expect(claude.aiView).not.toContain(`Content:\n\`\`\`plaintext\n${text}`)
-      expect(claude.failed).toBe(true)
+      expect(server.description).toBe(`read_file: ${PATH} - error - 0 lines`)
+      expect(server.payload.toolResult.content).toBe('')
+      expect(server.payload.error).toBe(`Error: ${text}`)
+      expect(server.aiView).not.toContain(`Content:\n\`\`\`plaintext\n${text}`)
+      expect(server.failed).toBe(true)
     })
 
     it.each([
       'String to replace not found in file.\nString: First line.',
       'File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.',
       'No changes to make: old_string and new_string are exactly the same.'
-    ])('never says a failed Edit updated the file, as a failed server edit does not: %s', async (text) => {
-      const claude = await storeClaudeTool(
-        'Edit',
-        { file_path: PATH, old_string: 'First line.', new_string: 'Last line.', replace_all: false },
-        `<tool_use_error>${text}</tool_use_error>`,
-        text
-      )
+    ])('never says a failed server edit updated the file: %s', async (text) => {
       const server = await storeServerFailure(
         'batshit_server_edit_file',
         'edit_file',
@@ -3429,94 +2944,40 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
         `Error: ${text}`
       )
 
-      expect(claude.description).toBe(`edit_file: ${PATH} - error - 0 lines`)
-      expect(claude.payload.toolResult.diff).toBe('')
-      expect(JSON.stringify(claude.payload)).not.toContain(`Updated ${PATH}`)
-      expect(claude.payload.toolResult).toEqual(server.payload.toolResult)
-      expect(claude.failed).toBe(true)
+      expect(server.description).toBe(`edit_file: ${PATH} - error - 0 lines`)
+      expect(server.payload.toolResult.diff).toBe('')
+      expect(JSON.stringify(server.payload)).not.toContain(`Updated ${PATH}`)
+      expect(server.failed).toBe(true)
     })
 
-    it('keeps only what a failed Write meant to write, as a failed server write does', async () => {
+    it('keeps only what a failed server write meant to write', async () => {
       const text = 'File has not been read yet. Read it first before writing to it.'
-      const claude = await storeClaudeTool('Write', { file_path: PATH, content: '# Notes\n' }, `<tool_use_error>${text}</tool_use_error>`, text)
       const server = await storeServerFailure('batshit_server_overwrite_file', 'write_file', { filePath: PATH, content: '# Notes\n' }, `Error: ${text}`)
 
-      expect(claude.payload.toolResult.content).toBe('# Notes')
-      expect(JSON.stringify(claude.payload.toolResult)).not.toContain(text)
-      expect(claude.payload.toolResult).toEqual(server.payload.toolResult)
-      expect(claude.payload.error).toBe(`Error: ${text}`)
-    })
-
-    it('stores a failed Grep with no matches', async () => {
-      const stored = await storeClaudeTool('Grep', { pattern: 'zzz', path: '/nope' }, 'Path does not exist: /nope', 'Path does not exist: /nope')
-
-      expect(stored.payload.operationKind).toBe('search_files')
-      expect(stored.payload.toolResult).toEqual({ query: 'zzz', output: '', stdout: '', truncated: false })
-      expect(stored.payload.error).toBe('Error: Path does not exist: /nope')
+      expect(server.payload.toolResult.content).toBe('# Notes')
+      expect(JSON.stringify(server.payload.toolResult)).not.toContain(text)
+      expect(server.payload.error).toBe(`Error: ${text}`)
     })
   })
 
   // Bug sweep (2026-09-18): send-routed's argument normalizer invented `Prompt__User_Message_`, n8n's
   // Subagent message field, from any tool's own `prompt` argument, and every reader takes that field
-  // for a subagent call, so Claude Code's WebFetch, CronCreate, and Agent helper (the real result
-  // shapes below, their values replaced) were stored, and drawn by the client, as Subagent cards.
-  // Only a real delegation is a subagent: the lane's own marking, a subagent tool's `chatInput`, or
-  // n8n's own field.
+  // for a subagent call. Only a real delegation is a subagent: the lane's own marking, a subagent
+  // tool's `chatInput`, or n8n's own field. (The managed Claude lane's cases, Claude Code's own
+  // WebFetch, CronCreate and Agent helper, went with that lane in SA-139 R5.)
   describe('only a real delegation is stored as a subagent', () => {
-    async function storeClaudeCall(name: string, input: Record<string, any>, blockContent: unknown, toolUseResult: unknown) {
-      const adapter = new ClaudeEventAdapter({ request, transport: 'cli' })
-      const chunk = await toolResultChunk(adapter, [
-        { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_claude_call', name, input }] } },
-        {
-          type: 'user',
-          tool_use_result: toolUseResult,
-          message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_claude_call', content: blockContent }] }
-        }
-      ])
-      return storeStep(cliStepForZip(chunk, adapter.getToolMetadataResolver(), sessionId))
-    }
+    it('stores a tool whose own argument is named prompt as that tool, never as a subagent', async () => {
+      const args = normalizeToolArgs({ url: 'https://www.example.com/listing', prompt: 'Return the address and the price.' })
+      const stored = await storeStep({
+        toolName: 'mcp__web__fetch_page',
+        originalToolName: 'mcp__web__fetch_page',
+        toolInput: args,
+        toolArgs: args,
+        toolResult: { content: 'The page lists the price.' },
+        toolCallId: 'mcp_fetch_1',
+        timestamp: '2026-09-18T08:00:00.000Z'
+      })
 
-    it.each([
-      {
-        tool: 'WebFetch',
-        input: { url: 'https://www.example.com/listing', prompt: 'Return the address and the price.' },
-        block: 'The server returned HTTP 403 Forbidden.',
-        result: {
-          bytes: 0,
-          code: 403,
-          codeText: 'Forbidden',
-          result: 'The server returned HTTP 403 Forbidden.',
-          durationMs: 292,
-          url: 'https://www.example.com/listing'
-        }
-      },
-      {
-        tool: 'CronCreate',
-        input: { cron: '*/15 * * * *', recurring: true, prompt: 'Run one polling cycle.' },
-        block: 'Scheduled recurring job de4b0e44 (Every 15 minutes).',
-        result: { id: 'de4b0e44', humanSchedule: 'Every 15 minutes', recurring: true, durable: false }
-      },
-      {
-        // Claude Code's own delegation helper: never a Batshit Subagent (SA-111 P4).
-        tool: 'Agent',
-        input: { description: 'Find the tests', subagent_type: 'Explore', prompt: 'Find every test file.' },
-        block: [{ type: 'text', text: 'Async agent launched successfully.' }],
-        result: {
-          isAsync: true,
-          status: 'async_launched',
-          agentId: 'a0000000000000000',
-          description: 'Find the tests',
-          resolvedModel: 'claude-sonnet-5',
-          prompt: 'Find every test file.',
-          outputFile: '/tmp/agent-output.txt',
-          canReadOutputFile: true
-        }
-      }
-    ])('stores $tool as a generic Claude tool, never as a subagent', async ({ tool, input, block, result }) => {
-      const stored = await storeClaudeCall(tool, input, block, result)
-
-      expect(stored.payload.operationKind).toBe('unknown_tool')
-      expect(stored.payload.rendererFamily).toBe('generic_tool')
       expect(stored.payload.isSubagent).not.toBe(true)
       expect(stored.payload.toolArgs).not.toHaveProperty('Prompt__User_Message_')
       expect(stored.description.startsWith('subagent:')).toBe(false)
@@ -3524,86 +2985,7 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
       expect(buildHydratedCoolToolStep(stored.payload).isSubagent).toBe(false)
     })
 
-    // BL-15 (2026-09-22): the Claude adapter labels its own helper `Claude Code Helper` on the step
-    // (SA-111 P4, AMD-111-03), and `prepareCoolTool` never read the step's own label, so the stored
-    // card said "Agent". Both real result shapes: an async launch and a finished helper run (Claude
-    // Code 2.1.258 transcripts, text and ids replaced).
-    it.each([
-      {
-        shape: 'an async launch',
-        input: { description: 'Find the tests', subagent_type: 'Explore', prompt: 'Find every test file.' },
-        block: [{ type: 'text', text: 'Async agent launched successfully.' }],
-        result: {
-          isAsync: true,
-          status: 'async_launched',
-          agentId: 'a0000000000000000',
-          description: 'Find the tests',
-          resolvedModel: 'claude-sonnet-5',
-          prompt: 'Find every test file.',
-          outputFile: '/tmp/agent-output.txt',
-          canReadOutputFile: true
-        }
-      },
-      {
-        shape: 'a finished run',
-        input: { description: 'Read the docs', subagent_type: 'claude-code-guide', prompt: 'Summarize the effort settings.', run_in_background: false },
-        block: [
-          { type: 'text', text: '## Effort settings\n\nThe docs list four levels.' },
-          { type: 'text', text: "agentId: a1111111111111111 (use SendMessage with to: 'a1111111111111111' to continue this agent)\n<usage>subagent_tokens: 102787\ntool_uses: 6\nduration_ms: 59964</usage>" }
-        ],
-        result: {
-          status: 'completed',
-          prompt: 'Summarize the effort settings.',
-          agentId: 'a1111111111111111',
-          agentType: 'claude-code-guide',
-          harnessNoteCount: 0,
-          harnessTailCount: 0,
-          harnessSectionHash: '0000000000000000',
-          content: [{ type: 'text', text: '## Effort settings\n\nThe docs list four levels.' }],
-          resolvedModel: 'claude-haiku-4-5-20251001',
-          totalDurationMs: 59964,
-          totalTokens: 102787,
-          totalToolUseCount: 6,
-          usage: { input_tokens: 8, output_tokens: 1341 },
-          toolStats: { readCount: 0, searchCount: 0, bashCount: 0, editFileCount: 0, linesAdded: 0, linesRemoved: 0, otherToolCount: 6 }
-        }
-      }
-    ])("stores Claude Code's own helper ($shape) with its label, as a generic card", async ({ input, block, result }) => {
-      const stored = await storeClaudeCall('Agent', input, block, result)
-      const hydrated = buildHydratedCoolToolStep(stored.payload)
-
-      expect(stored.payload.displayToolName).toBe('Claude Code Helper')
-      expect(stored.metadata.displayToolName).toBe('Claude Code Helper')
-      expect(hydrated.displayToolName).toBe('Claude Code Helper')
-      // Still never a Batshit Subagent (SA-111 P4): the label changes nothing else.
-      expect(stored.payload.operationKind).toBe('unknown_tool')
-      expect(stored.payload.rendererFamily).toBe('generic_tool')
-      expect(hydrated.isSubagent).toBe(false)
-      expect(stored.payload.toolName).toBe('Agent')
-      expect(stored.description.startsWith('Agent: Claude Code Helper - ')).toBe(true)
-    })
-
-    // A tool's own `code` is not a command's exit code (the F-P6-5 rule): a WebFetch reports the
-    // page's HTTP status there, and the description called a fetched page `exit 200`, which the reply
-    // check read as a failed tool.
-    it.each([
-      { code: 200, codeText: 'OK', result: 'The page lists the price.' },
-      { code: 403, codeText: 'Forbidden', result: 'The server returned HTTP 403 Forbidden.' }
-    ])('never calls a fetched page\'s HTTP $code an exit code', async ({ code, codeText, result }) => {
-      const url = 'https://www.example.com/listing'
-      const stored = await storeClaudeCall(
-        'WebFetch',
-        { url, prompt: 'Return the address and the price.' },
-        result,
-        { bytes: 120, code, codeText, result, durationMs: 292, url }
-      )
-
-      expect(stored.metadata).not.toHaveProperty('zipDescriptionStatus')
-      expect(stored.description).toBe(`WebFetch: ${url} - 1 line`)
-      expect(stored.failed).toBe(false)
-    })
-
-    it('still stores an API subagent call and a Claude call of a Batshit subagent as subagents', async () => {
+    it('still stores an API subagent call as a subagent', async () => {
       // vercelBrain's subagent tool: `{ chatInput, thread }`, its `kind: 'subagent'` result, and the
       // metadata its resolver stamps, as send-routed stores it.
       const args = normalizeToolArgs({ chatInput: 'Summarize the notes', thread: 'fresh' })
@@ -3633,51 +3015,20 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
         subagentId: 'research_helper',
         subagentType: 'api'
       })
-      const claude = await storeClaudeCall(
-        'mcp__batshit_gateway_cli_subagents__subagent_api_helper',
-        { chatInput: 'ask the API helper' },
-        'API subagent done.',
-        [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              success: true,
-              output: 'API subagent done.',
-              intermediateSteps: [],
-              subagentType: 'api',
-              subagentId: 'api-subagent',
-              subagentName: 'API Helper',
-              toolSource: 'managed-api-subagent'
-            })
-          }
-        ]
-      )
-
-      for (const stored of [api, claude]) {
-        expect(stored.payload.operationKind).toBe('subagent')
-        expect(stored.payload.isSubagent).toBe(true)
-        expect(buildHydratedCoolToolStep(stored.payload).isSubagent).toBe(true)
-      }
+      expect(api.payload.operationKind).toBe('subagent')
+      expect(api.payload.isSubagent).toBe(true)
+      expect(buildHydratedCoolToolStep(api.payload).isSubagent).toBe(true)
     })
   })
 
-  // Bug sweep items 6, 7, and 8 (2026-09-18) through every lane that runs the shared mapper.
+  // Bug sweep items 6, 7, and 8 (2026-09-18) through every lane that runs the shared mapper (since
+  // SA-139 R5, the API lane: the managed Claude lane went).
   describe('the mapper items on every lane (items 6, 7, 8)', () => {
     const NOTES = `${DIR}/notes.md`
 
     async function onEveryLane(command: string, printed: string, exitCode = 0) {
       const api = await storeStep(apiShellStep({ id: 'toolu_api_lane', command, stdout: printed, exitCode }, sessionId))
-      const codex = await storeCodexCommand({
-        id: 'call_lane',
-        command,
-        output: printed,
-        exitCode,
-        status: exitCode === 0 ? 'completed' : 'failed'
-      })
-      const claude = await storeClaudeBash(
-        exitCode === 0 ? claudeSuccess(command, printed.trimEnd()) : claudeFailure(command, printed.trimEnd(), exitCode)
-      )
-      return { api, codex, claude }
+      return { api }
     }
 
     it("stores a count of a quoted pattern as a search, not as the command 'foo' (item 6)", async () => {
@@ -3689,12 +3040,13 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
       }
     })
 
-    it('stores a sed read piped into grep as a read of the file sed read (item 7)', async () => {
+    // BL-2037: its output is search findings, so every lane stores it as a search of that file.
+    it('stores a sed read piped into grep as a search of the file sed read (item 7, BL-2037)', async () => {
       const lanes = await onEveryLane(`sed -n '1,5p' ${NOTES} | grep -i abc`, 'abc line one\nabc line two\n')
 
       for (const stored of Object.values(lanes)) {
-        expect(stored.payload.operationKind).toBe('read_file')
-        expect(stored.payload.toolResult.filePath).toBe(NOTES)
+        expect(stored.payload.operationKind).toBe('search_files')
+        expect(stored.description).toBe(`search_files: ${NOTES} - 2 lines`)
         expect(stored.metadata.zipDescriptionTarget).toBe(NOTES)
       }
     })
@@ -3704,14 +3056,8 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
     it('stores a read that ends in another statement as the command the mapper names it (item 8, BL-233)', async () => {
       const path = '/Users/Example/Hello/Notes.MD'
       const lanes = await onEveryLane(`cat ${path}; exit 3`, '# Notes\n', 3)
-      const refused = await storeClaudeBash({
-        command: `cat ${path}; exit 3`,
-        isError: true,
-        content: 'This Bash command contains multiple operations. The following part requires approval: exit 3',
-        toolUseResult: 'Error: This Bash command contains multiple operations. The following part requires approval: exit 3'
-      })
 
-      for (const stored of [...Object.values(lanes), refused]) {
+      for (const stored of Object.values(lanes)) {
         expect(stored.payload.operationKind).toBe('bash')
         expect(stored.payload.toolResult).not.toHaveProperty('filePath')
         expect(stored.description.startsWith(`bash: cat ${path}; exit 3 - `)).toBe(true)
@@ -3783,26 +3129,17 @@ describe('BL-5: a helper step is stored and reloaded the same under its old and 
 
 /* -------------------------------------------------------------------------------------------- *
  * BL-233 — the zip lane follows the one mapping. Every lane classifies a shell command once, with
- * the shared mapper (`mapBashCommandToRendererTool`): the API lane in send-routed, Codex and Claude
- * in their adapters. `normalizeToolStep` used to classify a command the mapper called a plain
+ * the shared mapper (`mapBashCommandToRendererTool`): the API lane in send-routed, Claude in its
+ * adapter. `normalizeToolStep` used to classify a command the mapper called a plain
  * command a second time, by a regex over the command text, so a test run piped into `tail` and
  * followed by `node src/cli.js` was stored as a Read File of `src/cli.js`: its output saved as the
  * file's content, Read File's zip rule, and a Read File card, while the Execution Viewer and Plan
  * mode said Bash.
  * -------------------------------------------------------------------------------------------- */
+// SA-139 R5: the API lane is the lane that runs the one mapping (the managed Claude lane went).
 describe('BL-233: the zip lane follows the one mapping', () => {
   const sessionId = 'session-one-mapping'
   const messageId = 'msg-one-mapping'
-  const request: any = {
-    sessionId,
-    messageId,
-    agentId: 'agent-one-mapping',
-    userId: 'user-one-mapping',
-    model: 'cli',
-    messages: [{ role: 'user', content: 'Run the tests' }],
-    availableTools: [],
-    maxToolRounds: 1
-  }
   // The benchmark agent's own lanes: Read File keeps 8 responses, Bash 1.
   const settings = {
     buffer_size_read_file: 8,
@@ -3829,18 +3166,6 @@ describe('BL-233: the zip lane follows the one mapping', () => {
     vi.mocked(createZipFromContent).mockClear()
   })
 
-  async function toolResultChunk(adapter: CodexEventAdapter | ClaudeEventAdapter, events: any[]) {
-    async function* stream() {
-      yield* events
-    }
-    let found: any = null
-    for await (const chunk of adapter.stream(stream() as any)) {
-      if ((chunk as any).type === 'tool-result') found = chunk
-    }
-    expect(found).toBeTruthy()
-    return found
-  }
-
   async function storeStep(step: Record<string, any>) {
     vi.mocked(createZipFromContent).mockClear()
     await adaptCoolToolsToZipSystem([step], sessionId, messageId, settings)
@@ -3859,42 +3184,7 @@ describe('BL-233: the zip lane follows the one mapping', () => {
 
   async function onEveryLane(command: string, printed: string, exitCode = 0) {
     const api = await storeStep(apiShellStep({ id: 'toolu_one_mapping', command, stdout: printed, exitCode }, sessionId))
-    const codexAdapter = new CodexEventAdapter({ request, transport: 'cli' })
-    const codexChunk = await toolResultChunk(
-      codexAdapter,
-      codexCommandEvents({
-        id: 'call_one_mapping',
-        command,
-        output: printed,
-        exitCode,
-        status: exitCode === 0 ? 'completed' : 'failed'
-      })
-    )
-    const codex = await storeStep(cliStepForZip(codexChunk, codexAdapter.getToolMetadataResolver(), sessionId))
-    const claudeAdapter = new ClaudeEventAdapter({ request, transport: 'cli' })
-    const text = printed.trimEnd()
-    const claudeChunk = await toolResultChunk(
-      claudeAdapter,
-      claudeBashEvents(
-        exitCode === 0
-          ? {
-              id: 'toolu_one_mapping_claude',
-              command,
-              isError: false,
-              content: text,
-              toolUseResult: { stdout: text, stderr: '', interrupted: false, isImage: false, noOutputExpected: false }
-            }
-          : {
-              id: 'toolu_one_mapping_claude',
-              command,
-              isError: true,
-              content: `Exit code ${exitCode}\n${text}`,
-              toolUseResult: `Error: Exit code ${exitCode}\n${text}`
-            }
-      )
-    )
-    const claude = await storeStep(cliStepForZip(claudeChunk, claudeAdapter.getToolMetadataResolver(), sessionId))
-    return { api, codex, claude }
+    return { api }
   }
 
   const kinds = (lanes: Record<string, { payload: any }>) =>
@@ -3903,11 +3193,8 @@ describe('BL-233: the zip lane follows the one mapping', () => {
   it('stores a test run the mapper calls a command as Bash on every lane, not as a Read File of its script', async () => {
     const lanes = await onEveryLane(TEST_RUN, `${TEST_OUTPUT}\n`)
 
-    expect(kinds(lanes)).toEqual({ api: 'bash', codex: 'bash', claude: 'bash' })
-    // Claude Code reports no exit code for a command that succeeded, so its status slot is empty.
+    expect(kinds(lanes)).toEqual({ api: 'bash' })
     expect(lanes.api.metadata.zipDescriptionStatus).toBe('exit 0')
-    expect(lanes.codex.metadata.zipDescriptionStatus).toBe('exit 0')
-    expect(lanes.claude.metadata.zipDescriptionStatus).toBeUndefined()
     for (const stored of Object.values(lanes)) {
       expect(stored.payload.rendererFamily).toBe('bash')
       expect(stored.payload.toolName).toBe('bash')
@@ -3928,7 +3215,7 @@ describe('BL-233: the zip lane follows the one mapping', () => {
     const path = '/Users/Example/Hello/Notes.MD'
     const lanes = await onEveryLane(`cat ${path}; exit 3`, '# Notes\n', 3)
 
-    expect(kinds(lanes)).toEqual({ api: 'bash', codex: 'bash', claude: 'bash' })
+    expect(kinds(lanes)).toEqual({ api: 'bash' })
     for (const stored of Object.values(lanes)) {
       expect(stored.payload.toolResult).not.toHaveProperty('filePath')
       expect(stored.description.startsWith(`bash: cat ${path}; exit 3 - `)).toBe(true)
@@ -3939,7 +3226,7 @@ describe('BL-233: the zip lane follows the one mapping', () => {
     const path = '/Users/Example/Hello/Notes.MD'
     const lanes = await onEveryLane(`cat ${path}`, '# Notes\n')
 
-    expect(kinds(lanes)).toEqual({ api: 'read_file', codex: 'read_file', claude: 'read_file' })
+    expect(kinds(lanes)).toEqual({ api: 'read_file' })
     for (const stored of Object.values(lanes)) {
       expect(stored.payload.toolResult.filePath).toBe(path)
       expect(stored.payload.toolResult.content).toBe('# Notes')
@@ -4234,7 +3521,7 @@ describe('BL-166 and BL-233 review follow-ups', () => {
     })
   })
 
-  // Finding 2: batshit-server's `execute_command` (builtInService.js), as an n8n Workflow Subagent or
+  // Finding 2: batshit-server's `execute_command` (builtInService.js), as an n8n workflow or
   // an MCP client calls it, never passed through a lane's mapper; the regex BL-233 removed had been
   // its only classifier, so `ls` became a Bash card. The zip write now runs the SAME mapper.
   describe('a command step no lane classified is classified by the shared mapper (finding 2)', () => {
@@ -4282,5 +3569,373 @@ describe('BL-166 and BL-233 review follow-ups', () => {
       expect(stored.payload.operationKind).toBe('bash')
       expect(stored.payload.toolResult).not.toHaveProperty('filePath')
     })
+  })
+})
+
+/* --------------------------------------------------------------------------------------------
+ * BL-1652 — a command that read several files is stored as one zip per file. The native Bash
+ * result carries a split proven against the files (`readSplit`, nativeTools.ts); every read part
+ * becomes a Read File of that file alone, whose command the dead-copy ledger reads, so an edit of
+ * one file retires that file's copy only. A split that no longer covers stdout is ignored.
+ * -------------------------------------------------------------------------------------------- */
+describe('BL-1652: a read of several files is stored as one zip per file', () => {
+  const sessionId = 'session-multi-read'
+  const messageId = 'msg-multi-read'
+  const DIR = '/tmp/batshit-example/week-calendar'
+  const A = "'use strict'\nconst x = 1\nmodule.exports = { x }\n"
+  const B = "const test = require('node:test')\ntest('week', () => {})\n"
+  const LS = 'cli.js\nisoWeek.js\n'
+
+  async function splitStep(command: string, stdout: string, files: Record<string, string>, id = 'toolu_multi_read_1') {
+    const { planShellReadSplit, matchShellReadSplit } = await import('$lib/utils/shellReadSplit')
+    const plan = planShellReadSplit(command)
+    const readSplit = plan ? matchShellReadSplit(plan, stdout, new Map(Object.entries(files))) : null
+    const step = apiShellStep({ id, command, stdout, exitCode: 0 })
+    // Only a local run is split (the shared fixture models an Apple Container run).
+    step.toolResult.backend = 'local'
+    if (readSplit) step.toolResult.readSplit = readSplit
+    return { step, readSplit }
+  }
+
+  async function store(steps: any[], reserved?: Record<string, string>) {
+    vi.mocked(createZipFromContent).mockClear()
+    const refs = await adaptCoolToolsToZipSystem(steps, sessionId, messageId, {}, undefined, reserved ? { reservedZipIdsByToolCallId: reserved } : {})
+    const calls = vi.mocked(createZipFromContent).mock.calls.filter((entry) => entry[1] === 'cool_tool')
+    return {
+      refs,
+      zips: calls.map((call: any) => ({ payload: JSON.parse(call[0]), metadata: call[4], zipId: call[5]?.zipId }))
+    }
+  }
+
+  it('stores each file under its own path, label and line count, and other output as its own Bash zip', async () => {
+    const command = `cd ${DIR} && cat src/isoWeek.js test/isoWeek.test.js && ls src`
+    const { step, readSplit } = await splitStep(command, A + B + LS, { 'src/isoWeek.js': A, 'test/isoWeek.test.js': B })
+    expect(readSplit).toBeTruthy()
+    const { refs, zips } = await store([step])
+    expect(refs.map((ref) => ref.reference.replace(/^\{\{batshit-zip:[^:]+:::/, ''))).toEqual([
+      'read_file: src/isoWeek.js - 3 lines}}',
+      'read_file: test/isoWeek.test.js - 2 lines}}',
+      expect.stringMatching(/^bash: cd \/tmp\/batshit-example\/week-calendar && ls src - exit 0 - 2 lines\}\}$/)
+    ])
+    // Stored as a one-file read stores its content: without the final newline.
+    expect(zips.map((zip) => zip.payload.toolResult.content ?? zip.payload.toolResult.stdout)).toEqual([A, B, LS].map((text) => text.replace(/\n$/, '')))
+    expect(zips.map((zip) => zip.payload.toolArgs.innerCommand)).toEqual([
+      `cd ${DIR} && cat src/isoWeek.js`,
+      `cd ${DIR} && cat test/isoWeek.test.js`,
+      `cd ${DIR} && ls src`
+    ])
+    expect(zips.every((zip) => zip.payload.toolCallId === 'toolu_multi_read_1')).toBe(true)
+    expect(zips.map((zip) => zip.metadata.shellReadSplitPart)).toEqual([
+      { index: 0, of: 3, command },
+      { index: 1, of: 3, command },
+      { index: 2, of: 3, command }
+    ])
+  })
+
+  it('gives each read zip a file set of its own, so an edit of one file retires that copy only', async () => {
+    const command = `cd ${DIR} && cat src/isoWeek.js test/isoWeek.test.js`
+    const { step } = await splitStep(command, A + B, { 'src/isoWeek.js': A, 'test/isoWeek.test.js': B })
+    const { zips } = await store([step])
+    const files = zips.map((zip) => {
+      const effect = describeToolResultFiles({ operationKind: zip.metadata.operationKind, payload: zip.payload }, { projectPath: DIR })
+      return effect.kind === 'read' ? [...effect.files.entries()] : effect.kind
+    })
+    expect(files).toEqual([[['src/isoWeek.js', 'whole']], [['test/isoWeek.test.js', 'whole']]])
+
+    const { findDeadCopies } = await import('$lib/utils/zipDeadCopies')
+    const edit = {
+      zipId: 'edit_1',
+      authorId: 'agent',
+      messageIndex: 2,
+      operationKind: 'edit_file',
+      payload: { operationKind: 'edit_file', toolArgs: { filePath: 'src/isoWeek.js' }, toolResult: { success: true, filePath: 'src/isoWeek.js' } }
+    }
+    const reads = zips.map((zip, at) => ({ zipId: `read_${at}`, authorId: 'agent', messageIndex: 1, operationKind: zip.metadata.operationKind, payload: zip.payload }))
+    const dead = findDeadCopies([...reads, edit], { projectPath: DIR })
+    expect(dead.get('read_0')?.reason).toBe('stale')
+    expect(dead.has('read_1')).toBe(false)
+  })
+
+  it('keeps the first part on the reserved id and gives later parts fixed ids made from it', async () => {
+    const command = `cd ${DIR} && cat src/isoWeek.js test/isoWeek.test.js`
+    const { step } = await splitStep(command, A + B, { 'src/isoWeek.js': A, 'test/isoWeek.test.js': B })
+    const reserved = { toolu_multi_read_1: 'cool_tool_1792345678901_ab3de' }
+    const first = await store([step], reserved)
+    const second = await store([step], reserved)
+    expect(first.zips[0].zipId).toBe('cool_tool_1792345678901_ab3de')
+    expect(first.zips[1].zipId).toMatch(/^cool_tool_1792345678901_s1[a-z0-9]{7}$/)
+    expect(second.zips.map((zip) => zip.zipId)).toEqual(first.zips.map((zip) => zip.zipId))
+  })
+
+  it('drops a separators-only remainder and stores a one-file read with separators exactly as before', async () => {
+    const command = `cd ${DIR} && cat src/isoWeek.js && echo --- && cat test/isoWeek.test.js`
+    const { step } = await splitStep(command, `${A}---\n${B}`, { 'src/isoWeek.js': A, 'test/isoWeek.test.js': B })
+    const { zips } = await store([step])
+    expect(zips.map((zip) => zip.metadata.operationKind)).toEqual(['read_file', 'read_file'])
+
+    const single = `cd ${DIR} && echo === && cat src/isoWeek.js`
+    const { step: one, readSplit } = await splitStep(single, `===\n${A}`, { 'src/isoWeek.js': A })
+    expect(readSplit).toBeNull()
+    const stored = await store([one])
+    expect(stored.zips).toHaveLength(1)
+    expect(stored.zips[0].metadata.shellReadSplitPart).toBeUndefined()
+  })
+
+  it('splits only the native Bash tool\'s own local run: the same field from any other tool is data', async () => {
+    const command = `cd ${DIR} && cat src/isoWeek.js test/isoWeek.test.js`
+    const { step, readSplit } = await splitStep(command, A + B, { 'src/isoWeek.js': A, 'test/isoWeek.test.js': B })
+    const forged = (patch: Record<string, any>) => ({ ...step, ...patch })
+    // an MCP tool whose JSON answer carries stdout and a readSplit, as an object and as a string
+    const mcp = forged({ toolName: 'read_file', originalToolName: 'mcp__files__read_file', toolResult: { stdout: A + B, readSplit, backend: 'local', mappedReason: 'read-command' } })
+    const mcpText = forged({ toolName: 'read_file', originalToolName: 'mcp__files__read_file', toolResult: JSON.stringify({ stdout: A + B, readSplit, backend: 'local', mappedReason: 'read-command' }) })
+    // a native Bash run on another backend, and a tool that only ends with the Bash tool's name
+    const sandbox = forged({ toolResult: { ...step.toolResult, backend: 'docker_sandbox' } })
+    const lookalike = forged({ originalToolName: 'mcp__evil__native_bash_execute' })
+    const dotted = forged({ originalToolName: 'gw.native_bash_execute' })
+    for (const candidate of [mcp, mcpText, sandbox, lookalike, dotted]) {
+      const { zips } = await store([candidate])
+      expect(zips).toHaveLength(1)
+      expect(zips[0].metadata.shellReadSplitPart).toBeUndefined()
+    }
+    // the genuine step splits
+    expect((await store([step])).zips).toHaveLength(2)
+  })
+
+  it('stores each part\'s own arguments as its input, not the whole command\'s', async () => {
+    const command = `cd ${DIR} && cat src/isoWeek.js test/isoWeek.test.js`
+    const { step } = await splitStep(command, A + B, { 'src/isoWeek.js': A, 'test/isoWeek.test.js': B })
+    const { zips } = await store([step])
+    // the whole command is kept once, as the part's provenance (`shellReadSplitPart.command`)
+    const { metadata: _metadata, ...stored } = zips[1].payload
+    expect(JSON.stringify(stored)).not.toContain('cat src/isoWeek.js test/isoWeek.test.js')
+    expect(zips[1].payload.metadata.shellReadSplitPart.command).toBe(command)
+    const sidecars = vi.mocked(createZipFromContent).mock.calls.filter((entry) => entry[1] === 'tool_raw')
+    for (const sidecar of sidecars) {
+      const { metadata: _sidecarMetadata, ...raw } = JSON.parse(String(sidecar[0]))
+      expect(JSON.stringify(raw)).not.toContain('cat src/isoWeek.js test/isoWeek.test.js')
+    }
+  })
+
+  it('stores one zip, as before, when the split no longer covers what the command printed', async () => {
+    const command = `cd ${DIR} && cat src/isoWeek.js test/isoWeek.test.js`
+    const { step } = await splitStep(command, A + B, { 'src/isoWeek.js': A, 'test/isoWeek.test.js': B })
+    step.toolResult.stdout = `${A + B}[redacted]`
+    const { zips } = await store([step])
+    expect(zips).toHaveLength(1)
+    expect(zips[0].metadata.shellReadSplitPart).toBeUndefined()
+    expect(zips[0].payload.toolResult).not.toHaveProperty('readSplit')
+  })
+})
+
+/* --------------------------------------------------------------------------------------------
+ * SA-137 (D4) — a proven read becomes its zip's `fileReadSource`. The native Bash tool seals the
+ * proof in this process (`fileReadProofSeal.ts`); the adapter writes the descriptor only from a
+ * sealed proof that names this chat, this reply, this call and this part, and never stores the
+ * proof itself. Without a proof (live file reads off) the zip is stored exactly as before.
+ * -------------------------------------------------------------------------------------------- */
+describe('SA-137: a proven read is stored with its fileReadSource', () => {
+  const sessionId = 'session-live-read'
+  const messageId = 'msg-live-read'
+  const DIR = '/tmp/batshit-example/live-read'
+  const A = "'use strict'\nconst x = 1\n"
+  const B = 'line one\nline two\n'
+
+  async function sealedProof(
+    reads: Array<{ part: number | null; file: string; locator: string; view: any }>,
+    ids: { sessionId: string; messageId: string; toolCallId: string } = { sessionId, messageId, toolCallId: 'toolu_live_read_1' },
+    sandbox?: 'apple_container' | 'docker_sandbox'
+  ) {
+    const { sealFileReadProof } = await import('$lib/server/services/fileReadProofSeal')
+    return sealFileReadProof({
+      version: 1,
+      userId: 'user-1',
+      agentId: 'agent-1',
+      ...ids,
+      backend: sandbox ?? 'local',
+      ...(sandbox ? { liveReadsOn: true } : {}),
+      workspaceRoot: DIR,
+      rootIdentity: '1:2',
+      cwd: DIR,
+      reads
+    })
+  }
+
+  function oneFileStep(id = 'toolu_live_read_1') {
+    const step = apiShellStep({ id, command: `cd ${DIR} && cat src/a.js`, stdout: A, exitCode: 0 })
+    step.toolResult.backend = 'local'
+    return step
+  }
+
+  async function store(steps: any[]) {
+    vi.mocked(createZipFromContent).mockClear()
+    await adaptCoolToolsToZipSystem(steps, sessionId, messageId, {}, undefined, {})
+    return vi.mocked(createZipFromContent).mock.calls
+      .filter((entry) => entry[1] === 'cool_tool')
+      .map((call: any) => ({ raw: String(call[0]), payload: JSON.parse(call[0]), metadata: call[4] }))
+  }
+
+  const whole = { kind: 'whole', numbering: 'none' }
+
+  it('stores a sealed one-file proof as the zip\'s fileReadSource, and never the proof', async () => {
+    const step = oneFileStep()
+    step.toolResult.fileReadProof = await sealedProof([{ part: null, file: 'src/a.js', locator: 'src/a.js', view: whole }])
+    const [zip] = await store([step])
+    expect(zip.metadata.fileReadSource).toEqual({
+      version: 1,
+      owner: { userId: 'user-1', agentId: 'agent-1', sessionId, messageId, toolCallId: 'toolu_live_read_1' },
+      backend: 'local',
+      workspaceRoot: DIR,
+      rootIdentity: '1:2',
+      cwd: DIR,
+      locator: 'src/a.js',
+      view: whole
+    })
+    expect(zip.raw).not.toContain('fileReadProof')
+    expect(zip.raw).not.toContain('"seal"')
+    // Neither the result zip nor its raw sidecar keeps the proof.
+    for (const call of vi.mocked(createZipFromContent).mock.calls) expect(String(call[0])).not.toContain('fileReadProof')
+  })
+
+  // SA-137 Round 2 (R2-6): a Bash read inside Apple Container or Docker Sandbox is proven host-side; its
+  // proof travels when it names the run's own backend, and the descriptor records that backend.
+  it.each(['apple_container', 'docker_sandbox'] as const)('stores a %s run\'s sealed proof with its own backend', async (sandbox) => {
+    const step = oneFileStep()
+    step.toolResult.backend = sandbox
+    step.toolResult.fileReadProof = await sealedProof([{ part: null, file: 'src/a.js', locator: 'src/a.js', view: whole }], undefined, sandbox)
+    const [zip] = await store([step])
+    expect(zip.metadata.fileReadSource).toMatchObject({ backend: sandbox, liveReadsOn: true, locator: 'src/a.js' })
+    expect(zip.raw).not.toContain('fileReadProof')
+    // A proof that names another backend than the run's describes nothing.
+    const mismatched = oneFileStep()
+    mismatched.toolResult.backend = sandbox
+    mismatched.toolResult.fileReadProof = await sealedProof([{ part: null, file: 'src/a.js', locator: 'src/a.js', view: whole }])
+    const [rejected] = await store([mismatched])
+    expect(rejected.metadata.fileReadSource).toBeUndefined()
+    // A proof the gate did not accept is not stored either.
+    expect(rejected.raw).not.toContain('fileReadProof')
+  })
+
+  it('stores no descriptor from an unsealed, changed or foreign proof, or from another tool', async () => {
+    const forged = oneFileStep()
+    forged.toolResult.fileReadProof = { ...(await sealedProof([{ part: null, file: 'src/a.js', locator: 'src/a.js', view: whole }])), seal: 'A'.repeat(43) }
+    const changed = oneFileStep()
+    const sealed = await sealedProof([{ part: null, file: 'src/a.js', locator: 'src/a.js', view: whole }])
+    changed.toolResult.fileReadProof = { ...sealed, reads: [{ ...sealed.reads[0], locator: '.env' }] }
+    const otherReply = oneFileStep()
+    otherReply.toolResult.fileReadProof = await sealedProof([{ part: null, file: 'src/a.js', locator: 'src/a.js', view: whole }], { sessionId, messageId: 'msg-other', toolCallId: 'toolu_live_read_1' })
+    // A genuine proof copied onto another call (a tab replaying an SSE event) describes nothing.
+    const otherCall = oneFileStep('toolu_live_read_2')
+    otherCall.toolResult.fileReadProof = sealed
+    const mcp = { ...oneFileStep(), originalToolName: 'mcp__files__read_file' }
+    mcp.toolResult = { ...mcp.toolResult, fileReadProof: sealed }
+    const otherBackend = oneFileStep()
+    otherBackend.toolResult.backend = 'docker_sandbox'
+    otherBackend.toolResult.fileReadProof = sealed
+    for (const [label, step] of Object.entries({ forged, changed, otherReply, otherCall, mcp, otherBackend })) {
+      const [zip] = await store([step])
+      expect(zip.metadata.fileReadSource, label).toBeUndefined()
+    }
+    // The genuine native local origin never stores the proof, sealed or not.
+    for (const step of [forged, changed, otherReply]) expect((await store([step]))[0].raw).not.toContain('fileReadProof')
+  })
+
+  it('gives each proven read part of a split its own descriptor, and the other output none', async () => {
+    const { planShellReadSplit, matchShellReadSplit } = await import('$lib/utils/shellReadSplit')
+    const command = `cd ${DIR} && cat src/a.js src/b.txt && ls src`
+    const stdout = A + B + 'a.js\nb.txt\n'
+    const readSplit = matchShellReadSplit(planShellReadSplit(command)!, stdout, new Map([['src/a.js', A], ['src/b.txt', B]]))!
+    const step = apiShellStep({ id: 'toolu_live_split_1', command, stdout, exitCode: 0 })
+    step.toolResult.backend = 'local'
+    step.toolResult.readSplit = readSplit
+    step.toolResult.fileReadProof = await sealedProof([
+      { part: 0, file: 'src/a.js', locator: 'src/a.js', view: whole },
+      { part: 1, file: 'src/b.txt', locator: 'src/b.txt', view: whole }
+    ], { sessionId, messageId, toolCallId: 'toolu_live_split_1' })
+    const zips = await store([step])
+    expect(zips.map((zip) => zip.metadata.fileReadSource?.locator ?? null)).toEqual(['src/a.js', 'src/b.txt', null])
+    expect(zips.map((zip) => zip.metadata.fileReadSource?.owner.toolCallId ?? null)).toEqual(['toolu_live_split_1', 'toolu_live_split_1', null])
+    for (const zip of zips) expect(zip.raw).not.toContain('fileReadProof')
+  })
+
+  it('stores no descriptor on a part that is not a Read File, even with a valid proof', async () => {
+    const step = apiShellStep({ id: 'toolu_live_ls', command: `cd ${DIR} && ls src`, stdout: 'a.js\n', exitCode: 0 })
+    step.toolResult.backend = 'local'
+    step.toolResult.fileReadProof = await sealedProof([{ part: null, file: 'src/a.js', locator: 'src/a.js', view: whole }],
+      { sessionId, messageId, toolCallId: 'toolu_live_ls' })
+    const [zip] = await store([step])
+    expect(zip.metadata.operationKind).not.toBe('read_file')
+    expect(zip.metadata.fileReadSource).toBeUndefined()
+  })
+
+  it('without a proof (live file reads off) stores the zip exactly as before', async () => {
+    const plain = oneFileStep('toolu_live_read_off')
+    const [zip] = await store([plain])
+    expect(zip.metadata).not.toHaveProperty('fileReadSource')
+    expect(zip.payload.toolResult).not.toHaveProperty('fileReadProof')
+  })
+})
+
+/* --------------------------------------------------------------------------------------------
+ * SA-137 (P2) — a refreshed copy is what a fresh read of the same output would show. The compile
+ * expands a stored Read File from its payload, or from its raw sidecar when the preview was cut;
+ * `refreshedReadTranscript` runs the same pipeline on the stored call with new output. With the
+ * file unchanged it is byte for byte the stored copy's transcript, with the same token count.
+ * -------------------------------------------------------------------------------------------- */
+describe('SA-137: a refreshed Read File transcript has the stored copy\'s form', () => {
+  const sessionId = 'session-refresh'
+  const messageId = 'msg-refresh'
+
+  async function storedCopy(command: string, stdout: string) {
+    vi.mocked(createZipFromContent).mockClear()
+    const step = apiShellStep({ id: 'toolu_refresh_1', command, stdout, exitCode: 0 })
+    step.toolResult.backend = 'local'
+    await adaptCoolToolsToZipSystem([step], sessionId, messageId, {}, undefined, {})
+    const calls = vi.mocked(createZipFromContent).mock.calls as any[]
+    const main = calls.find((call) => call[1] === 'cool_tool')
+    const raw = calls.find((call) => call[1] === 'tool_raw')
+    const payload = parseCoolToolPayload(main[0])!
+    // What compileForAI expands: the raw sidecar's payload when the policy prefers it.
+    const aiPayload = raw && shouldPreferRawSidecarForAiExpansion(payload) ? parseCoolToolPayload(raw[0])! : payload
+    const compiled = buildCoolToolAiContentWithSources('zip_1', { content: main[0], metadata: main[4] }, aiPayload)
+    return { payload, metadata: main[4], compiled }
+  }
+
+  const longFile = Array.from({ length: 5_000 }, (_, at) => `line ${at + 1}`).join('\n') + '\n'
+  const cases: Array<[string, string]> = [
+    ['cat src/a.js', 'one\ntwo\n'],
+    ['cat src/a.js', 'no final newline'],
+    ['cat src/a.js', 'tabs\there\t\tand there\r\ncrlf\n'],
+    ['cat -n src/a.js', '     1\tone\n     2\ttwo\n'],
+    ['sed -n 2,3p src/a.js', 'two\nthree\n'],
+    ['head -n 1 src/a.js', 'one\n'],
+    ['tail -n 2 src/a.js', 'y\nz\n'],
+    ['cat src/a.js', ''],
+    ['cat src/long.txt', longFile]
+  ]
+
+  it('is byte for byte the stored copy when the file is unchanged, with the same token count', async () => {
+    for (const [command, stdout] of cases) {
+      const stored = await storedCopy(command, stdout)
+      const refreshed = refreshedReadTranscript('zip_1', stored.payload, stored.metadata, stdout)
+      expect(refreshed?.text, `${command} ${JSON.stringify(stdout.slice(0, 40))}`).toBe(stored.compiled.text)
+      expect(refreshed?.parts).toEqual(stored.compiled.parts)
+      expect(refreshed?.promptTokens, command).toBe(stored.metadata.promptTokens)
+    }
+  })
+
+  it('shows the new text in the same form when the file changed', async () => {
+    const stored = await storedCopy('cat -n src/a.js', '     1\tone\n')
+    const refreshed = refreshedReadTranscript('zip_1', stored.payload, stored.metadata, '     1\tone\n     2\ttwo\n     3\tthree\n')!
+    const fresh = await storedCopy('cat -n src/a.js', '     1\tone\n     2\ttwo\n     3\tthree\n')
+    expect(refreshed.text).toBe(fresh.compiled.text)
+    expect(refreshed.text).toContain('Lines: 3')
+    expect(refreshed.promptTokens).toBe(fresh.metadata.promptTokens)
+  })
+
+  it('makes no transcript for anything that is not a native Bash Read File', async () => {
+    const stored = await storedCopy('cat src/a.js', 'x\n')
+    expect(refreshedReadTranscript('zip_1', { ...stored.payload, operationKind: 'bash' }, stored.metadata, 'x\n')).toBeNull()
+    expect(refreshedReadTranscript('zip_1', { ...stored.payload, originalToolName: 'mcp__files__read_file' }, stored.metadata, 'x\n')).toBeNull()
+    expect(refreshedReadTranscript('zip_1', { ...stored.payload, toolArgs: {} }, stored.metadata, 'x\n')).toBeNull()
   })
 })

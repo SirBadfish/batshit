@@ -11,11 +11,6 @@ import {
   PORTABLE_SKILL_SCOPED_DISCOVERY,
   resolveNativeToolUser
 } from '$lib/server/services/nativeToolAuth'
-import {
-  bindActingAgentId,
-  boundDelegatedAllowedControlIds,
-  boundScopeAgentId
-} from '$lib/server/services/actingAgentIdentity'
 
 type FindControlsRequest = {
   userId?: string
@@ -29,6 +24,8 @@ type FindControlsRequest = {
   includeDraft?: boolean
   limit?: number
   allowedControlIds?: string[]
+  brokerFamilies?: Array<'fabric' | 'batshit'>
+  domain?: 'agent-settings'
 }
 
 function toFindOptions(
@@ -38,11 +35,11 @@ function toFindOptions(
 ): ControlFindOptions {
   return {
     userId,
-    // SA-117 DL-117-04: bound off the run credential on the agent lane, the caller's claim
-    // everywhere else. Here it only narrows which controls are VISIBLE, but a scope hint the
-    // server minted is still better than one the body typed.
+    // This is a scope hint, not a server-vouched acting identity.
     agentId,
     query: body.query,
+    ...(body.domain === 'agent-settings' ? { domain: body.domain } : {}),
+    brokerFamilies: body.brokerFamilies,
     tags: Array.isArray(body.tags) ? body.tags : [],
     sourceType: body.sourceType,
     riskLevel: body.riskLevel,
@@ -67,6 +64,14 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       )
     }
 
+    if (body.brokerFamilies !== undefined && (!Array.isArray(body.brokerFamilies) ||
+      body.brokerFamilies.some((family) => family !== 'fabric' && family !== 'batshit'))) {
+      return json({ success: false, error: 'Invalid brokerFamilies: expected fabric and/or batshit.' }, { status: 400 })
+    }
+    if (body.domain !== undefined && body.domain !== 'agent-settings') {
+      return json({ success: false, error: 'Invalid domain: expected agent-settings.' }, { status: 400 })
+    }
+
     const auth = await resolveNativeToolUser({
       request,
       localsUserId: locals.user?.id ?? null,
@@ -80,26 +85,14 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       return apiFailure('Unauthorized', 401)
     }
 
-    const agentBinding = bindActingAgentId(auth, body.agentId)
-    if (!agentBinding.ok) {
-      return json(
-        { success: false, error: { code: agentBinding.code, message: agentBinding.message } },
-        { status: 400 }
-      )
-    }
-
-    // BL-81: a Subagent or Worker run is shown exactly what `/api/controls/use` will run for it:
-    // only the controls its credential carries (the ones its DCM offered it; none for a
-    // credential minted before BL-81), with agent allowlists judged by its scope id, the id
-    // that route judges them by. `boundScopeAgentId` and `boundDelegatedAllowedControlIds` have
-    // the reasons; both are empty on every other call, which keeps its existing answer.
-    const visibleForAgentId = boundScopeAgentId(auth) || agentBinding.agentId
-    const delegatedAllowedControlIds = boundDelegatedAllowedControlIds(auth)
+    const visibleForAgentId = typeof body.agentId === 'string' ? body.agentId.trim() || undefined : undefined
 
     if (auth.auth === 'portable-skill') {
       const portableResult = await findControls({
         ...toFindOptions(body, auth.userId, visibleForAgentId),
-        allowedControlIds: auth.portableSkillAllowedControlIds
+        allowedControlIds: auth.portableSkillAllowedControlIds,
+        actorType: auth.auth,
+        ...(auth.portableSkillToken ? { portableSettingsActor: { tokenId: auth.portableSkillToken.id, authorityGeneration: auth.portableSkillToken.authorityGeneration ?? 0 } } : {})
       })
       return json({
         success: true,
@@ -111,7 +104,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     const result = await findControls({
       ...toFindOptions(body, auth.userId, visibleForAgentId),
-      ...(delegatedAllowedControlIds ? { delegatedRun: true, delegatedAllowedControlIds } : {})
+      actorType: auth.auth
     })
     return json({
       success: true,

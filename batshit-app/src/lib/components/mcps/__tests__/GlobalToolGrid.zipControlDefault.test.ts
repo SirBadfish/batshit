@@ -18,6 +18,7 @@ import GlobalToolGrid from '../GlobalToolGrid.svelte'
 type Saved = { url: string; body: any }
 
 function stubFetch(settings: Record<string, unknown>) {
+  let persisted = settings
   const saves: Saved[] = []
   vi.stubGlobal(
     'fetch',
@@ -25,12 +26,13 @@ function stubFetch(settings: Record<string, unknown>) {
       const url = typeof input === 'string' ? input : input.url
       const method = (init?.method ?? 'GET').toUpperCase()
       if (url === '/api/user/settings' && method === 'GET') {
-        return new Response(JSON.stringify({ settings }), { status: 200 })
+        return new Response(JSON.stringify({ settings: persisted }), { status: 200 })
       }
       if (url === '/api/user/settings' && method === 'POST') {
         const body = JSON.parse(String(init?.body ?? '{}'))
         saves.push({ url, body })
-        return new Response(JSON.stringify({ settings: { ...settings, ...body } }), { status: 200 })
+        persisted = { ...persisted, ...body }
+        return new Response(JSON.stringify({ success: true, settings: persisted }), { status: 200 })
       }
       if (url === '/api/mcp/gateways') return new Response(JSON.stringify({ gateways: [] }), { status: 200 })
       if (url === '/api/cli-tools') return new Response(JSON.stringify({ tools: [] }), { status: 200 })
@@ -65,6 +67,19 @@ async function renderLoaded(settings: Record<string, unknown>) {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+})
+
+describe('per-agent retention leaves the Global Tool Grid', () => {
+  it('shows no retention controls and saves only Zip settings despite a retired raw block', async () => {
+    const saves = await renderLoaded({ global_api_reasoning_retention: { mode: 'whiteboard' }, global_zip_settings: { zip_ai_view_mode: 'appended' } })
+    expect(screen.queryByRole('button', { name: 'Reasoning Retention' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Display Whiteboard' })).toBeNull()
+    expect(screen.queryByRole('spinbutton', { name: 'Whiteboard Budget (estimated tokens)' })).toBeNull()
+    await chooseLayoutInline()
+    await waitFor(() => expect(saves).toHaveLength(1))
+    expect(saves[0].body).not.toHaveProperty('global_api_reasoning_retention')
+    expect(saves[0].body).not.toHaveProperty('global_api_reasoning_retention_patch')
+  })
 })
 
 describe('Global Tool Grid: the parked zip control permission (BL-231, BL-1484)', () => {

@@ -6,7 +6,9 @@ const CUSTOM_UPLOAD_TYPES = new Set([
   'goon_custom_models',
   'goon_custom_manifests',
   'goon_hair_assets',
-  'goon_hair_imports'
+  'goon_hair_imports',
+  'goon_clothing_assets',
+  'goon_closet'
 ]);
 
 function isCustomRecipeAsset(uploadType) {

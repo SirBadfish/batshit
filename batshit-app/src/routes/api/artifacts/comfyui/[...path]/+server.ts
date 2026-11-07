@@ -2,7 +2,6 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 import { apiFailure } from '$lib/server/services/apiResponses'
 import { env } from '$env/dynamic/private'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
-import { refuseDelegatedRunOutsideList } from '$lib/server/services/actingAgentIdentity'
 import {
   buildRuntimeUrlAliasMap,
   isRuntimeUrlAliasKey,
@@ -245,11 +244,6 @@ async function handleComfyUiProxy(request: Request, localsUserId: string | null,
 
   if (!auth) {
     return apiFailure('Unauthorized', 401)
-  }
-
-  const delegatedRefusal = refuseDelegatedRunOutsideList(auth, null)
-  if (delegatedRefusal) {
-    return apiFailure(delegatedRefusal.message, 403, { code: delegatedRefusal.code })
   }
 
   const requestPath = normalizeWorkflowPath(path)

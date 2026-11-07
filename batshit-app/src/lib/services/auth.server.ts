@@ -291,6 +291,15 @@ export class AuthService {
 
     // Create session
     async createSession(user: User, rememberMe = false): Promise<Session> {
+        // The account may already be durably created. Initialization failure publishes no
+        // auth session/cookie and never rolls that account or its saved access back.
+        const { initializeSystemSlashCommandsForUser } = await import('$lib/server/services/systemSlashCommands');
+        try {
+            await initializeSystemSlashCommandsForUser(user.id);
+        } catch (error) {
+            console.error('[Auth] Built-in skill initialization prevented sign-in:', error);
+            throw error;
+        }
         const redis = await this.ensureRedis();
         const token = this.generateToken();
         const now = new Date();

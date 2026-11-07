@@ -12,7 +12,8 @@ vi.mock('$lib/services/apiKey.server', () => ({
 
 vi.mock('$lib/server/redis', () => ({
   redis: {
-    getUserSettings: (...args: any[]) => mockGetUserSettings(...args)
+    getUserSettings: (...args: any[]) => mockGetUserSettings(...args),
+    execute: async (operation: any) => operation({ type: async () => 'none', get: async () => null })
   }
 }))
 

@@ -97,6 +97,52 @@ MiMo V2.5 ASR is available in the same recorded/uploaded lane. Batshit converts 
 
 Voice Mode never silently borrows the normal Transcribe STT provider. If the selected realtime lane isn't ready, Batshit fails clearly or falls back only to the explicit browser lane.
 
+## Voice model lists
+
+Batshit keeps the backend model lists for its built-in voice providers separate from your saved voice choices. Compatible model updates can appear in Voice Settings and Agent Voice Settings without another app update. The list checks again when you open the settings, return to the app, and periodically while the settings remain visible.
+
+A provider can have newer models that Batshit cannot use yet. The notice tells you when updates are waiting for compatibility checks or the list could not be refreshed. That does not change your selected provider, model, voice or default. Your own model IDs remain saved; a saved model that becomes unavailable stays visible until you deliberately choose something else.
+
+If a refresh fails, Batshit keeps the last model list it could read. If it cannot safely read model compatibility, it keeps your saved selection and explains why speech cannot start. Reopen Voice Settings to check again, then choose an available model deliberately. Repeated reads do not reset unreadable saved data.
+
+A provider may announce a shutdown date for a model. Batshit shows that date as a warning and keeps your saved choice; it does not silently select a replacement. Some newer models need a different API or additional app support, so they can remain pending even when the daily list is current.
+
+Backend model updates do not discover private voices or clones, install voice engines, provide an API key or prove your account can use a particular voice. Those keep their existing setup and provider requirements. Transcribe, recorded-turn Voice Mode and realtime microphone input remain separate lanes.
+
+## MiMo Model Inputs
+
+MiMo’s preset model uses your selected voice. Voice Design uses a voice description from Instructions; a saved voice profile can supply those instructions. The saved Voice value stays available for other models and is not sent to Voice Design. If the description is missing, set it in Voice Engines → MiMo → Instructions before trying again.
+
+Voice Clone needs an already configured supported MP3 or WAV audio reference rather than a preset name. Batshit keeps existing reference settings and reports missing or invalid input before requesting speech. This does not add a cloning or reference-upload workflow.
+
+## Model-specific setup
+
+Open **Settings → Voice → Global Voice Settings** to choose the provider, model and voice for spoken replies. To tune a provider's advanced options, open **Settings → Voice → Voice Engines → Text-to-Speech Engines**, select the provider, and use its **Advanced Settings**. An agent can inherit the global reply voice or choose its own in **Agent Settings → Voice**.
+
+The available model list depends on the provider and the current model catalog. If a model is waiting for compatibility information, keep your saved selection and refresh the list later. Refreshing does not change your selected model or voice. A provider key and a compatible voice are still needed where the provider requires them.
+
+## Qwen Audio workspace and voices
+
+For Qwen Audio 3.0 and 3.1, save your Alibaba Cloud API key in **Settings → API Keys**. In **Settings → Voice → Voice Engines → Text-to-Speech Engines → Alibaba Cloud Qwen TTS → Advanced Settings**, enter your complete HTTPS **Workspace endpoint** from Alibaba Model Studio. Use the endpoint for the same Beijing or Singapore region as your key.
+
+Return to **Global Voice Settings** or an agent's Voice settings, choose **Alibaba Cloud Qwen TTS** and the Qwen Audio model, then choose a voice offered for that model and workspace region. Qwen Audio has its own voice choices; an earlier Qwen3 voice such as Cherry is not automatically a Qwen Audio voice. If a saved voice or endpoint is incompatible, Batshit keeps the saved value and asks you to select a compatible one.
+
+The **Language type** field is optional. For the offered Qwen Audio 3.0 voices, use `zh` or `en`. The offered 3.1 Flash voices accept `ja`, `ko`, `fr`, `de`, `pt`, `it`, `vi`, or `id`. Leave the field blank for the offered 3.1 Plus voices. **Instructions** can provide delivery guidance. Existing Alibaba models keep their own settings and do not use the Qwen Audio workspace endpoint.
+
+## Model-specific reply voice options
+
+- **Inworld TTS-2 Flash** creates completed audio after a reply. Direct streaming is not available for Flash. Delivery mode and bracketed spoken steering instructions do not apply to Flash; non-verbal tags such as `[laugh]` can still work. Your saved delivery choice remains available for other Inworld models.
+- **Eleven v4** uses Stability and Similarity. Speed, Style and Speaker Boost do not apply to v4; their saved values remain available for other models.
+- **Cartesia Sonic 3.6** accepts Speed from 0.6 to 1.5 and Volume from 0.5 to 2. If an existing value is outside those ranges, change it before using 3.6. The saved value is not silently adjusted. You can choose the current stable model or its dated snapshot.
+- **StepAudio 3** needs a compatible voice. `zixinnansheng` is an offered preset; a compatible custom voice can be entered if you have one. StepAudio 2.5 accepts Instructions up to 200 characters. StepAudio 3 accepts up to 500, though characters such as emoji may count as two. Overlong instructions are not truncated; shorten them before retrying.
+- **Gemini 3.8 Flash TTS and Flash-Lite TTS** create a single spoken reply using a selected Google voice.
+
+## Recorded transcription choices
+
+Choose a provider and model under **Transcribe** in Global Voice Settings or Agent Settings. OpenAI `gpt-transcribe`, ElevenLabs `scribe_v2_medical`, Async `async_asr_v1.0`, and Mistral `voxtral-small-transcribe-3-0` transcribe recorded audio. They do not add continuous realtime microphone sessions. OpenAI `gpt-transcribe` and Async do not provide word timestamps or speaker labels in this path. Voxtral Small provides segment timestamps rather than word timestamps. Review medical transcripts as drafts; do not treat them as diagnoses or clinical decisions.
+
+Voice Mode STT is a separate choice from Transcribe. A recorded-turn model listens one turn at a time; it does not become a continuous microphone connection merely because a recorded transcription model is available.
+
 ## Saved choices and lip sync
 
 Voice Settings waits for your saved settings to load. If they cannot be read, use **Retry** before editing. The Goon Dock's **Lip Sync Lab** follows the same rule and saves the global mode and analyzer while keeping the independent blend and other Voice choices. Voice Settings saves lip-sync fields only when you change them; after a save, untouched lip-sync controls follow the saved answer while your later edits stay in the form.
@@ -265,6 +311,8 @@ Batshit queues group playback so one agent speaks at a time, and each agent can 
 - Protect provider keys and secret-including backups.
 - Don't expose local voice engines to the public internet without understanding the engine's auth and safety model.
 - Keep LiveKit and local speech engines backed up through their own setup notes; Batshit backups store references/settings, not the full external runtime.
+
+See [App Actions](../fabric/app-actions.md) for approved changes an agent can make to supported settings, with your selected scope and permission.
 
 ## Related docs
 

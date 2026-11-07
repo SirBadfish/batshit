@@ -1,72 +1,20 @@
 # Batshit Official n8n Workflow Templates
 
-These are public-safe n8n Workflow Subagent templates for Batshit. They intentionally omit n8n credential IDs, secret values, source-instance ownership metadata, version metadata, and private local URLs.
+These are public-safe n8n workflow templates for Batshit. They intentionally omit n8n credential IDs, secret values, source-instance ownership metadata, version metadata, and private local URLs.
 
 ## Templates
 
 | File | Use |
 | --- | --- |
-| `batshit-n8n-workflow-subagent.json` | Host/local n8n Workflow Subagent for `API` and `CLI` Primary Agents. |
-| `batshit-docker-n8n-workflow-subagent.json` | Docker-flavored Workflow Subagent for Batshit's optional Docker n8n profile. |
 | `batshit-n8n-wake-agent-on-schedule.json` | Wake-up webhook caller: a timed n8n workflow that starts a chat for one Batshit agent. For time-only triggers, Batshit's built-in Schedules need no n8n at all. |
 
 ## Import and configure
 
-Import the matching template through the n8n UI. Advanced users can also use `n8n import:workflow`; the templates include workflow-level IDs and were validated with n8n `2.22.1` CLI import in a clean disposable profile.
+Import the template through the n8n UI. Advanced users can also use `n8n import:workflow`; the template includes workflow-level IDs.
 
-Configure these pieces manually:
+Batshit does not copy provider API keys into n8n. Keep n8n workflow credentials in n8n. Read an imported workflow before you activate it, and test it with a small task first.
 
-- Provider credentials for the model node.
-- Redis credentials if you use the included memory node.
-- The Batshit Subagent Tools URL reachable from n8n.
-- The production webhook URL saved in the matching Batshit Subagent.
-
-Current templates use Batshit's short-lived `batshit_native_tool_token` payload value and send it as `x-batshit-native-tool-token`; no saved Header Auth credential is needed.
-
-URL defaults:
-
-- Host/local template: payload `batshit_frontend_url`, then `BATSHIT_FRONTEND_URL`, then `http://127.0.0.1:5620`.
-- Docker template: the same priority, with `http://app:3000` as its fallback.
-
-Source-checkout Batshit should set `BATSHIT_FRONTEND_URL=http://127.0.0.1:5621`.
-
-## Payload contract
-
-Workflow Subagents read Batshit's current payload fields:
-
-- `user_id`
-- `session_id`
-- `message_id`
-- `subagent_id`
-- `subagent_slug`
-- `subagent_thread_id`
-- `parent_agent_id`
-- `primary_agent_type`
-- `subagentPrompts`
-- `batshit_native_tool_token`
-- `batshit_frontend_url`
-
-Do not remove `parent_agent_id` or change `actor_type: subagent` in the tool context. Batshit uses those fields to resolve the parent-scoped permissions for the Subagent.
-
-Batshit treats slugs as exact user-owned names. It refuses collisions instead of silently adding a suffix.
-
-After the workflow is configured and active, create an `n8n Workflow Subagent` in Batshit, paste the Production webhook URL, and assign it to an `API` or `CLI` Primary Agent.
-
-Batshit does not copy provider API keys into n8n. Keep n8n workflow credentials in n8n.
-
-## Conversation threads
-
-Batshit sends a `subagent_thread_id` with each Workflow Subagent call. A fresh call creates a new id; a resumed call reuses the current id for that Subagent in the chat. Both templates append it to the Redis Chat Memory session key:
-
-```text
-subagent_sessions:<session_id>:subagent:<subagent_slug>:<subagent_thread_id>
-```
-
-Keep the included seven-day `sessionTTL`. When a fresh call changes the id, the old n8n conversation is no longer used and expires after that time. Batshit backs up its current thread id, but it does not copy conversations stored in external n8n Redis.
-
-If you imported a template before thread control was added, re-import the current template and configure its credentials, or update the existing Redis Chat Memory node's key to include `subagent_thread_id` and set `sessionTTL` to `604800`. Updating Batshit alone does not edit an already-imported n8n workflow. A workflow that ignores the id may keep answering, but a fresh call will not reset its conversation.
-
----
+Batshit backups do not include external n8n workflows or n8n credentials. Export workflows from n8n separately if you need a full n8n backup.
 
 ## Waking an agent on a schedule
 
@@ -78,9 +26,9 @@ If you imported a template before thread control was added, re-import the curren
 > the flow has outside steps before it reaches Batshit. This template stays supported for
 > people who already run their automations in n8n and want everything in one place.
 
-`batshit-n8n-wake-agent-on-schedule.json` is the other direction: instead of Batshit calling
-n8n, n8n calls Batshit and asks an agent to start working. Use it for a morning check-in, a
-nightly report, or anything else that should happen on a clock.
+`batshit-n8n-wake-agent-on-schedule.json` has n8n call Batshit and ask an agent to start
+working. Use it for a morning check-in, a nightly report, or anything else that should happen
+on a clock.
 
 It has three nodes: a Schedule Trigger set to 9:00 am, a **Configure** node holding the three
 things you edit, and one HTTP Request that calls Batshit.

@@ -56,9 +56,12 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { redis } from '$lib/server/redis'
 import { getActiveStream } from '$lib/server/services/streamAbortRegistry'
 import { resolveWokenTurnState } from '$lib/server/services/dm/wokenTurn'
+import { hasSettingsStandingConsent, type SettingsStandingConsent } from './appActions/settings/standingConsent'
+import type { AppActionsApprovalPreview } from '$lib/appActions/settings/managementContract'
 
 /* ------------------------------------------------------------------ *
  * Keys (DL-116-02)
@@ -89,8 +92,7 @@ const CONTROL_RISK_WINDOW_KEY_PREFIX = 'control_risk_approval:'
 /**
  * An approval id is `apr_` plus base64url, and NOTHING else may be turned into a key.
  *
- * The id is attacker-adjacent text: it arrives in a request body, and the managed CLI
- * resume names it back to the server. Without this guard, every one of those strings became
+ * The id is attacker-adjacent text. Without this guard, every one of those strings became
  * a Redis key — so the rule is that a malformed id answers "no such approval" WITHOUT
  * touching Redis at all, which the tests assert directly by watching for a key read.
  *
@@ -144,11 +146,15 @@ function scopedRiskWindowKey(options: {
 export type ControlApprovalRiskLevel = 'safe' | 'confirm' | 'restricted'
 
 /**
- * Which surface raised the card. A presentation and diagnostics label — which card style,
- * which resume shape — and never a security input: nothing in `decideRiskGate` branches on
- * it. It is derived from what the server can observe, never declared by the caller.
+ * Stored cards retain their historical label for display and expiry. Only live lanes can
+ * produce, decide, or spend consent; a retired CLI record cannot authorize a new run.
  */
 export type ControlApprovalLane = 'api' | 'cli' | 'service'
+export type LiveControlApprovalLane = Exclude<ControlApprovalLane, 'cli'>
+
+function isLiveApprovalLane(lane: unknown): lane is LiveControlApprovalLane {
+  return lane === 'api' || lane === 'service'
+}
 
 export type ControlApprovalStatus =
   | 'pending'
@@ -198,12 +204,62 @@ export interface ControlApprovalRecord {
   consumedAt?: string | null
 }
 
+declare const p5PendingBrand: unique symbol, p5DecisionBrand: unique symbol
+export type P5PendingApprovalWrite = Readonly<{ readonly [p5PendingBrand]: true }>
+export type P5ApprovalDecisionWrite = Readonly<{ readonly [p5DecisionBrand]: true }>
+declare const p5PendingObservationBrand: unique symbol
+export type P5PendingWriteObservation = Readonly<{ readonly [p5PendingObservationBrand]: true }>
+const pendingObservations = new WeakMap<object, { writes: P5PendingApprovalWrite[] }>()
+const pendingObservationContext = new AsyncLocalStorage<{ writes: P5PendingApprovalWrite[] }>()
+export function createP5PendingWriteObservation(): P5PendingWriteObservation {
+  const handle = Object.freeze({}) as P5PendingWriteObservation
+  pendingObservations.set(handle, { writes: [] })
+  return handle
+}
+export function withP5PendingWriteObservation<T>(handle: P5PendingWriteObservation, operation: () => Promise<T>): Promise<T> {
+  const state = pendingObservations.get(handle)
+  if (!state) throw new Error('The original pending-write observation is unavailable.')
+  return pendingObservationContext.run(state, operation)
+}
+export function readP5PendingWriteObservation(handle: P5PendingWriteObservation): readonly P5PendingApprovalWrite[] {
+  const state = pendingObservations.get(handle)
+  if (!state) throw new Error('The original pending-write observation is unavailable.')
+  return Object.freeze([...state.writes])
+}
+type P5ApprovalIdentity = Pick<ControlApprovalRecord, 'id' | 'userId' | 'agentId' | 'sessionId' | 'messageId' | 'controlId' | 'inputHash' | 'requestedAt'>
+const pendingWriteOwners = new WeakMap<object, { identity: P5ApprovalIdentity; decision?: P5ApprovalDecisionWrite }>()
+const pendingWriteResults = new WeakMap<object, P5PendingApprovalWrite>()
+const decisionWriteOwners = new WeakMap<object, { pending: P5PendingApprovalWrite; identity: P5ApprovalIdentity;
+  status: 'approved' | 'denied'; decidedAt: string; consumed: boolean }>()
+function p5ApprovalIdentity(record: ControlApprovalRecord): P5ApprovalIdentity {
+  return Object.freeze({ id: record.id, userId: record.userId, agentId: record.agentId, sessionId: record.sessionId,
+    messageId: record.messageId, controlId: record.controlId, inputHash: record.inputHash, requestedAt: record.requestedAt })
+}
+/** Only an actual returned pending-write object has this private receipt. */
+export function observeP5PendingApprovalWrite(record: object): P5PendingApprovalWrite | undefined { return pendingWriteResults.get(record) }
+export function readP5PendingApprovalWrite(receipt: P5PendingApprovalWrite): Readonly<P5ApprovalIdentity> {
+  const owner = pendingWriteOwners.get(receipt)
+  if (!owner) throw new Error('The original pending approval write is unavailable.')
+  return owner.identity
+}
+export function observeP5ApprovalDecisionWrite(pending: P5PendingApprovalWrite): P5ApprovalDecisionWrite | undefined {
+  return pendingWriteOwners.get(pending)?.decision
+}
+export function readP5ApprovalDecisionWrite(receipt: P5ApprovalDecisionWrite) {
+  const owner = decisionWriteOwners.get(receipt)
+  if (!owner || owner.consumed) throw new Error('The original approval decision is unavailable or already claimed.')
+  return Object.freeze({ pending: owner.pending, identity: owner.identity, status: owner.status, decidedAt: owner.decidedAt })
+}
+export function consumeP5ApprovalDecisionWrite(receipt: P5ApprovalDecisionWrite): void {
+  readP5ApprovalDecisionWrite(receipt)
+  decisionWriteOwners.get(receipt)!.consumed = true
+}
+
 /**
  * What a caller presents to spend an approval.
  *
- * Set ONLY by send-routed's resume paths — never read from model input. `kind` says which
- * resume it came from: `sdk` is the AI SDK re-executing the very call the user approved
- * (the API lane), `resume` is the follow-up turn a managed CLI agent gets (DL-116-08).
+ * Server-owned, never read from model input. `sdk` names the AI SDK's exact paused call;
+ * `resume` remains an audit value for matched approvals and historical records.
  */
 export interface ControlApprovalGrant {
   kind: 'sdk' | 'resume'
@@ -213,6 +269,7 @@ export interface ControlApprovalGrant {
 
 /** The block the card is built from. Returned inside the pause error's `details`. */
 export interface ControlApprovalRequest {
+  settingsPreview?: AppActionsApprovalPreview
   approvalId: string
   controlId: string
   controlTitle: string
@@ -237,7 +294,7 @@ export interface ControlApprovalRequest {
 /** What the audit entry records about how a risky control came to run (DL-116-12). */
 export interface ControlApprovalAudit {
   approvalId: string | null
-  kind: 'sdk' | 'resume' | 'scoped-window' | 'portable-skill-scope'
+  kind: 'sdk' | 'resume' | 'scoped-window' | 'portable-skill-scope' | 'settings-policy'
   decidedAt: string | null
 }
 
@@ -245,6 +302,12 @@ export type RiskGateDecision =
   | { kind: 'run'; approval: ControlApprovalAudit | null }
   | { kind: 'refuse-group'; message: string }
   | { kind: 'pause'; request: ControlApprovalRequest; wokenDmId: string | null }
+
+const p5RiskPauseWrites = new WeakMap<object, P5PendingApprovalWrite>()
+/** The actual gate's returned pause, never a deserialized tool-result request. */
+export function observeP5RiskPauseWrite(decision: RiskGateDecision): P5PendingApprovalWrite | undefined {
+  return p5RiskPauseWrites.get(decision)
+}
 
 /** The one wording for a risky control asked for inside a group chat (DL-116-10). */
 export const GROUP_RISK_REFUSAL_MESSAGE =
@@ -257,8 +320,7 @@ export const GROUP_RISK_REFUSAL_MESSAGE =
 /**
  * Turn a caller's claimed `sessionId` / `messageId` into the pair a card may be pinned to.
  *
- * Both arrive as request-body text on the managed CLI lane — the mode4 helper forwards
- * `BATSHIT_SESSION_ID` and `BATSHIT_MESSAGE_ID` — so neither may be trusted on its word:
+ * Both can arrive as request-body text, so neither may be trusted on its word:
  *
  *  - a session this user does not own is DROPPED, so a caller cannot speak for somebody
  *    else's chat and, with no session, the woken-turn gate falls back to the server-owned
@@ -291,14 +353,7 @@ export async function resolveApprovalCardTarget(options: {
   const claimedMessageId = trimmed(options.messageId)
   if (!claimedMessageId) return { sessionId }
 
-  // The message may not EXIST yet, and on the managed CLI lane it usually does not.
-  //
-  // The helper calls this from inside the very turn the card belongs to, and an assistant
-  // message is written when its turn finishes — so `EXISTS message:{session}:{id}` is 0 for
-  // exactly the id the card must land on. (Measured on BSMS: the record came back
-  // `lane: 'service'` with no message id, and the route logged its own "no card can render"
-  // warning, while the helper's env showed the right id arriving.)
-  //
+  // The message may not EXIST yet while the turn is running.
   // `getActiveStream` is the server's own note of which assistant message this session's
   // running turn is writing — set by `handleBatshitAgentStream` from the id it generated,
   // never from request text. Matching it is therefore as strong as a persisted message and
@@ -442,13 +497,14 @@ export async function createPendingApproval(options: {
   controlId: string
   controlTitle: string
   riskLevel: ControlApprovalRiskLevel
-  lane: ControlApprovalLane
+  lane: LiveControlApprovalLane
   input: unknown
   scopeKey?: string | null
   sdkApprovalId?: string | null
   toolCallId?: string | null
   now?: Date
 }): Promise<ControlApprovalRecord> {
+  if (!isLiveApprovalLane(options.lane)) throw new Error('[ControlApprovals] Retired or invalid approval lane.')
   const supplied = trimmed(options.approvalId)
   if (!supplied) return await writePendingApproval(options, generateApprovalId())
   if (!isWellFormedApprovalId(supplied)) {
@@ -480,7 +536,7 @@ async function writePendingApproval(
     controlId: string
     controlTitle: string
     riskLevel: ControlApprovalRiskLevel
-    lane: ControlApprovalLane
+    lane: LiveControlApprovalLane
     input: unknown
     scopeKey?: string | null
     sdkApprovalId?: string | null
@@ -513,6 +569,11 @@ async function writePendingApproval(
 
   const key = controlApprovalKey(record.id)
   await redis.json.set(key, '$', record as never)
+  // Capture the actual acknowledgement before TTL/index/publication awaits.
+  const pending = Object.freeze({}) as P5PendingApprovalWrite
+  pendingWriteOwners.set(pending, { identity: p5ApprovalIdentity(record) })
+  pendingWriteResults.set(record, pending)
+  pendingObservationContext.getStore()?.writes.push(pending)
   await redis.expire(key, CONTROL_APPROVAL_TTL_SECONDS)
   if (record.sessionId) {
     const indexKey = controlApprovalsIndexKey(record.sessionId)
@@ -642,13 +703,19 @@ export async function decideApproval(options: {
   now?: Date
   /** Server-owned account fence, evaluated inside the approval lock after its read. */
   mutate?: (write: () => Promise<void>) => Promise<void>
+  /** Private original workflow passage, never a body/gate-input field. */
+  originalPending?: P5PendingApprovalWrite
 }): Promise<ControlApprovalRecord | null> {
   const approvalId = trimmed(options.approvalId)
   if (!isWellFormedApprovalId(approvalId)) return null
 
   return await withApprovalLock(approvalId, async () => {
     const record = await getControlApproval(approvalId)
-    if (!record || record.userId !== options.userId) return null
+    if (!record || record.userId !== options.userId || !isLiveApprovalLane(record.lane)) return null
+    const pendingOwner = options.originalPending && pendingWriteOwners.get(options.originalPending)
+    if (options.originalPending && (!pendingOwner || JSON.stringify(pendingOwner.identity) !== JSON.stringify(p5ApprovalIdentity(record)))) {
+      throw new Error('The approval decision does not match its original pending write.')
+    }
     // A decided or spent approval keeps its answer. Re-deciding would let a second click
     // (or a replayed POST) turn a denial into an approval.
     if (record.status !== 'pending') return record
@@ -659,6 +726,12 @@ export async function decideApproval(options: {
     const write = async () => {
       written = await patchApprovalFields(approvalId, { status, decidedAt })
       if (!written) return
+      if (options.originalPending && pendingOwner) {
+        const receipt = Object.freeze({}) as P5ApprovalDecisionWrite
+        decisionWriteOwners.set(receipt, { pending: options.originalPending, identity: pendingOwner.identity,
+          status: options.approved ? 'approved' : 'denied', decidedAt, consumed: false })
+        pendingOwner.decision = receipt // known write survives later failure/Stop
+      }
       if (options.approved && record.scopeKey) {
         // The one window DL-116-04 keeps: an approved voice-engine setup lets a retry for
         // that same engine within five minutes skip the card. Seeded here and nowhere else.
@@ -679,12 +752,15 @@ export async function decideApproval(options: {
 }
 
 /** Mark a pending approval expired — send-routed's stale sweep, and nothing else. */
-export async function markApprovalExpired(approvalId: unknown): Promise<boolean> {
+export async function markApprovalExpired(approvalId: unknown, expected?: {
+  userId: string; sessionId: string; lane: 'cli'
+}): Promise<boolean> {
   const id = trimmed(approvalId)
   if (!isWellFormedApprovalId(id)) return false
   return await withApprovalLock(id, async () => {
     const record = await getControlApproval(id)
-    if (!record || record.status !== 'pending') return false
+    if (!record || record.status !== 'pending' || expected &&
+      (record.userId !== expected.userId || record.sessionId !== expected.sessionId || record.lane !== expected.lane)) return false
     return await patchApprovalFields(id, { status: 'expired', decidedAt: nowIso() })
   })
 }
@@ -774,6 +850,7 @@ function matchesApproval(
   }
 ): boolean {
   return (
+    isLiveApprovalLane(record.lane) &&
     record.status === 'approved' &&
     record.userId === criteria.userId &&
     (record.agentId ?? null) === (trimmed(criteria.agentId) || null) &&
@@ -795,7 +872,7 @@ export async function consumeApproval(approvalId: string): Promise<ControlApprov
   if (!isWellFormedApprovalId(approvalId)) return null
   return await withApprovalLock(approvalId, async () => {
     const record = await getControlApproval(approvalId)
-    if (!record || record.status !== 'approved') return null
+    if (!record || !isLiveApprovalLane(record.lane) || record.status !== 'approved') return null
     const consumedAt = nowIso()
     const written = await patchApprovalFields(approvalId, { status: 'consumed', consumedAt })
     if (!written) return null
@@ -956,15 +1033,18 @@ export async function decideRiskGate(options: {
   controlId: string
   controlTitle: string
   riskLevel: ControlApprovalRiskLevel
-  lane: ControlApprovalLane
+  lane: LiveControlApprovalLane
   input: unknown
   scopeKey?: string | null
   grant?: ControlApprovalGrant | null
   /** True only for a Portable Skill Token call — the token's family scope IS the consent. */
   portableSkillScope?: boolean
+  /** Opaque, exact-input proof of a saved user Settings policy decision; never a body field. */
+  settingsPolicyConsent?: SettingsStandingConsent
   toolCallId?: string | null
   now?: Date
 }): Promise<RiskGateDecision> {
+  if (!isLiveApprovalLane(options.lane)) throw new Error('[ControlApprovals] Retired or invalid approval lane.')
   // (0) SA-113 F-SEC-1, read FIRST (PR #106 review, F-2). A woken turn is driven by a DM
   // body or a webhook payload — untrusted text — so nothing below may exempt it from the
   // card, not even a Portable Skill Token. `resolveWokenTurnState` owns the fail-closed rule
@@ -995,6 +1075,10 @@ export async function decideRiskGate(options: {
     return { kind: 'refuse-group', message: GROUP_RISK_REFUSAL_MESSAGE }
   }
 
+  if (!wokenTurn.woken && hasSettingsStandingConsent(options.settingsPolicyConsent, {
+    userId: options.userId, agentId: options.agentId ?? '', controlId: options.controlId, inputHash: hashControlInput(options.input ?? {})
+  })) return { kind: 'run', approval: { approvalId: null, kind: 'settings-policy', decidedAt: (options.now ?? new Date()).toISOString() } }
+
   const inputHash = hashControlInput(options.input ?? {})
   const criteria = {
     userId: options.userId,
@@ -1004,9 +1088,8 @@ export async function decideRiskGate(options: {
     inputHash
   }
 
-  // (3) A server-owned approval a human clicked. The explicit grant is send-routed's SDK
-  // resume naming the exact record; the implicit lookup is the managed CLI agent's retry
-  // after its resume turn, which knows the ref and the input but not the id (DL-116-08).
+  // (3) A live server-owned approval a human clicked. The SDK grant names its exact record;
+  // an implicit match is still bound to the same user, agent, session, control and input.
   let matched: ControlApprovalRecord | null = null
   const grantId = trimmed(options.grant?.approvalId)
   if (grantId) {
@@ -1078,9 +1161,12 @@ export async function decideRiskGate(options: {
     }
   }
 
-  return {
+  const pause: RiskGateDecision = {
     kind: 'pause',
     request: toApprovalRequest(record, options.toolCallId, options.input ?? {}),
     wokenDmId
   }
+  const pending = observeP5PendingApprovalWrite(record)
+  if (pending) p5RiskPauseWrites.set(pause, pending)
+  return pause
 }

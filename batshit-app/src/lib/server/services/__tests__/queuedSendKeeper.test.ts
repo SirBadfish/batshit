@@ -60,7 +60,7 @@ describe('keepQueuedSendAtEnd', () => {
     expect(isQueuedSendMessageHidden(SESSION, 'b')).toBe(true)
     const forwardSessionEvent = vi.fn(async () => {})
 
-    await keepQueuedSendAtEnd({ sessionId: SESSION, userId: USER, userMessageId: 'b', entry, forwardSessionEvent })
+    await keepQueuedSendAtEnd({ sessionId: SESSION, userId: USER, userMessageId: 'b', reason: 'overflow', entry, forwardSessionEvent })
 
     expect((await redis.getAllMessages(SESSION)).map((m) => m.id)).toEqual(['a', 'a-reply', 'b'])
     expect(isQueuedSendMessageHidden(SESSION, 'b')).toBe(false)
@@ -75,12 +75,53 @@ describe('keepQueuedSendAtEnd', () => {
     expect(getActiveSessionTurn(SESSION)).toBeNull()
   })
 
+  // BL-903 (a): the reason is saved with the words in the same move, so every tab (after a
+  // reload too) draws the "Not sent" receipt from the message itself.
+  it('saves why the send was not sent on the message, keeping its other facts', async () => {
+    await seed()
+    await redis.updateMessage('b', SESSION, { metadata: { clipIds: ['clip_1'], client_sent: true } } as never, USER)
+    const entry = await keptEntry()
+    const forwardSessionEvent = vi.fn(async () => {})
+
+    // The send facts its request carried (`pickSendFacts`), which the page's message does not keep.
+    const sendFacts = { projectPath: '/work/p', claudePermissionMode: 'acceptEdits', voiceMode: 'voice', tts: true }
+    await keepQueuedSendAtEnd({ sessionId: SESSION, userId: USER, userMessageId: 'b', reason: 'stopped', sendFacts, entry, forwardSessionEvent })
+
+    const stored = (await redis.getAllMessages(SESSION)).at(-1) as any
+    expect(stored.id).toBe('b')
+    expect(stored.metadata).toEqual(
+      expect.objectContaining({ keptSend: { reason: 'stopped', sendFacts }, clipIds: ['clip_1'], client_sent: true })
+    )
+    // The tabs hear the moved record, mark included.
+    expect(forwardSessionEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'user_message',
+        message: expect.objectContaining({ id: 'b', metadata: expect.objectContaining({ keptSend: { reason: 'stopped', sendFacts } }) })
+      })
+    )
+  })
+
+  it('a send with no send facts saves the reason alone', async () => {
+    await seed()
+    const entry = await keptEntry()
+    await keepQueuedSendAtEnd({
+      sessionId: SESSION,
+      userId: USER,
+      userMessageId: 'b',
+      reason: 'overflow',
+      sendFacts: {},
+      entry,
+      forwardSessionEvent: vi.fn(async () => {})
+    })
+    expect(((await redis.getAllMessages(SESSION)).at(-1) as any).metadata.keptSend).toEqual({ reason: 'overflow' })
+  })
+
   it('never deletes the words, and still lets go when the message is already gone', async () => {
     await seed()
     const entry = await keptEntry('missing')
     const forwardSessionEvent = vi.fn(async () => {})
 
-    await keepQueuedSendAtEnd({ sessionId: SESSION, userId: USER, userMessageId: 'missing', entry, forwardSessionEvent })
+    await keepQueuedSendAtEnd({ sessionId: SESSION, userId: USER, userMessageId: 'missing', reason: 'overflow', entry, forwardSessionEvent })
 
     expect((await redis.getAllMessages(SESSION)).map((m) => m.id)).toEqual(['a', 'b', 'a-reply'])
     expect(forwardSessionEvent).not.toHaveBeenCalled()
@@ -100,6 +141,7 @@ describe('keepQueuedSendAtEnd', () => {
       sessionId: SESSION,
       userId: USER,
       userMessageId: 'b',
+      reason: 'overflow',
       entry,
       forwardSessionEvent,
       after
@@ -123,6 +165,7 @@ describe('keepQueuedSendAtEnd', () => {
       sessionId: SESSION,
       userId: USER,
       userMessageId: 'b',
+      reason: 'overflow',
       entry,
       forwardSessionEvent: vi.fn(async () => {})
     })

@@ -2,31 +2,78 @@
   import * as Select from '$lib/components/ui/select'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
   import { TYPESAFE_FEATURES } from '$lib/utils/jevJuice'
+  import { DEFAULT_LIVE_FILE_READS_ENABLED, LIVE_FILE_READS_HELP, LIVE_FILE_READS_LABEL } from '$lib/utils/liveFileReads'
+  import { REFRESHED_FILE_READS_GLOBAL_HINT } from '$lib/utils/refreshedFileReadsSettings'
 
-  // SA-129 DL-06 (BL-1484): the zip control permission is parked behind a hidden experiment key
-  // that no Settings surface reads or writes; the older keys are ignored
-  // (`zipAgentControlPermission.ts`).
+  // Agent zip control is retired (decision 7, 2026-10-23); startup removes its keys
+  // (`retiredZipControlFields.ts`).
   interface Props {
+    showSmartZip?: boolean
     zipAiViewMode: 'inline' | 'appended'
     zipToolNotesEnabled: boolean
     /** SA-120 P5 (LS-054): the ONE global smart zip switch. Off by default. */
     jevSmartZipEnabled: boolean
+    /** SA-137 P4a: the saved global Refreshed File Reads value; null is absent (the factory value, `DEFAULT_LIVE_FILE_READS_ENABLED`). */
+    liveFileReadsValue: boolean | null
+    /**
+     * Round 2 (R2-2): why Refreshed File Reads cannot run on this computer
+     * (`globalRefreshedFileReadsAvailability`: host reasons only), or null. The switch shows as
+     * unavailable with this sentence; the saved value is never changed or saved because of it.
+     */
+    liveFileReadsUnavailableReason?: string | null
+    /**
+     * Plain notes under the switch that do not lock it (the host could not be read; the global Zip
+     * view is inline). With none, and no reason, the short hint shows.
+     */
+    liveFileReadsNotes?: string[]
     onZipAiViewModeChange: (mode: 'inline' | 'appended') => void
     onZipToolNotesEnabledChange: (enabled: boolean) => void
     onJevSmartZipEnabledChange: (enabled: boolean) => void
+    onLiveFileReadsValueChange: (value: boolean | null) => void
   }
 
   let {
+    showSmartZip = true,
     zipAiViewMode,
     zipToolNotesEnabled,
     jevSmartZipEnabled,
+    liveFileReadsValue,
+    liveFileReadsUnavailableReason = null,
+    liveFileReadsNotes = [],
     onZipAiViewModeChange,
     onZipToolNotesEnabledChange,
-    onJevSmartZipEnabledChange
+    onJevSmartZipEnabledChange,
+    onLiveFileReadsValueChange
   }: Props = $props()
+
+  // The reason and the notes describe the switch for assistive technology; ids are per mounted
+  // strip, so two strips on a page never share one.
+  const uid = $props.id()
+  const reasonId = `${uid}-live-reads-reason`
+  const noteId = (index: number) => `${uid}-live-reads-note-${index}`
+  const showHint = $derived(!liveFileReadsUnavailableReason && liveFileReadsNotes.length === 0)
+  const hintId = `${uid}-live-reads-hint`
+  const liveFileReadsDescribedBy = $derived(
+    [
+      liveFileReadsUnavailableReason ? reasonId : null,
+      ...liveFileReadsNotes.map((_, index) => noteId(index)),
+      showHint ? hintId : null
+    ]
+      .filter(Boolean)
+      .join(' ') || undefined
+  )
+
+  // SA-137 D13: the factory value, named from the one constant the resolver uses.
+  const liveFileReadsDefaultLabel = `Default (${DEFAULT_LIVE_FILE_READS_ENABLED ? 'On' : 'Off'})`
+  const liveFileReadsSelected = $derived(
+    liveFileReadsValue === null ? 'default' : liveFileReadsValue ? 'enabled' : 'disabled'
+  )
+  const liveFileReadsSelectedLabel = $derived(
+    liveFileReadsValue === null ? liveFileReadsDefaultLabel : liveFileReadsValue ? 'Enabled' : 'Disabled'
+  )
 </script>
 
-<div class="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+<div class={`grid gap-3 md:grid-cols-2 ${showSmartZip ? 'xl:grid-cols-4' : 'xl:grid-cols-3'}`}>
   <label class="space-y-1">
     <span class="batshit-settings-form-label-line">
       <span class="batshit-settings-form-label">AI Zip Layout</span>
@@ -75,6 +122,7 @@
     </Select.Root>
   </label>
 
+  {#if showSmartZip}
   <label class="space-y-1">
     <span class="batshit-settings-form-label-line">
       <span class="batshit-settings-form-label">{TYPESAFE_FEATURES.smart_zip.switchLabel}</span>
@@ -119,4 +167,46 @@
       </Select.Content>
     </Select.Root>
   </label>
+  {/if}
+
+  <div class="space-y-1">
+    <label class="space-y-1">
+      <span class="batshit-settings-form-label-line">
+        <span class="batshit-settings-form-label">{LIVE_FILE_READS_LABEL}</span>
+        <SettingsInfoMenu ariaLabel={`About ${LIVE_FILE_READS_LABEL}`}>
+          {LIVE_FILE_READS_HELP}
+        </SettingsInfoMenu>
+      </span>
+      <Select.Root
+        type="single"
+        value={liveFileReadsSelected}
+        disabled={Boolean(liveFileReadsUnavailableReason)}
+        onValueChange={(value) =>
+          onLiveFileReadsValueChange(value === 'enabled' ? true : value === 'disabled' ? false : null)}
+      >
+        <Select.Trigger
+          class="batshit-settings-select-compact w-full"
+          size="sm"
+          data-testid="global-live-file-reads-select"
+          aria-describedby={liveFileReadsDescribedBy}
+        >
+          {liveFileReadsSelectedLabel}
+        </Select.Trigger>
+        <Select.Content>
+          <Select.Item value="default" label={liveFileReadsDefaultLabel}>{liveFileReadsDefaultLabel}</Select.Item>
+          <Select.Item value="enabled" label="Enabled">Enabled</Select.Item>
+          <Select.Item value="disabled" label="Disabled">Disabled</Select.Item>
+        </Select.Content>
+      </Select.Root>
+    </label>
+    {#if liveFileReadsUnavailableReason}
+      <p id={reasonId} class="batshit-settings-form-help is-warning" data-testid="global-live-file-reads-reason">{liveFileReadsUnavailableReason}</p>
+    {/if}
+    {#each liveFileReadsNotes as note, index (index)}
+      <p id={noteId(index)} class="batshit-settings-form-help" data-testid="global-live-file-reads-note">{note}</p>
+    {/each}
+    {#if showHint}
+      <p id={hintId} class="batshit-settings-form-help" data-testid="global-live-file-reads-hint">{REFRESHED_FILE_READS_GLOBAL_HINT}</p>
+    {/if}
+  </div>
 </div>

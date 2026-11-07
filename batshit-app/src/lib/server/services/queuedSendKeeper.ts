@@ -15,6 +15,13 @@
  * It releases the registration the line handed it by that registration's own id, the rule every
  * request follows (`releaseSessionTurn`). It lives here, not in send-routed, because a send over
  * the cap is answered at once and kept later, when no request of its own is left to do it.
+ *
+ * BL-903 (a): the move also saves why the send was not sent, and the facts its request carried
+ * (`metadata.keptSend: { reason, sendFacts }`, `SEND_FACT_KEYS`: project, voice, tool choice,
+ * approval and permission modes), in the same one-step script, so every tab draws the "Not sent"
+ * receipt from the message itself, after a reload too, and its Send now runs the send as it was
+ * made (`keptSendReceipt.ts`). The page's own message keeps only some of them; the compiler never
+ * reads the mark.
  */
 
 import { redis } from '$lib/server/redis'
@@ -31,6 +38,10 @@ export async function keepQueuedSendAtEnd(params: {
   sessionId: string
   userId: string
   userMessageId: string
+  /** Why the line kept it (the handover's reason: `stopped`, `approval_wait`, the cap, ...). */
+  reason: string
+  /** The send facts its request carried (`pickSendFacts`), saved with the mark. */
+  sendFacts?: Record<string, unknown>
   /** The lock the line handed this kept send. Released here, always. */
   entry: Pick<SessionTurnEntry, 'turnId'>
   /** Posts a session event to `/api/sse` for every tab on the chat (send-routed's own forward). */
@@ -41,7 +52,9 @@ export async function keepQueuedSendAtEnd(params: {
   const { sessionId, userId, userMessageId, entry, forwardSessionEvent } = params
   try {
     await params.after
-    const moved = await redis.moveMessageToEnd(sessionId, userMessageId)
+    const moved = await redis.moveMessageToEnd(sessionId, userMessageId, {
+      keptSend: { reason: params.reason, sendFacts: params.sendFacts ?? null }
+    })
     revealQueuedUserMessage(sessionId, userMessageId)
     if (!moved) return
     // A tab that took the message out of its list while it waited gets it back at the end; a

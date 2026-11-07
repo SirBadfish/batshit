@@ -17,12 +17,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const profileSync = vi.hoisted(() => ({
-  codex: vi.fn(async () => undefined),
   claude: vi.fn(async () => ({}))
 }))
-vi.mock('$lib/server/services/codexProfileManager', () => ({ syncAgentCodexProfiles: profileSync.codex }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({ syncAgentClaudeProfiles: profileSync.claude }))
-vi.mock('$lib/services/apiKey.server', () => ({
+vi.mock('$lib/services/apiKey.server', async importOriginal => ({
+  ...(await importOriginal<typeof import('$lib/services/apiKey.server')>()),
   apiKeyService: {
     // BL-1407: the explicit store writes the same { moved } record the guarded move reads below.
     store: vi.fn(async (service: string, token: string, userId: string) => {
@@ -57,13 +56,13 @@ vi.mock('$lib/server/services/mcpGatewayReferenceCleanup', async (importOriginal
 }))
 
 import { redis } from '$lib/server/redis'
-import { GatewayRegistryConflictError, mcpGatewayService } from '$lib/server/services/mcpGatewayService'
+import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
 import { mcpToolListCache } from '$lib/server/services/mcpToolListCache'
 import { sweepGatewayReferencesForUser } from '$lib/server/services/mcpGatewayReferenceCleanup'
 import { writeDockerMcpProfileEnv } from '$lib/server/services/dockerGatewayProfileConfig'
 import { migrateLegacyN8nInstanceMcpTokens } from '$lib/server/services/mcpGatewayTokenMigration'
 import { apiKeyService } from '$lib/services/apiKey.server'
-import { DELETE as deleteRoute, PUT as putRoute } from '../../../../routes/api/mcp/gateways/[id]/+server'
+import { GET as getRoute, DELETE as deleteRoute, PUT as putRoute } from '../../../../routes/api/mcp/gateways/[id]/+server'
 
 const USER = 'bl1371_user'
 const KEY = `mcp_gateways:${USER}`
@@ -224,7 +223,13 @@ async function toolListCopyKept(gatewayId: string): Promise<boolean> {
   return lookup.mock.calls.length === 0
 }
 
-function put(id: string, body: Record<string, unknown>) {
+async function put(id: string, body: Record<string, unknown>) {
+  const { namesHumanGatewaySource } = await import('../mcpGatewayService')
+  if (namesHumanGatewaySource(body) && !Object.hasOwn(body, 'expectedGatewaySource')) {
+    const shown = await getRoute({ locals: { user: { id: USER } }, params: { id } } as any)
+    const detail = await shown.json()
+    body = { ...body, expectedGatewaySource: detail.gateway?.sourceRevision }
+  }
   return putRoute({
     request: new Request(`http://localhost/api/mcp/gateways/${id}`, {
       method: 'PUT',
@@ -238,6 +243,27 @@ function put(id: string, body: Record<string, unknown>) {
 function del(id: string) {
   return deleteRoute({ locals: { user: { id: USER } }, params: { id } } as any) as Promise<Response>
 }
+
+/**
+ * SA-139 R4 removed the Primary profile sync that ran between a stored PUT and its read back, the
+ * step these cases used to stage a later change in. `step` now runs right before the read back:
+ * the first `get` once the stored registry shows `saved`. Restore it when the case ends.
+ */
+function beforeTheReadBack(saved: (registry: { gateways: any[] }) => boolean, step: () => Promise<unknown>) {
+  const realGet = mcpGatewayService.get.bind(mcpGatewayService)
+  let ran = false
+  const spy = vi.spyOn(mcpGatewayService, 'get').mockImplementation(async (userId: string, gatewayId: string) => {
+    if (!ran && saved(await storedRegistry())) {
+      ran = true
+      await step()
+    }
+    return realGet(userId, gatewayId)
+  })
+  return { ran: () => ran, restore: () => spy.mockRestore() }
+}
+
+const savedName = (id: string, name: string) => (registry: { gateways: any[] }) =>
+  registry?.gateways.find((gateway) => gateway.id === id)?.name === name
 
 describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1371: registry writes keep each other', () => {
   beforeEach(() => {
@@ -394,7 +420,6 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1371: registry 
     const body = await response.json()
     expect(body.error).not.toMatch(/not found|Invalid/)
     expect((await stored('gw-a')).name).toBe('Alpha')
-    expect(profileSync.codex).not.toHaveBeenCalled()
     expect(profileSync.claude).not.toHaveBeenCalled()
   })
 
@@ -407,7 +432,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1371: registry 
 
     expect(response.status).toBe(409)
     expect(await stored('gw-a')).not.toBeNull()
-    expect(profileSync.codex).not.toHaveBeenCalled()
+    expect(profileSync.claude).not.toHaveBeenCalled()
   })
 
   it('R6f: a PUT whose write was stored never answers 409 "nothing was saved" when the read back fails', async () => {
@@ -415,31 +440,24 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1371: registry 
     vi.clearAllMocks()
     // After the stored save, a gateway that needs a slug appears and three writes refuse the
     // read back's normalizing write, so `get` throws the conflict error after the save.
-    profileSync.codex.mockImplementationOnce(async () => {
+    const readBack = beforeTheReadBack(savedName('gw-a', 'Mine'), async () => {
       const registry = await storedRegistry()
       registry.gateways.push(custom('gw-new', 'Fresh Server'))
       await redis.json.set(KEY, '$', registry)
       beforeRegistryWrites(3, (n) => mcpGatewayService.update(USER, 'gw-a', { discoveredTools: [`t${n}`] }))
     })
+    try {
+      const response = await put('gw-a', { name: 'Mine' })
 
-    const response = await put('gw-a', { name: 'Mine' })
-
-    expect(response.status).toBe(500)
-    expect((await stored('gw-a')).name).toBe('Mine')
+      expect(readBack.ran()).toBe(true)
+      expect(response.status).toBe(500)
+      expect((await stored('gw-a')).name).toBe('Mine')
+    } finally {
+      readBack.restore()
+    }
   })
-
-  it('R6g: a DELETE whose delete was stored never answers 409 when the profile sync then fails with the conflict', async () => {
-    await mcpGatewayService.create(USER, custom('gw-a', 'Alpha'))
-    vi.clearAllMocks()
-    profileSync.codex.mockImplementationOnce(async () => {
-      throw new GatewayRegistryConflictError()
-    })
-
-    const response = await del('gw-a')
-
-    expect(response.status).toBe(500)
-    expect(await stored('gw-a')).toBeNull()
-  })
+  // R6g went with SA-139 R4: a stored DELETE runs no profile sync after it, so nothing follows
+  // the stored delete that could fail.
 
   it('R13: an update function answers plain fields synchronously; bad fields are refused with no retry; no change writes nothing', async () => {
     await mcpGatewayService.create(USER, custom('gw-a', 'Alpha'))
@@ -570,29 +588,26 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1371: registry 
     expect((await stored('gw-n')).metadata).toEqual({ base: 'x' })
   })
 
-  it('R12: an n8n PUT keeps metadata saved in its window and removes the token it replaced', async () => {
+  it('R12: a human n8n source save refuses a concurrent metadata source edit before storing its new token', async () => {
     await mcpGatewayService.create(USER, n8nInstance('gw-n', { authToken: 'legacy-token', base: 'x' }))
     beforeRegistryWrites(1, () => metadataWrittenElsewhere('gw-n', { note: 'saved meanwhile' }))
-
     const response = await put('gw-n', { metadata: { authToken: 'fresh-token', label: 'L' } })
-
-    expect(response.status).toBe(200)
-    expect(apiKeyService.store).toHaveBeenCalledWith('n8n_instance_mcp_token', 'fresh-token', USER)
-    // BL-1407: stored after the gateway write; the old copy then left through the guarded move.
-    expect(await redis.json.get(`api_keys:${USER}:n8n_instance_mcp_token`)).toEqual({ moved: 'fresh-token' })
-    expect((await stored('gw-n')).metadata).toEqual({ base: 'x', label: 'L', note: 'saved meanwhile' })
+    expect(response.status).toBe(409)
+    expect((await response.json()).code).toBe('gateway_source_changed')
+    expect(apiKeyService.store).not.toHaveBeenCalled()
+    expect(await redis.json.get(`api_keys:${USER}:n8n_instance_mcp_token`)).toBeNull()
+    expect((await stored('gw-n')).metadata).toEqual({ authToken: 'legacy-token', base: 'x', note: 'saved meanwhile' })
   })
 
-  it('R12b: an n8n PUT with no token stores none itself; its guarded move takes a copy stored after its read', async () => {
+  it('R12b: a concurrent restored legacy token refuses the stale human source before any token move', async () => {
     await mcpGatewayService.create(USER, n8nInstance('gw-n', { authToken: 'legacy-token', base: 'x' }))
     beforeRegistryWrites(1, () => metadataWrittenElsewhere('gw-n', { authToken: 'restored-token' }))
-
     const response = await put('gw-n', { metadata: { label: 'L' } })
-
-    expect(response.status).toBe(200)
+    expect(response.status).toBe(409)
+    expect((await response.json()).code).toBe('gateway_source_changed')
     expect(apiKeyService.store).not.toHaveBeenCalled()
-    expect(await redis.json.get(`api_keys:${USER}:n8n_instance_mcp_token`)).toEqual({ moved: 'restored-token' })
-    expect((await stored('gw-n')).metadata).toEqual({ base: 'x', label: 'L' })
+    expect(await redis.json.get(`api_keys:${USER}:n8n_instance_mcp_token`)).toBeNull()
+    expect((await stored('gw-n')).metadata).toEqual({ authToken: 'restored-token', base: 'x' })
   })
 
   it('R10: a delete sweeps the tool names of the gateway it actually removed', async () => {
@@ -610,5 +625,100 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1371: registry 
     // BL-1396: every name of the removed element is a candidate; the sweep's own registry read
     // keeps `shared` for gw-b (mcpGatewayReferenceCleanup.test.ts, BL-1396 cases).
     expect([...orphanToolNames]).toEqual(['only_alpha', 'shared'])
+  })
+})
+
+
+// Default fixture checks the finite dispatcher/shape contract only. The adjacent
+// strict real owner executes the actual read-only Lua; this fake is not Lua proof.
+describe('private original HTTP issue cut (default contract)', () => {
+  it('derives only the three fixed keys and preserves absent versus null raw fields', async () => {
+    const { READ_MCP_HTTP_ISSUE_CUT_SCRIPT } = await import('../mcpGatewayService')
+    const gateway = custom('http-held', 'Held', { authKeyName: 'http-reference' })
+    const actor = { id: 'http-actor', user_id: USER, agentType: 'api', created_at: 'held-actor', dcmDisplaySettings: null }
+    const fields = ['id','slug','name','type','created_at','enabled','url','authKeyName','metadata.authToken','stdioConfig','toolGroupings','dcmDisplayDefaults']
+    const keyRaw = JSON.stringify([{ encrypted: 'synthetic-only', iv: 'synthetic-iv', authTag: 'synthetic-tag' }])
+    const raw = (object: Record<string, unknown>, name: string) => Object.hasOwn(object, name) ? JSON.stringify([object[name]]) : '[]'
+    const answer = [...fields.map(field => raw(gateway, field)), keyRaw,
+      ...['id','user_id','agentType','created_at','dcmDisplaySettings','dcm_display_settings'].map(field => raw(actor, field))]
+    const original = vi.isMockFunction(redis.execute) ? vi.mocked(redis.execute).getMockImplementation() : redis.execute
+    if (!original) throw new Error('The existing default Redis client is unavailable.')
+    const issue = vi.spyOn(redis, 'execute').mockImplementation(read => Reflect.apply(original, redis, [async (client: Parameters<Parameters<typeof redis.execute>[0]>[0]) => read(new Proxy(client, {
+      get(target, key) {
+        if (key === 'eval') return async (script: unknown, options: { keys: string[]; arguments: string[] }) => {
+          expect(script).toBe(READ_MCP_HTTP_ISSUE_CUT_SCRIPT)
+          expect(options).toEqual({ keys: [KEY, `api_keys:${USER}:http-reference`, 'agent:http-actor'], arguments: ['http-held'] })
+          return answer
+        }
+        const value = Reflect.get(target, key, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      }
+    }))]))
+    try {
+      const cut = await mcpGatewayService.readMcpHttpIssueCut(USER, 'http-actor', 'http-held', ' HTTP-REFERENCE ')
+      expect(issue).toHaveBeenCalledOnce()
+      expect(cut.gateway).toMatchObject(gateway)
+      expect(cut.keyRaw).toBe(keyRaw)
+      expect(cut.actor.dcmDisplaySettings).toBeNull()
+      expect(Object.hasOwn(cut.actor, 'dcm_display_settings')).toBe(false)
+      await expect(mcpGatewayService.readMcpHttpIssueCut(USER, 'http-actor', 'http-held', 'ai_gateway')).rejects.toThrow('reference')
+      expect(issue).toHaveBeenCalledOnce()
+    } finally { issue.mockRestore() }
+  })
+})
+
+
+describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('human source original CAS/ACK boundary', () => {
+  beforeEach(() => { (redis as any).__resetTestStore(); restoreFake(); vi.clearAllMocks(); mcpToolListCache.clearAll() })
+  afterEach(() => vi.restoreAllMocks())
+  async function shown(id: string) {
+    const response = await getRoute({ locals: { user: { id: USER } }, params: { id } } as any)
+    expect(response.status).toBe(200)
+    return (await response.json()).gateway
+  }
+  it('requires original source metadata and never persists it or grants management authority', async () => {
+    await mcpGatewayService.create(USER, custom('human-source', 'Shown'))
+    const original = await shown('human-source'), before = await stored('human-source')
+    expect((await put('human-source', { name: 'Must not land', expectedGatewaySource: undefined })).status).toBe(400)
+    expect(await stored('human-source')).toEqual(before)
+    const response = await put('human-source', { name: 'Changed', expectedGatewaySource: original.sourceRevision })
+    expect(response.status).toBe(200)
+    const result = await response.json()
+    expect(result.sourceAcknowledgement).toMatchObject({ id: 'human-source', name: 'Changed', sourceRevision: expect.stringMatching(/^source1:/) })
+    expect(result.sourceAcknowledgement.sourceRevision).not.toBe(original.sourceRevision)
+    expect(await stored('human-source')).not.toHaveProperty('expectedGatewaySource')
+    expect(await stored('human-source')).not.toHaveProperty('sourceRevision')
+  })
+  it('checks the SAME original source on each functional CAS retry instead of adopting the winner', async () => {
+    await mcpGatewayService.create(USER, custom('human-source', 'Shown'))
+    const original = await shown('human-source'), merge = vi.fn(() => ({ name: 'Must not land' }))
+    beforeRegistryWrites(1, () => mcpGatewayService.update(USER, 'human-source', { url: 'https://new.example.test/mcp' }))
+    await expect(mcpGatewayService.update(USER, 'human-source', merge, undefined, { expectedGatewaySource: original.sourceRevision })).rejects.toMatchObject({ status: 409, code: 'gateway_source_changed' })
+    expect(merge).toHaveBeenCalledOnce()
+    expect(await stored('human-source')).toMatchObject({ name: 'Shown', url: 'https://new.example.test/mcp' })
+  })
+  it('keeps a real known source ACK paired with its own postimage when a later step changes the source', async () => {
+    await mcpGatewayService.create(USER, custom('human-source', 'Shown'))
+    const original = await shown('human-source')
+    const later = beforeTheReadBack(savedName('human-source', 'Actual ACK'), () =>
+      mcpGatewayService.update(USER, 'human-source', { name: 'Later source' }))
+    const response = await put('human-source', { name: 'Actual ACK', expectedGatewaySource: original.sourceRevision })
+    expect(later.ran()).toBe(true)
+    later.restore()
+    expect(response.status).toBe(200)
+    const result = await response.json()
+    expect(result.sourceAcknowledgement.name).toBe('Actual ACK')
+    expect((await stored('human-source')).name).toBe('Later source')
+    expect(result.sourceAcknowledgement.sourceRevision).not.toBe((await shown('human-source')).sourceRevision)
+  })
+  it('the finite existing CAS twin checks after serialization and leaves generic EVAL unavailable', async () => {
+    await mcpGatewayService.create(USER, custom('human-source', 'Shown'))
+    const root = await redis.json.getRaw(KEY, '$'), before = await storedRegistry(), stop = new Error('actual owner ended before issue')
+    let serialized = false
+    const check = vi.fn(() => { expect(serialized).toBe(true); throw stop })
+    await expect(redis.json.setIfUnchanged(KEY, '$', root!, { toJSON() { serialized = true; return before } }, { beforeIssue: check })).rejects.toBe(stop)
+    expect(check).toHaveBeenCalledOnce()
+    expect(await storedRegistry()).toEqual(before)
+    await redis.execute(client => { expect(client.eval).toBeUndefined(); return Promise.resolve() })
   })
 })

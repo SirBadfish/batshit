@@ -18,14 +18,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         const allowedKeys = [
             // Primary-agent prompts
             'batshit:batshit_mode3_system_prompt',
-            'batshit:batshit_mode4_system_prompt',
             // Base SA prompts
             'batshit:sub_system_prompt',
             'batshit:worker_prompt',
             'batshit:subagent_guidance',
             // Tool + zip guidance prompts
-            'batshit:tool_guidance_zip_enabled_prompt',
-            'batshit:tool_guidance_zip_disabled_prompt',
+            'batshit:tool_guidance_zip_prompt',
             'batshit:tool_guidance_memory_prompt',
             'batshit:dm_guidance',
             'batshit:jev_juice_guidance',
@@ -36,12 +34,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
             'batshit:system_prompt',
             // Last updated timestamps
             'batshit:batshit_mode3_system_prompt:last_updated',
-            'batshit:batshit_mode4_system_prompt:last_updated',
             'batshit:sub_system_prompt:last_updated',
             'batshit:worker_prompt:last_updated',
             'batshit:subagent_guidance:last_updated',
-            'batshit:tool_guidance_zip_enabled_prompt:last_updated',
-            'batshit:tool_guidance_zip_disabled_prompt:last_updated',
+            'batshit:tool_guidance_zip_prompt:last_updated',
             'batshit:tool_guidance_memory_prompt:last_updated',
             'batshit:dm_guidance:last_updated',
             'batshit:jev_juice_guidance:last_updated',

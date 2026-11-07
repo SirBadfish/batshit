@@ -3,8 +3,11 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { jsonResponse } from '$lib/test-utils/userSettingsRoute'
 import { redis } from '$lib/server/redis'
-import { MEMORY_CONFIG_KEY } from '$lib/server/services/memory/memoryKeys'
+import { MEMORY_CONFIG_KEY, MEMORY_INDEX_META_KEY } from '$lib/server/services/memory/memoryKeys'
 import { MEMORY_SCHEMA_VERSION } from '$lib/server/services/memory/memoryTypes'
+import { canonicalEmbeddingModelId } from '$lib/server/services/memory/memoryEmbedder'
+import { toast } from 'svelte-sonner'
+import MemorySystemCard from '../memory/MemorySystemCard.svelte'
 import MemorySettingsPanel from './MemorySettingsPanel.svelte'
 
 /**
@@ -56,6 +59,10 @@ const SAVED_PRESET = {
   }
 }
 const DEFAULT_EMBEDDING = { lane: 'builtin', modelId: 'builtin:embeddinggemma-300m' }
+const NEXT_EMBEDDING = { lane: 'builtin', modelId: 'builtin:all-minilm-l6-v2' }
+const PRESETS_UNAVAILABLE = 'Model presets could not be read. The saved choice is kept.'
+const INDEX_UNAVAILABLE = 'Current index status is unavailable. Reopen Memory Settings to check it.'
+const MISMATCH = 'The saved configuration does not match the built index.'
 
 function ensureBrowserStubs() {
   if (typeof Element !== 'undefined' && typeof Element.prototype.animate !== 'function') {
@@ -103,6 +110,8 @@ let failGetsWith: number | null = null
 let answerGetsWith: unknown | null = null
 /** While set, a config GET waits for it (a slow load). */
 let holdGets: Promise<void> | null = null
+let presetFailure: number | null = null
+let presetAnswer: unknown | null = null
 
 /**
  * A browser's view of the routes this panel loads: `/api/memory/config` goes to the REAL route
@@ -114,6 +123,8 @@ function installRoutes() {
   failGetsWith = null
   answerGetsWith = null
   holdGets = null
+  presetFailure = null
+  presetAnswer = null
   const locals = { user: { id: USER } }
   vi.stubGlobal(
     'fetch',
@@ -138,6 +149,8 @@ function installRoutes() {
       }
       if (path === '/api/agents' && method === 'GET') return jsonResponse({ agents: [] })
       if (path === '/api/user/saved-models' && method === 'GET') {
+        if (presetFailure !== null) return jsonResponse({ error: 'Preset list unavailable' }, presetFailure)
+        if (presetAnswer !== null) return jsonResponse(presetAnswer)
         return jsonResponse({
           models: [
             {
@@ -192,7 +205,24 @@ async function tryToPressSave() {
 describe('Memory Settings never turns a failed load into a save (BL-962)', () => {
   const originalFetch = global.fetch
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    if (process.env.VITEST_USE_REAL_REDIS !== 'true') {
+      // e177b5a85 made setMemoryConfig one Lua write, and the default lane's Redis fake has no EVAL
+      // (the route answered 400 "client.eval is not a function"). This is a default-lane stand-in
+      // for that Lua writer: it validates like it and stores the whole record (the script patches only
+      // `$.embedding` and `$.schema_version` of an existing one; these cases seed no other field). It is
+      // valid only for these non-preset cases (it skips preset reference admission), so a preset lane
+      // refuses here instead of saving unchecked.
+      const owner = await import('$lib/server/services/memory/memoryIndex')
+      const { canonicalEmbeddingModelId } = await import('$lib/server/services/memory/memoryEmbedder')
+      vi.spyOn(owner, 'setMemoryConfig').mockImplementation(async (embedding) => {
+        if (embedding.lane === 'preset') throw new Error('default-lane setMemoryConfig stand-in: preset lanes need the real writer')
+        const record = { embedding: structuredClone(embedding), schema_version: MEMORY_SCHEMA_VERSION }
+        canonicalEmbeddingModelId(record.embedding)
+        await redis.json.set(MEMORY_CONFIG_KEY, '$', record as never)
+        return record as Awaited<ReturnType<typeof owner.setMemoryConfig>>
+      })
+    }
     ensureBrowserStubs()
     vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -203,6 +233,107 @@ describe('Memory Settings never turns a failed load into a save (BL-962)', () =>
     vi.restoreAllMocks()
     global.fetch = originalFetch
   })
+
+  it.each(['failed', 'malformed'] as const)('a %s preset list is unknown, never a missing saved preset or an empty successful list', async mode => {
+    await seedStored(SAVED_PRESET)
+    installRoutes()
+    if (mode === 'failed') presetFailure = 500
+    else presetAnswer = {}
+    renderPanel()
+    expect(await screen.findByText(PRESETS_UNAVAILABLE)).toBeVisible()
+    expect(screen.getByText(/text-embedding-3-small.*preset status unavailable/)).toBeTruthy()
+    expect(screen.queryByText(/preset missing/)).toBeNull()
+    expect(screen.queryByText(/No model presets yet/)).toBeNull()
+    expect(puts).toEqual([])
+    expect(await storedConfig()).toEqual(SAVED_PRESET_RECORD())
+    expect(saveButton()).not.toBeDisabled()
+    await fireEvent.click(reindexButton() as HTMLElement)
+    expect(await screen.findByText('Re-Index All Memories?')).toBeVisible()
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel', exact: true }))
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/api/memory/reindex'))).toEqual([])
+    expect(await storedConfig()).toEqual(SAVED_PRESET_RECORD())
+  }, 60_000)
+
+  it('a successful empty preset list can report a missing choice without clearing the stored selection', async () => {
+    await seedStored(SAVED_PRESET)
+    installRoutes()
+    presetAnswer = { models: [] }
+    renderPanel()
+    expect(await screen.findByText(/text-embedding-3-small.*preset missing/)).toBeTruthy()
+    expect(screen.queryByText(PRESETS_UNAVAILABLE)).toBeNull()
+    expect(puts).toEqual([])
+    expect(await storedConfig()).toEqual(SAVED_PRESET_RECORD())
+  }, 60_000)
+
+  it('an unavailable preset read keeps the last-good label and options without changing the draft', async () => {
+    const changed = vi.fn()
+    const presets = [{ id: SAVED_PRESET.preset.presetId, modelId: 'text-embedding-3-small', modelName: 'Saved embedding', provider: 'openai', purpose: 'utility' }]
+    const draft = { ...SAVED_PRESET, localAi: SAVED_LOCAL_AI.localAi, api: { provider: 'openai', modelName: '', dims: 0 } }
+    const view = render(MemorySystemCard, { props: { draft: draft as any, presets, presetsState: 'ready', indexStatusCurrent: true,
+      indexMeta: null, builtinModels: [], apiProviders: [], onDraftChange: changed, onSave: vi.fn(), onReindex: vi.fn() } as any })
+    expect(screen.getByText('Saved embedding — openai')).toBeTruthy()
+    await view.rerender({ presetsState: 'unavailable' } as any)
+    expect(screen.getByText(PRESETS_UNAVAILABLE)).toBeVisible()
+    expect(screen.getByText('Saved embedding — openai')).toBeTruthy()
+    expect(screen.queryByText(/preset missing/)).toBeNull()
+    expect(changed).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('failed post-save config read makes an old mismatch=%s unknown without changing the index', async wasMismatch => {
+    await seedStored(DEFAULT_EMBEDDING)
+    const index = { embedding_model: canonicalEmbeddingModelId((wasMismatch ? NEXT_EMBEDDING : DEFAULT_EMBEDDING) as any), dims: wasMismatch ? 384 : 768,
+      index_schema_version: 1, schema_version: MEMORY_SCHEMA_VERSION, last_rebuilt_at: '2026-10-01T00:00:00.000Z' }
+    await redis.json.set(MEMORY_INDEX_META_KEY, '$', index)
+    installRoutes()
+    renderPanel()
+    await waitFor(() => expect(saveButton()).not.toBeNull())
+    expect(Boolean(screen.queryByText(new RegExp(MISMATCH)))).toBe(wasMismatch)
+    await fireEvent.keyDown(screen.getByRole('button', { name: 'embeddinggemma-300m', exact: true }), { key: 'ArrowDown' })
+    await fireEvent.pointerUp(await screen.findByRole('option', { name: /all-minilm-l6-v2/ }), { pointerType: 'mouse' })
+    const info = vi.spyOn(toast, 'info').mockImplementation(() => '' as any)
+    failGetsWith = 500
+    await fireEvent.click(saveButton() as HTMLElement)
+    expect(await screen.findByText(INDEX_UNAVAILABLE)).toBeVisible()
+    expect(screen.queryByText(new RegExp(MISMATCH))).toBeNull()
+    expect(screen.queryByText('Not built yet (it builds on app start).')).toBeNull()
+    expect(info).not.toHaveBeenCalled()
+    expect(puts).toHaveLength(1)
+    expect(await storedConfig()).toEqual({ embedding: NEXT_EMBEDDING, schema_version: MEMORY_SCHEMA_VERSION })
+    expect(await redis.json.get(MEMORY_INDEX_META_KEY)).toEqual(index)
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/api/memory/reindex'))).toEqual([])
+    expect(saveButton()).not.toBeDisabled()
+  }, 60_000)
+
+  it('only a successful current config readback presents a changed-model mismatch and its re-index notice', async () => {
+    await seedStored(DEFAULT_EMBEDDING)
+    const index = { embedding_model: canonicalEmbeddingModelId(DEFAULT_EMBEDDING as any), dims: 768, index_schema_version: 1,
+      schema_version: MEMORY_SCHEMA_VERSION, last_rebuilt_at: '2026-10-01T00:00:00.000Z' }
+    await redis.json.set(MEMORY_INDEX_META_KEY, '$', index)
+    installRoutes()
+    renderPanel()
+    await waitFor(() => expect(saveButton()).not.toBeNull())
+    await fireEvent.keyDown(screen.getByRole('button', { name: 'embeddinggemma-300m', exact: true }), { key: 'ArrowDown' })
+    await fireEvent.pointerUp(await screen.findByRole('option', { name: /all-minilm-l6-v2/ }), { pointerType: 'mouse' })
+    const info = vi.spyOn(toast, 'info').mockImplementation(() => '' as any)
+    await fireEvent.click(saveButton() as HTMLElement)
+    expect(await screen.findByText(new RegExp(MISMATCH))).toBeVisible()
+    await waitFor(() => expect(info).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText(INDEX_UNAVAILABLE)).toBeNull()
+    expect(await redis.json.get(MEMORY_INDEX_META_KEY)).toEqual(index)
+  }, 60_000)
+
+  it('an incomplete post-save status envelope is unknown rather than proof of a missing or matching index', async () => {
+    await seedStored(DEFAULT_EMBEDDING)
+    installRoutes()
+    renderPanel()
+    await waitFor(() => expect(saveButton()).not.toBeNull())
+    answerGetsWith = { embedding: DEFAULT_EMBEDDING }
+    await fireEvent.click(saveButton() as HTMLElement)
+    expect(await screen.findByText(INDEX_UNAVAILABLE)).toBeVisible()
+    expect(screen.queryByText('Not built yet (it builds on app start).')).toBeNull()
+    expect(puts).toHaveLength(1)
+    expect(await storedConfig()).toEqual({ embedding: DEFAULT_EMBEDDING, schema_version: MEMORY_SCHEMA_VERSION })
+  }, 60_000)
 
   it('the load fails and the user presses Save: nothing is sent and the saved preset lane is still stored', async () => {
     await seedStored(SAVED_PRESET)

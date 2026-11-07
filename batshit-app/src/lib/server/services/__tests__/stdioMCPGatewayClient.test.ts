@@ -80,6 +80,18 @@ describe('stdioMCPGatewayClient', () => {
     })
   })
 
+  it('keeps an ordinary already-resolved launch exact and closes only its actual client', async () => {
+    const close = vi.fn().mockResolvedValue(undefined)
+    mockCreateMCPClient.mockResolvedValue({ close })
+    const { stdioMCPGatewayClient } = await import('../stdioMCPGatewayClient')
+    const resolved = { command: '/owned/node', args: ['/owned/server.cjs','literal'], cwd: '/owned', env: {}, startupTimeoutMs: 1000, toolCallTimeoutMs: 2000 }
+    const opened = await stdioMCPGatewayClient.createClient({ gateway: { id: 'ordinary', name: 'Ordinary', type: 'stdio', enabled: true,
+      created_at: '2026-10-21T00:00:00Z', stdioConfig: { command: 'unused' } }, resolved })
+    expect(mockResolveStdioGatewayProcessConfig).not.toHaveBeenCalled()
+    expect(transportInstances[0].config).toEqual({ command: resolved.command, args: resolved.args, cwd: resolved.cwd, env: {}, stderr: 'pipe' })
+    expect(opened.toolCallTimeoutMs).toBe(2000)
+    await opened.client.close(); expect(close).toHaveBeenCalledOnce(); expect(transportInstances[0].close).not.toHaveBeenCalled()
+  })
   it('returns a failed health check when the client startup throws', async () => {
     mockCreateMCPClient.mockRejectedValue(new Error('spawn ENOENT'))
 

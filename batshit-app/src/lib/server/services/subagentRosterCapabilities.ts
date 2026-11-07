@@ -21,6 +21,8 @@
  */
 
 import type { SubagentType } from '$lib/utils/subagentType'
+import { formatDelegationDuration, normalizeSubagentTimeoutSeconds } from '$lib/utils/subagentTimeout'
+import { normalizeSubagentMaxToolSteps } from '$lib/utils/subagentToolSteps'
 import type { AgentSlashCapability } from '$lib/server/services/slashCommandCapabilities'
 import type { SubagentResolvedScope } from '$lib/server/services/subagentRuntimeScope'
 
@@ -29,7 +31,7 @@ const MAX_ROSTER_SKILLS = 6
 /** MCP gateways listed inline before the roster switches to a count. */
 const MAX_ROSTER_GATEWAYS = 4
 
-export type SubagentThreadState = 'none' | 'resumable'
+export type SubagentThreadState = 'none' | 'resumable' | 'unavailable'
 
 export interface SubagentRosterCapabilityInput {
   scope: SubagentResolvedScope
@@ -39,16 +41,15 @@ export interface SubagentRosterCapabilityInput {
   model?: string | null
   provider?: string | null
   threadState: SubagentThreadState
+  /** The Subagent's own time limit in seconds, when it sets one (delegation limits). */
+  timeoutSeconds?: unknown
+  /** The Subagent's own tool-step limit, when it sets one. */
+  maxToolSteps?: unknown
 }
 
-const SUBAGENT_TYPE_LABELS: Record<string, string> = {
-  'n8n-workflow': 'n8n Workflow Subagent',
-  api: 'API Subagent',
-  cli: 'CLI Subagent'
-}
-
-export function subagentTypeLabel(type: SubagentType | string): string {
-  return SUBAGENT_TYPE_LABELS[type] ?? 'Subagent'
+/** SA-139 R6 (D16): one Subagent kind, so the roster line names the role, never a type. */
+export function subagentTypeLabel(_type: SubagentType | string): string {
+  return 'Subagent'
 }
 
 function formatModel(input: SubagentRosterCapabilityInput): string {
@@ -56,34 +57,18 @@ function formatModel(input: SubagentRosterCapabilityInput): string {
   const provider = input.provider?.trim()
   if (model && provider) return `${provider}/${model}`
   if (model) return model
-  // Honest absence over an invented default: an n8n Workflow Subagent's model lives in the
-  // workflow, and a CLI subagent may inherit the primary's CLI model at run time.
+  // Honest absence over an invented default: a subagent with no model of its own runs on the
+  // primary's model at run time.
   return 'not set here'
 }
 
-/**
- * Tool families in the shape the primary can act on. n8n Workflow Subagents are a
- * deliberate special case: their tools are wired inside the n8n workflow, so Batshit has
- * nothing truthful to enumerate and says so rather than printing an empty list.
- */
+/** Tool families in the shape the primary can act on. */
 function formatToolFamilies(input: SubagentRosterCapabilityInput): string {
-  if (input.scope.subagentType === 'n8n-workflow') return 'defined in n8n'
-
   const native = input.scope.nativeToolSettings
   const families: string[] = []
 
-  if (input.scope.subagentType === 'cli') {
-    // BL-878 (Josh, 2026-09-28): a CLI Subagent runs commands and searches with the CLI's own
-    // built-in tools. Its Bash and Web Search switches are off and greyed out on screen, and
-    // Batshit gives its runs neither (`CLI_LANE_GETS_BATSHIT_BASH`; Batshit's Web Search is not
-    // offered to the CLI lane), yet the shared resolver turns an absent value on, so printing
-    // "Bash" or "Web Search" from those toggles told the primary a CLI Subagent had tools that
-    // its own settings do not govern. Say what it does have. Its Batshit tools follow below.
-    families.push('built-in CLI tools')
-  } else {
-    if (native.bashEnabled) families.push('Bash')
-    if (native.webSearchEnabled) families.push('Web Search')
-  }
+  if (native.bashEnabled) families.push('Bash')
+  if (native.webSearchEnabled) families.push('Web Search')
 
   if (native.dynamicMcpEnabled) {
     const gateways = input.scope.resolvedGateways
@@ -116,17 +101,35 @@ function formatSkills(capabilities: AgentSlashCapability[]): string {
 }
 
 /**
- * The trailing `— type; model; tools: …; skills: …; thread: …` fragment for one roster
- * line. Deterministic for a given set of records so it never churns the DCM between sends.
+ * Delegation limits (Josh, 2026-10-24): a Subagent has no time or tool-step limit unless it
+ * sets one, so its roster line names a limit only when one is set (`limits: 2 hours, 40 tool
+ * steps`), and says nothing otherwise.
+ */
+function formatLimits(input: SubagentRosterCapabilityInput): string | null {
+  const parts: string[] = []
+  const seconds = normalizeSubagentTimeoutSeconds(input.timeoutSeconds)
+  if (seconds !== undefined) parts.push(formatDelegationDuration(seconds))
+  const steps = normalizeSubagentMaxToolSteps(input.maxToolSteps)
+  if (steps !== undefined) parts.push(`${steps} tool step${steps === 1 ? '' : 's'}`)
+  return parts.length > 0 ? parts.join(', ') : null
+}
+
+/**
+ * The trailing `— Subagent; model; tools: …; skills: …; [limits: …;] thread: …` fragment for one
+ * roster line. Deterministic for a given set of records so it never churns the DCM between
+ * sends.
  */
 export function buildSubagentRosterCapabilityFragment(
-  input: SubagentRosterCapabilityInput
+  input: SubagentRosterCapabilityInput,
+  options: { includeThread?: boolean } = {}
 ): string {
+  const limits = formatLimits(input)
   return [
     subagentTypeLabel(input.scope.subagentType),
     `model: ${formatModel(input)}`,
     `tools: ${formatToolFamilies(input)}`,
     `skills: ${formatSkills(input.capabilities)}`,
-    `thread: ${input.threadState}`
+    ...(limits ? [`limits: ${limits}`] : []),
+    ...(options.includeThread === false ? [] : [`thread: ${input.threadState}`])
   ].join('; ')
 }

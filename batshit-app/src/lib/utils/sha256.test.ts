@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { createHash } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
-import { sha256Hex } from './sha256'
+import { sha256BytesHex, sha256Hex } from './sha256'
 
 const nodeHash = (text: string) => createHash('sha256').update(Buffer.from(new TextEncoder().encode(text))).digest('hex')
 
@@ -26,5 +26,15 @@ describe('sha256Hex (BL-474 step 2: the server and the page bind a decision to t
 
   it('reads a lone surrogate as U+FFFD, as UTF-8 storage keeps it', () => {
     expect(sha256Hex('a\uD800b')).toBe(sha256Hex('a�b'))
+  })
+
+  it('hashes binary bytes and exact sliced views without mutation', () => {
+    for (const length of [0, 1, 55, 56, 63, 64, 65, 400_104]) {
+      const buffer = Uint8Array.from({ length: length + 8 }, (_, index) => (index * 73 + 128) & 255)
+      const before = buffer.slice()
+      const view = buffer.subarray(3, 3 + length)
+      expect(sha256BytesHex(view)).toBe(createHash('sha256').update(view).digest('hex'))
+      expect(buffer).toEqual(before)
+    }
   })
 })

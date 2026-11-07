@@ -1,14 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RequestEvent } from '@sveltejs/kit'
+import { BUILTIN_PLUGIN_SKILLS } from '$lib/server/services/systemPluginPackage'
 
-vi.mock('$lib/server/redis', () => ({
-  redis: {
-    json: {
-      get: vi.fn(),
-      set: vi.fn()
+const reads = vi.hoisted(() => ({ command: vi.fn(), plugin: vi.fn() }))
+
+vi.mock('$lib/server/redis', () => {
+  const get = vi.fn((key: string) => key.startsWith('agent_plugin:') ? reads.plugin(key) : reads.command(key))
+  return {
+    redis: {
+      execute: (callback: any) => callback({ keys: async () => ['agent_plugin:user-1:batshit'], json: { get } }),
+      json: { get, getRaw: async () => null, set: vi.fn() }
     }
   }
-}))
+})
 
 vi.mock('$lib/server/services/skillRegistry', () => ({
   evaluateSkillDependencies: vi.fn(),
@@ -45,6 +49,14 @@ const baseCommand = {
   updated_at: new Date().toISOString()
 }
 
+const plugin = {
+  id: 'batshit', user_id: 'user-1', name: 'Batshit', description: 'Explicit test plugin access',
+  builtIn: true, version: '1.1.0', revision: 'test-plugin-access',
+  skills: BUILTIN_PLUGIN_SKILLS.map(skill => ({ commandId: skill.commandId, skillId: skill.skillId,
+    name: skill.displayName, invocation: `/batshit:${skill.commandId}` })),
+  enabled_for_all_agents: true, enabled_agent_ids: [], created_at: 'test-created', updated_at: 'test-updated'
+}
+
 function buildEvent(body: Record<string, unknown>): RequestEvent {
   const request = new Request('http://localhost/api/slash-commands/cmd-skill/invoke', {
     method: 'POST',
@@ -62,7 +74,8 @@ function buildEvent(body: Record<string, unknown>): RequestEvent {
 describe('POST /api/slash-commands/[id]/invoke (skill)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    vi.mocked(redis.json.get).mockResolvedValue(baseCommand as any)
+    reads.command.mockResolvedValue(baseCommand)
+    reads.plugin.mockResolvedValue(plugin)
     vi.mocked(redis.json.set).mockResolvedValue(true as any)
     vi.mocked(evaluateSkillDependencies).mockResolvedValue({ statuses: [] } as any)
     vi.mocked(bootstrapSystemSlashCommands).mockResolvedValue({} as any)
@@ -112,7 +125,7 @@ describe('POST /api/slash-commands/[id]/invoke (skill)', () => {
   })
 
   it('prefers live skill dependencies for unified artifacts skill', async () => {
-    vi.mocked(redis.json.get).mockResolvedValue({
+    reads.command.mockResolvedValue({
       ...baseCommand,
       id: 'artifact-creator',
       name: 'artifact-creator',
@@ -178,7 +191,7 @@ describe('POST /api/slash-commands/[id]/invoke (skill)', () => {
       skill_id: 'artifact_creator'
     }
 
-    vi.mocked(redis.json.get)
+    reads.command
       .mockResolvedValueOnce(staleCommand as any)
       .mockResolvedValueOnce(repairedCommand as any)
     vi.mocked(expectedSystemSkillIdForCommand).mockReturnValue('artifact_creator')
@@ -211,7 +224,7 @@ describe('POST /api/slash-commands/[id]/invoke (skill)', () => {
   })
 
   it('allows invocation for commands enabled for all agents', async () => {
-    vi.mocked(redis.json.get).mockResolvedValue({
+    reads.command.mockResolvedValue({
       ...baseCommand,
       enabled_for_all_agents: true,
       enabled_agent_ids: []
@@ -227,5 +240,21 @@ describe('POST /api/slash-commands/[id]/invoke (skill)', () => {
     expect(response.status).toBe(200)
     const payload = await response.json()
     expect(payload.expansion).toContain('Use the global route')
+  })
+
+  it('refuses unreadable plugin access without assuming the test grant', async () => {
+    reads.plugin.mockResolvedValue({ ...plugin, enabled_agent_ids: 'unreadable' })
+    const response = await POST(buildEvent({ agentId: 'agent-1', rawArgs: '' }))
+    expect(response.status).toBe(500)
+    expect(await response.json()).toEqual({ error: 'Failed to invoke slash command' })
+    expect(getSkill).not.toHaveBeenCalled()
+  })
+
+  it('keeps a disabled plugin disabled despite enabled legacy command fields', async () => {
+    reads.command.mockResolvedValue({ ...baseCommand, id: 'artifact-creator', skill_id: 'artifact_creator', enabled_for_all_agents: true })
+    reads.plugin.mockResolvedValue({ ...plugin, enabled_for_all_agents: false })
+    const response = await POST(buildEvent({ agentId: 'agent-1', rawArgs: '' }))
+    expect(response.status).toBe(403)
+    expect(getSkill).not.toHaveBeenCalled()
   })
 })

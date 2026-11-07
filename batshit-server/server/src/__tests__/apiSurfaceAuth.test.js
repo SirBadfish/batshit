@@ -29,6 +29,7 @@ const TEST_TOKEN = 'gauntlet-security-wave-test-token';
 
 let child;
 let baseUrl;
+let fixtureDir;
 let backupStagingDir;
 
 async function findFreePort() {
@@ -61,13 +62,19 @@ async function waitForHealth(url, timeoutMs = 20000) {
 }
 
 beforeAll(async () => {
-  backupStagingDir = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-server-backup-stage-test-'));
+  fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-server-backup-stage-test-'));
+  backupStagingDir = path.join(fixtureDir, 'staging');
+  await fs.mkdir(backupStagingDir, { mode: 0o700 });
+  // File config overrides environment values, so never inherit the caller's config.
+  const configPath = path.join(fixtureDir, 'config.json');
+  await fs.writeFile(configPath, '{}', { flag: 'wx', mode: 0o600 });
   const port = await findFreePort();
   baseUrl = `http://127.0.0.1:${port}`;
   child = spawn(process.execPath, ['src/index.js'], {
     cwd: SERVER_ROOT,
     env: {
       ...process.env,
+      CONFIG_PATH: configPath,
       PORT: String(port),
       BATSHIT_SERVER_HOST: '127.0.0.1',
       // A developer .env may flip these (e.g. HTTPS_ONLY); the proof needs plain HTTP.
@@ -102,7 +109,7 @@ afterAll(async () => {
       });
     });
   }
-  if (backupStagingDir) await fs.rm(backupStagingDir, { recursive: true, force: true });
+  if (fixtureDir) await fs.rm(fixtureDir, { recursive: true, force: true });
 });
 
 const tokenHeaders = { 'x-batshit-service-token': TEST_TOKEN };
@@ -159,6 +166,7 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
     { method: 'POST', path: '/api/upload' },
     { method: 'POST', path: '/api/upload/single' },
     { method: 'POST', path: '/api/upload/avatar' },
+    { method: 'POST', path: '/api/upload/goon-custom-package/inspect', body: { filename: 'test.bgoon' } },
     { method: 'DELETE', path: '/api/upload/asset', body: { uploadType: 'images', filename: 'x.png' } },
     { method: 'POST', path: '/api/upload/asset-deletion/reserve', body: { uploadType: 'goon_custom_models', filename: 'x.glb' } },
     { method: 'POST', path: '/api/upload/asset-maintenance/begin', body: { token: '00000000-0000-4000-8000-000000000000' } },
@@ -271,67 +279,6 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
       },
     );
     expect(replay.status).toBe(401);
-  });
-
-  it('rejects a Clothing artifact without exact immutable-owner IDs before storage', async () => {
-    const form = new FormData();
-    form.set('role', 'motion-definition');
-    form.set('file', new Blob(['{}'], { type: 'application/json' }), 'motion.json');
-    const response = await fetch(`${baseUrl}/api/upload/goon-clothing-asset`, {
-      method: 'POST',
-      headers: tokenHeaders,
-      body: form,
-    });
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual(
-      expect.objectContaining({ error: expect.stringContaining('assetId must be') }),
-    );
-  });
-
-  it.each([
-    {
-      label: 'unknown role',
-      role: 'archive',
-      filename: 'garment.zip',
-      bytes: Uint8Array.from([0x50, 0x4b, 0x03, 0x04]),
-      error: 'role is unsupported',
-    },
-    {
-      label: 'spoofed GLB',
-      role: 'geometry',
-      filename: 'garment.glb',
-      bytes: new TextEncoder().encode('{}'),
-      error: 'content does not match .glb',
-    },
-    {
-      label: 'non-object JSON',
-      role: 'motion-definition',
-      filename: 'motion.json',
-      bytes: new TextEncoder().encode('[]'),
-      error: 'must contain one JSON object',
-    },
-    {
-      label: 'spoofed PNG',
-      role: 'base-color',
-      filename: 'base-color.png',
-      bytes: new TextEncoder().encode('not a png'),
-      error: 'content does not match .png',
-    },
-  ])('rejects Clothing $label bytes before storage', async ({ role, filename, bytes, error }) => {
-    const form = new FormData();
-    form.set('assetId', 'fixture-top');
-    form.set('revisionId', 'fixture-top-r1');
-    form.set('role', role);
-    form.set('file', new Blob([bytes]), filename);
-    const response = await fetch(`${baseUrl}/api/upload/goon-clothing-asset`, {
-      method: 'POST',
-      headers: tokenHeaders,
-      body: form,
-    });
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual(
-      expect.objectContaining({ error: expect.stringContaining(error) }),
-    );
   });
 
   it('executes an allow-listed tool with the token (file-tree lane stays alive)', async () => {

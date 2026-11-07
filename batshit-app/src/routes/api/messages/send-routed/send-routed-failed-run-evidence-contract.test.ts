@@ -16,9 +16,10 @@ const source = readFileSync('src/routes/api/messages/send-routed/+server.ts', 'u
  */
 describe('send-routed: the evidence of a reply that failed mid-stream (BL-245)', () => {
   it('shows the recorder every part the loop reads, before the loop acts on it', () => {
-    const loop = source.indexOf('\n    for await (const chunk of result.stream) {\n')
+    const loop = source.indexOf('\n    for await (const chunk of withToolResultsOnStop(result.stream, streamAbortSignal, {\n')
     const switchAt = source.indexOf('\n      switch (chunk.type) {\n', loop)
     expect(loop).toBeGreaterThan(-1)
+    expect(source.slice(loop, switchAt)).toContain('onEarlyEnd: () => resolveOnFinish?.(),')
     expect(source.slice(loop, switchAt + 1)).toContain('\n      streamStepRecorder.observe(chunk)\n')
   })
 
@@ -26,27 +27,33 @@ describe('send-routed: the evidence of a reply that failed mid-stream (BL-245)',
     const catchAt = source.indexOf('\n  } catch (error: any) {\n    const isAbortError = isStopError(')
     const firstSnapshot = source.indexOf("persistRuntimeSnapshot('failed'", catchAt)
     const block = source.slice(catchAt, firstSnapshot)
-    expect(block).toContain('\n    if (!isCliProvider) {\n')
+    expect(catchAt).toBeGreaterThan(-1)
+    expect(firstSnapshot).toBeGreaterThan(catchAt)
+    // SA-139 R4: the API lane is the only Primary run, so the write has no lane condition.
+    expect(source).not.toContain('isCliProvider')
     expect(block).toContain(
-      "\n      const recordedSteps = streamStepRecorder.steps(isAbortError ? 'interrupted' : 'error')\n      if (recordedSteps.length > 0 && llmCaptureClaim.claim('failure')) {\n"
+      "\n    const recordedSteps = streamStepRecorder.steps(isAbortError ? 'interrupted' : 'error')\n    if (recordedSteps.length > 0 && llmCaptureClaim.claim('failure')) {\n"
     )
     // No run total: a call that never finished makes the total unknown, never a partial sum.
-    expect(block).toContain('\n            totalUsage: null,\n')
-    expect(block).toContain('\n            llmCalls: capture.llmCalls,\n')
+    expect(block).toContain('\n          totalUsage: null,\n')
+    expect(block).toContain('\n          llmCalls: capture.llmCalls,\n')
   })
 
   it('the finish callback claims the calls before it awaits anything, and writes them only if it owns them (review finding 1)', () => {
     // It can still be busy when the loop's 2 s wait for it ends and a failure path runs; the
     // snapshot merge keeps both writers' rows, so two writers showed the calls twice.
+    // SA-139 R4: the API lane's write is the only one left, so it is no longer an `else` branch.
     const branch = source.indexOf(
-      "\n        } else {\n          // Claimed before anything here awaits: a failure path that runs while this callback\n"
+      "\n      try {\n        // Claimed before anything here awaits: a failure path that runs while this callback\n"
     )
     expect(branch).toBeGreaterThan(-1)
-    const body = source.slice(branch, source.indexOf('\n          // SA-093 P4 (`API` lane)', branch))
-    const claim = body.indexOf("\n          const ownsLlmCapture = llmCaptureClaim.claim('finish')\n")
+    const bodyEnd = source.indexOf('\n        // SA-093 P4 (`API` lane)', branch)
+    expect(bodyEnd).toBeGreaterThan(branch)
+    const body = source.slice(branch, bodyEnd)
+    const claim = body.indexOf("\n        const ownsLlmCapture = llmCaptureClaim.claim('finish')\n")
     expect(claim).toBeGreaterThan(-1)
     expect(body.slice(0, claim)).not.toContain('await ')
-    expect(body).toContain('\n            ...(ownsLlmCapture\n              ? {\n                  llmSummary: capture.llmSummary,\n                  llmCalls: capture.llmCalls,\n')
+    expect(body).toContain('\n          ...(ownsLlmCapture\n            ? {\n                llmSummary: capture.llmSummary,\n                llmCalls: capture.llmCalls,\n')
     expect(source.split('llmCaptureClaim.claim(').length - 1).toBe(2)
   })
 
@@ -57,7 +64,11 @@ describe('send-routed: the evidence of a reply that failed mid-stream (BL-245)',
 
   it('reads the provider’s own words out of an error chunk before anything else', () => {
     const errorCase = source.indexOf("\n        case 'error': {\n          await flushRawReasoningFallback()\n")
-    const body = source.slice(errorCase, source.indexOf("\n        case 'steer': {\n", errorCase))
+    // SA-139 R4: the CLI `steer` case that followed it went with the lane.
+    const errorCaseEnd = source.indexOf("\n        case 'finish-step': {\n", errorCase)
+    expect(errorCase).toBeGreaterThan(-1)
+    expect(errorCaseEnd).toBeGreaterThan(errorCase)
+    const body = source.slice(errorCase, errorCaseEnd)
     expect(body).toContain('\n          const providerError = providerStreamErrorFrom(rawError)\n')
     expect(body).toContain(
       '\n          if (providerError) {\n            normalizedError = providerError\n          } else if (rawError instanceof Error) {\n'

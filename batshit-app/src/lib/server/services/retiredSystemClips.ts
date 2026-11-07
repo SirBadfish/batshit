@@ -5,7 +5,7 @@ import { removeClipFromSessionState } from '$lib/server/services/clipDeletion'
 // detaches them from any session that still references them, so instances
 // created before the retirement converge on the current System Clip set.
 // SA-092: the Batshit Guide clip became the /batshit-guide system skill.
-const RETIRED_SYSTEM_CLIP_IDS = ['batshit_guide']
+const RETIRED_SYSTEM_CLIP_IDS = ['batshit_guide', 'goon_guide']
 
 const SYSTEM_CLIPS_SET_KEY = 'user:system:clips'
 

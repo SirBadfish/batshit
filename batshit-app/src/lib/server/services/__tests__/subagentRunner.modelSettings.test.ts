@@ -39,12 +39,6 @@ vi.mock('$lib/server/services/providers', () => {
   }
 })
 
-vi.mock('$lib/server/services/codexBridge', () => ({ CodexBridge: vi.fn() }))
-vi.mock('$lib/server/services/claudeBridge', () => ({ ClaudeBridge: vi.fn() }))
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  buildAgentProfileId: vi.fn((value: string) => `profile-${value}`),
-  prepareManagedCodexSubagentProfile: vi.fn(),
-}))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   prepareManagedClaudeSubagentProfile: vi.fn(),
 }))
@@ -73,7 +67,7 @@ vi.mock('$lib/server/services/subagentRuntimeScope', () => ({
     dcmDisplaySettings: { version: 1, groups: {}, tools: {} },
     projectPath: null,
   })),
-  buildManagedSubagentDynamicInfo: vi.fn(async () => ''),
+  prepareManagedSubagentDynamicInfo: vi.fn(async () => () => ''),
   appendManagedSubagentDynamicInfo: (systemPrompt: string) => systemPrompt,
 }))
 
@@ -267,6 +261,20 @@ beforeEach(() => {
 })
 
 describe('BL-800: a Subagent run sends its preset settings (the request body the provider gets)', () => {
+  // SA-139 R1: the retired Codex CLI is never detected by a model-name substring. An API
+  // Subagent on an OpenAI model whose id contains "codex" runs on the API lane as before.
+  it('runs an API Subagent on an OpenAI "codex" model id on the API lane, untouched by the Codex CLI refusal', async () => {
+    const preset = { id: 'preset-openai-codex-model', provider: 'openai', modelId: 'gpt-5-codex',
+      connection: { id: 'direct:openai', type: 'direct', service: 'openai' }, settings: {} }
+    subagentRedis.seed(`model:${preset.id}`, preset)
+    const bodies = useLane('lmstudio')
+
+    const result = await run(subagentFor(preset))
+
+    expect(result).toMatchObject({ status: 'completed', subagentType: 'api' })
+    expect(bodies).toHaveLength(1)
+  })
+
   it('sends the temperature, max tokens, top p, reasoning setting and Custom Parameter of the preset', async () => {
     const preset = localPreset({
       temperature: 0.3,
@@ -377,12 +385,14 @@ describe('BL-800: a Subagent run sends its preset settings (the request body the
 
     expect(bodies).toHaveLength(1)
     expect(bodies[0]).toMatchObject({ temperature: 0.2, max_tokens: 1024 })
-    // The system cache point is still there, on Anthropic's default lifetime.
+    // The system cache point is still there, on Anthropic's default lifetime, and (BL-1976) the
+    // request-level point rides even a one-call run.
     expect(bodies[0].system.at(-1).cache_control).toEqual({ type: 'ephemeral' })
+    expect(bodies[0].cache_control).toEqual({ type: 'ephemeral' })
     expect(JSON.stringify(bodies[0])).not.toContain('"ttl"')
   })
 
-  it('a delegated tool loop keeps its step-2 cache point AND the preset\'s other provider options (the per-step merge)', async () => {
+  it('a delegated tool loop keeps its tool-loop cache point AND the preset\'s other provider options (the per-step merge)', async () => {
     const preset = anthropicPreset({ temperature: 0.2, maxTokens: 1024, disableParallelToolUse: true, cacheControl: '1h' })
     subagentRedis.seed(`model:${preset.id}`, preset)
     // The tool the run calls: one step calls it, the second answers.
@@ -414,9 +424,10 @@ describe('BL-800: a Subagent run sends its preset settings (the request body the
       expect(body.tool_choice).toMatchObject({ disable_parallel_tool_use: true })
       expect(body.system.at(-1).cache_control).toEqual({ type: 'ephemeral' })
     }
-    // BL-183: no conversation-end cache point on the first request, the request-level one from the
-    // second on, on the five-minute lifetime (the preset's 1-hour TTL is not sent).
-    expect(bodies[0].cache_control).toBeUndefined()
+    // BL-1976 (Josh, 2026-10-21; Subagents and Workers share the hook): the request-level cache
+    // point from the FIRST request on (BL-183 started it on the second), on the five-minute lifetime
+    // (the preset's 1-hour TTL is not sent).
+    expect(bodies[0].cache_control).toEqual({ type: 'ephemeral' })
     expect(bodies[1].cache_control).toEqual({ type: 'ephemeral' })
     expect(JSON.stringify(bodies)).not.toContain('"ttl"')
   })

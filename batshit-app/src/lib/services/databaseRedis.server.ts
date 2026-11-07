@@ -1,3 +1,10 @@
+import { createSkillDcmUpdate, type SkillDcmUpdate } from '$lib/server/services/skillDcmUpdate'
+import { classifyStoredSkillReadZip } from '$lib/utils/skillReadZip'
+import { readOpenSkillSessions, previewOpenSkillSessions, readSkillSessionRecordForCompile, projectSkillSessionsForPendingMessage } from '$lib/server/services/skillSessions'
+import { recoverOpenSkillReadMessages } from '$lib/server/services/skillSessionCompile'
+import { withZipStateLock } from '$lib/server/services/zipStateLock'
+import { buildOpenSkillsDcmLines, type OpenSkillSession } from '$lib/utils/skillSessions'
+import { buildOpenSkillContext, replaceOpenSkillSectionBody, replaceOpenSkillSectionInDcm } from '$lib/server/services/openSkillContext'
 // Database service for Redis operations - Re-export layer
 // Maintains the existing API while delegating to focused service clients.
 
@@ -8,6 +15,8 @@ import { agentStore } from './agentStore'
 import { slashCommandStore } from './slashCommandStore'
 import { userStore, type DeleteFolderOptions } from './userStore'
 import { redis } from '$lib/server/redis'
+import { agentSetupCache, renderAgentSetup, renderSetupChanges, setupMetadata, setupTokenEstimate, type AgentSetupBlock, type LiveAgentSetup, type PreparedAgentSetup } from '$lib/server/services/agentSetupCache'
+import { assertSettingsLifecycle, captureSettingsLifecycle } from '$lib/server/services/appActions/settings/lifecycle'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
 import { readPackagedCoreSystemPromptDefault } from '$lib/server/services/systemPromptRegistry'
 import {
@@ -15,7 +24,7 @@ import {
   buildSkillsCommandsDcmLines,
   getEnabledAgentSlashCapabilities
 } from '$lib/server/services/slashCommandCapabilities'
-import { normalizeSubagentType } from '$lib/utils/subagentType'
+import { isRetiredSubagentType, normalizeSubagentType } from '$lib/utils/subagentType'
 import { resolveSubagentSlug } from '$lib/utils/subagentSlug'
 import { countOneMoreMessage, createZipStateView, type UnzippedItem, type ZipStateView } from '$lib/services/zipping'
 
@@ -28,6 +37,7 @@ import type { GroupChatAgentSettings } from '$lib/types/groupChat'
 import {
   buildPreservedReasoningHistory,
   collectDeadCopyToolResults,
+  collectLiveReadCandidates,
   compileForAI,
   type CompileDeadCopy,
   type ZipCompression,
@@ -35,15 +45,22 @@ import {
   type ZipExposure
 } from '$lib/services/messageCompiler'
 import { replaceAddressSourceRanges, materializeAddressSources, type PositionedAddressSource } from '$lib/utils/addressSourceRanges'
-import { findDeadCopies, type DeadCopyReason } from '$lib/utils/zipDeadCopies'
+import {
+  describeDeadCopiesCompressedThisTurn,
+  findDeadCopies,
+  type DeadCopyFile,
+  type DeadCopyReason
+} from '$lib/utils/zipDeadCopies'
 import { classifyToolResultSize, type ToolResultSizeGuard } from '$lib/utils/toolResultSizeGuard'
-import { describeUnzippedItemForDcm } from '$lib/utils/zipHoldWords'
+import { describeUnzippedItemForDcm, isAgentHold } from '$lib/utils/zipHoldWords'
 import { normalizeId } from '$lib/utils/idNormalizer'
 import { replacePromptVariables } from '$lib/utils/promptVariables'
 import { createReference, extractAllReferences } from '$lib/services/universalResolver'
 import { buildFileReferenceBlock, type FileReferencePayload } from '$lib/utils/fileMentions'
 import {
-  type DynamicMcpDiscoverableRef, buildDynamicMcpIndex } from '$lib/server/services/dynamicMcpIndex'
+  type DynamicMcpDiscoverableRef, type DynamicMcpIndexResult, buildDynamicMcpIndex } from '$lib/server/services/dynamicMcpIndex'
+import { readApiUtilities, type ApiUtilityScope } from '$lib/server/services/apiUtilityRuntime'
+import { API_UTILITY_CONTROL_IDS } from '$lib/utils/apiUtilityControls'
 import {
   buildGoonDcmLines as formatGoonDcmLines,
   shouldIncludeGoonSpokenCues
@@ -55,16 +72,25 @@ import {
   buildMemoryPromptBlock,
   buildSubagentGuidancePromptBlock,
   buildToolGuidanceZipPromptBlock,
+  buildWorkingContextGuidance,
   normalizeDynamicMcpPromptContent
 } from '$lib/utils/toolPromptInjection'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
+import { resolveApiReasoningRetention } from '$lib/utils/reasoningRetention'
+import { formatWhiteboardDcmLines } from '$lib/utils/whiteboard'
+import { readAgentWhiteboard } from '$lib/server/services/whiteboard'
+import type { WhiteboardContextSnapshot } from '$lib/server/services/approvalResumeReplay'
+import type { LiveFileReadTurn } from '$lib/server/services/liveFileReadTurn.server'
+import { readLiveFileReadOutcome, type LiveReadReceipt } from '$lib/server/services/liveFileReadOutcome.server'
+import { buildLiveReadStateLines, describeLiveReadThisTurn, refreshedFileReadsUnavailableReason, resolveLiveFileReadsEnabled, resolveZipAiViewModeOf, type LiveReadThisTurn } from '$lib/utils/liveFileReads'
+import { LIVE_FILE_READ_FACTS_MAX_COPIES, type SessionLiveReadFacts } from '$lib/utils/liveFileReadFacts'
+import { estimateTokens } from '$lib/utils/tokens'
 import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
 import { resolveAgentJevJudgeToolEnabled } from '$lib/utils/jevJuiceControl'
 import { buildDmRosterDcmLines } from '$lib/utils/dmRoster'
 import {
   WORKERS_FEATURE_ENABLED,
   WORKERS_MAX_CONCURRENT,
-  WORKERS_MAX_RUNS_PER_TURN,
   resolveWorkersEnabled,
   shouldCompileDelegationGuidance
 } from '$lib/utils/delegationCapabilities'
@@ -75,8 +101,8 @@ import {
 } from '$lib/server/services/memory/memoryRecall'
 import {
   applyPromptRuntimeScope,
-  brokerToolNamesForScope,
-  runtimeFlavorToScope
+  applyPromptSessionScope,
+  brokerToolNamesForScope
 } from '$lib/utils/promptRuntimeScope'
 import {
   isBrokerAvailable,
@@ -98,7 +124,15 @@ import {
 } from '$lib/utils/clipAiView'
 import { normalizeSessionClipState } from '$lib/server/services/sessionClipState'
 import { resolveDefaultNativeExecutionBackend } from '$lib/server/services/nativeExecutionDefaults'
+import { normalizeNativeBashAccessMode, nativeBashAfterPatchFromProvider } from '$lib/utils/nativeBashAfterPatch'
+import type { ToolApprovalMode } from '$lib/types/tool-approvals'
+import { agentTypedFileToolsValue, globalTypedFileToolsValue, resolveTypedFileToolsGrant, typedFileToolsUnavailableReason } from '$lib/utils/typedFileToolsGrant'
+import { readTypedFileToolsHost } from '$lib/server/services/typedFileToolsHost.server'
+import { readToolOperationalSettings } from '$lib/server/toolOperationalSettingsOwner'
+import { resolveToolOperationalSettings } from '$lib/utils/toolOperationalSettings'
+import { resolveZipToolNotesEnabled as resolveSharedZipToolNotesEnabled } from '$lib/utils/replyControl'
 import {
+  categoryDefaults,
   getToolSettings,
   getTypeZipSettings,
   shouldPreferFieldSettingsForTool
@@ -107,7 +141,6 @@ import {
   calculateAgentMessagesFromEndByIndex,
   calculateRecoveryHoldByIndex
 } from '$lib/utils/zipMessageAge'
-import { resolveZipAgentControlPermission } from '$lib/utils/zipAgentControlPermission'
 import {
   calculateInterruptedReasoningRecoveryActiveByIndex,
   getActiveInterruptedReasoningRecoveryBlock
@@ -117,15 +150,12 @@ import {
   getContextCompactionState
 } from '$lib/utils/contextCompaction'
 import { applyFixedSessionGraduationToMessages } from '$lib/utils/fixedSessionGraduation'
+import { isFixedSession } from '$lib/utils/fixedSession'
 import { buildControlErrorDcmLines } from '$lib/utils/controlTags'
 import { summarizeControlInputSchema } from '$lib/services/controlSchemaSummary'
 import { resolveManagedSubagentScope } from '$lib/server/services/subagentRuntimeScope'
 import { buildSubagentRosterCapabilityFragment } from '$lib/server/services/subagentRosterCapabilities'
-import { buildSubagentThreadStateKey } from '$lib/server/services/subagentThreads'
-import {
-  buildCliSubagentMcpToolReference,
-  buildCliWorkerSpawnToolReference
-} from '$lib/utils/cliSubagentToolNames'
+import { buildSubagentThreadKey } from '$lib/server/services/subagentThreads'
 import { buildSkillSessionContextLines } from '$lib/server/services/skillSessionContext'
 import type {
   JevJuiceHintProvider,
@@ -136,11 +166,12 @@ import { zipBelongsToAnotherChat } from '$lib/utils/zipReferenceSafety'
 import {
   getPrimaryAgentSystemPromptLabel,
   getPrimaryAgentSystemPromptRedisKey,
-  isManagedPrimaryAgentType,
+  isApiPrimaryAgentType,
   isN8nPrimaryAgentType,
   normalizePrimaryAgentType,
   primaryAgentAllowsAgentBrowser,
-  primaryAgentAllowsNativeBash
+  primaryAgentAllowsNativeBash,
+  retiredPrimaryAgentRefusal
 } from '$lib/utils/primaryAgentType'
 import {
   normalizeNativeExecutionBackend,
@@ -150,12 +181,39 @@ import {
 import {
   COMPILED_TAG,
   compiledConversation,
+  compiledCurrentMessage,
   compiledElement,
+  disarmCompiledTags,
   isBatshitWrittenUserMessage,
+  withZipIndexStatus,
+  ZIP_INDEX_STATUS_HEADINGS,
   type CompiledMessageTag,
   type CurrentMessageFrom
 } from '$lib/utils/compiledChatTags'
 import { isOutsideNote, type AddressSourceKind, type AddressSourcePiece } from '$lib/utils/imageAddressOrigin'
+
+/** SA-129 P1 / BL-1541: a dead copy as one history pass sees it (`findHistoryDeadCopies`). */
+type HistoryDeadCopy = CompileDeadCopy & {
+  files: DeadCopyFile[]
+  /** It died in the reply that just finished (the newest assistant message and the failed parts it continues). */
+  diedThisTurn: boolean
+}
+
+/** BL-1541: an older copy the dead-copy rule compressed this turn, for its Zipped this turn line. */
+type DeadCopyThisTurn = { zipId: string; files: DeadCopyFile[] }
+
+/** Decision 5 (Josh, 2026-10-23): what the Zip Index's status sections are written from (`buildZipStateSnapshot`). */
+type ZipIndexStatusState = {
+  hasZipHistory: boolean
+  unzipped: UnzippedItem[]
+  /** SA-129 P2: the held items this compile compressed as dead copies, and why. */
+  deadCopies?: Map<string, DeadCopyReason>
+  sizeGuards?: Map<string, ToolResultSizeGuard>
+  /** BL-1541: the older copies the dead-copy rule compressed this turn, in chat order. */
+  deadCopiesThisTurn?: DeadCopyThisTurn[]
+  /** SA-137 Round 2: the Read File copies Refreshed File Reads zipped this turn, in chat order. */
+  liveReadsThisTurn?: LiveReadThisTurn[]
+}
 
 export type PrecompiledHistory = {
   formattedMessages: string[]
@@ -164,6 +222,8 @@ export type PrecompiledHistory = {
   globalZipSettings?: Record<string, any>
   /** BL-474 step 2: the source of each piece of `chatHistory` (`compileChatHistory`). */
   addressSources?: AddressSourcePiece[]
+  /** SA-137 Round 2: the Read File copies Refreshed File Reads zipped for this speaker this turn. */
+  liveReadsThisTurn?: LiveReadThisTurn[]
 }
 
 /**
@@ -210,22 +270,7 @@ type NativeBashDcmState = {
   automationDenyListCount: number
 }
 
-type NativeAgentBrowserRuntimeMode = 'chromium' | 'chrome-cdp'
 
-type NativeAgentBrowserProvider = 'local' | 'browserbase' | 'browseruse' | 'kernel'
-
-type NativeAgentBrowserDcmState = {
-  enabled: boolean
-  liveViewEnabled: boolean
-  runtimeMode: NativeAgentBrowserRuntimeMode
-  provider: NativeAgentBrowserProvider
-  cdpPort: number
-  timeoutMs: number
-  session: string | null
-  profilePath: string | null
-  executablePath: string | null
-  extraFlagsCount: number
-}
 
 /**
  * SA-128 (DL-02): who the compile is FOR, and the current display name of every other agent
@@ -235,6 +280,26 @@ type NativeAgentBrowserDcmState = {
 type SpeakerView = {
   selfAgentId: string | null
   agentNames: Map<string, string>
+}
+
+type AgentSetupToolIndex = Pick<DynamicMcpIndexResult, 'text' | 'discoverable' | 'resolvedGatewayIds' | 'setupBlocks' | 'sources' | 'hintBudget' | 'apiUtilityProjection' | 'allowedSkillToolHints' | 'completeFeatureHintRefs'>
+type SetupRuntimeAdmission = LiveAgentSetup & { brokerAvailable?: boolean; toolsRegistered?: boolean; apiUtilityScope?: ApiUtilityScope }
+export interface FormattedChatInputResult {
+  structuredInput: any
+  primarySystemPrompt?: string
+  subagentDescription?: Record<string, string>
+  resolvedProjectPath?: string | null
+  addressSources: CompiledAddressSources
+  whiteboardContextSnapshot?: WhiteboardContextSnapshot
+  refreshedFileReadsTurn: boolean
+  agentSetup?: PreparedAgentSetup
+  /** Read-only canonical DCM refresh, bound to this compile's exact original text span. */
+  refreshOpenSkills?: () => Promise<SkillDcmUpdate | undefined>
+  /** Same formatter/index for an actual native read's prospective delivery budget. */
+  previewOpenSkillContext?: (skillId: string, result: Record<string, any>, messageId: string) => Promise<{ text: string; fingerprint: string }>
+  readOpenSkillContext?: () => Promise<{ text: string; fingerprint: string }>
+  /** Server-private second stage: no discovery, recall, Clip or Judge work repeats. */
+  finalizeAgentSetup?: (fingerprint: string, additional?: SetupRuntimeAdmission) => Promise<FormattedChatInputResult>
 }
 
 // Simple in-memory cache to avoid hammering /api/users/:id/settings during SSR and hitting rate limits
@@ -269,7 +334,7 @@ export class DatabaseService {
   }
 
   // Load unzipped items directly from Redis (server-side, no auth headers needed)
-  private async loadUnzippedFromRedis(sessionId: string): Promise<UnzippedItem[]> {
+  private async loadUnzippedFromRedis(sessionId: string, strict = false): Promise<UnzippedItem[]> {
     try {
       const ids = await redis.sMembers(`unzipped:${sessionId}`)
       if (!ids || ids.length === 0) return []
@@ -277,7 +342,7 @@ export class DatabaseService {
       const items: UnzippedItem[] = []
 
       for (const zipId of ids) {
-        const raw = await redis.get(`unzipped_item:${sessionId}:${zipId}`)
+        const raw = strict ? await redis.json.get(`unzipped_item:${sessionId}:${zipId}`) : await redis.get(`unzipped_item:${sessionId}:${zipId}`)
         if (!raw) continue
 
         let parsed: any = raw
@@ -303,19 +368,36 @@ export class DatabaseService {
 
       return items
     } catch (error) {
+      if (strict) throw error
       console.error('[buildFormattedChatInput] Failed to load unzipped items from Redis:', error)
       return []
     }
   }
 
-  private async loadRezippedFromRedis(sessionId: string): Promise<string[]> {
+  private async loadRezippedFromRedis(sessionId: string, strict = false): Promise<string[]> {
     try {
       const ids = await redis.sMembers(`rezipped:${sessionId}`)
       return ids || []
     } catch (error) {
+      if (strict) throw error
       console.error('[buildFormattedChatInput] Failed to load rezipped items from Redis:', error)
       return []
     }
+  }
+
+  private async loadSkillAwareZipState(sessionId: string, userId: string | undefined | null, pending: boolean) {
+    return withZipStateLock(sessionId, async () => {
+      const record = userId ? await readSkillSessionRecordForCompile({ userId, sessionId }) : undefined
+      const strict = Boolean(record?.entries.some((entry) => entry.status === 'open'))
+      const [stored, rezipped] = await Promise.all([
+        this.loadUnzippedFromRedis(sessionId, strict), this.loadRezippedFromRedis(sessionId, strict)
+      ])
+      const projected = record ? projectSkillSessionsForPendingMessage(record, stored, pending) : {
+        record: undefined, unzipped: pending ? countOneMoreMessage(stored).kept : stored, rezipped: [] as string[]
+      }
+      return { record: projected.record, sourceRecord: record, unzipped: projected.unzipped,
+        rezipped: [...new Set([...rezipped, ...projected.rezipped])], expiryRezipped: projected.rezipped }
+    })
   }
 
   // Decode base64 safely in both server and browser without importing Buffer in client bundle
@@ -625,16 +707,26 @@ export class DatabaseService {
     return userStore.deleteFolder(folderId, options)
   }
 
+  /**
+   * SA-139 R4 (D14): a stored retired Primary type (the Claude Code CLI lane, Codex CLI, n8n)
+   * compiles nothing, so no compile ever reads it as an API agent. Every model-facing compile
+   * (`buildFormattedChatInput`, `prepareGroupHistory`) asks this first; the dispatch sites
+   * refuse readably before they get here.
+   */
+  private assertCompilablePrimary(agent: any) {
+    const retired = retiredPrimaryAgentRefusal(agent)
+    if (retired) throw new Error(`${retired.error} ${retired.details}`)
+  }
+
   private async loadSystemPrompts(
     agent: AgentRow,
-    userId?: string,
-    promptOptions?: {
-      runtimeFlavor?: 'codex' | 'claude' | 'vercel'
-    }
+    userId?: string
   ) {
     let primarySystemPrompt = ''
     let globalCustomPrompt = ''
     let globalZipSettings: Record<string, any> | undefined
+    let globalTypedFileTools: boolean | null = null
+    let globalToolOperationsSource: { value: unknown } | undefined
     let defaultWorkspacePath: string | undefined
     let agentDefaultProjectPath: string | undefined
     let agentDefaultProjectRules: Record<string, any> | undefined
@@ -647,10 +739,12 @@ export class DatabaseService {
       if (cached) {
         if (now - cached.fetchedAt <= USER_SETTINGS_CACHE_TTL_MS) {
           hasFreshCachedSettings = true
+          globalToolOperationsSource = { value: cached.settings }
           if (shouldIncludeGlobalPrompt) {
             globalCustomPrompt = cached.settings.global_custom_system_prompt || ''
           }
           globalZipSettings = cached.settings.global_zip_settings || undefined
+          globalTypedFileTools = globalTypedFileToolsValue(cached.settings)
           defaultWorkspacePath = cached.settings.default_workspace_path || undefined
         } else {
           invalidateUserSettingsCache(userId)
@@ -658,20 +752,10 @@ export class DatabaseService {
       }
     }
 
-    const primaryAgentType = normalizePrimaryAgentType(agent)
-
-    if (!isManagedPrimaryAgentType(primaryAgentType)) {
-      throw new Error('The n8n Primary Agent type was removed from Batshit.')
-    }
-
-    const runtimeFlavor = promptOptions?.runtimeFlavor ?? 'vercel'
-
-    const primaryPromptKey =
-      primaryAgentType === 'api' && (runtimeFlavor === 'codex' || runtimeFlavor === 'claude')
-        ? getPrimaryAgentSystemPromptRedisKey('cli')
-        : getPrimaryAgentSystemPromptRedisKey(primaryAgentType)
-
-    primarySystemPrompt = await this.loadPrimarySystemPrompt(primaryPromptKey)
+    // SA-139 R4 (D14): the one Primary prompt is the API one. A retired record never compiles
+    // (`assertCompilablePrimary` runs before every compile); `findSessionZipFacts` reads only the
+    // project paths here, so an old chat of a leftover record still reads.
+    primarySystemPrompt = await this.loadPrimarySystemPrompt(getPrimaryAgentSystemPromptRedisKey('api'))
 
     if (userId && !hasFreshCachedSettings) {
       // No error caching and no fabricated defaults here: every compile attempts a fresh
@@ -679,12 +763,14 @@ export class DatabaseService {
       // Compiling without the user's global prompt / zip settings / workspace path is a
       // silently corrupted send (G-0031/G-0152a).
       const userSettings = await this.getUserSettings(userId)
+      globalToolOperationsSource = { value: userSettings }
       if (userSettings) {
         USER_SETTINGS_CACHE.set(userId, { settings: userSettings, fetchedAt: now })
         if (shouldIncludeGlobalPrompt) {
           globalCustomPrompt = userSettings.global_custom_system_prompt || ''
         }
         globalZipSettings = userSettings.global_zip_settings || undefined
+        globalTypedFileTools = globalTypedFileToolsValue(userSettings)
         defaultWorkspacePath = userSettings.default_workspace_path || undefined
       }
     }
@@ -725,6 +811,8 @@ export class DatabaseService {
       primarySystemPrompt,
       globalCustomPrompt,
       globalZipSettings,
+      globalTypedFileTools,
+      globalToolOperationsSource,
       defaultWorkspacePath,
       agentDefaultProjectPath,
       agentDefaultProjectRules
@@ -977,27 +1065,12 @@ export class DatabaseService {
     }
   }
 
-  /** BL-231: the one rule the Global Tool Grid shows too; OFF with nothing saved. */
-  private resolveZipControlPermission(
-    agent: any,
-    globalZipSettings?: Record<string, any>
-  ): boolean {
-    return resolveZipAgentControlPermission(agent, globalZipSettings)
-  }
-
   private resolveZipToolNotesEnabled(
     agent: any,
     globalZipSettings?: Record<string, any>
   ): boolean {
-    if (typeof agent?.zip_tool_notes_enabled === 'boolean') {
-      return agent.zip_tool_notes_enabled
-    }
-
-    if (typeof globalZipSettings?.zip_tool_notes_enabled === 'boolean') {
-      return globalZipSettings.zip_tool_notes_enabled
-    }
-
-    return true
+    // One rule with the reply end and the compression hint (BL-1785).
+    return resolveSharedZipToolNotesEnabled(agent, globalZipSettings)
   }
 
   private resolveZipAiViewMode(
@@ -1020,34 +1093,39 @@ export class DatabaseService {
   }
 
   private async resolveToolZipGuidancePrompt(options: {
-    hasPermission: boolean
     notesEnabled: boolean
     agent: any
     zipViewMode: 'inline' | 'appended'
-    runtimeFlavor: 'codex' | 'claude' | 'vercel'
+    /** SA-136 D7: the agent's tool build offers `read_file`, `write_file` and `edit_file`. */
+    typedFileTools?: boolean
+    /** SA-137 P5: this turn refreshes open file reads at its start. */
+    liveFileReads?: boolean
+    bashCommandsAfterPatchRun?: boolean
   }): Promise<string> {
-    const promptKey = options.hasPermission
-      ? 'batshit:tool_guidance_zip_enabled_prompt'
-      : 'batshit:tool_guidance_zip_disabled_prompt'
-    const storedPrompt = await this.readStoredPromptText(promptKey)
+    // BL-1777: one record ("Tool Prompt: Zips"); its packaged default is the built block below.
+    const storedPrompt = await this.readStoredPromptText('batshit:tool_guidance_zip_prompt')
     const fallbackPrompt = buildToolGuidanceZipPromptBlock({
-      runtimeFlavor: options.runtimeFlavor,
-      zipControlPermission: options.hasPermission ? 'agent' : 'user',
       zipAiViewMode: options.zipViewMode,
-      toolNotesEnabled: options.notesEnabled
+      toolNotesEnabled: options.notesEnabled,
+      typedFileTools: options.typedFileTools === true,
+      liveFileReads: options.liveFileReads === true,
+      bashCommandsAfterPatchRun: options.bashCommandsAfterPatchRun === true
     })
     const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
     // SA-096 P1: the Fetch Zip instruction is the one place this block still names a broker
     // tool, so it resolves to the receiving agent's real tool name (DL-4).
-    const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(options.runtimeFlavor))
-    return replacePromptVariables(prompt, options.agent, {
+    const brokerNames = brokerToolNamesForScope('api')
+    return replacePromptVariables(applyPromptRuntimeScope(prompt, 'api'), options.agent, {
       ...(options.agent?.settings ?? {}),
-      runtime_flavor: options.runtimeFlavor,
+      runtime_flavor: 'vercel',
       zip_ai_view_mode: options.zipViewMode,
-      zip_control_permission: options.hasPermission ? 'agent' : 'user',
       zip_tool_notes_enabled: options.notesEnabled ? 'enabled' : 'disabled',
       tool_search_tool: brokerNames.search,
-      tool_use_tool: brokerNames.use
+      tool_use_tool: brokerNames.use,
+      api_tool_zip_guidance: fallbackPrompt,
+      // SA-139 R4: a saved custom prompt may still name the retired CLI placeholder outside a
+      // `<!-- runtime:cli -->` section; it keeps compiling the agent's own (API) guidance.
+      cli_tool_zip_guidance: fallbackPrompt
     })
   }
 
@@ -1100,13 +1178,7 @@ export class DatabaseService {
   }
 
   private normalizeBashAccessMode(value: unknown): NativeBashAccessMode | null {
-    if (typeof value !== 'string') return null
-    const normalized = value.trim().toLowerCase()
-    if (!normalized) return null
-    if (['plan', 'read_only', 'readonly'].includes(normalized)) return 'plan'
-    if (['agent', 'workspace'].includes(normalized)) return 'agent'
-    if (['dangerous', 'unrestricted'].includes(normalized)) return 'dangerous'
-    return null
+    return normalizeNativeBashAccessMode(value)
   }
 
   private defaultNativeExecutionBackend(mode: NativeBashAccessMode): NativeExecutionBackend {
@@ -1114,32 +1186,6 @@ export class DatabaseService {
     // Shared single source of truth with native tool dispatch and the settings route's
     // runtime-defaults rider, so all three surfaces agree on the install default (G-0027).
     return resolveDefaultNativeExecutionBackend()
-  }
-
-  private normalizeAgentBrowserRuntimeMode(value: unknown): NativeAgentBrowserRuntimeMode | null {
-    if (typeof value !== 'string') return null
-    const normalized = value.trim().toLowerCase()
-    if (!normalized) return null
-    if (normalized === 'chromium' || normalized === 'separate-chromium' || normalized === 'separate_chromium') {
-      return 'chromium'
-    }
-    if (normalized === 'chrome-cdp' || normalized === 'chrome_cdp' || normalized === 'cdp' || normalized === 'chrome') {
-      return 'chrome-cdp'
-    }
-    return null
-  }
-
-  private normalizeAgentBrowserProvider(value: unknown): NativeAgentBrowserProvider | null {
-    if (typeof value !== 'string') return null
-    const normalized = value.trim().toLowerCase()
-    if (!normalized) return null
-    if (normalized === 'local') return 'local'
-    if (normalized === 'browserbase') return 'browserbase'
-    if (normalized === 'browseruse' || normalized === 'browser_use' || normalized === 'browser-use') {
-      return 'browseruse'
-    }
-    if (normalized === 'kernel') return 'kernel'
-    return null
   }
 
   private resolveNativeBashDcmState(agent: any): NativeBashDcmState | null {
@@ -1223,6 +1269,21 @@ export class DatabaseService {
     }
   }
 
+  /**
+   * SA-136 D7: whether this Primary API agent's tool build offers the typed file tools, by the
+   * same rule as `buildMode3NativeTools`' Primary path (the agent's value, then the user's global
+   * value, then the factory value; Bash on; a qualified host/backend, read as the DCM's Bash line reads
+   * it), so the zip guidance names the typed tools only to an agent that has them and every other
+   * agent's prompt stays byte-identical. Subagents and Workers do not compile through here.
+   */
+  private typedFileToolsOffered(agent: any, globalTypedFileTools: boolean | null): boolean {
+    if (normalizePrimaryAgentType(agent) !== 'api') return false
+    const state = this.resolveNativeBashDcmState(agent)
+    if (!state?.enabled || typedFileToolsUnavailableReason(state.backend, readTypedFileToolsHost()) !== null) return false
+    const providerSettings = agent?.provider_specific_settings ?? agent?.providerSpecificSettings ?? null
+    return resolveTypedFileToolsGrant(agentTypedFileToolsValue(providerSettings), globalTypedFileTools)
+  }
+
   private buildNativeBashDcmLine(agent: any): string | null {
     const state = this.resolveNativeBashDcmState(agent)
     if (!state) return null
@@ -1251,10 +1312,8 @@ export class DatabaseService {
     return 'runtime_network: backend=local | localhost is this Batshit runtime; feature tools resolve runtime aliases internally.'
   }
 
-  private resolveNativeAgentBrowserDcmState(agent: any): NativeAgentBrowserDcmState | null {
-    const primaryAgentType = normalizePrimaryAgentType(agent)
-    if (!primaryAgentAllowsAgentBrowser(primaryAgentType)) return null
-
+  private async buildNativeAgentBrowserDcmLines(agent: any, userId?: string, confirmedSource?: { value: unknown }): Promise<string[] | null> {
+    if (!primaryAgentAllowsAgentBrowser(normalizePrimaryAgentType(agent))) return null
     const providerSettings =
       agent?.provider_specific_settings && typeof agent.provider_specific_settings === 'object'
         ? agent.provider_specific_settings
@@ -1275,120 +1334,36 @@ export class DatabaseService {
           providerSettings.agentBrowserEnabled ??
           providerSettings.nativeAgentBrowserEnabled
       ) ?? true
-    const liveViewEnabled =
-      this.parseBooleanSetting(
-        nested.agentBrowserLiveViewEnabled ??
-          nested.nativeAgentBrowserLiveViewEnabled ??
-          providerSettings.agentBrowserLiveViewEnabled ??
-          providerSettings.nativeAgentBrowserLiveViewEnabled
-      ) ?? true
-    const runtimeMode =
-      this.normalizeAgentBrowserRuntimeMode(
-        nested.agentBrowserRuntimeMode ??
-          nested.nativeAgentBrowserRuntimeMode ??
-          nested.agentBrowserMode ??
-          providerSettings.agentBrowserRuntimeMode ??
-          providerSettings.nativeAgentBrowserRuntimeMode
-      ) ?? 'chromium'
-    const provider =
-      this.normalizeAgentBrowserProvider(
-        nested.agentBrowserProvider ??
-          nested.nativeAgentBrowserProvider ??
-          providerSettings.agentBrowserProvider ??
-          providerSettings.nativeAgentBrowserProvider
-      ) ?? 'local'
-    const cdpPort = Math.min(
-      65535,
-      Math.max(
-        1,
-        this.parseIntegerSetting(
-          nested.agentBrowserCdpPort ??
-            nested.nativeAgentBrowserCdpPort ??
-            providerSettings.agentBrowserCdpPort ??
-            providerSettings.nativeAgentBrowserCdpPort
-        ) ?? 9222
-      )
-    )
-    const timeoutMs = Math.min(
-      120_000,
-      Math.max(
-        1_000,
-        this.parseIntegerSetting(
-          nested.agentBrowserTimeoutMs ??
-            nested.nativeAgentBrowserTimeoutMs ??
-            providerSettings.agentBrowserTimeoutMs ??
-            providerSettings.nativeAgentBrowserTimeoutMs
-        ) ?? 45_000
-      )
-    )
-    const session = this.parseOptionalStringSetting(
-      nested.agentBrowserSession ??
-        nested.nativeAgentBrowserSession ??
-        providerSettings.agentBrowserSession ??
-        providerSettings.nativeAgentBrowserSession
-    )
-    const profilePath = this.parseOptionalStringSetting(
-      nested.agentBrowserProfilePath ??
-        nested.agentBrowserProfile ??
-        nested.nativeAgentBrowserProfilePath ??
-        nested.nativeAgentBrowserProfile ??
-        providerSettings.agentBrowserProfilePath ??
-        providerSettings.agentBrowserProfile ??
-        providerSettings.nativeAgentBrowserProfilePath ??
-        providerSettings.nativeAgentBrowserProfile
-    )
-    const executablePath = this.parseOptionalStringSetting(
-      nested.agentBrowserExecutablePath ??
-        nested.nativeAgentBrowserExecutablePath ??
-        providerSettings.agentBrowserExecutablePath ??
-        providerSettings.nativeAgentBrowserExecutablePath
-    )
-    const extraFlags = this.parseStringListSetting(
-      nested.agentBrowserExtraFlags ??
-        nested.nativeAgentBrowserExtraFlags ??
-        providerSettings.agentBrowserExtraFlags ??
-        providerSettings.nativeAgentBrowserExtraFlags
-    )
-
-    return {
-      enabled,
-      liveViewEnabled,
-      runtimeMode,
-      provider,
-      cdpPort,
-      timeoutMs,
-      session,
-      profilePath,
-      executablePath,
-      extraFlagsCount: extraFlags.length
-    }
-  }
-
-  private buildNativeAgentBrowserDcmLines(agent: any): string[] | null {
-    const state = this.resolveNativeAgentBrowserDcmState(agent)
-    if (!state) return null
-    if (!state.enabled) return ['native_agent_browser: disabled']
-
+    if (!enabled) return ['native_agent_browser: disabled']
+    if (!confirmedSource && !userId) throw new Error('Agent Browser defaults require an authenticated user context.')
+    const operational = confirmedSource
+      ? resolveToolOperationalSettings(confirmedSource.value)
+      : await readToolOperationalSettings(userId!)
+    const state = operational.agentBrowser
+    const containerized = readTypedFileToolsHost().containerized
     const autoDefaults: string[] = []
-    if (state.liveViewEnabled) autoDefaults.push('--headed')
-    if (state.runtimeMode === 'chrome-cdp') {
-      autoDefaults.push(`--cdp http://127.0.0.1:${state.cdpPort}`)
+    if (containerized) {
+      autoDefaults.push('desktop_launch_defaults=not_applied')
+    } else {
+      if (state.liveViewEnabled) autoDefaults.push('--headed')
+      if (state.runtimeMode === 'chrome-cdp') autoDefaults.push(`--cdp http://127.0.0.1:${state.cdpPort}`)
+      if (state.session) autoDefaults.push(`--session ${state.session}`)
+      if (state.profilePath) autoDefaults.push(`--profile ${state.profilePath}`)
+      if (state.executablePath) autoDefaults.push('--executable-path <configured>')
     }
     if (state.provider !== 'local') autoDefaults.push(`-p ${state.provider}`)
-    if (state.session) autoDefaults.push(`--session ${state.session}`)
-    if (state.profilePath) autoDefaults.push(`--profile ${state.profilePath}`)
-    if (state.executablePath) autoDefaults.push('--executable-path <configured>')
-    if (state.extraFlagsCount > 0) autoDefaults.push(`extra_flags=${state.extraFlagsCount}`)
-
+    if (state.extraFlags.length > 0) autoDefaults.push(`extra_flags=${state.extraFlags.length}`)
     return [
-      `native_agent_browser: enabled | via=native_bash_execute | run "agent-browser --help" first | workflow=open <url> -> snapshot -i -> click/fill @eN -> snapshot`,
+      containerized
+        ? 'native_agent_browser: enabled | runtime=docker-sidecar'
+        : `native_agent_browser: enabled | via=native_bash_execute | run "agent-browser --help" first | workflow=open <url> -> snapshot -i -> click/fill @eN -> snapshot`,
       `native_agent_browser_defaults: ${autoDefaults.length > 0 ? autoDefaults.join(', ') : '(none)'} | timeout_ms=${state.timeoutMs}`
     ]
   }
 
   private resolveNativeDynamicMcpEnabled(agent: any): boolean | null {
     const primaryAgentType = normalizePrimaryAgentType(agent)
-    if (!isManagedPrimaryAgentType(primaryAgentType)) {
+    if (!isApiPrimaryAgentType(primaryAgentType)) {
       return null
     }
 
@@ -1415,7 +1390,7 @@ export class DatabaseService {
 
   private resolveNativeCliToolsEnabled(agent: any): boolean | null {
     const primaryAgentType = normalizePrimaryAgentType(agent)
-    if (!isManagedPrimaryAgentType(primaryAgentType)) {
+    if (!isApiPrimaryAgentType(primaryAgentType)) {
       return null
     }
 
@@ -1441,7 +1416,7 @@ export class DatabaseService {
   }
 
   private isBatshitPrimaryAgent(agent: any): boolean {
-    return isManagedPrimaryAgentType(normalizePrimaryAgentType(agent))
+    return isApiPrimaryAgentType(normalizePrimaryAgentType(agent))
   }
 
   private resolveDynamicMcpEnabled(agent: any): boolean {
@@ -1471,12 +1446,9 @@ export class DatabaseService {
    * narrower than registration — withholding guidance from an agent that has the tools is
    * the failure this packet exists to prevent.
    */
-  private hasBrokerAccess(
-    agent: any,
-    runtimeFlavor: 'codex' | 'claude' | 'vercel'
-  ): boolean {
+  private hasBrokerAccess(agent: any): boolean {
     return isBrokerAvailable({
-      runtime: runtimeFlavorToScope(runtimeFlavor),
+      runtime: 'api',
       toggles: resolveBrokerToolToggles(this.getAgentProviderSettings(agent))
     })
   }
@@ -1491,51 +1463,48 @@ export class DatabaseService {
     return {}
   }
 
-  private hasAnyToolAccess(context: {
-    agent: any
-    assignedSubagents?: any[]
-    runtimeFlavor?: 'codex' | 'claude' | 'vercel'
-  }): boolean {
-    const runtimeFlavor = context.runtimeFlavor ?? 'vercel'
-    return runtimeFlavor === 'codex' || runtimeFlavor === 'claude' || runtimeFlavor === 'vercel'
-  }
-
   /**
    * SA-104 P3: the Memory guidance block for memory-enabled agents. Mirrored in the
    * one compile path (SA-106 retired the second, n8n-only implementation).
+   *
+   * Decision 11 (option A): the packaged text is one text for both lanes and no longer holds
+   * `{{ $api_memory_guidance }}`. The variable is still filled, with the lane-scoped fallback,
+   * only for an Admin-customized copy saved before that change (a customized copy is never
+   * refreshed); without it such a copy would send the placeholder literally.
+   *
+   * The `<!-- session:infinite -->` part is kept only when the compiled session is an Infinite
+   * Session (`isFixedSession`); it is scoped before the runtime pass, like the runtime blocks.
    */
   private async resolveMemoryGuidancePrompt(
     agent: any,
-    runtimeFlavor: 'codex' | 'claude' | 'vercel'
+    infiniteSession: boolean
   ) {
     const storedPrompt = await this.readStoredPromptText('batshit:tool_guidance_memory_prompt')
-    const fallbackPrompt = buildMemoryPromptBlock({ runtimeFlavor })
+    const fallbackPrompt = buildMemoryPromptBlock({ infiniteSession })
     const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
-    const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(runtimeFlavor))
-    return replacePromptVariables(prompt, agent, {
+    const brokerNames = brokerToolNamesForScope('api')
+    const sessionScoped = applyPromptSessionScope(prompt, { infiniteSession })
+    return replacePromptVariables(applyPromptRuntimeScope(sessionScoped, 'api'), agent, {
       ...(agent?.settings ?? {}),
-      runtime_flavor: runtimeFlavor,
+      runtime_flavor: 'vercel',
       tool_search_tool: brokerNames.search,
-      tool_use_tool: brokerNames.use
+      tool_use_tool: brokerNames.use,
+      api_memory_guidance: fallbackPrompt
     })
   }
 
-  private async resolveDynamicMcpPrompt(
-    agent: any,
-    runtimeFlavor: 'codex' | 'claude' | 'vercel'
-  ) {
+  private async resolveDynamicMcpPrompt(agent: any) {
     const storedPrompt = await this.readStoredPromptText('batshit:dynamic_mcp_prompt')
-    const fallbackPrompt = buildDynamicMcpPromptBlock({ runtimeFlavor })
+    const fallbackPrompt = buildDynamicMcpPromptBlock()
     const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
     const normalizedPrompt = normalizeDynamicMcpPromptContent(prompt)
     // SA-096: drop the other runtimes' tool names, call shapes, and examples before variable
     // substitution so an API agent is never taught a tool name it does not have.
-    const scope = runtimeFlavorToScope(runtimeFlavor)
-    const scopedPrompt = applyPromptRuntimeScope(normalizedPrompt, scope)
-    const brokerNames = brokerToolNamesForScope(scope)
+    const scopedPrompt = applyPromptRuntimeScope(normalizedPrompt, 'api')
+    const brokerNames = brokerToolNamesForScope('api')
     return replacePromptVariables(scopedPrompt, agent, {
       ...(agent?.settings ?? {}),
-      runtime_flavor: runtimeFlavor,
+      runtime_flavor: 'vercel',
       tool_search_tool: brokerNames.search,
       tool_use_tool: brokerNames.use
     })
@@ -1544,14 +1513,15 @@ export class DatabaseService {
   /**
    * SA-111 P1 (DL-111-01) — the delegation guidance block. Same shape as the broker and
    * memory guidance resolvers: stored Redis prompt first, packaged/code fallback second,
-   * runtime-scoped so an API primary is never taught the CLI call shape (or vice versa).
+   * runtime-scoped so a retired section (a saved `<!-- runtime:cli -->` one) never compiles.
    */
   /**
    * SA-113 P2 (DL-113-04a) — the Agent DM guidance block.
    *
    * Same contract as memory's: the packaged Markdown is the default, Admin can override it
    * in Redis, and the code fallback compiles when neither exists. Gated on
-   * `resolveAgentDmsEnabled` alone — an agent without DMs pays nothing.
+   * `resolveAgentDmsEnabled` alone (Agent DMs plus Fabric & Utilities) — an agent without
+   * DMs pays nothing.
    */
   /**
    * SA-113 P2 (DL-113-04b) — the one DM store read a compile makes.
@@ -1589,16 +1559,13 @@ export class DatabaseService {
     }
   }
 
-  private async resolveDmGuidancePrompt(
-    agent: any,
-    runtimeFlavor: 'codex' | 'claude' | 'vercel'
-  ) {
+  private async resolveDmGuidancePrompt(agent: any) {
     const storedPrompt = await this.readStoredPromptText('batshit:dm_guidance')
     const prompt = storedPrompt?.trim() ? storedPrompt : buildDmGuidancePromptBlock()
-    const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(runtimeFlavor))
+    const brokerNames = brokerToolNamesForScope('api')
     return replacePromptVariables(prompt, agent, {
       ...(agent?.settings ?? {}),
-      runtime_flavor: runtimeFlavor,
+      runtime_flavor: 'vercel',
       tool_search_tool: brokerNames.search,
       tool_use_tool: brokerNames.use
     })
@@ -1607,78 +1574,30 @@ export class DatabaseService {
   /**
    * SA-120 P2 (H1) — the Judge Juice judgment-tool guidance block. Same contract as the DM
    * block: stored Redis prompt first, code fallback second. Gated by the caller on
-   * `resolveAgentJevJudgeToolEnabled` alone — the switch that opens `sys.judge.*` in the
-   * broker — so an agent without the tool pays nothing and is never taught a control it
-   * cannot call.
+   * `resolveAgentJevJudgeToolEnabled` alone — the switch plus Fabric & Utilities, the same
+   * pair that opens `sys.judge.*` in the broker — so an agent without the tool pays nothing
+   * and is never taught a control it cannot call.
    */
-  private async resolveJevJuiceGuidancePrompt(
-    agent: any,
-    runtimeFlavor: 'codex' | 'claude' | 'vercel'
-  ) {
+  private async resolveJevJuiceGuidancePrompt(agent: any) {
     const storedPrompt = await this.readStoredPromptText('batshit:jev_juice_guidance')
     const prompt = storedPrompt?.trim() ? storedPrompt : buildJevJuiceGuidancePromptBlock()
-    const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(runtimeFlavor))
+    const brokerNames = brokerToolNamesForScope('api')
     return replacePromptVariables(prompt, agent, {
       ...(agent?.settings ?? {}),
-      runtime_flavor: runtimeFlavor,
+      runtime_flavor: 'vercel',
       tool_search_tool: brokerNames.search,
       tool_use_tool: brokerNames.use
     })
   }
 
-  private async resolveSubagentGuidancePrompt(
-    agent: any,
-    runtimeFlavor: 'codex' | 'claude' | 'vercel'
-  ) {
+  private async resolveSubagentGuidancePrompt(agent: any) {
     const storedPrompt = await this.readStoredPromptText('batshit:subagent_guidance')
-    const fallbackPrompt = buildSubagentGuidancePromptBlock({ runtimeFlavor })
+    const fallbackPrompt = buildSubagentGuidancePromptBlock()
     const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
-    const scope = runtimeFlavorToScope(runtimeFlavor)
-    const scopedPrompt = applyPromptRuntimeScope(prompt, scope)
+    const scopedPrompt = applyPromptRuntimeScope(prompt, 'api')
     return replacePromptVariables(scopedPrompt, agent, {
       ...(agent?.settings ?? {}),
-      runtime_flavor: runtimeFlavor
-    })
-  }
-
-  private shouldInjectToolGuidance(context: {
-    agent: any
-    assignedSubagents?: any[]
-    runtimeFlavor?: 'codex' | 'claude' | 'vercel'
-  }): boolean {
-    return this.hasAnyToolAccess({
-      agent: context.agent,
-      assignedSubagents: context.assignedSubagents,
-      runtimeFlavor: context.runtimeFlavor
-    })
-  }
-
-  private shouldInjectZipGuidance(
-    messages: Message[],
-    agent: any,
-    globalZipSettings?: Record<string, any>,
-    context?: {
-      assignedSubagents?: any[]
-      runtimeFlavor?: 'codex' | 'claude' | 'vercel'
-    }
-  ): boolean {
-    const hasPermission = this.resolveZipControlPermission(agent, globalZipSettings)
-    if (hasPermission) return true
-
-    const hasZipHistory = messages.some((message) => {
-      const metadata = (message as any)?.metadata || {}
-      if (Array.isArray(metadata?.zipIds) && metadata.zipIds.length > 0) return true
-      if (Array.isArray(metadata?.zip_ids) && metadata.zip_ids.length > 0) return true
-      if (typeof message?.content !== 'string') return false
-      const refs = extractAllReferences(message.content)
-      return refs.some((ref) => ref.type === 'zip')
-    })
-    if (hasZipHistory) return true
-
-    return this.hasAnyToolAccess({
-      agent,
-      assignedSubagents: context?.assignedSubagents,
-      runtimeFlavor: context?.runtimeFlavor
+      runtime_flavor: 'vercel'
     })
   }
 
@@ -1761,12 +1680,19 @@ export class DatabaseService {
         entry.zip.optionalContent ||
         entry.zip.description ||
         (zipData?.type ? `${zipData.type} content` : '')
-      const summary = noteSummary || fallbackSummary
+      // BL-1652: every part of a split multi-file read shares the call's Tool Note, so each part's
+      // line starts with its own label (its path and line count); the note follows as the call's.
+      const splitPart = metadata.shellReadSplitPart
+      const ownLabel = typeof entry.zip.description === 'string' ? entry.zip.description : ''
+      const summary =
+        splitPart && Number(splitPart.of) > 1 && ownLabel
+          ? noteSummary ? `${ownLabel}; note for the whole command: ${noteSummary}` : ownLabel
+          : noteSummary || fallbackSummary
 
       const summarySegment = summary ? ` | summary: "${summary}"` : ''
 
       indexLines.push(
-        `${indexLines.length + 1}) ${messageId} | tool: ${toolName} | zipId (use in unzip/zip): ${zipId}${summarySegment}`
+        `${indexLines.length + 1}) ${messageId} | tool: ${toolName} | zipId: ${zipId}${summarySegment}`
       )
 
       const blockLines = [
@@ -1801,7 +1727,7 @@ export class DatabaseService {
         'Index (chronological):',
         indexLines.join('\n'),
         '',
-        'Unzipped content (chronological):',
+        'Zip Block (chronological):',
         contentBlocks.join('\n\n')
       ].join('\n')
     )
@@ -1827,6 +1753,11 @@ export class DatabaseService {
       deadCopyProjectPath?: string | null
       /** BL-490: the chat this pass compiles for; a zip of another chat is never read. */
       zipOwner: { sessionId: string; userId?: string | null }
+      /**
+       * SA-137: the actual API turn's live file reads, made by the route only (never a preview).
+       * The first pass reads; every later pass of the same turn gets the same frozen snapshot.
+       */
+      liveFileReadTurn?: Pick<LiveFileReadTurn, 'snapshotFor'> & Partial<Pick<LiveFileReadTurn, 'replyMessageId' | 'replyMessageIds'>>
     },
     speakers: SpeakerView
   ) {
@@ -1863,6 +1794,42 @@ export class DatabaseService {
       }
       return zipCompilationCache.get(zipId)!
     }
+    // SA-137 (D6): the turn's one frozen live-read snapshot, asked for before the history loop from
+    // this pass's provisional candidates. The dead-copy rules apply exactly as with the feature off
+    // (Josh, 2026-11-04; D3 amended): a stale or superseded copy is a candidate only where the
+    // feature-off compile keeps it open too, so a refresh never keeps more open than that compile.
+    const liveSnapshot = options.liveFileReadTurn
+      ? await options.liveFileReadTurn.snapshotFor(zipViewMode, () =>
+          collectLiveReadCandidates({
+            messages,
+            agent,
+            globalZipSettings,
+            zipState: options.zipState,
+            zipResolver: resolveZipForCompilation,
+            agentMessagesFromEndByIndex,
+            recoveryHoldByIndex,
+            deadCopies: () => this.findHistoryDeadCopies(
+              messages,
+              resolveZipForCompilation,
+              options.deadCopyProjectPath ?? null,
+              agentMessagesFromEndByIndex
+            ),
+            groupToolSharing: options.groupToolSharing,
+            replyMessageId: options.liveFileReadTurn?.replyMessageId ?? null,
+            replyMessageIds: options.liveFileReadTurn?.replyMessageIds ?? null
+          }), options.deadCopyProjectPath ?? null)
+      : null
+    // What `compileForAI` reads: the frozen outcomes plus every part of the turn's reply, read live
+    // from the turn (a context continuation adds its id after the snapshot froze).
+    const liveReads = liveSnapshot
+      ? {
+          copies: liveSnapshot.copies,
+          strict: liveSnapshot.strict,
+          replyMessageId: liveSnapshot.replyMessageId,
+          ...(options.liveFileReadTurn?.replyMessageIds ? { replyMessageIds: options.liveFileReadTurn.replyMessageIds } : {}),
+          missingReason: liveSnapshot.replayed ? 'not-in-replay' : 'not-refreshable'
+        }
+      : undefined
     // SA-129 P1 (DL-01): the dead copies among this pass's own tool results, built before the
     // history loop from the same zip reads it makes (the cache above), never shared.
     const deadCopies = await this.findHistoryDeadCopies(
@@ -1921,7 +1888,8 @@ export class DatabaseService {
                   : undefined,
               onZipCompressed: (compression) => compressedZips.push(compression),
               onZipExposed: (exposed) => exposedZips.push(exposed),
-              onDeliveredSource: (piece) => messagePieces.push(piece)
+              onDeliveredSource: (piece) => messagePieces.push(piece),
+              liveReads
             }
           )
 
@@ -2003,7 +1971,39 @@ export class DatabaseService {
         : zipAppend
       : baseHistory
 
-    return { formattedMessages, currentDay, chatHistory, compressedZips, exposedZips, addressSources }
+    // BL-1541: the older copies the dead-copy rule compressed in this pass because of the reply
+    // that just finished. Their references never say why; the Zip Index does, this turn only.
+    const deadCopiesThisTurn: DeadCopyThisTurn[] = []
+    const listedDeadCopies = new Set<string>()
+    for (const compression of compressedZips) {
+      const zipId = normalizeId(compression.zipId)
+      const dead = deadCopies.get(zipId)
+      if (!compression.deadCopyNamed || !dead?.diedThisTurn || listedDeadCopies.has(zipId)) continue
+      listedDeadCopies.add(zipId)
+      deadCopiesThisTurn.push({ zipId, files: dead.files })
+    }
+
+    // SA-137 Round 2: the Read File copies Refreshed File Reads zipped this turn (grown past the size
+    // guard, or not refreshed), each said once in the Zip Index, this turn only.
+    const liveReadsThisTurn: LiveReadThisTurn[] = []
+    const listedLiveReads = new Set<string>()
+    for (const compression of compressedZips) {
+      if (!compression.liveRead) continue
+      const zipId = normalizeId(compression.zipId)
+      if (listedLiveReads.has(zipId)) continue
+      listedLiveReads.add(zipId)
+      const readerName = compression.readerAgentId
+        ? speakers.agentNames.get(compression.readerAgentId) ?? 'another agent'
+        : null
+      liveReadsThisTurn.push({
+        zipId,
+        file: compression.descriptionParts?.target || compression.description || 'a file read',
+        liveRead: compression.liveRead,
+        ...(readerName ? { readerName } : {})
+      })
+    }
+
+    return { formattedMessages, currentDay, chatHistory, compressedZips, exposedZips, addressSources, deadCopiesThisTurn, liveReadsThisTurn }
   }
 
   /**
@@ -2029,16 +2029,31 @@ export class DatabaseService {
    * reply's. Each result is judged within its own author, as in every compile.
    */
   async findSessionDeadCopies(sessionId: string, userId: string): Promise<Map<string, DeadCopyReason>> {
+    return (await this.findSessionZipFacts(sessionId, userId)).deadCopies
+  }
+
+  /**
+   * SA-129 P2 and SA-137 P4 (D10): the chat's dead copies and what live file reads did for the
+   * chat's newest reply, for the zip badges and the Zip Manager, from stored records only (no file is
+   * read). The receipt (`live_file_reads:{sessionId}`) is `current` only while its reply is the
+   * chat's newest reply and live file reads still resolve on for its agent; the dead copies are the
+   * ledger's own, with no exemption (D3 amended, 2026-11-04), as every compile finds them. A receipt of an earlier reply is
+   * `changed`. When the newest reply's agent has live file reads on but no usable receipt names that
+   * reply (missing, expired, from an earlier app process, unreadable, or never prepared), the state is
+   * `unknown` and that agent's own live-capable reads say so: never a guessed open or stale state.
+   */
+  async findSessionZipFacts(sessionId: string, userId: string): Promise<{ deadCopies: Map<string, DeadCopyReason>; liveReads: SessionLiveReadFacts | null }> {
     const messages = (await redis.getSessionMessages(sessionId)) as Message[]
     const newestUser = [...messages].reverse().find((message) => message.role === 'user')
     const newestReply = [...messages].reverse().find((message) => message.role === 'assistant' && message.agent_id)
+    const agents = await redis.getAgents(userId)
     const requestedProjectPath =
       typeof (newestUser as any)?.metadata?.projectPath === 'string'
         ? ((newestUser as any).metadata.projectPath as string).trim()
         : ''
     let projectPath: string | null = requestedProjectPath || null
     if (!projectPath && newestReply?.agent_id) {
-      const agent = (await redis.getAgents(userId)).find((row) => row.id === newestReply.agent_id) ?? null
+      const agent = agents.find((row) => row.id === newestReply.agent_id) ?? null
       if (agent) {
         const { agentDefaultProjectPath, defaultWorkspacePath } = await this.loadSystemPrompts(agent as AgentRow, userId)
         projectPath = agentDefaultProjectPath?.trim() || defaultWorkspacePath?.trim() || null
@@ -2050,27 +2065,123 @@ export class DatabaseService {
       return zipCache.get(zipId)!
     }
     const { results } = await collectDeadCopyToolResults(messages, resolveZip)
+    const liveReads = await this.findSessionLiveReadFacts(sessionId, userId, newestReply ?? null, agents, results)
     const reasons = new Map<string, DeadCopyReason>()
     for (const [zipId, dead] of findDeadCopies(results, { projectPath })) reasons.set(zipId, dead.reason)
-    return reasons
+    return { deadCopies: reasons, liveReads }
+  }
+
+  private async findSessionLiveReadFacts(
+    sessionId: string,
+    userId: string,
+    newestReply: Message | null,
+    agents: AgentRow[],
+    results: Awaited<ReturnType<typeof collectDeadCopyToolResults>>['results']
+  ): Promise<SessionLiveReadFacts | null> {
+    if (!newestReply?.agent_id) return null
+    let record: Awaited<ReturnType<typeof readLiveFileReadOutcome>> = null
+    let unreadable = false
+    try {
+      record = await readLiveFileReadOutcome(sessionId, userId)
+    } catch (error) {
+      // A storage failure is unknown, never the OFF answer (D10).
+      console.warn('[SA-137] The chat\'s live file read receipt could not be read; the badges say its state is unknown:', error instanceof Error ? error.message : error)
+      unreadable = true
+    }
+    const receipts = [record?.pending ?? null, record?.delivered ?? null].filter(
+      (receipt): receipt is LiveReadReceipt => Boolean(receipt) && (receipt!.delivery === 'prepared' || receipt!.delivery === 'issued')
+    )
+    const globalZipSettings = (await redis.getUserSettings(userId))?.global_zip_settings ?? null
+    // Round 2: on, and available for that agent now (one rule with the route, R2-2).
+    const host = readTypedFileToolsHost()
+    const liveOnFor = (agentId: string) => {
+      const agent = agents.find((row) => row.id === agentId) ?? null
+      if (!agent || !resolveLiveFileReadsEnabled(agent as any, globalZipSettings as any)) return false
+      return refreshedFileReadsUnavailableReason({
+        primaryType: normalizePrimaryAgentType(agent),
+        zipViewMode: resolveZipAiViewModeOf(agent as any, globalZipSettings as any),
+        backend: this.resolveNativeBashDcmState(agent)?.backend ?? null,
+        host
+      }) === null
+    }
+    /**
+     * The chat's Read File copies whose turn-start state a record would have said (strict freshness
+     * decides every one: refreshed and shown, or zipped), minus `known`.
+     */
+    const liveCapableReads = (_agentId: string, known: Record<string, unknown> = {}) => results
+      .filter((result) => result.operationKind === 'read_file' && !known[result.zipId])
+      .map((result) => result.zipId)
+      // Review N3: the newest copies first get a fact when the chat has more than the bound.
+      .slice(-LIVE_FILE_READ_FACTS_MAX_COPIES)
+    const at = (receipt: LiveReadReceipt) => receipt.issuedAt ?? receipt.preparedAt ?? receipt.reservedAt
+    const receipt = receipts.find((candidate) => candidate.messageId === newestReply.id) ?? null
+    if (!receipt) {
+      if (liveOnFor(newestReply.agent_id)) {
+        const copies: SessionLiveReadFacts['copies'] = {}
+        for (const zipId of liveCapableReads(newestReply.agent_id)) copies[zipId] = { status: 'unknown' }
+        return { state: 'unknown', replyId: newestReply.id, agentId: newestReply.agent_id, ...(unreadable ? { unknownReason: 'unreadable' } : { unknownReason: 'missing' }), copies, overflow: 0 }
+      }
+      const newest = receipts[0]
+      return newest
+        ? { state: 'changed', replyId: newest.messageId, agentId: newest.agentId, delivery: newest.delivery as 'prepared' | 'issued', at: at(newest), copies: {}, overflow: 0 }
+        : null
+    }
+    const stillOn = liveOnFor(receipt.agentId)
+    const copies: SessionLiveReadFacts['copies'] = {}
+    if (stillOn) {
+      for (const copy of receipt.copies ?? []) {
+        copies[copy.zipId] = copy.status === 'refreshed'
+          ? { status: 'refreshed', promptTokens: copy.promptTokens }
+          : { status: 'static', reason: copy.reason }
+      }
+      // Copies the receipt could not hold: their outcome is unknown, never shown as live or stale.
+      if ((receipt.overflow ?? 0) > 0) {
+        for (const zipId of liveCapableReads(receipt.agentId, copies)) copies[zipId] = { status: 'unknown' }
+      }
+    }
+    return {
+      state: stillOn ? 'current' : 'changed',
+      replyId: receipt.messageId,
+      agentId: receipt.agentId,
+      delivery: receipt.delivery as 'prepared' | 'issued',
+      at: at(receipt),
+      ...(receipt.replayUnavailable ? { replayUnavailable: receipt.replayUnavailable } : {}),
+      ...(stillOn && receipt.strict === true ? { strict: true } : {}),
+      copies,
+      overflow: receipt.overflow ?? 0
+    }
   }
 
   /**
    * SA-129 P1 (DL-01): every tool result this pass will compile, in chat order, read through the
    * pass's own zip resolver, then `findDeadCopies`. Each dead copy carries how many of its
    * author's replies had finished when it died (`agentMessagesFromEndByIndex` at its message
-   * minus at the message that killed it), which decides whether its reference names the reason.
-   * A zip that cannot be read is left out, so it can neither die nor kill another copy.
+   * minus at the message that killed it), which decides whether the Zip Index names it
+   * (BL-1541), its files, and whether it died in the reply that just finished (the newest
+   * assistant message of `messages`, with the failed parts it continues). A zip that cannot be read is left out, so it can neither die nor
+   * kill another copy.
    */
   private async findHistoryDeadCopies(
     messages: Message[],
     resolveZip: (zipId: string) => Promise<any | null>,
     projectPath: string | null,
     agentMessagesFromEndByIndex: number[]
-  ): Promise<Map<string, CompileDeadCopy>> {
+  ): Promise<Map<string, HistoryDeadCopy>> {
     const { results, messageIndexByZip } = await collectDeadCopyToolResults(messages, resolveZip)
+    // The reply that just finished: the newest assistant message and, when it continues a reply
+    // that ran out of room, every failed part directly before it (`findContextContinuationTurn`);
+    // a continuation run compiles no `<dynamic_info>`, so the next turn says it.
+    const newestReplyIndex = messages.findLastIndex((message) => message?.role === 'assistant')
+    let replyStartIndex = newestReplyIndex
+    while (
+      replyStartIndex > 0 &&
+      messages[replyStartIndex - 1]?.role === 'assistant' &&
+      (messages[replyStartIndex - 1] as any)?.metadata?.response_failed === true
+    ) {
+      replyStartIndex -= 1
+    }
 
-    const deadCopies = new Map<string, CompileDeadCopy>()
+    const deadCopies = new Map<string, HistoryDeadCopy>()
     for (const [zipId, dead] of findDeadCopies(results, { projectPath })) {
       const readAt = messageIndexByZip.get(zipId) ?? dead.deadAtMessageIndex
       deadCopies.set(zipId, {
@@ -2078,7 +2189,9 @@ export class DatabaseService {
         repliesUntilDead: Math.max(
           0,
           (agentMessagesFromEndByIndex[readAt] ?? 0) - (agentMessagesFromEndByIndex[dead.deadAtMessageIndex] ?? 0)
-        )
+        ),
+        files: dead.files,
+        diedThisTurn: replyStartIndex >= 0 && dead.deadAtMessageIndex >= replyStartIndex
       })
     }
     return deadCopies
@@ -2124,8 +2237,11 @@ export class DatabaseService {
         currentAgentId?: string | null
         sharedTools?: string[]
       }
+      /** SA-137: the speaker's live-read turn; its snapshot is the one the speaker's compile uses. */
+      liveFileReadTurn?: Pick<LiveFileReadTurn, 'snapshotFor'> & Partial<Pick<LiveFileReadTurn, 'replyMessageId' | 'replyMessageIds'>>
     }
   ): Promise<PrecompiledHistory> {
+    this.assertCompilablePrimary(agent)
     const fetchImpl = options?.fetch ?? (typeof fetch !== 'undefined' ? fetch : undefined)
 
     const {
@@ -2135,20 +2251,24 @@ export class DatabaseService {
     } = await this.loadSystemPrompts(agent, userId)
     const globalZipSettings =
       options?.globalZipSettingsOverride ?? loadedGlobalZipSettings
-    const agentForHistory =
+    const historyAgent =
       options?.zipSettingsAgentOverride !== undefined
         ? options.zipSettingsAgentOverride
         : agent
 
+    const agentForHistory = normalizePrimaryAgentType(agent) === 'api'
+      ? { ...historyAgent, api_reasoning_retention: resolveApiReasoningRetention(agent).mode }
+      : historyAgent
+
     // F-P5-11: this pass's own zip state, read from Redis. Server compiles overlap in one
     // process, so none of them reads or writes the browser's `zippingService` singleton.
-    const [serverUnzipped, serverRezipped] = await Promise.all([
-      this.loadUnzippedFromRedis(sessionId),
-      this.loadRezippedFromRedis(sessionId)
-    ])
-    const zipState = createZipStateView(serverUnzipped, serverRezipped)
-
-    const speakers = await this.buildSpeakerView(messages, agent, options?.groupContext)
+    const skillZipState = await this.loadSkillAwareZipState(sessionId, userId, false)
+    const zipState = createZipStateView(skillZipState.unzipped, skillZipState.rezipped)
+    const groupMessages = skillZipState.record && agent?.id ? await recoverOpenSkillReadMessages({
+      record: skillZipState.record, agentId: agent.id, messages, unzipped: skillZipState.unzipped,
+      groupToolSharing: options?.groupToolSharing
+    }) : messages
+    const speakers = await this.buildSpeakerView(groupMessages, agent, options?.groupContext)
 
     // SA-109: group runs compile history once and reuse it per speaker, so the
     // clip rewrite has to happen here too — no lane keeps raw clip syntax.
@@ -2158,8 +2278,8 @@ export class DatabaseService {
       fetchImpl
     )
 
-    const { formattedMessages, currentDay, chatHistory, addressSources } = await this.compileChatHistory(
-      messages,
+    const { formattedMessages, currentDay, chatHistory, addressSources, liveReadsThisTurn } = await this.compileChatHistory(
+      groupMessages,
       agentForHistory,
       globalZipSettings,
       {
@@ -2179,7 +2299,8 @@ export class DatabaseService {
       currentDay,
       chatHistory: chatHistory ?? compiledConversation(formattedMessages),
       globalZipSettings,
-      addressSources
+      addressSources,
+      liveReadsThisTurn
     }
   }
 
@@ -2216,8 +2337,7 @@ export class DatabaseService {
           metadata.projectRules && typeof metadata.projectRules === 'object'
             ? metadata.projectRules
             : null,
-        fileReferences: Array.isArray(metadata.fileReferences) ? metadata.fileReferences : [],
-        subagentIds: Array.isArray(metadata.subagentSnapshot) ? metadata.subagentSnapshot : []
+        fileReferences: Array.isArray(metadata.fileReferences) ? metadata.fileReferences : []
       }
     }
     return null
@@ -2227,7 +2347,9 @@ export class DatabaseService {
     messages: Message[],
     unzipped: UnzippedItem[],
     deadCopies: Map<string, DeadCopyReason> = new Map(),
-    sizeGuards: Map<string, ToolResultSizeGuard> = new Map()
+    sizeGuards: Map<string, ToolResultSizeGuard> = new Map(),
+    deadCopiesThisTurn: DeadCopyThisTurn[] = [],
+    liveReadsThisTurn: LiveReadThisTurn[] = []
   ) {
     const hasZipHistory =
       unzipped.length > 0 ||
@@ -2244,8 +2366,66 @@ export class DatabaseService {
       hasZipHistory,
       unzipped,
       deadCopies,
-      sizeGuards
+      sizeGuards,
+      deadCopiesThisTurn,
+      liveReadsThisTurn
     }
+  }
+
+  /**
+   * Decision 5 (Josh, 2026-10-23): the Zip Index's status sections, which were the DCM's `Current
+   * Zip State` until then: one home for every Zip fact. Each section is said only when it has
+   * something (`withZipIndexStatus` places them at the top of `<zip_index>`). The Zip Index sits in
+   * the tail after `</conversation>`, rewritten every turn like the DCM, so the live counts cost no
+   * cache. A held copy is said once, on its Zip Holds line (BL-1541, BL-2042), never under Zipped
+   * this turn as well.
+   */
+  private buildZipIndexStatusLines(options: {
+    zipState: ZipIndexStatusState
+    autoZipContent: string[]
+    autoZipTools: string[]
+    agentId: string | null
+  }): string[] {
+    const { zipState, autoZipContent, autoZipTools } = options
+    const unzipped = Array.isArray(zipState.unzipped) ? zipState.unzipped : []
+    const settings = [
+      ...(autoZipContent.length > 0 ? [`- Auto-zipped content: ${autoZipContent.join(', ')}`] : []),
+      ...(autoZipTools.length > 0 ? [`- Auto-zipped tools: ${autoZipTools.join(', ')}`] : [])
+    ]
+    // BL-1541: the one place the agent learns why an older copy compressed, on that turn
+    // only; its reference keeps its plain label. A copy an agent holds keeps its hold line.
+    // Both ids are state ids already; `normalizeId` is not safe to apply twice (BL-853).
+    const agentHeld = new Set(unzipped.filter(isAgentHold).map((item) => item.zipId))
+    const compressedThisTurn = describeDeadCopiesCompressedThisTurn(
+      (zipState.deadCopiesThisTurn ?? []).filter((copy) => !agentHeld.has(copy.zipId))
+    )
+    // SA-137 Round 2: each Read File copy Refreshed File Reads zipped this turn, once; a held one
+    // says it on its hold line, which it replaces the size words on (BL-2042: never "fetch it").
+    const liveReadsThisTurn = new Map((zipState.liveReadsThisTurn ?? []).map((copy) => [copy.zipId, copy] as const))
+    const heldIds = new Set(unzipped.map((item) => normalizeId(item.zipId)))
+    const zippedThisTurn = [
+      ...(compressedThisTurn ? [compressedThisTurn] : []),
+      ...buildLiveReadStateLines(zipState.liveReadsThisTurn ?? [], heldIds)
+    ]
+    const describe = (item: UnzippedItem) => {
+      const liveRead = liveReadsThisTurn.get(normalizeId(item.zipId))
+      const line = describeUnzippedItemForDcm(item, {
+        agentId: options.agentId,
+        deadCopy: zipState.deadCopies?.get(normalizeId(item.zipId)) ?? null,
+        sizeGuard: liveRead ? undefined : zipState.sizeGuards?.get(normalizeId(item.zipId)) ?? null
+      })
+      return liveRead ? `${line} | ${describeLiveReadThisTurn(liveRead.liveRead)}` : line
+    }
+    // A Judge Juice open is no hold (SA-120 P5), so it has its own heading.
+    const holds = unzipped.filter((item) => item.source !== 'inferred').map(describe)
+    const judgeJuice = unzipped.filter((item) => item.source === 'inferred').map(describe)
+    const sections = [
+      settings.length > 0 ? [`${ZIP_INDEX_STATUS_HEADINGS.settings}:`, ...settings] : [],
+      zippedThisTurn.length > 0 ? [`${ZIP_INDEX_STATUS_HEADINGS.zippedThisTurn}:`, ...zippedThisTurn] : [],
+      holds.length > 0 ? [`${ZIP_INDEX_STATUS_HEADINGS.holds}:`, ...holds] : [],
+      judgeJuice.length > 0 ? [`${ZIP_INDEX_STATUS_HEADINGS.judgeJuice}:`, ...judgeJuice] : []
+    ].filter((section) => section.length > 0)
+    return sections.flatMap((section, index) => (index === 0 ? section : ['', ...section]))
   }
 
   private buildAutoZipSummary(options: {
@@ -2274,13 +2454,17 @@ export class DatabaseService {
       if (settings.auto_zip) autoZipTools.add(tool)
     }
 
-    const resolveBooleanSetting = (key: string) => {
+    const resolveBooleanSetting = (key: string): boolean | undefined => {
       if (typeof agent?.[key] === 'boolean') return agent[key]
       if (typeof globalZipSettings?.[key] === 'boolean') return globalZipSettings[key]
-      return false
+      return undefined
     }
 
-    if (resolveBooleanSetting('auto_zip_all_other_tools')) {
+    // An absent row inherits the factory default, as `getToolSettings` resolves it for an
+    // unmapped tool; a new agent record carries no stored zip row (SA-126, 2026-10-19).
+    const allOtherAutoZip =
+      resolveBooleanSetting('auto_zip_all_other_tools') ?? categoryDefaults.allOther.auto_zip === true
+    if (allOtherAutoZip && resolveBooleanSetting('zip_disabled_all_other_tools') !== true) {
       autoZipTools.add('all_other_tools')
     }
 
@@ -2346,46 +2530,71 @@ export class DatabaseService {
   }
 
   private async buildDynamicMcpDcm(options: {
+    apiUtilityScope?: ApiUtilityScope
     /** Server-resolved turn selection; undefined keeps non-turn preview defaults. */
     mcpGatewayScope?: string[]
+    p5McpOwner?: import('$lib/server/services/appActions/mcp/originalTask').P5OriginalPreparation
     userId?: string | null
     agentId?: string | null
     projectPath?: string | null
     nativeDynamicMcpEnabled?: boolean | null
     nativeCliToolsEnabled?: boolean | null
-    isCodexMode?: boolean
-  }): Promise<{
-    text: string
-    /** SA-120 P1: the typed refs the agent can reach, for the Judge Juice hint provider. */
-    discoverable: DynamicMcpDiscoverableRef[]
-    resolvedGatewayIds: string[] | null
-  }> {
-    const empty = { text: '', discoverable: [] as DynamicMcpDiscoverableRef[], resolvedGatewayIds: null }
+    whiteboardControlsEnabled?: boolean
+    providerSettings?: unknown
+    memoryControlsEnabled?: boolean
+    dmControlsEnabled?: boolean
+    scheduleControlsEnabled?: boolean
+    judgeControlsEnabled?: boolean
+    featureHintGates?: Parameters<typeof buildDynamicMcpIndex>[0]['featureHintGates']
+  }): Promise<AgentSetupToolIndex> {
+    const empty: AgentSetupToolIndex = { text: '', discoverable: [], resolvedGatewayIds: null, setupBlocks: [], sources: [], hintBudget: { limit: 3000, budgetedTokens: 0, featureTokens: 0 }, apiUtilityProjection: 'unprepared' }
     const userId = options.userId?.trim()
     const agentId = options.agentId?.trim()
+    if (options.p5McpOwner) {
+      const owner = await import('$lib/server/services/appActions/mcp/originalTask')
+      const identity = owner.readP5ApiManagementIdentity(options.p5McpOwner)
+      if (identity.userId !== userId || identity.agentId !== agentId) throw new Error('The original API discovery identity changed.')
+    }
     if (!userId || !agentId) return empty
 
     try {
       const result = await buildDynamicMcpIndex({
+        apiUtilityScope: options.apiUtilityScope,
+        primarySettingsActor: true,
+        providerSettings: options.providerSettings,
+        memoryControlsEnabled: options.memoryControlsEnabled,
+        dmControlsEnabled: options.dmControlsEnabled,
+        scheduleControlsEnabled: options.scheduleControlsEnabled,
+        judgeControlsEnabled: options.judgeControlsEnabled,
+        featureHintGates: options.featureHintGates,
         userId,
         agentId,
         selectedGateways: options.mcpGatewayScope,
+        p5McpOwner: options.p5McpOwner,
         projectPath: options.projectPath ?? null,
         nativeDynamicMcpEnabled: options.nativeDynamicMcpEnabled,
         cliToolsEnabled:
           typeof options.nativeCliToolsEnabled === 'boolean'
             ? options.nativeCliToolsEnabled
             : undefined,
-        isCodexMode: options.isCodexMode === true
+        whiteboardControlsEnabled: options.whiteboardControlsEnabled
       })
       return {
         text: typeof result.text === 'string' ? result.text : '',
         discoverable: Array.isArray(result.discoverable) ? result.discoverable : [],
-        resolvedGatewayIds: result.resolvedGatewayIds ?? null
+        resolvedGatewayIds: result.resolvedGatewayIds ?? null,
+        setupBlocks: result.setupBlocks, sources: result.sources, hintBudget: result.hintBudget, apiUtilityProjection: result.apiUtilityProjection,
+        allowedSkillToolHints: result.allowedSkillToolHints, completeFeatureHintRefs: result.completeFeatureHintRefs
       }
     } catch (error) {
+      if (options.p5McpOwner) {
+        const owner = await import('$lib/server/services/appActions/mcp/originalTask')
+        const identity = owner.readP5ApiManagementIdentity(options.p5McpOwner)
+        if (identity.userId !== userId || identity.agentId !== agentId) throw error
+        if (owner.p5ApiHasVerifiedMcpSource(options.p5McpOwner)) throw error
+      }
       console.warn('[buildDynamicInfoBlock] Failed to build MCP DCM index:', error)
-      return empty
+      throw error
     }
   }
 
@@ -2402,7 +2611,7 @@ export class DatabaseService {
       return { lines: buildSkillsCommandsDcmLines(capabilities), capabilities }
     } catch (error) {
       console.warn('[buildDynamicInfoBlock] Failed to load skills/commands DCM index:', error)
-      return { lines: [], capabilities: [] }
+      throw error
     }
   }
 
@@ -2463,28 +2672,35 @@ export class DatabaseService {
     )
   }
 
+  private buildWorkersSetupLine(agent: any): string {
+    if (!WORKERS_FEATURE_ENABLED) return ''
+    return resolveWorkersEnabled(agent)
+      ? `workers: enabled (max ${WORKERS_MAX_CONCURRENT} parallel)`
+      : 'workers: disabled'
+  }
+
   private async buildDynamicInfoBlock(options: {
+    sessionId?: string
+    openSkillSessions?: OpenSkillSession[]
+    allowUnpreparedSkillHints?: boolean
+    toolIndex: AgentSetupToolIndex
+    skillsCommandsDcm: { lines: string[]; capabilities: AgentSlashCapability[] }
     /** Server-resolved turn selection; undefined keeps non-turn preview defaults. */
     mcpGatewayScope?: string[]
+    p5McpOwner?: import('$lib/server/services/appActions/mcp/originalTask').P5OriginalPreparation
     userId?: string | null
     currentUserMessage?: string | null
-    agentRecord?: any
     agentId?: string | null
     projectPath?: string | null
     agentDefaultProjectPath?: string | null
     projectRules?: Record<string, any> | null
     fileReferences?: FileReferencePayload[]
-    subagentDescriptions?: Record<string, string>
-    /** SA-111 P1 (DL-111-03): per-subagent `type; model; tools; skills; thread` facts. */
-    subagentCapabilityFragments?: Record<string, string>
-    assignedSubagents?: any[]
     defaultWorkspacePath?: string | null
     nativeDynamicMcpEnabled?: boolean | null
     previousSnapshot?: {
       projectPath?: string | null
       projectRules?: Record<string, any> | null
       fileReferences?: FileReferencePayload[]
-      subagentIds?: string[]
     } | null
     goonId?: string | null
     goonsEnabled?: boolean
@@ -2492,18 +2708,6 @@ export class DatabaseService {
     goonPresentationMode?: DesktopGoonPresentationMode | null
     groupContext?: GroupChatDcmContext
     voiceState?: VoiceState
-    zipState?: {
-      hasZipHistory: boolean
-      unzipped: UnzippedItem[]
-      /** SA-129 P2: the held items this compile compressed as dead copies, and why. */
-      deadCopies?: Map<string, DeadCopyReason>
-      sizeGuards?: Map<string, ToolResultSizeGuard>
-    }
-    autoZipContent?: string[]
-    autoZipTools?: string[]
-    zipControlPermission?: boolean
-    zipAiViewMode?: 'inline' | 'appended'
-    isCodexMode?: boolean
     controlErrorLines?: string[]
     /** SA-104 P4: preformatted "Memory context:" lines from the recall engine. */
     memoryDcmLines?: string[]
@@ -2513,6 +2717,7 @@ export class DatabaseService {
     dmRosterDcmLines?: string[]
     /** SA-110 (DL-110-01): the episode whiteboard section (Infinite Sessions only). */
     whiteboardDcmLines?: string[]
+    whiteboardControlsEnabled?: boolean
     /** SA-110 P2 (DL-110-05): awareness changes newer than the stored fold snapshot. */
     awarenessPendingDcmLines?: string[]
     /**
@@ -2521,7 +2726,7 @@ export class DatabaseService {
      * close the DCM (the cache-free tail). Absent on subagent and group compiles.
      */
     jevJuiceHintProvider?: JevJuiceHintProvider
-  }): Promise<{ text: string; addressSourcePieces: AddressSourcePiece[] }> {
+  }): Promise<{ text: string; addressSourcePieces: AddressSourcePiece[]; openSkillsText: string }> {
     const statusIcons = {
       new: '\u2705',
       updated: '\u2733\uFE0F',
@@ -2561,6 +2766,11 @@ export class DatabaseService {
     }
 
     const lines: string[] = []
+    const openContext = options.userId && options.agentId && options.sessionId
+      ? await buildOpenSkillContext({ actor: { userId: options.userId, sessionId: options.sessionId, agentId: options.agentId },
+        skills: options.openSkillSessions, toolIndex: options.toolIndex, allowUnprepared: options.allowUnpreparedSkillHints })
+      : { lines: buildOpenSkillsDcmLines(options.openSkillSessions ?? []), text: buildOpenSkillsDcmLines(options.openSkillSessions ?? []).join('\n') }
+    lines.push(...openContext.lines)
     const explicitProjectPath = options.projectPath?.trim()
     const agentDefaultProjectPath = options.agentDefaultProjectPath?.trim()
     const fallbackProjectPath = options.defaultWorkspacePath?.trim()
@@ -2572,14 +2782,6 @@ export class DatabaseService {
       !Array.isArray(options.projectRules)
         ? options.projectRules
         : null
-
-    const subagentDescriptions = options.subagentDescriptions || {}
-    const subagentKeys = Object.keys(subagentDescriptions)
-    const currentSubagentIds = normalizeList(
-      (options.assignedSubagents || []).map((candidate) => String(candidate?.id || ''))
-    )
-    const previousSubagentIds = normalizeList(options.previousSnapshot?.subagentIds || [])
-    const subagentStatus = resolveStatus(currentSubagentIds, previousSubagentIds)
 
     const groupContext = options.groupContext
     if (groupContext?.agentOrder && groupContext.agentOrder.length > 0) {
@@ -2663,114 +2865,7 @@ export class DatabaseService {
       lines.push(...options.controlErrorLines, '')
     }
 
-    const agentId = options.agentId?.trim()
-    if (agentId) {
-      lines.push(`${statusIcons.current} agent_id: ${agentId}`)
-    }
-    lines.push(`${subagentStatus} subagents:`)
-
-    if (subagentKeys.length > 0) {
-      if (options.isCodexMode === true) {
-        lines.push('CLI subagent delegation: call the MCP server/tool pair shown for the chosen subagent.')
-      }
-      for (const key of subagentKeys) {
-        const subagent = options.assignedSubagents?.find((candidate) => {
-          return resolveSubagentSlug(candidate) === key
-        })
-        const displayName = subagent?.displayName || subagent?.name || key
-        const rawDescription = subagentDescriptions[key] || ''
-        const cleanedDescription = rawDescription.replace(/\s+/g, ' ').trim()
-        const cliToolReference =
-          options.isCodexMode === true
-            ? buildCliSubagentMcpToolReference(options.agentRecord, subagent)
-            : null
-        const toolSuffix = cliToolReference
-          ? `; server: ${cliToolReference.serverName}; tool: ${cliToolReference.toolName}; full: ${cliToolReference.fullToolName}`
-          : ''
-        const label = displayName ? `${displayName} (${key}${toolSuffix})` : key
-        // SA-111 P1 (DL-111-03): capability facts trail the description so the primary can
-        // pick the right specialist instead of guessing from a name.
-        const capabilityFragment = options.subagentCapabilityFragments?.[key]?.trim() || ''
-        const capabilitySuffix = capabilityFragment ? ` \u2014 ${capabilityFragment}` : ''
-        lines.push(
-          cleanedDescription
-            ? `- ${label}: ${cleanedDescription}${capabilitySuffix}`
-            : `- ${label}${capabilitySuffix}`
-        )
-      }
-    } else {
-      lines.push('- (none)')
-    }
-
-    // SA-111 P4 (DL-111-03): the workers line and the `spawn_workers` tool ship together —
-    // an agent told it has workers must actually have the tool, and an agent whose setting
-    // is off must be told so rather than left guessing. On a managed CLI lane the line
-    // carries the exact composed MCP name, the same AMD-111-01 rule the subagent lines use.
-    if (WORKERS_FEATURE_ENABLED) {
-      if (resolveWorkersEnabled(options.agentRecord)) {
-        const workerToolReference =
-          options.isCodexMode === true
-            ? buildCliWorkerSpawnToolReference(options.agentRecord)
-            : null
-        const workerToolSuffix = workerToolReference
-          ? `; tool: ${workerToolReference.fullToolName}`
-          : ''
-        lines.push(
-          `workers: enabled (max ${WORKERS_MAX_CONCURRENT} parallel, ${WORKERS_MAX_RUNS_PER_TURN} per turn)${workerToolSuffix}`
-        )
-      } else {
-        lines.push('workers: disabled')
-      }
-    }
-
-    lines.push('')
-
-    const previousProjectPath = options.previousSnapshot?.projectPath?.trim() || ''
-    const projectStatus = resolveStatus(
-      resolvedProjectPath || '(not set)',
-      previousProjectPath || '(not set)'
-    )
-
-    lines.push(`${projectStatus} project_path: ${resolvedProjectPath || '(not set)'}`)
-    const previousProjectRules =
-      options.previousSnapshot?.projectRules &&
-      typeof options.previousSnapshot.projectRules === 'object' &&
-      !Array.isArray(options.previousSnapshot.projectRules)
-        ? options.previousSnapshot.projectRules
-        : null
-    const currentProjectRulesKey = projectRules ? JSON.stringify(projectRules) : ''
-    const previousProjectRulesKey = previousProjectRules ? JSON.stringify(previousProjectRules) : ''
-    const projectRulesStatus = resolveStatus(currentProjectRulesKey, previousProjectRulesKey)
-    if (projectRules) {
-      lines.push(`${projectRulesStatus} project_rules_json:`)
-      const serializedRules = JSON.stringify(projectRules, null, 2)
-      for (const line of serializedRules.split('\n')) {
-        lines.push(`  ${line}`)
-      }
-    }
-    const nativeBashLine = this.buildNativeBashDcmLine(options.agentRecord)
-    if (nativeBashLine) {
-      lines.push(`${statusIcons.current} ${nativeBashLine}`)
-    }
-    const runtimeNetworkLine = this.buildRuntimeNetworkDcmLine(options.agentRecord)
-    if (runtimeNetworkLine) {
-      lines.push(`${statusIcons.current} ${runtimeNetworkLine}`)
-    }
-    const nativeAgentBrowserLines = this.buildNativeAgentBrowserDcmLines(options.agentRecord)
-    if (nativeAgentBrowserLines?.length) {
-      lines.push(`${statusIcons.current} ${nativeAgentBrowserLines[0]}`)
-      for (const detailLine of nativeAgentBrowserLines.slice(1)) {
-        lines.push(`  ${detailLine}`)
-      }
-    }
-    const skillsCommandsDcm = await this.buildSkillsCommandsDcm({
-      userId: options.userId,
-      agentId: options.agentId
-    })
-    const skillsCommandsLines = skillsCommandsDcm.lines
-    if (skillsCommandsLines.length > 0) {
-      lines.push('', ...skillsCommandsLines)
-    }
+    const skillsCommandsDcm = options.skillsCommandsDcm
 
     const skillSessionContextLines = await buildSkillSessionContextLines({
       userId: options.userId,
@@ -2830,47 +2925,10 @@ export class DatabaseService {
       lines.push('', ...options.awarenessPendingDcmLines)
     }
 
-    // SA-110 (DL-110-01): the episode whiteboard rides here — a sibling directly
-    // after the memory section, present even when that section is empty. Tail bytes
-    // are cache-free by construction, so the board's by-design churn costs nothing.
+    // One current-board fragment after history, independent of a memory section.
+    // It is frozen within the reply; a save changes only the next new-turn compile.
     if (options.whiteboardDcmLines && options.whiteboardDcmLines.length > 0) {
       lines.push('', ...options.whiteboardDcmLines)
-    }
-
-    const zipState = options.zipState
-    const autoZipContent = Array.isArray(options.autoZipContent) ? options.autoZipContent : []
-    const autoZipTools = Array.isArray(options.autoZipTools) ? options.autoZipTools : []
-    const hasAutoZip = autoZipContent.length > 0 || autoZipTools.length > 0
-    if (zipState?.hasZipHistory || hasAutoZip) {
-      const unzipped = Array.isArray(zipState?.unzipped) ? zipState.unzipped : []
-      lines.push('', 'Current Zip State:')
-      if (options.zipAiViewMode) {
-        lines.push(`- zip_ai_view_mode: ${options.zipAiViewMode}`)
-      }
-      if (typeof options.zipControlPermission === 'boolean') {
-        lines.push(
-          `- zip_control_permission: ${options.zipControlPermission ? 'agent' : 'user-only'}`
-        )
-      }
-      if (autoZipContent.length > 0) {
-        lines.push(`- Auto-zipped content: ${autoZipContent.join(', ')}`)
-      }
-      if (autoZipTools.length > 0) {
-        lines.push(`- Auto-zipped tools: ${autoZipTools.join(', ')}`)
-      }
-      if (unzipped.length === 0) {
-        lines.push('- Unzipped: (none)')
-      } else {
-        for (const item of unzipped) {
-          lines.push(
-            describeUnzippedItemForDcm(item, {
-              agentId: options.agentId ?? null,
-              deadCopy: zipState?.deadCopies?.get(normalizeId(item.zipId)) ?? null,
-              sizeGuard: zipState?.sizeGuards?.get(normalizeId(item.zipId)) ?? null
-            })
-          )
-        }
-      }
     }
 
     const goonLines = await this.buildGoonDcmLines({
@@ -2885,29 +2943,7 @@ export class DatabaseService {
       lines.push('', ...goonLines)
     }
 
-    let discoverable: DynamicMcpDiscoverableRef[] = []
-    let resolvedGatewayIds: string[] | null = null
-    if (options.agentRecord) {
-      const mcpDcm = await this.buildDynamicMcpDcm({
-        mcpGatewayScope: options.mcpGatewayScope,
-        userId: options.userId,
-        agentId: options.agentId,
-        projectPath:
-          options.projectPath ??
-          options.agentDefaultProjectPath ??
-          options.defaultWorkspacePath ??
-          null,
-        nativeDynamicMcpEnabled: options.nativeDynamicMcpEnabled,
-        nativeCliToolsEnabled: this.resolveCliToolsEnabled(options.agentRecord),
-        isCodexMode: options.isCodexMode
-      })
-      discoverable = mcpDcm.discoverable
-      resolvedGatewayIds = mcpDcm.resolvedGatewayIds
-
-      if (mcpDcm.text) {
-        lines.push('', ...mcpDcm.text.split('\n'))
-      }
-    }
+    const { discoverable, resolvedGatewayIds } = options.toolIndex
 
     // SA-120 P1 (DL-120-05): Judge Juice hints close the DCM. The provider owns the network
     // call, its deadline, and its evidence; the compiler only appends what comes back.
@@ -2928,7 +2964,7 @@ export class DatabaseService {
       }
     }
 
-    if (!lines.length) return { text: '', addressSourcePieces: [] }
+    if (!lines.length) return { text: '', addressSourcePieces: [], openSkillsText: '' }
     // SA-128 (DL-04): one `<dynamic_info>` element; the base prompts say it is Batshit's
     // context for this turn (never stored), not the user speaking.
     const text = compiledElement(COMPILED_TAG.dynamicInfo, lines.join('\n'))
@@ -2948,7 +2984,7 @@ export class DatabaseService {
           }
         ]
       : [{ source: 'batshit' as const, text }]
-    return { text, addressSourcePieces }
+    return { text, addressSourcePieces, openSkillsText: openContext.text }
   }
 
   // ========== Complex buildFormattedChatInput - Keep in main class for now ==========
@@ -2961,10 +2997,16 @@ export class DatabaseService {
     assignedSubagents?: any[],
     userId?: string,
     options?: {
+      /** Actual API send finalizes after its real tool bundle is prepared. */
+      deferAgentSetup?: boolean
+      agentSetupSend?: boolean
+      /** Same server turn overrides supplied to native Bash registration. */
+      groupMemberRun?: boolean
+      toolApprovalMode?: ToolApprovalMode
       /** Same server-resolved turn scope used by execution and credentials. */
       mcpGatewayScope?: string[]
+    p5McpOwner?: import('$lib/server/services/appActions/mcp/originalTask').P5OriginalPreparation
       fetch?: typeof fetch
-      runtimeFlavor?: 'codex' | 'claude' | 'vercel'
       projectPath?: string | null
       projectRules?: Record<string, any> | null
       fileReferences?: FileReferencePayload[]
@@ -3017,27 +3059,61 @@ export class DatabaseService {
        * writes nothing.
        */
       countsPendingUserMessage?: boolean
+      /** Actual same-reply API provider replay already carries these admitted results. */
+      skillSessionReplayMessageIds?: ReadonlySet<string>
+      /** Server-owned same-reply snapshot. Never supplied by a browser. */
+      whiteboardContextSnapshot?: WhiteboardContextSnapshot
+      whiteboardMessageId?: string
+      /** SA-137: the actual API turn's live file reads (made by the route, never by a preview). */
+      liveFileReadTurn?: Pick<LiveFileReadTurn, 'snapshotFor'> & Partial<Pick<LiveFileReadTurn, 'snapshot' | 'replayUnavailable' | 'replyMessageId' | 'replyMessageIds'>>
     }
-  ): Promise<{
-    structuredInput: any
-    primarySystemPrompt?: string
-    subagentDescription?: Record<string, string>
-    resolvedProjectPath?: string | null
-    /** BL-474 step 2: what this compile delivered, piece by piece, with each piece's source. */
-    addressSources: CompiledAddressSources
-  }> {
+  ): Promise<FormattedChatInputResult> {
+    this.assertCompilablePrimary(agent)
+    // SA-139 R2/R5 (D14): a record of a removed Subagent type (n8n, or the CLI Subagent) is never on a roster, whatever
+    // the caller loaded (its stored assignment is never cleaned), so it can never fail a compile.
+    assignedSubagents = assignedSubagents?.filter(
+      (subagent) => !isRetiredSubagentType(normalizeSubagentType(subagent, subagent?.subagentType))
+    )
+    if (options?.agentSetupSend && !options.deferAgentSetup) {
+      throw new Error('An API send requires its actual registered tool preparation. Nothing was sent.')
+    }
     // Server compilation must not fall back to global fetch for relative app routes.
     // SvelteKit only allows request-scoped event.fetch for those URLs.
     const fetchImpl = options?.fetch
+    const setupIdentity = userId && agent?.id && sessionId ? { userId, agentId: agent.id as string, sessionId } : null
+    const setupLifecycle = setupIdentity ? captureSettingsLifecycle([`agent:${setupIdentity.agentId}`, `session:${sessionId}`]) : null
+    const setupGuard = () => { if (setupLifecycle) assertSettingsLifecycle(setupLifecycle) }
+    if (options?.p5McpOwner) {
+      const owner = await import('$lib/server/services/appActions/mcp/originalTask')
+      for (const id of options.mcpGatewayScope ?? []) await owner.readP5ApiVerifiedMcpAuthority(options.p5McpOwner, id)
+    }
 
     const {
       primarySystemPrompt,
       globalCustomPrompt,
       globalZipSettings,
+      globalTypedFileTools,
+      globalToolOperationsSource,
       defaultWorkspacePath,
       agentDefaultProjectPath,
       agentDefaultProjectRules
-    } = await this.loadSystemPrompts(agent, userId, options)
+    } = await this.loadSystemPrompts(agent, userId)
+    const apiRetention = normalizePrimaryAgentType(agent) === 'api'
+      ? options?.whiteboardContextSnapshot?.settings ?? resolveApiReasoningRetention(agent)
+      : null
+    if (apiRetention) agent = { ...agent, api_reasoning_retention: apiRetention.mode }
+    const whiteboardControlsEnabled = Boolean(apiRetention?.whiteboardEnabled &&
+      !options?.groupContext && options?.voiceState?.voiceMode !== 'speech-to-speech' &&
+      resolveBrokerToolToggles(agent?.provider_specific_settings).batshitToolsEnabled)
+    const whiteboardDcmLines = apiRetention
+      ? options?.whiteboardContextSnapshot?.dcmLines ?? (whiteboardControlsEnabled && userId && agent?.id
+        ? formatWhiteboardDcmLines(await readAgentWhiteboard({ userId, sessionId, agentId: agent.id }), apiRetention)
+        : [])
+      : null
+    const whiteboardContextSnapshot: WhiteboardContextSnapshot | undefined = apiRetention && userId && agent?.id && options?.whiteboardMessageId
+      ? { schema_version: 1, userId, sessionId, agentId: agent.id, messageId: options.whiteboardMessageId,
+          settings: apiRetention, dcmLines: [...(whiteboardDcmLines ?? [])] }
+      : undefined
     // The DCM's project path, and (SA-129 P1) what relative file paths in tool results resolve against.
     const resolvedProjectPath =
       options?.projectPath?.trim() ||
@@ -3070,34 +3146,32 @@ export class DatabaseService {
     // handed to every reader explicitly (history passes, the unzipped count, the DCM).
     // Server compiles overlap in one process (parallel chats, a wake-up, a token preview),
     // so none of them reads or writes the browser's `zippingService` singleton.
-    const [storedUnzipped, serverRezipped] = await Promise.all([
-      this.loadUnzippedFromRedis(sessionId),
-      this.loadRezippedFromRedis(sessionId)
-    ])
-    // SA-129 P2: a new user message counts once toward every temporary hold at the accepted-send
-    // boundary; this compile already sees the state as it will be then (a hold that ends with
-    // this message is gone, the others show one more message).
-    const serverUnzipped = options?.countsPendingUserMessage
-      ? countOneMoreMessage(storedUnzipped).kept
-      : storedUnzipped
-    // SA-120 P5: whose rezip each marker is. Only a smart-zip turn needs it (Jev may reopen
-    // its own rezip and nobody else's), so every other compile skips these reads.
-    const serverRezippedSources =
-      options?.jevJuiceSmartZipProvider && serverRezipped.length > 0
-        ? await loadRezippedSources(sessionId, serverRezipped)
-        : {}
+    const skillZipState = await this.loadSkillAwareZipState(sessionId, userId, options?.countsPendingUserMessage === true)
+    const serverUnzipped = skillZipState.unzipped
+    const serverRezipped = skillZipState.rezipped
+    const serverRezippedSources = {
+      ...(options?.jevJuiceSmartZipProvider && serverRezipped.length > 0 ? await loadRezippedSources(sessionId, serverRezipped) : {}),
+      ...Object.fromEntries(skillZipState.expiryRezipped.map((id) => [id, 'user' as const]))
+    }
 
     let zipState = createZipStateView(serverUnzipped, serverRezipped, serverRezippedSources)
 
-    const sessionRecord = await redis.getSession(sessionId).catch(() => null)
+    // BL-2217: a failed read rejects the compile (`SESSION_UNAVAILABLE`); an absent record
+    // (a speech-to-speech fallback id) compiles as a regular chat.
+    const sessionRecord = await redis.getSessionForCompile(sessionId)
     const compactionState = getContextCompactionState(sessionRecord?.metadata ?? null)
     // SA-104 P6: Infinite-Session graduation applies at the same site as compaction
     // (idempotent; regular sessions pass through unchanged — DL-104-12). This server
     // application is load-bearing for approval resumes, which reload raw messages.
-    const contextMessages = applyFixedSessionGraduationToMessages(
+    let contextMessages = applyFixedSessionGraduationToMessages(
       applyContextCompactionToMessages(messages, compactionState.events),
       sessionRecord
     )
+    if (skillZipState.record && agent?.id && !options?.precompiledHistory) contextMessages = await recoverOpenSkillReadMessages({
+      record: skillZipState.record, agentId: agent.id, messages: contextMessages, unzipped: serverUnzipped,
+      replayedMessageIds: options?.skillSessionReplayMessageIds,
+      ...(options?.groupContext ? { groupToolSharing: { currentAgentId: agent.id, sharedTools: [] } } : {})
+    })
     const precompiledHistory = options?.precompiledHistory
     // SA-128: read only when this compile builds its own history (a group run arrives with it
     // precompiled), and once even when the smart-zip turn runs the history pass twice.
@@ -3138,7 +3212,9 @@ export class DatabaseService {
           // Group runs compile history once and get no Judge Juice provider (DL-120-06).
           compressedZips: [] as ZipCompression[],
           exposedZips: [] as ZipExposed[],
-          addressSources: precompiledHistory.addressSources ?? []
+          addressSources: precompiledHistory.addressSources ?? [],
+          deadCopiesThisTurn: [] as DeadCopyThisTurn[],
+          liveReadsThisTurn: precompiledHistory.liveReadsThisTurn ?? []
         }
       : await compileHistoryPass(zipState)
 
@@ -3152,7 +3228,10 @@ export class DatabaseService {
     if (options?.jevJuiceSmartZipProvider && !precompiledHistory && currentUserMessage) {
       let opens: Awaited<ReturnType<JevJuiceSmartZipProvider>> = []
       // SA-129 P1: a dead copy stays compressed through any `inferred` unzip, so it is never offered.
-      const zippedItems = compiledHistory.compressedZips.filter((zip) => !zip.deadCopy)
+      // SA-137 Round 2: while Refreshed File Reads is strict, a Read File copy opens only when the
+      // turn refreshed it, so none is offered (an `inferred` open could not show it).
+      const strictLiveReads = options?.liveFileReadTurn?.snapshot?.strict === true
+      const zippedItems = compiledHistory.compressedZips.filter((zip) => !zip.deadCopy && classifyStoredSkillReadZip({ type: zip.zipType, metadata: zip }) === 'non_skill' && !(strictLiveReads && zip.operationKind === 'read_file'))
       try {
         opens = await options.jevJuiceSmartZipProvider({
           currentUserMessage,
@@ -3168,6 +3247,7 @@ export class DatabaseService {
         zippedItems
           .filter(
             (zip) =>
+              classifyStoredSkillReadZip({ type: zip.zipType, metadata: zip }) === 'non_skill' &&
               !zip.sizeGuard &&
               !(zip.zipType === 'cool_tool' && classifyToolResultSize(zip.tokens)) &&
               !zip.groupUnshared &&
@@ -3177,6 +3257,9 @@ export class DatabaseService {
       )
       const accepted = (Array.isArray(opens) ? opens : []).filter((open) => open && openable.has(open.zipId))
       if (accepted.length > 0) {
+        // BL-1515: an open names the message's raw zip id, the stored state its state id
+        // (`normalizeId` of the raw id, BL-476). Only the raw side is normalized, once: a second
+        // cut of a state id whose random part is all digits misses it.
         const openedIds = new Set(accepted.map((open) => normalizeId(open.zipId)))
         const overlay: UnzippedItem[] = accepted.map((open) => ({
           zipId: normalizeId(open.zipId),
@@ -3191,8 +3274,8 @@ export class DatabaseService {
           source: 'inferred'
         }))
         zipState = createZipStateView(
-          [...serverUnzipped.filter((item) => !openedIds.has(normalizeId(item.zipId))), ...overlay],
-          serverRezipped.filter((id) => !openedIds.has(normalizeId(id))),
+          [...serverUnzipped.filter((item) => !openedIds.has(item.zipId)), ...overlay],
+          serverRezipped.filter((id) => !openedIds.has(id)),
           serverRezippedSources
         )
         compiledHistory = await compileHistoryPass(zipState)
@@ -3475,52 +3558,62 @@ export class DatabaseService {
     // Add primary Batshit system prompt (with variable replacement)
     if (primarySystemPrompt) {
       const processedPrimary = replacePromptVariables(primarySystemPrompt, agent, agent?.settings)
-      const promptLabel = getPrimaryAgentSystemPromptLabel(
-        normalizePrimaryAgentType(agent) as 'api' | 'cli'
-      )
+      const promptLabel = getPrimaryAgentSystemPromptLabel('api')
       mergedSystemPrompt += `==== ${promptLabel} ====\n\n${processedPrimary}`
     }
 
-    const runtimeFlavor = options?.runtimeFlavor ?? 'vercel'
+    const setupFeatureGates = { memory: false, dm: false, schedule: false, judge: false, whiteboard: false, zip: false, skill: Boolean(primarySystemPrompt) }
 
-    const zipPermission = this.resolveZipControlPermission(agent, globalZipSettings)
     const zipViewMode = this.resolveZipAiViewMode(agent, globalZipSettings)
     const zipToolNotesEnabled = this.resolveZipToolNotesEnabled(agent, globalZipSettings)
-    const shouldInjectToolGuidance = this.shouldInjectToolGuidance({
+    // SA-137 P5 (D12) and Round 2: only a turn the route gave a `LiveFileReadTurn` (an API Primary
+    // turn with the setting on where it is available, `refreshedFileReadsUnavailableReason`, or the
+    // approval resume of such a turn, even when its replay could not be used) in the appended
+    // layout; every other prompt, previews included, keeps its text. One answer for the zip rules
+    // and for `edit_file`'s text, which send-routed hands to the tools (Josh, 2026-10-22).
+    const refreshedFileReadsTurn = Boolean(options?.liveFileReadTurn) && zipViewMode === 'appended'
+    // Decision 11: the working-context section says "As discussed earlier" and names Tool Notes
+    // only when this block really went out before it.
+    let toolZipBlockSent = false
+    const toolZipPrompt = await this.resolveToolZipGuidancePrompt({
+      notesEnabled: zipToolNotesEnabled,
       agent,
-      assignedSubagents,
-      runtimeFlavor
+      zipViewMode,
+      typedFileTools: this.typedFileToolsOffered(agent, globalTypedFileTools),
+      liveFileReads: refreshedFileReadsTurn,
+      bashCommandsAfterPatchRun: this.resolveNativeBashDcmState(agent)?.enabled === true &&
+        nativeBashAfterPatchFromProvider(agent?.provider_specific_settings ?? agent?.providerSpecificSettings ?? null, {
+          groupMemberRun: options?.groupMemberRun ?? Boolean(options?.groupContext),
+          toolApprovalMode: options?.toolApprovalMode
+        })
     })
-    const shouldInjectZipGuidance = this.shouldInjectZipGuidance(contextMessages, agent, globalZipSettings, {
-      assignedSubagents,
-      runtimeFlavor
-    })
-    if (shouldInjectToolGuidance || shouldInjectZipGuidance) {
-      const toolZipPrompt = await this.resolveToolZipGuidancePrompt({
-        hasPermission: zipPermission,
-        notesEnabled: zipToolNotesEnabled,
-        agent,
-        zipViewMode,
-        runtimeFlavor
-      })
-      if (toolZipPrompt.trim()) {
-        if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
-        const label = zipPermission
-          ? 'TOOL + ZIP GUIDANCE (ZIP CONTROL ENABLED)'
-          : 'TOOL + ZIP GUIDANCE (ZIP CONTROL USER-ONLY)'
-        mergedSystemPrompt += `==== ${label} ====\n\n${toolZipPrompt}`
-      }
+    if (toolZipPrompt.trim()) {
+      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+      // Decision 7 (Josh, 2026-10-23): agent zip control is retired, so the label names no permission.
+      mergedSystemPrompt += `==== TOOL + ZIP GUIDANCE ====\n\n${toolZipPrompt}`
+      toolZipBlockSent = true
     }
 
-    // SA-096 P5: the broker block is gated on broker availability alone, not nested under
-    // the tool + zip condition. `shouldInjectToolGuidance` is stricter than the broker on
-    // the n8n lane (it wants MCP selections or subagents), so nesting hid the instructions
-    // from n8n agents whose Batshit Tools node advertises broker families in their DCM.
-    if (this.hasBrokerAccess(agent, runtimeFlavor)) {
-      const dynamicMcpPrompt = await this.resolveDynamicMcpPrompt(agent, runtimeFlavor)
+    if (apiRetention) {
+      const workingContext = buildWorkingContextGuidance({ settings: apiRetention,
+        toolNotesEnabled: zipToolNotesEnabled && toolZipBlockSent,
+        whiteboardAvailable: whiteboardControlsEnabled,
+        toolZipBlockSent })
+      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+      mergedSystemPrompt += `==== MAINTAINING YOUR WORKING CONTEXT ====\n\n${workingContext}`
+    }
+
+    // SA-096 P5: the broker block is gated on broker availability alone, never nested under
+    // the tool + zip block: nesting once hid the instructions from agents whose broker
+    // families were live (the n8n lane's stricter tool gate, retired since).
+    const discoveryOffset = mergedSystemPrompt.length
+    let discoveryAppend = ''
+    if (this.hasBrokerAccess(agent)) {
+      const dynamicMcpPrompt = await this.resolveDynamicMcpPrompt(agent)
       if (dynamicMcpPrompt.trim()) {
         if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
         mergedSystemPrompt += `==== DYNAMIC TOOL SEARCH / DISCOVERY (WHEN ENABLED) ====\n\n${dynamicMcpPrompt}`
+        discoveryAppend = mergedSystemPrompt.slice(discoveryOffset)
       }
     }
 
@@ -3537,7 +3630,7 @@ export class DatabaseService {
         workersEnabled: resolveWorkersEnabled(agent)
       })
     ) {
-      const delegationPrompt = await this.resolveSubagentGuidancePrompt(agent, runtimeFlavor)
+      const delegationPrompt = await this.resolveSubagentGuidancePrompt(agent)
       if (delegationPrompt.trim()) {
         if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
         mergedSystemPrompt += `==== SUBAGENTS & WORKERS (DELEGATION) ====\n\n${delegationPrompt}`
@@ -3547,26 +3640,29 @@ export class DatabaseService {
     // SA-113 P2 (DL-113-04a): Agent DM guidance sits directly after the delegation block
     // and before MEMORY INSTRUCTIONS — both are "other things you can reach", and DMs are
     // the closer sibling of delegation. Stable-prefix bytes: they move only when the
-    // agent's `dms_enabled` or the stored prompt changes.
+    // agent's `dms_enabled`, its Fabric & Utilities switch, or the stored prompt changes.
     if (resolveAgentDmsEnabled(agent)) {
-      const dmPrompt = await this.resolveDmGuidancePrompt(agent, runtimeFlavor)
+      const dmPrompt = await this.resolveDmGuidancePrompt(agent)
       if (dmPrompt.trim()) {
         if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
         mergedSystemPrompt += `==== AGENT DMS (MESSAGING) ====\n\n${dmPrompt}`
+        setupFeatureGates.dm = true
       }
     }
 
     // SA-120 P2 (H1): the Judge Juice judgment-tool guidance sits directly after the DM
     // block and before MEMORY INSTRUCTIONS — one more "thing you can reach". Gated on the
-    // agent's `jev_juice_judge_tool` switch alone, the same switch that opens `sys.judge.*`
-    // in the broker (DL-120-06), so a control the agent cannot call is never taught.
-    // Stable-prefix bytes: they move only when the switch or the stored prompt changes.
+    // agent's `jev_juice_judge_tool` switch plus Fabric & Utilities, the same pair that opens
+    // `sys.judge.*` in the broker (DL-120-06), so a control the agent cannot call is never
+    // taught. Stable-prefix bytes: they move only when either switch or the stored prompt
+    // changes.
     // Jev's ANSWERS never land here (DL-120-05); this only teaches how to ask.
     if (resolveAgentJevJudgeToolEnabled(agent)) {
-      const jevPrompt = await this.resolveJevJuiceGuidancePrompt(agent, runtimeFlavor)
+      const jevPrompt = await this.resolveJevJuiceGuidancePrompt(agent)
       if (jevPrompt.trim()) {
         if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
         mergedSystemPrompt += `==== JUDGE JUICE (JUDGMENT TOOL) ====\n\n${jevPrompt}`
+        setupFeatureGates.judge = true
       }
     }
 
@@ -3575,10 +3671,14 @@ export class DatabaseService {
     // compiled prefix (DL-104-04): it changes only when enablement or the stored prompt
     // changes.
     if (resolveAgentMemoryEnabled(agent)) {
-      const memoryPrompt = await this.resolveMemoryGuidancePrompt(agent, runtimeFlavor)
+      const memoryPrompt = await this.resolveMemoryGuidancePrompt(
+        agent,
+        isFixedSession(sessionRecord)
+      )
       if (memoryPrompt.trim()) {
         if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
         mergedSystemPrompt += `==== MEMORY INSTRUCTIONS (AGENT MEMORY ENABLED) ====\n\n${memoryPrompt}`
+        setupFeatureGates.memory = true
       }
     }
 
@@ -3590,6 +3690,8 @@ export class DatabaseService {
     if (sharedInsert) {
       mergedSystemPrompt += sharedInsert
     }
+
+    const setupPrefix = mergedSystemPrompt
 
     // ---------- Identity zone ----------
 
@@ -3639,6 +3741,8 @@ export class DatabaseService {
     const subagentModels: Record<string, { provider?: string | null; model?: string | null }> = {}
     // SA-111 P1 (DL-111-03): the capability fragment appended to each DCM roster line.
     const subagentCapabilityFragments: Record<string, string> = {}
+    const subagentThreads = new Map<string, 'none' | 'resumable' | 'unavailable'>()
+    const subagentSetup = new Map<string, AgentSetupBlock>()
 
     if (assignedSubagents && assignedSubagents.length > 0) {
       // One gateway-registry read per compile, shared by every subagent's roster line, and
@@ -3662,6 +3766,7 @@ export class DatabaseService {
       }
 
       for (const swf of assignedSubagents) {
+        if (isRetiredSubagentType(normalizeSubagentType(swf, swf?.subagentType))) continue
         const subagentScope = await resolveManagedSubagentScope({
           userId: userId ?? '',
           subagent: swf,
@@ -3682,39 +3787,36 @@ export class DatabaseService {
 
         // `thread: resumable` means this subagent already holds prior context in THIS chat
         // session, so a `thread: "resume"` call continues it instead of starting over.
-        //
-        // SA-111 P2: two owners, two keys. Batshit stores a managed API/CLI subagent's
-        // exchanges itself, while an n8n Workflow Subagent's conversation lives in n8n's own
-        // Redis — Batshit only holds the thread id that names it (DL-111-06). Reading the
-        // managed key for an n8n subagent would report `none` whenever n8n runs on a
-        // separate Redis, which is exactly the kind of confident-but-wrong roster fact the
-        // primary would act on.
-        let threadState: 'none' | 'resumable' = 'none'
+        let threadState: 'none' | 'resumable' | 'unavailable' = 'none'
         if (sessionId) {
-          const threadKey = buildSubagentThreadStateKey(
-            sessionId,
-            safeKey,
-            subagentScope.subagentType
-          )
+          const threadKey = buildSubagentThreadKey(sessionId, safeKey)
           try {
             threadState = (await redis.exists(threadKey)) ? 'resumable' : 'none'
           } catch (error) {
+            threadState = 'unavailable'
             console.warn('[buildDynamicInfoBlock] Failed to read subagent thread state:', error)
           }
         }
 
         const needsGatewayNames =
-          subagentScope.subagentType !== 'n8n-workflow' &&
           subagentScope.nativeToolSettings.dynamicMcpEnabled &&
           subagentScope.resolvedGateways.length > 0
+        subagentThreads.set(safeKey, threadState)
         subagentCapabilityFragments[safeKey] = buildSubagentRosterCapabilityFragment({
           scope: subagentScope,
           capabilities: subagentCapabilities,
           gatewayNames: needsGatewayNames ? await resolveGatewayNames() : new Map(),
           model: subagentModel.model,
           provider: subagentModel.provider,
-          threadState
-        })
+          threadState,
+          // Delegation limits: named only when this Subagent sets one.
+          timeoutSeconds: swf.timeout_seconds ?? swf.settings?.timeout_seconds,
+          maxToolSteps: swf.max_tool_steps ?? swf.settings?.max_tool_steps
+        }, { includeThread: false })
+        const label = `${swf.displayName || swf.name || safeKey} (${safeKey})`
+        const text = `- ${setupMetadata(label)}: ${setupMetadata(saDescription.replace(/\s+/g, ' ').trim())} — ${setupMetadata(subagentCapabilityFragments[safeKey])}`
+        subagentSetup.set(safeKey, { key: `subagent:${swf.id}`, source: 'api-utilities', section: 'subagents', order: 0,
+          text, items: [{ key: `subagent:${swf.id}`, label, text }] })
       }
 
     }
@@ -3746,7 +3848,7 @@ export class DatabaseService {
 
     const previousSnapshot = this.getPreviousDynamicSnapshot(contextMessages)
     // SA-129 P2: a hold on a copy this compile compressed as dead (an agent's hold on a copy it
-    // edited since) says so in `Current Zip State`, so the agent is never surprised.
+    // edited since) says so in the Zip Index, so the agent is never surprised.
     const heldDeadCopies = new Map<string, DeadCopyReason>()
     const heldSizeGuards = new Map<string, ToolResultSizeGuard>()
     for (const compression of compiledHistory.compressedZips) {
@@ -3757,7 +3859,9 @@ export class DatabaseService {
       contextMessages,
       zipState.getAllUnzipped(),
       heldDeadCopies,
-      heldSizeGuards
+      heldSizeGuards,
+      compiledHistory.deadCopiesThisTurn,
+      compiledHistory.liveReadsThisTurn
     )
     const autoZipSummary = this.buildAutoZipSummary({
       agent,
@@ -3771,56 +3875,124 @@ export class DatabaseService {
       !Array.isArray(options.projectRules)
         ? options.projectRules
         : agentDefaultProjectRules ?? null
+    setupFeatureGates.whiteboard = Boolean(apiRetention && whiteboardControlsEnabled)
+    setupFeatureGates.zip = toolZipBlockSent && resolveBrokerToolToggles(agent?.provider_specific_settings).fetchZipEnabled
+    setupFeatureGates.schedule = setupFeatureGates.dm
+    const skillsCommandsDcm = await this.buildSkillsCommandsDcm({ userId, agentId: agent?.id })
+    const readToolIndex = (apiUtilityScope?: ApiUtilityScope) => this.buildDynamicMcpDcm({
+      apiUtilityScope,
+      userId, agentId: agent?.id, mcpGatewayScope: options?.mcpGatewayScope, p5McpOwner: options?.p5McpOwner,
+      projectPath: resolvedProjectPath, nativeDynamicMcpEnabled,
+      nativeCliToolsEnabled: this.resolveCliToolsEnabled(agent), whiteboardControlsEnabled,
+      providerSettings: this.getAgentProviderSettings(agent),
+      memoryControlsEnabled: resolveAgentMemoryEnabled(agent), dmControlsEnabled: resolveAgentDmsEnabled(agent),
+      scheduleControlsEnabled: resolveAgentDmsEnabled(agent), judgeControlsEnabled: resolveAgentJevJudgeToolEnabled(agent),
+      featureHintGates: setupFeatureGates
+    })
+    // The routed API path waits for its actual eligible registrations. Other
+    // callers still read once here; previews never register tools to guess a scope.
+    let toolIndex: AgentSetupToolIndex = options?.deferAgentSetup
+      ? { text: '', discoverable: [], resolvedGatewayIds: null, setupBlocks: [], sources: [],
+        hintBudget: { limit: 3000, budgetedTokens: 0, featureTokens: 0 }, apiUtilityProjection: 'unprepared' }
+      : await readToolIndex()
+    const setupBlocks: AgentSetupBlock[] = []
+    const fact = (key: string, text: string, section: AgentSetupBlock['section'] = 'facts') => {
+      if (!text) return
+      setupBlocks.push({ key, source: 'runtime', section, order: setupBlocks.length,
+        text, items: [{ key, label: key, text }] })
+    }
+    if (agent?.id) fact('agent_id', `agent_id: ${setupMetadata(agent.id)}`)
+    fact('workers', this.buildWorkersSetupLine(agent))
+    const network = this.buildRuntimeNetworkDcmLine(agent)
+    if (network) fact('runtime_network', setupMetadata(network))
+    const browser = await this.buildNativeAgentBrowserDcmLines(agent, userId, globalToolOperationsSource)
+    if (browser?.length) fact('native_agent_browser', browser.map(setupMetadata).join('\n'))
+    const bash = this.buildNativeBashDcmLine(agent)
+    if (bash) fact('native_bash', setupMetadata(bash))
+    if (skillsCommandsDcm.lines.length) setupBlocks.push({
+      key: 'skills_commands', source: 'skills', section: 'skills', order: 0,
+      text: skillsCommandsDcm.lines.join('\n'),
+      items: skillsCommandsDcm.capabilities.map((capability, index) => ({
+        key: `skill:${capability.id}`, label: capability.invocation,
+        text: skillsCommandsDcm.lines[index + 1]
+      }))
+    })
+    fact('project_path', `project_path: ${setupMetadata(resolvedProjectPath || '(not set)')}`, 'project')
+    if (projectRules) fact('project_rules_json', `project_rules_json: ${setupMetadata(JSON.stringify(projectRules))}`, 'project')
+    const liveSetup: LiveAgentSetup = {
+      blocks: [...setupBlocks, ...toolIndex.setupBlocks],
+      sources: [{ id: 'runtime', label: 'Agent runtime', available: true }, { id: 'skills', label: 'Skills', available: true }, ...toolIndex.sources]
+    }
     const controlErrorLines = buildControlErrorDcmLines(contextMessages as any[])
-    const dynamicInfoResult = currentMessageFormatted
+    // A consumed MCP prerequisite is the same task with no new user message.
+    // Only its genuine original owner can request fresh DCM before the child API
+    // run; ordinary empty/context-limit compiles retain their existing path.
+    let prerequisiteDcm = false
+    if (!currentMessageFormatted && options?.p5McpOwner) {
+      const owner = await import('$lib/server/services/appActions/mcp/originalTask')
+      prerequisiteDcm = owner.p5ApiNeedsPrerequisiteDcm(options.p5McpOwner)
+    }
+    const initialOpenSkills = skillZipState.record && userId && agent?.id
+      ? await readOpenSkillSessions({ userId, sessionId, agentId: agent.id }, skillZipState.record) : []
+    const dynamicInfoResult = currentMessageFormatted || prerequisiteDcm
         ? await this.buildDynamicInfoBlock({
+          toolIndex, skillsCommandsDcm, sessionId,
+          openSkillSessions: initialOpenSkills,
+          allowUnpreparedSkillHints: options?.deferAgentSetup === true,
           mcpGatewayScope: options?.mcpGatewayScope,
+          p5McpOwner: options?.p5McpOwner,
           userId: userId ?? null,
           controlErrorLines,
           currentUserMessage: currentUserMessage ?? null,
-          agentRecord: agent,
           agentId: agent?.id ?? null,
           projectPath: options?.projectPath ?? null,
           agentDefaultProjectPath: agentDefaultProjectPath ?? null,
           projectRules,
           defaultWorkspacePath: defaultWorkspacePath ?? null,
           fileReferences: options?.fileReferences ?? [],
-          subagentDescriptions: subagentDescription,
-          subagentCapabilityFragments,
-          assignedSubagents,
           nativeDynamicMcpEnabled,
           previousSnapshot,
           goonId: agent?.goon_id ?? null,
           goonsEnabled,
           goonsSettings: options?.goonsSettings ?? null,
           goonPresentationMode: options?.goonPresentationMode ?? null,
-          jevJuiceHintProvider: options?.jevJuiceHintProvider,
+          jevJuiceHintProvider: currentMessageFormatted && !options?.deferAgentSetup ? options?.jevJuiceHintProvider : undefined,
           groupContext: options?.groupContext,
           voiceState: options?.voiceState,
-          zipState: zipStateSnapshot,
-          autoZipContent: autoZipSummary.autoZipContent,
-          autoZipTools: autoZipSummary.autoZipTools,
-          zipControlPermission: zipPermission,
-          zipAiViewMode: zipViewMode,
-          isCodexMode: options?.runtimeFlavor === 'codex' || options?.runtimeFlavor === 'claude',
           memoryDcmLines,
           clipRosterDcmLines,
           dmRosterDcmLines: dmRoster.lines,
-          whiteboardDcmLines: memoryCompileContext?.whiteboardDcmLines ?? [],
+          whiteboardDcmLines: whiteboardDcmLines ?? memoryCompileContext?.whiteboardDcmLines ?? [],
+          whiteboardControlsEnabled,
           awarenessPendingDcmLines: memoryCompileContext?.awarenessPendingDcmLines ?? []
         })
-      : { text: '', addressSourcePieces: [] }
+      : { text: '', addressSourcePieces: [], openSkillsText: '' }
     const dynamicInfo = dynamicInfoResult.text
-    const currentMessageForLLM = currentMessageFormatted
+    // Decision 5 (Josh, 2026-10-23): the Zip Index carries what the DCM's `Current Zip State` did,
+    // on the same compiles (the ones that build a DCM), whichever pass or group run made the history.
+    const zipIndexStatusLines = currentMessageFormatted || prerequisiteDcm
+      ? this.buildZipIndexStatusLines({
+          zipState: zipStateSnapshot,
+          autoZipContent: autoZipSummary.autoZipContent,
+          autoZipTools: autoZipSummary.autoZipTools,
+          agentId: agent?.id ?? null
+        })
+      : []
+    const historyForLLM = withZipIndexStatus(resolvedChatHistory, zipIndexStatusLines)
+    // Decision 11 (Josh, 2026-10-24): the message to answer now is labeled `<current_message>`, in
+    // the place it always had: after `</conversation>` and any `<zip_index>`, before
+    // `<dynamic_info>` and the clip elements. About 8 tokens, in the uncached tail.
+    const currentMessageElement = currentMessageFormatted ? compiledCurrentMessage(currentMessageFormatted) : ''
+    const currentMessageForLLM = currentMessageElement
       ? dynamicInfo
-        ? `${currentMessageFormatted}\n\n${dynamicInfo}`
-        : currentMessageFormatted
-      : ''
+        ? `${currentMessageElement}\n\n${dynamicInfo}`
+        : currentMessageElement
+      : dynamicInfo
     
     // SA-128 (DL-01): `<conversation>` (and the zip index), then the new message and its
     // `<dynamic_info>`. The tags carry the structure, so there are no section headers.
-    if (resolvedChatHistory) {
-      textContent += resolvedChatHistory
+    if (historyForLLM) {
+      textContent += historyForLLM
     }
 
     if (currentMessageForLLM) {
@@ -3946,7 +4118,7 @@ export class DatabaseService {
         userSystemPromptLength: userSystemPrompt?.length || 0,
         globalCustomPromptLength: globalCustomPrompt?.length || 0,
         mergedSystemPromptLength: mergedSystemPrompt?.length || 0,
-        previousConversationLength: resolvedChatHistory?.length || 0,
+        previousConversationLength: historyForLLM?.length || 0,
         currentMessageLength: currentMessageForLLM?.length || 0,
         unzippedItemsCount,
         clippedItemsCount: dedupedClippedContent.length,
@@ -3954,6 +4126,12 @@ export class DatabaseService {
         resolvedProjectPath,
         assignedSubagents: assignedSubagentMetadata,
         subagentModels,
+        ...(apiRetention ? { whiteboardContext: {
+          enabled: whiteboardControlsEnabled, placement: 'dcm',
+          renderedTokenEstimate: estimateTokens((whiteboardDcmLines ?? []).join('\n')),
+          budgetTokens: apiRetention.whiteboardBudgetTokens,
+          mode: apiRetention.mode
+        } } : {}),
         // SA-104 P4: inserted-memory visibility for the Execution Viewer (rides the
         // recorded snapshot's structuredInput untouched on every lane).
         ...(memoryCompileContext?.memoryContext
@@ -3986,6 +4164,8 @@ export class DatabaseService {
         text: standingMediaItems.length > 0 ? standingMediaItems.map((item) => item.filename).join('\n') : ''
       },
       ...(compiledHistory.addressSources ?? []),
+      // Decision 5: the Zip Index's status lines are Batshit's own words, as they were in the DCM.
+      { source: 'batshit', text: zipIndexStatusLines.join('\n') },
       {
         source:
           options?.currentMessageFrom === 'batshit'
@@ -3998,7 +4178,7 @@ export class DatabaseService {
         source: 'memory',
         text: [
           ...memoryDcmLines,
-          ...(memoryCompileContext?.whiteboardDcmLines ?? []),
+          ...(whiteboardDcmLines ?? memoryCompileContext?.whiteboardDcmLines ?? []),
           ...(memoryCompileContext?.awarenessPendingDcmLines ?? [])
         ].join('\n')
       },
@@ -4012,13 +4192,207 @@ export class DatabaseService {
         dedupedClippedContent.filter((item) => item.contentType !== 'text').length
     }
 
-    return {
-      structuredInput,  // The actual structured data
-      primarySystemPrompt: compiledMainSystemPrompt || undefined,
-      subagentDescription: subagentDescription,
-      resolvedProjectPath,
-      addressSources
+    const identitySuffix = mergedSystemPrompt.slice(setupPrefix.length).replace(/^\n\n/, '')
+    const identityBeforeAwareness = systemPromptBeforeAwareness.slice(setupPrefix.length).replace(/^\n\n/, '')
+    const clippedTextTail = String(live[0].text).slice(textContent.length)
+    const finalize = async (fingerprint?: string, additional?: SetupRuntimeAdmission): Promise<FormattedChatInputResult> => {
+      setupGuard()
+      let baseLive = liveSetup
+      if (options?.deferAgentSetup) {
+        if (!additional?.apiUtilityScope) throw new Error('The actual API utility registration set is unavailable. Nothing was sent.')
+        toolIndex = await readToolIndex(additional.apiUtilityScope)
+        setupGuard()
+        baseLive = { blocks: [...setupBlocks, ...toolIndex.setupBlocks],
+          sources: [...liveSetup.sources, ...toolIndex.sources] }
+      }
+      const subagentTargets = additional?.apiUtilityScope ? readApiUtilities(additional.apiUtilityScope, { userId, agentId: agent?.id })
+        .find(entry => entry.controlId === API_UTILITY_CONTROL_IDS.subagent)?.targets ?? [] : []
+      const subagentBlocks = subagentTargets.map(target => subagentSetup.get(target.metadata.slug)).filter((block): block is AgentSetupBlock => !!block)
+      if (subagentBlocks.length) subagentBlocks[0] = { ...subagentBlocks[0], text: `subagents:\n${subagentBlocks[0].text}` }
+      baseLive = { ...baseLive, blocks: [...baseLive.blocks, ...subagentBlocks] }
+      let completeLive: LiveAgentSetup = additional ? {
+        blocks: [...baseLive.blocks, ...additional.blocks], sources: [...baseLive.sources, ...additional.sources]
+      } : baseLive
+      let prefix = setupPrefix
+      if (additional?.brokerAvailable !== undefined && additional.brokerAvailable !== Boolean(discoveryAppend)) {
+        const before = setupPrefix.slice(0, discoveryOffset)
+        const after = setupPrefix.slice(discoveryOffset + discoveryAppend.length).replace(/^\n\n/, '')
+        const guide = additional.brokerAvailable ? await this.resolveDynamicMcpPrompt(agent) : ''
+        prefix = [before, guide.trim() ? `==== DYNAMIC TOOL SEARCH / DISCOVERY (WHEN ENABLED) ====\n\n${guide}` : '', after].filter(Boolean).join('\n\n')
+      }
+      if (additional?.toolsRegistered === false) {
+        const keep = completeLive.blocks.filter(block => block.section !== 'tools' && !['native_bash', 'runtime_network', 'native_agent_browser'].includes(block.key))
+          .map(block => block.key === 'workers' ? { ...block, text: 'workers: disabled (tool runtime unavailable for this model)',
+            items: [{ key: 'workers', label: 'workers', text: 'workers: disabled (tool runtime unavailable for this model)' }] } : block)
+        const sources = new Set(keep.map(block => block.source))
+        completeLive = { blocks: keep, sources: completeLive.sources.filter(source => sources.has(source.id)) }
+      }
+      // This is the only deferred Judge hint call. It consumes the same live
+      // actor/runtime projection, after the actual registrations are known.
+      let finalizedDynamic = dynamicInfo
+      let finalizedDynamicPieces = dynamicInfoResult.addressSourcePieces
+      if (userId && agent?.id && (currentMessageFormatted || prerequisiteDcm)) {
+        const skillIndex = additional?.toolsRegistered === false || additional?.brokerAvailable === false
+          ? { ...toolIndex, allowedSkillToolHints: [], completeFeatureHintRefs: [] } : toolIndex
+        const context = await buildOpenSkillContext({ actor: { userId, sessionId, agentId: agent.id },
+          skills: initialOpenSkills, toolIndex: skillIndex })
+        finalizedDynamic = replaceOpenSkillSectionInDcm(dynamicInfo, dynamicInfoResult.openSkillsText, context.text)
+        if (finalizedDynamic !== dynamicInfo) {
+          if (finalizedDynamicPieces.length === 1 && finalizedDynamicPieces[0].text === dynamicInfo) {
+            finalizedDynamicPieces = finalizedDynamic ? [{ source: 'batshit', text: finalizedDynamic }] : []
+          } else if (!finalizedDynamicPieces.length) {
+            finalizedDynamicPieces = finalizedDynamic ? [{ source: 'batshit', text: finalizedDynamic }] : []
+          } else {
+            const [first, ...rest] = finalizedDynamicPieces
+            if (first.source !== 'batshit') throw new Error('The original open skill provenance is unavailable. Nothing was sent.')
+            finalizedDynamicPieces = [{ ...first, text: replaceOpenSkillSectionBody(first.text, dynamicInfoResult.openSkillsText, context.text) }, ...rest]
+          }
+        }
+      }
+      let openSkillSectionPrefix = ''
+      if (subagentTargets.length) {
+        const threads = 'subagent_threads:\n' + subagentTargets.map(target =>
+          `- ${setupMetadata(target.metadata.slug)}: ${subagentThreads.get(target.metadata.slug) ?? 'unavailable'}`).join('\n')
+        openSkillSectionPrefix = disarmCompiledTags(threads)
+        const body = finalizedDynamic ? finalizedDynamic.slice('<dynamic_info>\n'.length, -'\n</dynamic_info>'.length) : ''
+        finalizedDynamic = compiledElement(COMPILED_TAG.dynamicInfo, [threads, body].filter(Boolean).join('\n\n'))
+        finalizedDynamicPieces = finalizedDynamicPieces.length === 1 && finalizedDynamicPieces[0].text === dynamicInfo
+          ? [{ source: 'batshit', text: finalizedDynamic }]
+          : [{ source: 'batshit', text: threads }, ...finalizedDynamicPieces]
+      }
+      if (options?.deferAgentSetup && currentMessageFormatted && options.jevJuiceHintProvider) {
+        setupGuard()
+        try {
+          const hints = await options.jevJuiceHintProvider({ currentUserMessage: currentUserMessage ?? '',
+            skills: additional?.toolsRegistered === false ? [] : skillsCommandsDcm.capabilities,
+            discoverable: additional?.toolsRegistered === false ? [] : toolIndex.discoverable,
+            resolvedGatewayIds: additional?.toolsRegistered === false ? null : toolIndex.resolvedGatewayIds })
+          if (hints?.length) {
+            const beforeHints = finalizedDynamic
+            const body = finalizedDynamic ? finalizedDynamic.slice('<dynamic_info>\n'.length, -'\n</dynamic_info>'.length) : ''
+            finalizedDynamic = compiledElement(COMPILED_TAG.dynamicInfo, [body, hints.join('\n')].filter(Boolean).join('\n\n'))
+            finalizedDynamicPieces = finalizedDynamicPieces.length === 1 && finalizedDynamicPieces[0].text === beforeHints
+              ? [{ source: 'batshit', text: finalizedDynamic }]
+              : [...finalizedDynamicPieces, { source: 'batshit', text: hints.join('\n') }]
+          }
+        } catch (error) { console.error('[Agent Setup] Judge hint provider failed; no hint lines this turn:', error) }
+      }
+      const selection = setupIdentity ? agentSetupCache.prepare({
+        identity: setupIdentity, live: completeLive, precedingBytes: prefix,
+        toolFingerprint: fingerprint, preview: !options?.agentSetupSend, guard: setupGuard
+      }) : undefined
+      const setupText = selection?.text ?? renderAgentSetup(completeLive)
+      const sentBlocks = selection?.snapshot.blocks ?? completeLive.blocks
+      const sizeOf = (predicate: (block: AgentSetupBlock) => boolean) => setupTokenEstimate(sentBlocks.filter(predicate).map(block => block.text).join('\n'))
+      const changes = selection?.changes ?? renderSetupChanges(undefined, completeLive)
+      const prompt = [prefix, setupText, identitySuffix].filter(Boolean).join('\n\n')
+      const beforeAwareness = [prefix, setupText, identityBeforeAwareness].filter(Boolean).join('\n\n')
+      const dynamic = changes ? finalizedDynamic
+        ? finalizedDynamic.slice(0, '<dynamic_info>\n'.length) + changes + '\n\n' + finalizedDynamic.slice('<dynamic_info>\n'.length)
+        : compiledElement(COMPILED_TAG.dynamicInfo, changes)
+        : finalizedDynamic
+      const newCurrent = [currentMessageElement, dynamic].filter(Boolean).join('\n\n')
+      const main = [historyForLLM, newCurrent].filter(Boolean).join('\n\n') + clippedTextTail
+      const liveParts = live.map((part, index) => index === 0 ? { ...part, text: main } : part)
+      const body = standing.length + liveParts.length === 1 ? main : [...standing, ...liveParts]
+      const dynamicPieces = finalizedDynamicPieces
+      const originalDynamic = new Set(dynamicInfoResult.addressSourcePieces)
+      const updatedPieces = dynamicPieces.length === 1 && dynamicPieces[0].text === finalizedDynamic
+        ? [{ source: 'batshit' as const, text: dynamic }]
+        : [...(changes ? [{ source: 'batshit' as const, text: changes }] : []), ...dynamicPieces]
+      const pieces: AddressSourcePiece[] = []
+      let insertedDynamic = false
+      const dynamicAddressStart = addressPieces.length - clippedSources.length - 1 - dynamicInfoResult.addressSourcePieces.length
+      for (const [index, piece] of addressPieces.entries()) {
+        if (index === 0) { pieces.push({ ...piece, text: beforeAwareness }); continue }
+        if (!originalDynamic.size && index === dynamicAddressStart && dynamic) pieces.push(...updatedPieces)
+        if (originalDynamic.has(piece)) {
+          if (!insertedDynamic) { pieces.push(...updatedPieces); insertedDynamic = true }
+        } else pieces.push(piece)
+      }
+      let currentMain = main
+      let currentDynamic = dynamic
+      let currentCoreDynamic = finalizedDynamic
+      let currentOpenText = dynamicInfoResult.openSkillsText
+      // Final API registration may have replaced the provisional section before dispatch.
+      if (userId && agent?.id && sessionId) {
+        const context = await buildOpenSkillContext({ actor: { userId, sessionId, agentId: agent.id },
+          skills: initialOpenSkills, toolIndex: additional?.toolsRegistered === false || additional?.brokerAvailable === false
+            ? { allowedSkillToolHints: [], completeFeatureHintRefs: [] } : toolIndex })
+        currentOpenText = context.text
+      }
+      const contextIndex = additional?.toolsRegistered === false || additional?.brokerAvailable === false
+        ? { allowedSkillToolHints: [], completeFeatureHintRefs: [] } : toolIndex
+      // Keep the original pre-countdown identity, since a projected Close bumps revision.
+      const projectedOut = new Set((skillZipState.sourceRecord?.entries ?? []).filter(entry => entry.status === 'open' &&
+        !initialOpenSkills.some(open => open.agentId === entry.agentId && open.skillId === entry.skillId &&
+          open.generation === entry.generation && open.revision === entry.revision))
+        .map(entry => `${entry.agentId}:${entry.skillId}:${entry.generation}:${entry.revision}`))
+      const visibleSkills = (skills: readonly OpenSkillSession[]) => skills.filter(entry =>
+        !projectedOut.has(`${entry.agentId}:${entry.skillId}:${entry.generation}:${entry.revision}`))
+      const readOpenSkillContext = userId && agent?.id && sessionId ? async () => buildOpenSkillContext({
+        actor: { userId, sessionId, agentId: agent.id }, toolIndex: contextIndex,
+        skills: visibleSkills(await readOpenSkillSessions({ userId, sessionId, agentId: agent.id })) }) : undefined
+      const refreshOpenSkills = readOpenSkillContext ? async () => {
+        setupGuard()
+        const context = await readOpenSkillContext()
+        if (context.text === currentOpenText) return undefined
+        const replaced = replaceOpenSkillSectionInDcm(currentCoreDynamic, currentOpenText, context.text, openSkillSectionPrefix)
+        const nextDynamic = changes ? replaced
+          ? replaced.slice(0, '<dynamic_info>\n'.length) + changes + '\n\n' + replaced.slice('<dynamic_info>\n'.length)
+          : compiledElement(COMPILED_TAG.dynamicInfo, changes) : replaced
+        const prefix = [historyForLLM, currentMessageElement].filter(Boolean).join('\n\n')
+        const start = prefix.length
+        const removed = currentDynamic ? `${prefix ? '\n\n' : ''}${currentDynamic}` : ''
+        const inserted = nextDynamic ? `${prefix ? '\n\n' : ''}${nextDynamic}` : ''
+        const update = createSkillDcmUpdate(currentMain, start, removed, inserted, context.text)
+        currentMain = currentMain.slice(0, start) + inserted + currentMain.slice(start + removed.length)
+        currentDynamic = nextDynamic
+        currentCoreDynamic = replaced
+        currentOpenText = context.text
+        return update
+      } : undefined
+      const previewOpenSkillContext = userId && agent?.id && sessionId ? async (skillId: string, result: Record<string, any>, messageId: string) => {
+        const skills = await previewOpenSkillSessions({ userId, sessionId, agentId: agent.id }, skillId,
+          result.skillName || result.skill?.name || skillId, messageId)
+        return buildOpenSkillContext({ actor: { userId, sessionId, agentId: agent.id }, toolIndex: contextIndex, skills: visibleSkills(skills) })
+      } : undefined
+      return {
+        refreshOpenSkills, readOpenSkillContext, previewOpenSkillContext,
+        structuredInput: { ...structuredInput, messages: [{ ...chatMessages[0], content: body }],
+          metadata: { ...structuredInput.metadata, mergedSystemPromptLength: prompt.length,
+            currentMessageLength: newCurrent.length, agentSetup: {
+              placement: 'batshit-zone-end', estimatedTokens: setupTokenEstimate(setupText),
+              clock: 'observed-provider-request',
+              snapshot: 'frozen',
+              skillCatalogTokens: sizeOf(block => block.section === 'skills'),
+              featureHintTokens: sizeOf(block => block.hintClass === 'fixed-feature'),
+              budgetedToolHintTokens: sizeOf(block => block.hintClass === 'scalable-tools'),
+              liveIndex: toolIndex.hintBudget,
+              apiUtilityProjection: toolIndex.apiUtilityProjection,
+              toolHintBudget: toolIndex.hintBudget.limit, changeNoteTokens: setupTokenEstimate(changes)
+            } } },
+        primarySystemPrompt: prompt || undefined, subagentDescription, resolvedProjectPath,
+        whiteboardContextSnapshot, addressSources: { ...addressSources, pieces: pieces.filter(piece => piece.text) },
+        refreshedFileReadsTurn, agentSetup: selection
+      }
     }
+    // The deferred result is private preparation only. The route finalizes it
+    // from its actual registered bundle before budget/EV/provenance capture.
+    if (options?.deferAgentSetup) {
+      let finalized = false
+      return {
+        structuredInput, primarySystemPrompt: compiledMainSystemPrompt || undefined,
+        subagentDescription, resolvedProjectPath, whiteboardContextSnapshot, addressSources, refreshedFileReadsTurn,
+        finalizeAgentSetup(fingerprint, additional) {
+          if (finalized) throw new Error('This Agent Setup compile was already finalized.')
+          finalized = true
+          return finalize(fingerprint, additional)
+        }
+      }
+    }
+    return finalize()
+
   }
 
   /**

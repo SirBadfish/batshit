@@ -21,7 +21,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
     return json({ prompt })
   } catch (error) {
     console.error('Error getting global prompt:', error)
-    return json({ prompt: '' })
+    return json({ error: 'Failed to get global prompt' }, { status: 500 })
   }
 }
 

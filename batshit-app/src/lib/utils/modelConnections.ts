@@ -3,15 +3,36 @@ import type {
   CatalogModel,
   CatalogModelIdVariant
 } from '$lib/types/modelCatalog'
-import type { SavedModel, ModelConnectionInfo } from '$lib/types/savedModels'
+import type { SavedModel, ModelConnectionInfo, ModelPurpose } from '$lib/types/savedModels'
 import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 import { isChatgptPlanConnection } from './chatgptPlanConnection'
+import { CLAUDE_PLAN_SERVICE, isClaudePlanConnection } from './claudePlanConnection'
+import { inferModelPurpose, reviewedModelPurpose } from './modelPurpose'
+
+/** Chat eligibility only: catalog presence is not an executable text adapter. */
+export function chatModelUnavailableReason(connection: ModelConnectionInfo, effectiveId?: string | null, purpose: ModelPurpose = 'chat'): string | null {
+  const service = connection.service ?? resolveConnectionServiceFromId(connection.id)
+  const connectionId = connection.id ?? (connection.type === 'direct' ? `direct:${service}` : connection.type)
+  if (reviewedModelPurpose({ connectionId, id: effectiveId }) === 'utility') {
+    return 'This decision endpoint does not generate chat replies. Choose a chat model in Settings → Models.'
+  }
+  if (purpose !== 'chat') return null
+  if (connection.type === 'direct' && service === 'replicate') {
+    return 'Replicate text models are not supported in Batshit. Choose another connection for chat.'
+  }
+  if (connection.type === 'direct' && service === 'mimo_token_plan' &&
+    (effectiveId === 'mimo-v2.5-pro' || effectiveId === 'mimo-v2.5')) {
+    return 'MiMo retired this Token Plan chat model on October 21, 2026. Choose a V2.6 model in Settings → Models.'
+  }
+  return null
+}
 
 export function resolveConnectionServiceFromId(
   connectionId?: string | null
 ): string | undefined {
   if (!connectionId) return undefined
   if (isChatgptPlanConnection(connectionId)) return 'chatgpt-plan'
+  if (isClaudePlanConnection(connectionId)) return CLAUDE_PLAN_SERVICE
   if (connectionId === 'vercel-gateway') return 'vercel'
   if (connectionId === 'openrouter') return 'openrouter'
   if (connectionId.startsWith('direct:')) {
@@ -31,6 +52,7 @@ const DIRECT_MULTI_DEVELOPER_SERVICES = new Set([
   'baseten',
   'cerebras',
   'qwencloud',
+  'alibaba',
   'qwen_token_plan',
   'kimi_code',
   'minimax_token_plan',
@@ -38,6 +60,14 @@ const DIRECT_MULTI_DEVELOPER_SERVICES = new Set([
   'chatgpt-plan',
   ...LOCAL_AI_SERVER_IDS
 ])
+
+// Connection/service names are not always the model maker's published namespace.
+// Keep this finite: a single-maker connection must still reject unrelated variants.
+const DIRECT_SERVICE_DEVELOPERS: Readonly<Record<string, readonly string[]>> = {
+  mimo: ['xiaomi'],
+  zai_coding: ['zai'],
+  stepfun: ['stepai']
+}
 
 function normalizeConnectionValue(value?: string | null): string {
   return value?.trim().toLowerCase() ?? ''
@@ -75,6 +105,9 @@ export function isDirectDeveloperCompatible(
   }
 
   const service = getConnectionService(connection)
+  if (DIRECT_SERVICE_DEVELOPERS[service]?.includes(normalizedDeveloper)) {
+    return true
+  }
   if (service.startsWith('custom_')) {
     return true
   }
@@ -123,6 +156,11 @@ export function isModelAllowedForConnection(
   connection: CatalogConnectionOption | null
 ): boolean {
   if (!connection) return true
+  const effectiveId = model.idVariants?.[connection.id]?.effectiveId ?? model.name
+  const purpose = model.purpose ?? inferModelPurpose({ id: effectiveId, name: model.name, tags: model.tags, connectionId: connection.id })
+  if (purpose === 'chat' && chatModelUnavailableReason({
+    type: connection.transport, service: connection.service ?? resolveConnectionServiceFromId(connection.id), id: connection.id
+  }, effectiveId)) return false
   const transport = resolveModelTransport(model)
 
   const selectedVariant = model.idVariants?.[connection.id]
@@ -171,8 +209,16 @@ export function autoSelectConnectionForModel(
 ): CatalogConnectionOption | null {
   if (!connectionOptions.length) return null
 
-  const readyOptions = connectionOptions.filter((option) => option.status === 'ready')
-  const pool = readyOptions.length ? readyOptions : connectionOptions
+  const advertisedIds = new Set([
+    ...(model.connectionId ? [model.connectionId] : []),
+    ...(model.availableConnections ?? []),
+    ...Object.keys(model.idVariants ?? {})
+  ])
+  const compatibleOptions = connectionOptions.filter((option) =>
+    (!advertisedIds.size || advertisedIds.has(option.id)) && isModelAllowedForConnection(model, option)
+  )
+  const readyOptions = compatibleOptions.filter((option) => option.status === 'ready')
+  const pool = readyOptions.length ? readyOptions : compatibleOptions
 
   if (model.connectionId) {
     const directMatch = pool.find((option) => option.id === model.connectionId)

@@ -1,27 +1,25 @@
 import { createHash } from 'node:crypto'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, symlinkSync, realpathSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { HostCommandRecordStore, type HostCommandRecord, type HostDeleteHolder } from '../hostCommandRecords'
+import { HostCommandRecordStore, type HostCommandRecord, type HostDeleteHolder, type HostOriginalRequestRecord } from '../hostCommandRecords'
 import type { HostProcessIdentity } from '../hostProcessIdentity'
 
 const mocks = vi.hoisted(() => ({
-  boot: vi.fn(), table: vi.fn(), warning: vi.fn()
+  boot: vi.fn(), table: vi.fn()
 }))
 vi.mock('../hostProcessIdentity', () => ({
   readHostBootIdentity: mocks.boot,
   readHostProcessTable: mocks.table
-}))
-vi.mock('../codexCleanupWarnings', () => ({
-  recordRecoveredCodexCleanupWarning: mocks.warning
 }))
 
 import {
   hostOwnerResource, hostProfileResource, pinHostCommandOwner, prepareHostCommand,
   withHostCommandDeletion
 } from '../hostCommandOwnership'
+import { managedProfileResource } from '../managedProfileResource'
 
 const ownerA = { userId: 'user-one', kind: 'agent' as const, id: 'agent-a' }
 const ownerB = { userId: 'user-one', kind: 'agent' as const, id: 'agent-b' }
@@ -41,7 +39,6 @@ beforeEach(() => {
   ;(globalThis as any).__batshitHostCommandOwnershipV1 = { instanceId: 'current-app', live: new Map() }
   mocks.boot.mockReset().mockResolvedValue(boot)
   mocks.table.mockReset().mockImplementation(async () => new Map([[self.pid, self]]))
-  mocks.warning.mockReset().mockResolvedValue(undefined)
 })
 afterEach(() => {
   if (previousRoot === undefined) delete process.env.BATSHIT_COMMAND_RECORDS_DIR
@@ -60,6 +57,16 @@ function saved(options: Partial<HostCommandRecord> = {}): HostCommandRecord {
   }
 }
 function persist(run: HostCommandRecord): void { store.prepare(run, store.pin(run.resources)) }
+// Nothing writes `p5-original-request` receipts any more (the Codex-parent MCP request owner was
+// retired); an older app may have left one. Plant it as the stored rows it would have written.
+function persistOriginalRequest(request: HostOriginalRequestRecord): void {
+  store.pin(request.resources)
+  for (const resource of request.resources) {
+    const db = new DatabaseSync(resourceDb(resource))
+    try { db.prepare('INSERT INTO runs(run_id,record) VALUES (?,?)').run(request.runId, JSON.stringify(request)) }
+    finally { db.close() }
+  }
+}
 const resourceDb = (resource: string) => path.join(root, 'resources', createHash('sha256').update(resource).digest('hex'), 'ledger.sqlite')
 function liveTable(...rows: HostProcessIdentity[]) {
   mocks.table.mockImplementation(async () => new Map([[self.pid, self], ...rows.map((row) => [row.pid, row] as const)]))
@@ -67,6 +74,47 @@ function liveTable(...rows: HostProcessIdentity[]) {
 const holder = (process: HostProcessIdentity): HostDeleteHolder => ({ ...boot, instanceId: 'old-deleter', process })
 
 describe('host command ownership recovery and deletion', () => {
+  const leftoverRequest = (options: Partial<HostOriginalRequestRecord> = {}): HostOriginalRequestRecord => ({
+    version: 1, kind: 'p5-original-request', runId: 'original-request',
+    resources: [hostOwnerResource(ownerA), hostProfileResource('batshit_agent_original')].sort(),
+    bootId: boot.bootId, namespaceId: boot.namespaceId, instanceId: 'old-app', lane: 'p5',
+    owner: ownerA, profileId: 'batshit_agent_original', sessionId: 'session-a', messageId: 'message-a', requestId: 'request-a',
+    phase: 'active', children: [], journal: { outer: 'open', continuation: 'open', replies: [{ id: 'reply', save: 'issued' }], nativeRuns: [], management: [] },
+    ...options
+  })
+  it.each(['same-boot', 'old-boot'] as const)('retires a leftover Codex MCP request receipt from %s so the owner and profile delete runs', async kind => {
+    const request = leftoverRequest({ bootId: kind === 'old-boot' ? 'previous-boot' : boot.bootId })
+    persistOriginalRequest(request)
+    const remove = vi.fn(async () => 'deleted')
+    await expect(withHostCommandDeletion(request.resources, remove)).resolves.toBe('deleted')
+    expect(remove).toHaveBeenCalledOnce()
+    expect(store.records(request.resources)).toEqual([])
+    expect(store.recoveryNotices(request.resources)).toEqual([])
+    for (const resource of request.resources) expect(store.pin([resource])[resource]).toBe(1)
+  })
+  it('keeps a leftover receipt while its recorded child Codex run is still alive, then retires both', async () => {
+    const child = saved({ runId: 'child-run', resources: leftoverRequest().resources })
+    const request = leftoverRequest({ children: [child.runId] })
+    persistOriginalRequest(request)
+    persist(child)
+    liveTable(observed)
+    const remove = vi.fn(async () => 'deleted')
+    await expect(withHostCommandDeletion(request.resources, remove)).rejects.toThrow(/still running/)
+    expect(remove).not.toHaveBeenCalled()
+    expect(store.records(request.resources)).toHaveLength(2)
+    liveTable()
+    await expect(withHostCommandDeletion(request.resources, remove)).resolves.toBe('deleted')
+    expect(store.records(request.resources)).toEqual([])
+  })
+  it('preserves the actual physical alias identity before first-use profile ancestors exist', () => {
+    const physical = path.join(root, 'physical'), alias = path.join(root, 'alias')
+    mkdirSync(physical); symlinkSync(physical, alias)
+    const realRoot = path.join(physical, 'never', 'agents'), aliasRoot = path.join(alias, 'never', 'agents')
+    const profile = 'batshit_agent_resource_alias'
+    expect(hostProfileResource(profile, aliasRoot)).toBe(managedProfileResource(profile, realRoot))
+    expect(hostProfileResource(profile, realRoot)).toBe(JSON.stringify(['profile', path.join(realpathSync.native(physical), 'never', 'agents', profile)]))
+    expect(() => hostProfileResource('../outside', aliasRoot)).toThrow()
+  })
   it('refuses to use the user home when a test loses its command-record root', () => {
     const caseRoot = process.env.BATSHIT_COMMAND_RECORDS_DIR
     expect(process.env.VITEST).toBe('true')
@@ -87,35 +135,28 @@ describe('host command ownership recovery and deletion', () => {
       code: 'host_command_cleanup_unverified', status: 409
     })
     expect(store.records(run.resources)).toHaveLength(1)
-    expect(mocks.warning).not.toHaveBeenCalled()
     const other = [hostOwnerResource(ownerB)]
     await expect(withHostCommandDeletion(other, async () => 'deleted')).resolves.toBe('deleted')
     expect(store.pin(other)[other[0]]).toBe(1)
   })
 
-  it('writes the limited Codex warning before completing a gone or birth-changed record', async () => {
+  it('clears a leftover Codex run with the host notice once its recorded process is birth-changed', async () => {
     const run = saved()
     persist(run)
-    mocks.warning.mockImplementation(async () => {
-      expect(store.records(run.resources)).toHaveLength(1)
-    })
     liveTable({ ...observed, started: 'replacement-birth' })
     const notices = await withHostCommandDeletion(run.resources, async (received) => [...received])
     expect(notices).toHaveLength(1)
     expect(notices[0]).toMatch(/without a record may still run/)
-    expect(mocks.warning).toHaveBeenCalledWith({
-      userId: ownerA.userId, sessionId: run.sessionId, messageId: run.messageId
-    })
+    expect(store.recoveryNotices(run.resources)).toEqual(notices)
     expect(store.records(run.resources)).toEqual([])
   })
 
-  it('also warns before clearing an absent recorded Codex process', async () => {
+  it('also clears an absent recorded Codex process with the host notice', async () => {
     const run = saved()
     persist(run)
     liveTable()
     const notices = await withHostCommandDeletion(run.resources, async (received) => [...received])
     expect(notices).toHaveLength(1)
-    expect(mocks.warning).toHaveBeenCalledOnce()
     expect(store.records(run.resources)).toEqual([])
   })
 
@@ -126,7 +167,6 @@ describe('host command ownership recovery and deletion', () => {
     const notices = await withHostCommandDeletion(run.resources, async (received) => [...received])
     expect(notices).toHaveLength(1)
     expect(store.recoveryNotices(run.resources)).toEqual(notices)
-    expect(mocks.warning).not.toHaveBeenCalled()
     expect(store.records(run.resources)).toEqual([])
     // A lost REST response does not lose the host's most recent warning.
     const retried = await withHostCommandDeletion(run.resources, async (received) => [...received])
@@ -149,7 +189,6 @@ describe('host command ownership recovery and deletion', () => {
       expect(signal).not.toHaveBeenCalled()
     } finally { signal.mockRestore() }
     expect(store.records(run.resources)).toEqual([])
-    expect(mocks.warning).not.toHaveBeenCalled()
   })
 
   it('refuses same-boot records from another process namespace', async () => {
@@ -168,16 +207,6 @@ describe('host command ownership recovery and deletion', () => {
     liveTable()
     await expect(withHostCommandDeletion(run.resources, async () => 'deleted')).resolves.toBe('deleted')
     expect(store.records(run.resources)).toEqual([])
-    expect(mocks.warning).not.toHaveBeenCalled()
-  })
-
-  it('retains the record when the durable warning cannot be written', async () => {
-    const run = saved()
-    persist(run)
-    mocks.warning.mockRejectedValueOnce(new Error('warning disk failure'))
-    await expect(withHostCommandDeletion(run.resources, async () => 'deleted')).rejects.toThrow(/could not verify command cleanup/i)
-    expect(store.records(run.resources)).toHaveLength(1)
-    expect(store.recoveryNotices(run.resources)).toHaveLength(1)
   })
 
   it('retains the run if the host notice cannot be durably saved', async () => {
@@ -189,7 +218,6 @@ describe('host command ownership recovery and deletion', () => {
     await expect(withHostCommandDeletion(run.resources, async () => 'deleted')).rejects.toThrow(/host notice write failure/)
     expect(store.records(run.resources)).toHaveLength(1)
     expect(store.recoveryNotices(run.resources)).toEqual([])
-    expect(mocks.warning).not.toHaveBeenCalled()
   })
 
   it('refuses a live holder of an active deletion marker', async () => {
@@ -257,12 +285,12 @@ describe('host command ownership recovery and deletion', () => {
     const entered: string[] = []
     await withHostCommandDeletion([owner], async () => {
       await Promise.all([
-        withHostCommandDeletion([profile], async () => { entered.push('codex'); return 'ok' }),
-        withHostCommandDeletion([profile], async () => { entered.push('claude'); return 'ok' })
+        withHostCommandDeletion([profile], async () => { entered.push('profile-folder'); return 'ok' }),
+        withHostCommandDeletion([profile], async () => { entered.push('claude-home'); return 'ok' })
       ])
       return 'ok'
     })
-    expect(entered.sort()).toEqual(['claude', 'codex'])
+    expect(entered.sort()).toEqual(['claude-home', 'profile-folder'])
     expect(store.pin([owner])[owner]).toBe(1)
     expect(store.pin([profile])[profile]).toBe(1)
   })
@@ -270,7 +298,7 @@ describe('host command ownership recovery and deletion', () => {
   it('a shared profile guard cannot stop another owner, but that owner can clean its live run', async () => {
     const profileId = 'batshit_agent_shared'
     const pin = pinHostCommandOwner(ownerB, profileId)
-    const lease = await prepareHostCommand(pin, { kind: 'codex', program: 'codex' })
+    const lease = await prepareHostCommand(pin, { kind: 'guardian', program: 'command' })
     lease.observe([observed])
     liveTable(observed)
     const cleanup = vi.fn(async () => lease.complete())

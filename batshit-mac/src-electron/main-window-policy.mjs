@@ -4,6 +4,30 @@ const MAIN_WINDOW_MIN_WIDTH = MAIN_CHAT_MIN_WIDTH + (PERSISTENT_RAIL_WIDTH * 2);
 const MAIN_WINDOW_MIN_HEIGHT = 720;
 /** A restored window must keep at least this much of itself reachable on screen. */
 const MIN_VISIBLE_EDGE = 80;
+/**
+ * The app's top bar height, `--app-header-height` (2.8125rem) in batshit-app's app.css. macOS
+ * centres the window buttons in a title bar overlay of this height, so they line up with the bar.
+ */
+export const MAIN_WINDOW_TITLE_BAR_HEIGHT = 45;
+/** Tells the main preload that the page draws the title bar itself (see preload.cjs). */
+export const MAIN_WINDOW_HIDDEN_TITLE_BAR_ARGUMENT = '--batshit-title-bar=hidden';
+
+/**
+ * On macOS the main window has no title bar of its own: Batshit's dark top bar runs to the window
+ * edge and the red, yellow and green buttons sit inside it. `titleBarOverlay` gives the page the
+ * buttons' area through the CSS `env(titlebar-area-*)` values, which are unset in full screen
+ * (where the buttons hide) and in every ordinary browser, so the Docker app never moves.
+ */
+export function resolveMainWindowTitleBarPolicy(platform) {
+  if (platform !== 'darwin') return Object.freeze({ options: Object.freeze({}), preloadArguments: [] });
+  return Object.freeze({
+    options: Object.freeze({
+      titleBarStyle: 'hidden',
+      titleBarOverlay: Object.freeze({ height: MAIN_WINDOW_TITLE_BAR_HEIGHT })
+    }),
+    preloadArguments: Object.freeze([MAIN_WINDOW_HIDDEN_TITLE_BAR_ARGUMENT])
+  });
+}
 
 export function resolveMainWindowSizePolicy() {
   return Object.freeze({
@@ -53,8 +77,13 @@ export function normalizeMainWindowBounds(value) {
  * saved. A display can be disconnected, resized, or rearranged between runs, so
  * restored bounds are never trusted: the window is clamped to the minimum usable
  * size, shrunk to fit a smaller screen, and pulled back until a reachable strip
- * of its title bar is on screen. Returning bounds that are off-screen would
+ * of its top bar is on screen. Returning bounds that are off-screen would
  * leave the window impossible to move without resetting state by hand.
+ *
+ * With no title bar, the top bar's left end (the window buttons and the logo,
+ * which drag) is the one part that is always a drag handle; its right end can
+ * be all buttons. So a restored window may hang off the right edge or the
+ * bottom, but never off the left edge, and its top stays below the menu bar.
  */
 export function restoreMainWindowBounds({ saved, workArea }) {
   const requested = normalizeMainWindowBounds(saved);
@@ -66,7 +95,7 @@ export function restoreMainWindowBounds({ saved, workArea }) {
   const visible = Math.min(MIN_VISIBLE_EDGE, width, height);
 
   return Object.freeze({
-    x: Math.min(area.x + area.width - visible, Math.max(area.x - width + visible, requested.x)),
+    x: Math.min(area.x + area.width - visible, Math.max(area.x, requested.x)),
     y: Math.min(area.y + area.height - visible, Math.max(area.y, requested.y)),
     width,
     height

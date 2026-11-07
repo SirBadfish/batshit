@@ -1,4 +1,5 @@
-import type { ModelPurpose, ModelTransport } from '$lib/types/savedModels'
+import type { ModelPurpose, ModelTransport } from './modelIdentity'
+import type { ModelReasoningDescriptor, ReasoningEvidenceRecord } from './reasoningControls'
 
 /** Published model properties, never an account's effective inference budget. */
 export interface PublishedModelMetadata {
@@ -30,6 +31,8 @@ export interface CatalogModelIdVariant {
   modelId: string
   effectiveId: string
   source: CatalogModelVariantSource
+  /** Exact-connection public control evidence. No account data or executable adapter mappings. */
+  reasoningEvidence?: CatalogReasoningEvidence
   /**
    * BL-68 / BL-132: this connection's own limits, when they differ from the
    * row's. Always present for a connection that joined the row through a
@@ -139,4 +142,21 @@ export interface CatalogConnectionOption {
   n8nStatus?: CatalogConnectionStatus | 'unknown'
   n8nDescription?: string
   requiredN8NCredentials?: string[]
+}
+
+/** Published facts about configurable controls, not whether the model internally reasons. */
+export interface CatalogReasoningLastGood extends ModelReasoningDescriptor {
+  scope: 'public'
+  support: 'supported' | 'unsupported'
+  runtime?: { id: string; version: string }
+}
+
+export interface CatalogReasoningEvidence extends Omit<ReasoningEvidenceRecord, 'lastGood'> {
+  lastGood?: CatalogReasoningLastGood
+}
+
+export interface CatalogReasoningProjection {
+  status: 'supported' | 'unsupported' | 'unknown'
+  evidence?: CatalogReasoningEvidence
+  reason?: string
 }

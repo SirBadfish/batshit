@@ -131,9 +131,48 @@ export function findHeldMessageAwaitingAnswer<T extends MessageLike>(
   return null
 }
 
+/**
+ * BL-921 — the unanswered messages that stand with the held words when their answer is saved.
+ *
+ * The answer to held words is saved at the end of the chat, so a send the chat's line kept at the
+ * same card (it moved to the end, unanswered, while the card waited) stood between the words and
+ * their answer: the chat read held words, kept message (Not sent), answer, and every later turn read
+ * the kept message before that answer. These are the user messages in the held words' own run (no
+ * reply between them and the held words, back to the card's reply) before the answer, other than
+ * the held words, in chat order: they move behind the answer. Words held for a card (this one's
+ * earlier holds, which the same answer reads, or another card's) never move. A Send now of the held
+ * words moves the words below them first, so they can stand before the words too. Nothing when anything but user
+ * messages stands between the held words and the answer (a message with a reply never moves), or
+ * when the answer is not stored after the held words.
+ */
+export function findUnansweredBesideHeldAnswer(
+  messages: readonly MessageLike[] | null | undefined,
+  heldMessageId: string,
+  answerMessageId: string
+): string[] {
+  if (!Array.isArray(messages)) return []
+  const heldIndex = messages.findIndex((message) => message?.id === heldMessageId)
+  const answerIndex = messages.findIndex((message) => message?.id === answerMessageId)
+  if (heldIndex < 0 || answerIndex <= heldIndex) return []
+  for (let index = heldIndex + 1; index < answerIndex; index += 1) {
+    if (messages[index]?.role !== 'user') return []
+  }
+  let start = heldIndex
+  while (start > 0 && messages[start - 1]?.role === 'user') start -= 1
+  return messages
+    .slice(start, answerIndex)
+    .filter((message) => !readWaitsForApproval(message?.metadata))
+    .map((message) => message?.id)
+    .filter((id): id is string => typeof id === 'string' && id !== heldMessageId)
+}
+
 export type HeldMessageReceipt = {
   messageId: string
-  state: 'waiting' | 'expired' | 'stopped' | 'failed'
+  /**
+   * `not_sent`: a kept send whose card held it for 15 minutes, or one Batshit kept itself (stopping
+   * or a restore, the cap, a deleted agent) (BL-903 a and c, `keptSendReceipt.ts`).
+   */
+  state: 'waiting' | 'expired' | 'stopped' | 'failed' | 'not_sent'
   label: string
 }
 
@@ -144,7 +183,9 @@ export type HeldMessageReceipt = {
  * reply after it (the follow-up and its placeholder, a new message's or a Send now's reply) has
  * answered or read it, while a send kept at the same card may stand after it (BL-905). While its card waits it
  * says so. If the card expired and only the page's own Deny answered it, the words were never sent,
- * and it says so (`approvalCardExpired`, written by the server). Otherwise, while a reply runs (the
+ * and it says so (`approvalCardExpired`, written by the server). A server-confirmed retired-card
+ * settlement also proves those still-held words were not answered, without rewriting them.
+ * Otherwise, while a reply runs (the
  * resume, or the follow-up that answers it) there is nothing to say. After it, a Stop means stop,
  * and a failed reply left the words unanswered: both say not sent. An answered card with nothing
  * else to say leaves an ordinary message.
@@ -164,7 +205,7 @@ export function resolveHeldMessageReceipt(input: {
   if (card && approvalSummaryIsPending(cardMetadata.toolApprovals)) {
     return { messageId: heldMessage.id, state: 'waiting', label: WAITS_FOR_APPROVAL_SENTENCE }
   }
-  if (metadataOf(heldMessage).approvalCardExpired === true) {
+  if (metadataOf(heldMessage).approvalCardExpired === true || card?.role === 'assistant' && cardMetadata.retiredApprovalSettled === true) {
     return { messageId: heldMessage.id, state: 'expired', label: HELD_CARD_EXPIRED_SENTENCE }
   }
   if (input.busy) return null

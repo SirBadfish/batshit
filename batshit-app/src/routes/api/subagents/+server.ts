@@ -1,14 +1,12 @@
+import { withoutSkillReadSettings } from '$lib/utils/skillSessions'
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
-import {
-	getClaudeConfigOverrideValidationError,
-} from '$lib/server/services/claudeSettings'
-import {
-	getCodexConfigOverrideValidationError,
-} from '$lib/server/services/codexSettings'
-import { syncManagedCliSubagentProfile } from '$lib/server/services/cliSubagentProfileSync'
-import { runTrackedN8nCompatibilitySync } from '$lib/server/services/n8nParameterCompatibility'
+import { createSubjectPopulation, SubjectPopulationError } from '$lib/server/services/subjectPopulation'
+import { PresetReferenceWriteError } from '$lib/server/services/modelPresetReferenceGuard'
+import { withSettingsRecordReplacement } from '$lib/server/services/appActions/settings/lifecycle'
+import { CODEX_CLI_RETIRED_CODE, CODEX_CLI_RETIRED_ERROR, CODEX_CLI_SUBAGENT_RETIRED_DETAILS,
+	CLAUDE_CLI_PRESET_REFUSAL, namesClaudeCliModel, namesRetiredCodexCliModel } from '$lib/utils/cliRuntimeIdentity'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import type { SubagentRow } from '$lib/types/database'
@@ -18,16 +16,16 @@ import {
 	resolveUploadUrlsForBrowserInPayload
 } from '$lib/server/services/batshitServerUrls'
 import {
-		canonicalizeSubagentRecord,
-		isCliSubagentType,
-	isN8nSubnodeSubagentType,
-	isWorkflowBackedSubagentType,
+	canonicalizeSubagentRecord,
+	isRetiredN8nSubagentType,
 	normalizeSubagentType,
+	retiredSubagentRefusal,
 } from '$lib/utils/subagentType'
 import {
 	getSubagentTimeoutValidationError,
 	normalizeSubagentTimeoutSeconds,
 } from '$lib/utils/subagentTimeout'
+import { getSubagentMaxToolStepsValidationError, normalizeSubagentMaxToolSteps } from '$lib/utils/subagentToolSteps'
 
 // GET /api/subagents - List all subagents for the current user
 export const GET: RequestHandler = async ({ locals }) => {
@@ -53,7 +51,9 @@ export const GET: RequestHandler = async ({ locals }) => {
 			if (subagentData) {
 				// json.get returns array when using JSONPath '$', so extract first element
 				const subagent = Array.isArray(subagentData) ? subagentData[0] : subagentData
-				if (subagent) {
+				// SA-139 R2 (D14): a record of a removed n8n Subagent type is never listed. A leftover
+				// CLI Subagent (R5) is listed, so its Delete is reachable; every other use refuses it.
+				if (subagent && !isRetiredN8nSubagentType(normalizeSubagentType(subagent as Record<string, any>))) {
 					subagents.push(
 						resolveUploadUrlsForBrowserInPayload(
 							canonicalizeSubagentRecord(subagent as Record<string, any>) as SubagentRow
@@ -80,7 +80,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 	}
 
 	try {
-		const body = await request.json()
+		const body = withoutSkillReadSettings(await request.json()) as Record<string, any>
+		// A duplicate never inherits a Primary's management authority.
+		delete body.app_action_policy
 		const { id: providedId, displayName, description, ...settings } = body
 
 		if (!displayName) {
@@ -89,52 +91,51 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 		const requestedSubagentType =
 			typeof body.subagentType === 'string' ? body.subagentType.trim().toLowerCase() : ''
-		if (
-			Object.prototype.hasOwnProperty.call(body, 'subagentType') &&
-			!['n8n-workflow', 'api', 'cli'].includes(requestedSubagentType)
-		) {
-			return json(
-				{ error: 'Subagent type must be n8n Workflow, API, or CLI.', code: 'subagent_type_invalid' },
-				{ status: 400 }
-			)
-		}
-		const subagentType = normalizeSubagentType(undefined, body.subagentType)
-		if (isN8nSubnodeSubagentType(subagentType)) {
+		// SA-139 R2 (D14): a request for a removed n8n Subagent type (by type, legacy alias or
+		// workflow target) is refused, never created as an API Subagent.
+		const requestedStoredType = normalizeSubagentType(body, body.subagentType)
+		if (isRetiredN8nSubagentType(requestedStoredType)) {
 			return json(
 				{
-					error: 'n8n Subnode Subagents were removed from Batshit.',
+					error: 'n8n Workflow Subagents were removed from Batshit. n8n workflows still work as tools.',
 					code: 'subagent_type_retired'
 				},
 				{ status: 400 }
 			)
 		}
-		const webhookUrl =
-			typeof body.webhook_url === 'string'
-				? body.webhook_url.trim()
-				: typeof body.webhookUrl === 'string'
-					? body.webhookUrl.trim()
-					: ''
-
-		if (isWorkflowBackedSubagentType(subagentType) && !webhookUrl) {
+		// SA-139 R5 (D14): a request for the removed CLI Subagent type (Claude Code CLI or Codex
+		// CLI, by type or by a typeless record's lane) is refused, never created as an API Subagent.
+		const retired = retiredSubagentRefusal(body, body.subagentType, { request: true })
+		if (retired) return json(retired, { status: 409 })
+		if (Object.prototype.hasOwnProperty.call(body, 'subagentType') && requestedSubagentType !== 'api') {
 			return json(
-				{ error: 'Production webhook URL is required for n8n Workflow Subagents.' },
+				{ error: 'The Subagent type must be API.', code: 'subagent_type_invalid' },
 				{ status: 400 }
 			)
 		}
-
-		const codexValidationError = getCodexConfigOverrideValidationError(body.codex_settings ?? null)
-		if (codexValidationError) {
-			return json({ error: codexValidationError }, { status: 400 })
+		// The removed CLI lanes' presets are never stored on a Subagent (it would only fail at its
+		// first run), and neither are their settings blocks.
+		if (namesRetiredCodexCliModel(body)) {
+			return json(
+				{ error: CODEX_CLI_RETIRED_ERROR, code: CODEX_CLI_RETIRED_CODE, details: CODEX_CLI_SUBAGENT_RETIRED_DETAILS },
+				{ status: 409 }
+			)
 		}
-
-		const claudeValidationError = getClaudeConfigOverrideValidationError(body.claude_settings ?? null)
-		if (claudeValidationError) {
-			return json({ error: claudeValidationError }, { status: 400 })
+		if (namesClaudeCliModel(body)) {
+			return json({ error: CLAUDE_CLI_PRESET_REFUSAL }, { status: 400 })
 		}
+		delete settings.codex_settings
+		delete settings.claude_settings
+		delete settings.expectedCliPromotion
 
 		const timeoutValidationError = getSubagentTimeoutValidationError(body.timeout_seconds)
 		if (timeoutValidationError) {
 			return json({ error: timeoutValidationError }, { status: 400 })
+		}
+
+		const maxToolStepsValidationError = getSubagentMaxToolStepsValidationError(body.max_tool_steps)
+		if (maxToolStepsValidationError) {
+			return json({ error: maxToolStepsValidationError }, { status: 400 })
 		}
 
 		const service = redis
@@ -170,52 +171,33 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			description,
 			...settings,
 			timeout_seconds: normalizeSubagentTimeoutSeconds(body.timeout_seconds),
+			max_tool_steps: normalizeSubagentMaxToolSteps(body.max_tool_steps),
 			...(Object.prototype.hasOwnProperty.call(body, 'avatar_icon_ref')
 				? { avatar_icon_ref: normalizeOptionalIconRefInput(body.avatar_icon_ref, 'avatar_icon_ref') }
 				: {}),
 			...(Object.prototype.hasOwnProperty.call(body, 'avatar_icon_fit')
 				? { avatar_icon_fit: normalizeOptionalAvatarIconFitInput(body.avatar_icon_fit, 'avatar_icon_fit') }
 				: {}),
-			subagentType,
-			webhook_url: isWorkflowBackedSubagentType(subagentType) ? webhookUrl || undefined : undefined,
-			webhookUrl: isWorkflowBackedSubagentType(subagentType) ? webhookUrl || undefined : undefined,
-			workflowName:
-				isWorkflowBackedSubagentType(subagentType) && typeof body.workflowName === 'string'
-					? body.workflowName.trim() || undefined
-					: undefined,
+			subagentType: 'api',
+			webhook_url: undefined,
+			webhookUrl: undefined,
+			workflowName: undefined,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
 		}) as SubagentRow
-		const storageSubagent = normalizeUploadUrlsForStorageInPayload(subagent)
+		const proposedSubagent = normalizeUploadUrlsForStorageInPayload(subagent)
 
 		// Story 6.9c: Save to Redis with slug-based key
-		await service.json.set(`subagent:${id}`, '$', storageSubagent) // Use json.set for objects
-		await service.sAdd(`user:${locals.user.id}:subagents`, id)
-
-		if (isCliSubagentType(storageSubagent.subagentType)) {
-			await syncManagedCliSubagentProfile(locals.user.id, storageSubagent)
-		}
-
-		let compatibilityWarning: string | null = null
-		if (isWorkflowBackedSubagentType(storageSubagent.subagentType)) {
-			try {
-				await runTrackedN8nCompatibilitySync({
-					userId: locals.user.id,
-					trigger: 'workflow-subagent-save'
-				})
-			} catch (error) {
-				compatibilityWarning =
-					error instanceof Error ? error.message : 'Failed to sync n8n parameter support'
-				console.warn('[subagents] saved workflow subagent but parameter sync failed', error)
-			}
-		}
+		const { record: storageSubagent } = await withSettingsRecordReplacement(`subagent:${id}`, () =>
+			service.execute(client => createSubjectPopulation(client, { userId: locals.user!.id, subjectId: id,
+				kind: 'subagent', mode: 'create', record: proposedSubagent })))
 
 		return json({
-			subagent: resolveUploadUrlsForBrowserInPayload(storageSubagent),
-			compatibilityWarning
+			subagent: resolveUploadUrlsForBrowserInPayload(storageSubagent)
 		})
 	} catch (error) {
 		console.error('Failed to create subagent:', error)
+		if (error instanceof SubjectPopulationError || error instanceof PresetReferenceWriteError) return json({ error: error.message, code: error.code }, { status: error.status })
 		return json(
 			{ error: error instanceof Error ? error.message : 'Failed to create subagent' },
 			{ status: (error as any)?.status ?? 500 }

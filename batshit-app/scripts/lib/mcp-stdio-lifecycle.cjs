@@ -12,13 +12,15 @@
  *
  * That omission is invisible for a bridge that holds no open libuv handle: stdin EOF closes
  * the last handle, the event loop drains, and Node exits on its own. `mode4-controls-mcp.cjs`
- * exited in 8 ms for exactly that reason and never leaked.
+ * (the managed CLI helper bridge, removed in SA-139 R5) exited in 8 ms for exactly that reason
+ * and never leaked.
  *
- * It is fatal for a bridge that holds one. `codex-subagent-mcp.cjs` and
- * `claude-permission-mcp.cjs` both `await redis.connect()` at startup, and that socket keeps
- * the loop alive forever. macOS reparents the helper to PID 1 and it never dies: 63 live
+ * It is fatal for a bridge that holds one. The Subagent bridge and the Claude permission helper
+ * (both removed with the Claude Code CLI Primary in SA-139 R4) awaited `redis.connect()` at
+ * startup, and that socket kept the loop alive forever. macOS reparents the helper to PID 1 and it never dies: 63 live
  * orphans (~237 MB resident, all `--agent=megasmoke_codex_primary`, 3–4 days old) were
- * measured on one Mac, plus one new orphan per managed Codex turn on the dev lane.
+ * measured on one Mac, plus one new orphan per managed turn on the dev lane (all measured on
+ * the Codex CLI lane, removed in SA-139 R1).
  *
  * "Exits by accident because it happens to hold no handle" is not a contract. Every stdio
  * bridge installs this, so adding a Redis client, a keep-alive socket, or an interval to any

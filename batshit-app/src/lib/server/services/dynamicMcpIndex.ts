@@ -1,4 +1,9 @@
 import { redis } from '$lib/server/redis'
+import { DEFAULT_DCM_TOOL_NAME_THRESHOLD, normalizeTotalHintTokens } from '$lib/utils/dynamicSchemaHintSettings'
+import { AGENT_SETUP_FEATURES } from '$lib/utils/agentSetupFeatures'
+import { setupMetadata, type AgentSetupBlock, type AgentSetupSource } from './agentSetupCache'
+import type { ActingAgentLane as ControlActorType } from './actingAgentIdentity'
+import { readApiUtilities, type ApiUtilityScope } from './apiUtilityRuntime'
 import { mcpGatewayDiscovery } from './mcpGatewayDiscovery'
 import { resolveMCPSelections } from './mcpSelectionResolver'
 import type {
@@ -11,6 +16,8 @@ import type {
 } from '$lib/types/database'
 import {
   buildSchemaSummary,
+  buildSchemaHintSummary,
+  formatCliSchemaHint,
   getSchemaHintText,
   normalizeSchemaHintCaps,
   type SchemaHintCaps
@@ -34,7 +41,9 @@ import {
 import {
   BROKER_ARTIFACT_ALLOWED_CONTROL_IDS,
   isControlIdAllowedByList,
-  resolveBrokerFabricAllowedControlIds,
+  resolveBrokerRuntimeAllowedControlIds,
+  brokerControlRef,
+  isBatshitUtilityControlId,
   resolveBrokerFamilies,
   resolveBrokerToolToggles,
   type BrokerRuntime,
@@ -47,6 +56,7 @@ import {
   ARTIFACT_TOOL_GRID_GROUP_NAME,
   ARTIFACT_TOOL_GRID_ID,
   FABRIC_TOOL_GRID_GROUP_NAME,
+  FABRIC_TOOL_GRID_DISPLAY_NAME,
   FABRIC_TOOL_GRID_ID,
   describeFabricControlFamilies,
   normalizeArtifactToolGridSettings,
@@ -90,11 +100,16 @@ export type { DcmGroupVisibility, DcmToolVisibility }
 
 export interface DynamicMcpIndexTool {
   name: string
+  /** Canonical typed ref when a runtime utility is directly callable from its hint. */
+  ref?: string
   visibility: DcmToolVisibility
   schemaHint?: string | null
 }
 
 export interface DynamicMcpIndexGroup {
+  /** Stable identity survives duplicate display-name disambiguation. */
+  id?: string
+  source?: string
   name: string
   toolCount: number
   visibility: DcmGroupVisibility
@@ -107,9 +122,11 @@ export interface DynamicMcpIndexGroup {
    * the Fabric group sets it.
    */
   families?: string[]
+  /** The remaining operational families are explained by their Batshit plugin skills. */
+  skillGuidance?: boolean
 }
 
-export type DynamicMcpDiscoverableFamily = 'mcp' | 'cli' | 'fabric' | 'artifact'
+export type DynamicMcpDiscoverableFamily = 'mcp' | 'cli' | 'fabric' | 'batshit' | 'artifact'
 
 /**
  * SA-120 P1: one discoverable capability the agent can reach through the broker, in
@@ -129,6 +146,7 @@ export interface DynamicMcpDiscoverableRef {
   hint: string | null
   /** MCP only: already registered in the agent's runtime tool list (no discovery needed). */
   enabled: boolean
+  groupKey?: string
 }
 
 export interface DynamicMcpIndexResult {
@@ -151,10 +169,23 @@ export interface DynamicMcpIndexResult {
   }
   threshold: number
   schemaHintCaps: SchemaHintCaps
+  setupBlocks: AgentSetupBlock[]
+  sources: AgentSetupSource[]
+  hintBudget: { limit: number; budgetedTokens: number; featureTokens: number }
+  apiUtilityProjection: 'registered' | 'unprepared' | 'not-applicable'
+  /** Current allowance before presentation filtering; absent only on an unprepared projection. */
+  allowedSkillToolHints?: import('$lib/utils/skillToolGroups').AllowedSkillToolHint[]
+  /** Only complete, uncapped fixed Setup hints may suppress the same opened-skill guidance. */
+  completeFeatureHintRefs?: string[]
 }
 
 interface DynamicMcpIndexOptions {
+  /** Actual final API registrations, server-private; previews never mint this handle. */
+  apiUtilityScope?: ApiUtilityScope
+  p5McpOwner?: import('./appActions/mcp/originalTask').P5OriginalPreparation
   userId: string
+  /** Set only by the Primary compiler; delegated/preview indexes do not infer actor identity. */
+  primarySettingsActor?: boolean
   agentId?: string | null
   toolSelections?: MCPToolSelections | null
   selectedGateways?: string[] | null
@@ -163,9 +194,12 @@ interface DynamicMcpIndexOptions {
   nativeDynamicMcpEnabled?: boolean | null
   cliToolsEnabled?: boolean | null
   dcmDisplaySettings?: AgentDcmDisplaySettings | null
-  isCodexMode?: boolean
   includeEnabledTools?: boolean
+  /** Verified server producer lane, never accepted from Tool Grid request data. */
+  controlActorType?: ControlActorType
   toolNameThreshold?: number
+  /** Actual emitted guidance gates, intersected with the permitted live controls. */
+  featureHintGates?: Partial<Record<'memory' | 'dm' | 'schedule' | 'judge' | 'whiteboard' | 'zip' | 'skill', boolean>>
   /**
    * Which runtime's broker registration rules decide which families are reachable.
    * SA-096 P4: `api` and `n8n` open Fabric on fetch-zip, `cli` does not — the index must
@@ -189,6 +223,7 @@ interface DynamicMcpIndexOptions {
    * from `agent:{agentId}` (route callers); subagent callers pass explicit false.
    */
   memoryControlsEnabled?: boolean
+  whiteboardControlsEnabled?: boolean
   /** SA-113 P2 (DL-113-03): explicit value wins; subagent scopes pass false. */
   dmControlsEnabled?: boolean
   /** SA-115 P2 (DL-115-10): explicit value wins; subagent scopes pass false. */
@@ -204,12 +239,21 @@ interface WorkingGroup extends DynamicMcpIndexGroup {
   forceToolList?: boolean
 }
 
+export class ToolHintBudgetError extends Error {
+  readonly code = 'TOOL_HINT_BUDGET_TOO_SMALL'
+  readonly status = 400
+  constructor(readonly budgetTokens: number, readonly minimumRequiredTokens: number) {
+    super(`The Total Hint Budget is ${budgetTokens} estimated tokens, but enabled group names and counts need at least ${minimumRequiredTokens}. Increase the budget or reduce/shorten enabled group metadata. Saved settings were kept.`)
+    this.name = 'ToolHintBudgetError'
+  }
+}
+
 const UNGROUPED_GROUP = 'Ungrouped Tools'
 // Exported so `mcpGatewayReferenceCleanup` can pin its reserved-ID list against
 // the real placeholder instead of a copied literal (SA-096 P6).
 export const UNKNOWN_GATEWAY = 'unknown_gateway'
 const UNKNOWN_GATEWAY_LABEL = 'Unknown Gateway'
-const DEFAULT_TOOL_NAME_THRESHOLD = 6
+const DEFAULT_TOOL_NAME_THRESHOLD = DEFAULT_DCM_TOOL_NAME_THRESHOLD
 const MIN_TOOL_NAME_THRESHOLD = 1
 const MAX_TOOL_NAME_THRESHOLD = 100
 const REQUIRED_DYNAMIC_TOOLS = ['batshit_server_dynamic_mcp_find', 'batshit_server_dynamic_mcp_use']
@@ -260,9 +304,6 @@ function isDynamicMcpEnabled(
   if (typeof options.nativeDynamicMcpEnabled === 'boolean') {
     return options.nativeDynamicMcpEnabled
   }
-  if (options.isCodexMode === true) {
-    return true
-  }
   return hasRequiredDynamicTools(enabledNames)
 }
 
@@ -283,10 +324,11 @@ function extractSchema(tool: any): any {
   return tool.inputSchema?.jsonSchema || tool.inputSchema || tool.parameters || tool.schema || null
 }
 
-function formatGroupLine(name: string, count: number, families?: string[]): string {
+function formatGroupLine(name: string, count: number, families?: string[], skillGuidance = false): string {
   const label = count === 1 ? 'tool' : 'tools'
   const familyText = families && families.length > 0 ? `: ${families.join(', ')}` : ''
-  return `- ${name} (${count} ${label}${familyText})`
+  const guidance = skillGuidance ? '; the Batshit skills explain them' : ''
+  return `- ${setupMetadata(name)} (${count} ${label}${setupMetadata(familyText)}${guidance})`
 }
 
 /**
@@ -306,16 +348,16 @@ function buildDcmText(groups: DynamicMcpIndexGroup[]): string {
       Array.isArray(group.tools) &&
       group.tools.length > 0
     ) {
-      body.push(`${formatGroupLine(group.name, group.toolCount, group.families)}:`)
+      body.push(`${formatGroupLine(group.name, group.toolCount, group.families, group.skillGuidance)}:`)
       for (const tool of group.tools) {
         const hint =
           tool.visibility === 'name+hint' && tool.schemaHint
             ? ` — ${tool.schemaHint}`
             : ''
-        body.push(`  - ${tool.name}${hint}`)
+        body.push(`  - ${setupMetadata(tool.ref ?? tool.name)}${setupMetadata(hint)}`)
       }
     } else {
-      body.push(formatGroupLine(group.name, group.toolCount, group.families))
+      body.push(formatGroupLine(group.name, group.toolCount, group.families, group.skillGuidance))
     }
 
     if (group.note) {
@@ -330,39 +372,16 @@ function buildDcmText(groups: DynamicMcpIndexGroup[]): string {
   )
 }
 
-function buildCliFieldSummary(inputSchema: Record<string, any> | undefined): string {
-  if (!inputSchema || typeof inputSchema !== 'object') return ''
-  const properties =
-    inputSchema.properties && typeof inputSchema.properties === 'object'
-      ? Object.entries(inputSchema.properties as Record<string, any>)
-      : []
-  if (properties.length === 0) return ''
-
-  const required = new Set(
-    Array.isArray(inputSchema.required)
-      ? inputSchema.required.filter((value: unknown): value is string => typeof value === 'string')
-      : []
-  )
-
-  return properties
-    .slice(0, 4)
-    .map(([fieldName, field]) => {
-      const type =
-        typeof field?.type === 'string'
-          ? field.type
-          : field?.type === 'array' && typeof field?.items?.type === 'string'
-            ? `array<${field.items.type}>`
-            : 'value'
-      return required.has(fieldName) ? `${fieldName}:${type}*` : `${fieldName}:${type}`
-    })
-    .join(', ')
+function buildCliFieldSummary(inputSchema: Record<string, any> | undefined, caps: SchemaHintCaps): string {
+  return formatCliSchemaHint(inputSchema, caps)
 }
 
 function truncateHint(value: string, maxChars: number): string {
-  const trimmed = value.trim()
+  const trimmed = setupMetadata(value.trim())
   if (!Number.isFinite(maxChars) || maxChars <= 0) return trimmed
   if (trimmed.length <= maxChars) return trimmed
-  return `${trimmed.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
+  const notice = '… (full schema required)'
+  return `${trimmed.slice(0, Math.max(0, maxChars - notice.length)).trimEnd()}${notice}`
 }
 
 interface BrokerFamilyEntry {
@@ -392,40 +411,52 @@ function normalizeDescription(value: unknown): string | null {
 function buildBrokerFamilyGroup(input: {
   gatewayId: string
   groupName: string
+  displayName?: string
   gatewayDefaults: GatewayDcmDisplaySettings
   agentSettings: AgentDcmDisplaySettings
   entries: BrokerFamilyEntry[]
   note?: string | null
   /** SA-072 P2 step 0: derives the group line's family words from the COUNTED entries. */
   describeFamilies?: (countedNames: string[]) => string[]
+  /** Fabric's enabled line is fixed; retired presentation choices no longer hide controls. */
+  alwaysOneLine?: boolean
+  alwaysDiscoverable?: boolean
 }): WorkingGroup | null {
   if (input.entries.length === 0) return null
 
   const agentGroupMode = input.agentSettings.groups[buildCompositeKey(input.gatewayId, input.groupName)]
-  const effectiveGroupMode = resolveEffectiveGroupMode({
+  const savedGroupMode = resolveEffectiveGroupMode({
     agentSettings: input.agentSettings,
     gatewayDefaults: input.gatewayDefaults,
     gatewayId: input.gatewayId,
     groupName: input.groupName
   })
+  const retainedPreference = normalizeLegacyGroupMode(input.agentSettings.groupDisplayPreferences?.[buildCompositeKey(input.gatewayId, input.groupName)])
+  const inheritedPreference = normalizeLegacyGroupMode(input.gatewayDefaults.groups[input.groupName])
+  const unhiddenPreference = retainedPreference && retainedPreference !== 'hidden' ? retainedPreference
+    : inheritedPreference && inheritedPreference !== 'hidden' ? inheritedPreference : 'group+tools+hints'
+  const restoredAgentMode = input.alwaysDiscoverable && savedGroupMode === 'hidden' && retainedPreference && retainedPreference !== 'hidden'
+    ? retainedPreference : agentGroupMode
+  const effectiveGroupMode = input.alwaysOneLine ? 'group-only'
+    : input.alwaysDiscoverable && savedGroupMode === 'hidden' ? unhiddenPreference : savedGroupMode
   const groupVisibility = mapGroupModeToVisibility(effectiveGroupMode)
   if (groupVisibility === 'hidden') return null
 
   const group: WorkingGroup = {
     gatewayId: input.gatewayId,
-    gatewayName: input.groupName,
-    baseName: input.groupName,
-    name: input.groupName,
+    gatewayName: input.displayName ?? input.groupName,
+    baseName: input.displayName ?? input.groupName,
+    name: input.displayName ?? input.groupName,
     toolCount: 0,
     visibility: groupVisibility,
     tools: groupVisibility === 'group-only' ? undefined : [],
-    forceToolList: isExplicitAgentToolListMode(agentGroupMode),
+    forceToolList: !input.alwaysOneLine && isExplicitAgentToolListMode(restoredAgentMode),
     note: input.note ?? null
   }
   const countedNames: string[] = []
 
   for (const entry of input.entries) {
-    const toolVisibility = resolveEffectiveToolVisibility({
+    const toolVisibility = input.alwaysOneLine ? 'name-only' : input.alwaysDiscoverable ? effectiveGroupMode === 'group+tools+hints' ? 'name+hint' : 'name-only' : resolveEffectiveToolVisibility({
       agentSettings: input.agentSettings,
       gatewayDefaults: input.gatewayDefaults,
       gatewayId: input.gatewayId,
@@ -458,11 +489,11 @@ function buildBrokerFamilyGroup(input: {
   return group
 }
 
-function buildCliToolHint(record: Record<string, any>): string {
+function buildCliToolHint(record: Record<string, any>, caps: SchemaHintCaps): string {
   const parts: string[] = []
   const title = typeof record.title === 'string' ? record.title.trim() : ''
   const description = typeof record.description === 'string' ? record.description.trim() : ''
-  const schemaSummary = buildCliFieldSummary(record.inputSchema)
+  const schemaSummary = buildCliFieldSummary(record.inputSchema, caps)
 
   if (title) parts.push(title)
   if (description) parts.push(description)
@@ -478,8 +509,7 @@ async function resolveEnabledTools(
     userId,
     agentId,
     toolSelections,
-    selectedGateways,
-    isCodexMode
+    selectedGateways
   } = options
 
   if (!userId) return { names: new Set<string>(), tools: {}, resolvedGateways: undefined }
@@ -496,8 +526,7 @@ async function resolveEnabledTools(
     userId,
     agentId: agentId ?? undefined,
     selectedGateways: selectedGateways ?? undefined,
-    toolSelections: toolSelections ?? undefined,
-    isCodexMode: isCodexMode ?? false
+    toolSelections: toolSelections ?? undefined
   })
 
   const names = new Set<string>(
@@ -523,11 +552,11 @@ async function resolveIndexMemoryControlsEnabled(
   const agentId = options.agentId?.trim()
   if (!agentId) return false
   try {
-    const agent = (await redis.get(`agent:${agentId}`)) as Record<string, unknown> | null
+    const agent = (await redis.get(`agent:${agentId}`, { throwOnError: true })) as Record<string, unknown> | null
     return resolveAgentMemoryEnabled(agent)
   } catch (error) {
     console.warn('[Dynamic MCP DCM] Failed to resolve memory enablement:', error)
-    return false
+    throw error
   }
 }
 
@@ -541,11 +570,11 @@ async function resolveIndexDmControlsEnabled(
   const agentId = options.agentId?.trim()
   if (!agentId) return false
   try {
-    const agent = (await redis.get(`agent:${agentId}`)) as Record<string, unknown> | null
+    const agent = (await redis.get(`agent:${agentId}`, { throwOnError: true })) as Record<string, unknown> | null
     return resolveAgentDmsEnabled(agent)
   } catch (error) {
     console.warn('[Dynamic MCP DCM] Failed to resolve Agent DM enablement:', error)
-    return false
+    throw error
   }
 }
 
@@ -559,11 +588,11 @@ async function resolveIndexJudgeControlsEnabled(
   const agentId = options.agentId?.trim()
   if (!agentId) return false
   try {
-    const agent = (await redis.get(`agent:${agentId}`)) as Record<string, unknown> | null
+    const agent = (await redis.get(`agent:${agentId}`, { throwOnError: true })) as Record<string, unknown> | null
     return resolveAgentJevJudgeToolEnabled(agent)
   } catch (error) {
     console.warn('[Dynamic MCP DCM] Failed to resolve Judge Juice judgment-tool enablement:', error)
-    return false
+    throw error
   }
 }
 
@@ -584,13 +613,14 @@ async function resolveIndexBrokerToggles(
   }
 
   try {
-    const agent = (await redis.get(`agent:${agentId}`)) as Record<string, unknown> | null
+    const agent = (await redis.get(`agent:${agentId}`, { throwOnError: true })) as Record<string, unknown> | null
+    if (!agent) throw new Error('The agent whose tool scope was requested no longer exists.')
     return resolveBrokerToolToggles(
       agent?.provider_specific_settings ?? agent?.providerSpecificSettings ?? null
     )
   } catch (error) {
     console.warn('[Dynamic MCP DCM] Failed to resolve broker toggles:', error)
-    return resolveBrokerToolToggles(null)
+    throw error
   }
 }
 
@@ -635,6 +665,7 @@ export async function buildDynamicMcpIndex(
     optionalLimit: admin.dcm_schema_hint_optional_limit,
     maxChars: admin.dcm_schema_hint_max_chars
   })
+  const totalHintTokens = normalizeTotalHintTokens(admin.dcm_schema_hint_total_tokens)
 
   const enabled = await resolveEnabledTools(options)
   const enabledToolNames = enabled.names
@@ -660,11 +691,12 @@ export async function buildDynamicMcpIndex(
   const brokerToggles = await resolveIndexBrokerToggles(options)
   brokerToggles.dynamicMcpEnabled = dynamicMcpEnabled
   brokerToggles.cliToolsEnabled = cliToolsEnabled
-  const brokerRuntime: BrokerRuntime =
-    options.runtime ?? (options.isCodexMode === true ? 'cli' : 'api')
-  const controlRuntimeMode: ControlRuntimeMode = brokerRuntime === 'cli' ? 'mode4' : 'mode3'
+  const brokerRuntime: BrokerRuntime = options.runtime ?? 'api'
+  // SA-139 P7: `mode4` was the removed managed CLI lanes' control mode; every index is `mode3` now.
+  const controlRuntimeMode: ControlRuntimeMode = 'mode3'
   const allowFabricControlTools = options.allowFabricControlTools !== false
   const memoryControlsEnabled = await resolveIndexMemoryControlsEnabled(options)
+  const whiteboardControlsEnabled = options.whiteboardControlsEnabled === true
   const dmControlsEnabled = await resolveIndexDmControlsEnabled(options)
   // SA-115 P2: schedules ride the same per-agent switch as DMs, so they resolve from it
   // rather than adding a second read of the same agent record.
@@ -680,14 +712,21 @@ export async function buildDynamicMcpIndex(
     allowArtifactRuntimeTools: options.allowArtifactRuntimeTools,
     allowFabricControlTools: options.allowFabricControlTools,
     memoryControlsEnabled,
+    whiteboardControlsEnabled,
     dmControlsEnabled,
     scheduleControlsEnabled,
     judgeControlsEnabled
   })
-  const fabricReachable = brokerFamilies.includes('fabric')
+  const fabricReachable = brokerFamilies.includes('fabric') || brokerFamilies.includes('batshit')
+  const apiUtilities = readApiUtilities(options.apiUtilityScope, { userId, agentId: options.agentId ?? controlAgentId })
+  const apiReady = !!options.apiUtilityScope
+  // SA-139 P7: every index is on `api` now, so the utilities source always applies.
+  const apiUtilityProjection = apiReady ? 'registered' as const : 'unprepared' as const
+  const apiSource: AgentSetupSource = { id: 'api-utilities', label: 'Batshit Utilities', available: apiReady,
+    ...(!apiReady ? { unavailableReason: 'unprepared' as const } : {}) }
   const artifactReachable = brokerFamilies.includes('artifact')
 
-  if (!dynamicMcpEnabled && cliTools.length === 0 && !fabricReachable && !artifactReachable) {
+  if (!dynamicMcpEnabled && cliTools.length === 0 && !fabricReachable && !artifactReachable && !apiUtilities.length) {
     let enabledTokens = 0
     let enabledToolCount = 0
 
@@ -716,7 +755,10 @@ export async function buildDynamicMcpIndex(
         groups: 0
       },
       threshold: toolNameThreshold,
-      schemaHintCaps
+      schemaHintCaps,
+      setupBlocks: [], sources: [apiSource], apiUtilityProjection,
+      allowedSkillToolHints: [], completeFeatureHintRefs: [],
+      hintBudget: { limit: totalHintTokens, budgetedTokens: 0, featureTokens: 0 }
     }
   }
 
@@ -727,21 +769,45 @@ export async function buildDynamicMcpIndex(
   const gatewayDefaults = await resolveGatewayDisplayDefaults(userId)
   let allTools: Record<string, any> = {}
   let metadata = new Map<string, any>()
-  if (dynamicMcpEnabled) {
+  const sources: AgentSetupSource[] = [
+    { id: 'controls', label: 'Batshit controls', available: true },
+    { id: 'cli', label: 'CLI Tools', available: true }
+  ]
+  sources.push(apiSource)
+  if (dynamicMcpEnabled && enabled.resolvedGateways?.length !== 0) {
     const mcpData = await mcpGatewayDiscovery.loadToolsForUser(
       userId,
       enabled.resolvedGateways,
       undefined,
-      { skipFiltering: true, projectPath: options.projectPath ?? null }
+      { skipFiltering: true, projectPath: options.projectPath ?? null, p5Owner: options.p5McpOwner }
     )
+    if (mcpData.unavailable) throw new Error('The current MCP tool catalogue could not be read; Agent Setup was not changed.')
     allTools = mcpData.tools
     metadata = mcpData.metadata
+    const availability = mcpData.gatewayAvailability ?? []
+    for (const gatewayId of enabled.resolvedGateways ?? [...new Set([...metadata.values()].map(meta => meta.gatewayId))]) {
+      const status = availability.find(row => row.gatewayId === gatewayId)
+      sources.push({ id: `mcp:${gatewayId}`, label: status?.gatewayName ?? gatewayId, available: status?.available !== false })
+    }
   }
 
   const groups = new Map<string, WorkingGroup>()
   const discoverable: DynamicMcpDiscoverableRef[] = []
   let dcmToolCount = 0
   let availableToolCount = 0
+  if (apiUtilities.length) {
+    const groupKey = buildCompositeKey('__api_utilities__', 'Batshit Utilities')
+    const tools = apiUtilities.map(entry => {
+      const hint = getSchemaHintText(buildSchemaHintSummary(entry.schemaHintFields, schemaHintCaps))
+      discoverable.push({ ref: brokerControlRef(entry.controlId), family: 'batshit', name: entry.controlId,
+        group: 'Batshit Utilities', groupKey, description: normalizeDescription(entry.description), hint, enabled: false })
+      return { name: entry.controlId, ref: brokerControlRef(entry.controlId), visibility: 'name+hint' as const, schemaHint: hint }
+    })
+    groups.set(groupKey, { gatewayId: '__api_utilities__', gatewayName: 'Batshit Utilities', baseName: 'Batshit Utilities',
+      name: 'Batshit Utilities', source: 'api-utilities', toolCount: tools.length, visibility: 'group+tools', tools })
+    dcmToolCount += tools.length
+    availableToolCount += tools.length
+  }
 
   if (dynamicMcpEnabled) {
     for (const [toolName, tool] of Object.entries(allTools)) {
@@ -775,6 +841,7 @@ export async function buildDynamicMcpIndex(
         family: 'mcp',
         name: toolName,
         group: baseGroupName,
+        groupKey: buildCompositeKey(gatewayId, baseGroupName),
         description: normalizeDescription((tool as any)?.description),
         hint: getSchemaHintText(buildSchemaSummary(extractSchema(tool), schemaHintCaps)) || null,
         enabled: enabledToolNames.has(toolName)
@@ -881,10 +948,11 @@ export async function buildDynamicMcpIndex(
           family: 'cli',
           name: record.toolId,
           group: CLI_TOOL_GRID_GROUP_NAME,
+          groupKey,
           description: normalizeDescription(
             [record.title, record.description].filter(Boolean).join(' — ')
           ),
-          hint: buildCliFieldSummary((record as Record<string, any>).inputSchema) || null,
+          hint: buildCliFieldSummary((record as Record<string, any>).inputSchema, schemaHintCaps) || null,
           enabled: false
         })
 
@@ -896,7 +964,9 @@ export async function buildDynamicMcpIndex(
           cliGroup.tools.push({
             name: record.toolId,
             visibility: toolVisibility,
-            schemaHint: toolVisibility === 'name+hint' ? buildCliToolHint(record as Record<string, any>) : null
+            schemaHint: toolVisibility === 'name+hint'
+              ? truncateHint(buildCliToolHint(record as Record<string, any>, schemaHintCaps), schemaHintCaps.maxChars)
+              : null
           })
         }
       }
@@ -911,10 +981,12 @@ export async function buildDynamicMcpIndex(
   // per-runtime visibility filter the broker's own search applies, and the allowlist is
   // the one tool registration builds, so the count here is the count the agent can reach.
   const fabricAllowedControlIds = fabricReachable
-    ? resolveBrokerFabricAllowedControlIds({
+    ? resolveBrokerRuntimeAllowedControlIds({
+        runtime: brokerRuntime,
         toggles: brokerToggles,
         allowFabricControlTools: options.allowFabricControlTools,
         memoryControlsEnabled,
+        whiteboardControlsEnabled,
         dmControlsEnabled,
         scheduleControlsEnabled,
         judgeControlsEnabled
@@ -922,6 +994,9 @@ export async function buildDynamicMcpIndex(
     : []
   const fabricControls = fabricReachable
     ? await (await loadListVisibleControls())({
+        p5McpOwner: options.p5McpOwner,
+        actorType: options.controlActorType ?? (options.primarySettingsActor === true ? 'in-process' : undefined),
+        ownedPrimaryPreview: options.primarySettingsActor === true && options.controlActorType === 'session',
         userId,
         agentId: controlAgentId,
         runtimeMode: controlRuntimeMode,
@@ -929,6 +1004,21 @@ export async function buildDynamicMcpIndex(
       })
     : []
 
+  const featureBlocks: AgentSetupBlock[] = []
+  const featureRefs = new Set<string>()
+  const completeFeatureHintRefs = new Set<string>()
+  // This is the exact actor/runtime allowance already used by broker registration/search.
+  // Metadata contributes relevance only; display-only hiding and Admin caps cannot remove
+  // fields from a deliberately opened skill.
+  const nativeSkillControls = fabricReachable ? NATIVE_FABRIC_HELPER_CONTROL_META.filter(meta =>
+    isControlIdAllowedByList(meta.controlId, fabricAllowedControlIds)) : []
+  const nativeSkillControlIds = new Set(nativeSkillControls.map(meta => meta.controlId))
+  const allowedSkillToolHints = [
+    ...nativeSkillControls,
+    ...fabricControls.filter(control => !nativeSkillControlIds.has(control.controlId)),
+    ...apiUtilities
+  ].map(control => ({ controlId: control.controlId, ref: brokerControlRef(control.controlId),
+    schemaHint: control.schemaHint?.trim() || null }))
   if (fabricReachable) {
     const nativeHelperIds = new Set(
       NATIVE_FABRIC_HELPER_CONTROL_META.map((meta) => meta.controlId)
@@ -954,16 +1044,58 @@ export async function buildDynamicMcpIndex(
         }))
     ].sort((left, right) => left.name.localeCompare(right.name))
 
+    // Display-only Fabric choices cannot hide the hints replacing emitted guidance.
+    // `entries` has already passed the exact live actor/runtime/control allowance.
+    const gates: NonNullable<DynamicMcpIndexOptions['featureHintGates']> = options.featureHintGates ?? (options.primarySettingsActor ? {
+      memory: memoryControlsEnabled, dm: dmControlsEnabled, schedule: scheduleControlsEnabled,
+      judge: judgeControlsEnabled, whiteboard: whiteboardControlsEnabled,
+      zip: brokerToggles.fetchZipEnabled, skill: true
+    } : {})
+    const fixedDefinitions = [
+      ...NATIVE_FABRIC_HELPER_CONTROL_META.filter(meta => meta.controlId === 'sys.zip.fetch' &&
+        isControlIdAllowedByList(meta.controlId, fabricAllowedControlIds)),
+      ...fabricControls.filter(control => control.sourceType === 'core' && !nativeHelperIds.has(control.controlId))
+    ]
+    for (const [index, { id: gate, label, controls }] of AGENT_SETUP_FEATURES.entries()) {
+      if (!gates[gate]) continue
+      const selected = fixedDefinitions.filter(entry => (controls as readonly string[]).includes(entry.controlId))
+        .map(entry => ({ name: entry.controlId, hint: entry.schemaHint }))
+        .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+      if (!selected.length) continue
+      for (const entry of selected) {
+        featureRefs.add(brokerControlRef(entry.name))
+        if (entry.hint?.trim()) completeFeatureHintRefs.add(brokerControlRef(entry.name))
+      }
+      featureBlocks.push({
+        key: `feature:${gate}`, source: 'controls', order: index, section: 'tools', hintClass: 'fixed-feature',
+        text: `- ${label}:\n` + selected.map(entry => `  - ${brokerControlRef(entry.name)}${entry.hint ? ` — ${setupMetadata(entry.hint)}` : ''}`).join('\n'),
+        items: selected.map(entry => ({ key: brokerControlRef(entry.name), label: brokerControlRef(entry.name),
+          text: `${brokerControlRef(entry.name)}${entry.hint ? ` — ${entry.hint}` : ''}` }))
+      })
+      for (const entry of selected) {
+        if (discoverable.some(row => row.ref === brokerControlRef(entry.name))) continue
+        discoverable.push({ ref: brokerControlRef(entry.name), family: isBatshitUtilityControlId(entry.name) ? 'batshit' : 'fabric',
+          name: entry.name, group: FABRIC_TOOL_GRID_DISPLAY_NAME, description: null,
+          hint: entry.hint, enabled: false, groupKey: buildCompositeKey(FABRIC_TOOL_GRID_ID, FABRIC_TOOL_GRID_GROUP_NAME) })
+      }
+    }
+
     availableToolCount += entries.length
+    // These exact tools already have their full always-on Setup lines. The retained
+    // family/count line describes only the remaining searchable operational tools.
+    const remainingEntries = entries.filter(entry => !featureRefs.has(brokerControlRef(entry.name)))
     const fabricGroup = buildBrokerFamilyGroup({
       gatewayId: FABRIC_TOOL_GRID_ID,
       groupName: FABRIC_TOOL_GRID_GROUP_NAME,
+      displayName: FABRIC_TOOL_GRID_DISPLAY_NAME,
       gatewayDefaults: fabricToolGridSettings.dcmDisplayDefaults,
       agentSettings: dcmDisplaySettings,
-      entries,
-      describeFamilies: describeFabricControlFamilies
+      entries: remainingEntries,
+      describeFamilies: describeFabricControlFamilies,
+      alwaysOneLine: true
     })
     if (fabricGroup) {
+      fabricGroup.skillGuidance = true
       dcmToolCount += fabricGroup.toolCount
       groups.set(buildCompositeKey(FABRIC_TOOL_GRID_ID, FABRIC_TOOL_GRID_GROUP_NAME), fabricGroup)
       // Same per-entry visibility the group applied: hidden controls never become hints.
@@ -972,11 +1104,13 @@ export async function buildDynamicMcpIndex(
       )
       for (const entry of entries) {
         if (fabricGroup.tools && !visibleNames.has(entry.name)) continue
+        if (featureRefs.has(brokerControlRef(entry.name))) continue
         discoverable.push({
-          ref: `fabric:${entry.name}`,
-          family: 'fabric',
+          ref: brokerControlRef(entry.name),
+          family: isBatshitUtilityControlId(entry.name) ? 'batshit' : 'fabric',
           name: entry.name,
-          group: FABRIC_TOOL_GRID_GROUP_NAME,
+          group: FABRIC_TOOL_GRID_DISPLAY_NAME,
+          groupKey: buildCompositeKey(FABRIC_TOOL_GRID_ID, FABRIC_TOOL_GRID_GROUP_NAME),
           description: null,
           hint: entry.hint,
           enabled: false
@@ -1019,6 +1153,7 @@ export async function buildDynamicMcpIndex(
     availableToolCount += entries.length
     const artifactGroup = buildBrokerFamilyGroup({
       gatewayId: ARTIFACT_TOOL_GRID_ID,
+      alwaysDiscoverable: true,
       groupName: ARTIFACT_TOOL_GRID_GROUP_NAME,
       gatewayDefaults: artifactToolGridSettings.dcmDisplayDefaults,
       agentSettings: dcmDisplaySettings,
@@ -1041,6 +1176,7 @@ export async function buildDynamicMcpIndex(
           family: 'artifact',
           name: entry.name,
           group: ARTIFACT_TOOL_GRID_GROUP_NAME,
+          groupKey: buildCompositeKey(ARTIFACT_TOOL_GRID_ID, ARTIFACT_TOOL_GRID_GROUP_NAME),
           description: null,
           hint: entry.hint,
           enabled: false
@@ -1052,15 +1188,19 @@ export async function buildDynamicMcpIndex(
   const workingGroups = Array.from(groups.values())
   applyDuplicateGroupDisambiguation(workingGroups)
 
-  const sortedGroups = workingGroups
-    .sort((left, right) => left.name.localeCompare(right.name))
-    .map((group) => ({
+  const sortedGroups = Array.from(groups.entries())
+    .sort(([, left], [, right]) => left.name.localeCompare(right.name))
+    .map(([id, group]) => ({
+      id,
+      source: group.source ?? (group.gatewayId === CLI_TOOL_GRID_ID ? 'cli'
+        : group.gatewayId === FABRIC_TOOL_GRID_ID || group.gatewayId === ARTIFACT_TOOL_GRID_ID ? 'controls' : `mcp:${group.gatewayId}`),
       name: group.name,
       toolCount: group.toolCount,
       visibility: group.visibility,
       tools: group.tools,
       note: group.note ?? null,
       ...(group.families ? { families: group.families } : {}),
+      ...(group.skillGuidance ? { skillGuidance: true } : {}),
       forceToolList: group.forceToolList
     }))
 
@@ -1076,7 +1216,7 @@ export async function buildDynamicMcpIndex(
     }
 
     const toolEntries = Array.isArray(group.tools)
-      ? [...group.tools].sort((left, right) => left.name.localeCompare(right.name))
+      ? [...group.tools].filter(entry => group.source !== 'controls' || !featureRefs.has(brokerControlRef(entry.name))).sort((left, right) => left.name.localeCompare(right.name))
       : []
 
     for (const entry of toolEntries) {
@@ -1099,7 +1239,37 @@ export async function buildDynamicMcpIndex(
   }
 
   const resultGroups = sortedGroups.map(({ forceToolList, ...group }) => group)
-  const dcmText = buildDcmText(resultGroups)
+  const groupBody = (group: DynamicMcpIndexGroup) => buildDcmText([group]).split('\n').slice(2).join('\n')
+  const bodyTokens = () => estimateTokens(resultGroups.map(groupBody).join('\n'))
+  // Exact display choices still respect the total budget. Collapse the largest
+  // complete groups, with stable IDs breaking ties; never drop identities.
+  for (const group of [...resultGroups].filter(group => group.tools?.length || group.note).sort((a, b) => {
+    const cost = estimateTokens(groupBody(b)) - estimateTokens(groupBody(a))
+    return cost || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+  })) {
+    if (bodyTokens() <= totalHintTokens) break
+    group.tools = undefined
+    group.note = null
+  }
+  if (bodyTokens() > totalHintTokens) throw new ToolHintBudgetError(totalHintTokens, bodyTokens())
+  const setupBlocks: AgentSetupBlock[] = [...featureBlocks, ...resultGroups.map((group, index) => ({
+    key: group.id, source: group.source, order: 100 + index, section: 'tools' as const, hintClass: 'scalable-tools' as const,
+    text: groupBody(group),
+    items: [
+      { key: `group:${group.id}`, label: group.name, text: formatGroupLine(group.name, group.toolCount, group.families, group.skillGuidance) +
+        (group.tools?.length ? `; listed tools: ${group.tools.map(tool => `${setupMetadata(tool.ref ?? tool.name)}${tool.visibility === 'name+hint' && tool.schemaHint ? ' (hint)' : ''}`).join(', ')}` : '; names and count only') },
+      ...(group.note ? [{ key: `group-note:${group.id}`, label: `${group.name} note`, text: group.note }] : []),
+      ...discoverable.filter(entry => entry.groupKey === group.id && !featureRefs.has(entry.ref))
+        .map(entry => {
+          const displayed = group.tools?.find(tool => tool.name === entry.name)
+          const detail = !displayed ? ' (details not listed in Agent Setup)'
+            : displayed.visibility === 'name+hint' && displayed.schemaHint ? ` — ${displayed.schemaHint}` : ' (name only)'
+          return { key: entry.ref, label: entry.ref, text: entry.ref + detail }
+        })
+    ]
+  }))]
+  const body = setupBlocks.map(block => block.text).filter(Boolean).join('\n')
+  const dcmText = body ? ['tool_discovery', '(current discoverable tools and hints for this agent)', body].join('\n') : ''
 
   // Approx token estimation for enabled tools
   let enabledTokens = 0
@@ -1132,6 +1302,9 @@ export async function buildDynamicMcpIndex(
       groups: resultGroups.length
     },
     threshold: toolNameThreshold,
-    schemaHintCaps
+    schemaHintCaps,
+    setupBlocks, sources, allowedSkillToolHints, completeFeatureHintRefs: [...completeFeatureHintRefs],
+    hintBudget: { limit: totalHintTokens, budgetedTokens: bodyTokens(), featureTokens: estimateTokens(featureBlocks.map(block => block.text).join('\n')) },
+    apiUtilityProjection
   }
 }

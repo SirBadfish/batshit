@@ -13,7 +13,7 @@ import {
   VRMHumanBoneName,
   type VRMLookAtBoneApplier
 } from '@pixiv/three-vrm'
-import { MToonNodeMaterial } from '@pixiv/three-vrm/nodes'
+import { GoonMToonNodeMaterial } from './goonMToonNodeMaterial'
 import {
   VRMAnimationLoaderPlugin,
   VRMLookAtQuaternionProxy,
@@ -477,6 +477,7 @@ type GoonZoomGesture =
     }
 
 export type GoonAnimationSyncOptions = {
+  signal?: AbortSignal
   deferredFiles?: GoonFileRef[]
 }
 
@@ -550,6 +551,7 @@ type LookAtRangeMapApplier = Pick<
 >
 
 type MaterialOriginalState = {
+  visible?: boolean
   map?: THREE.Texture | null
   shadeMultiplyTexture?: THREE.Texture | null
   normalMap?: THREE.Texture | null
@@ -1084,6 +1086,7 @@ export class GoonEngine implements GoonStageHost {
   private deferredAnimationQueue: GoonFileRef[] = []
   private deferredAnimationUrls = new Set<string>()
   private deferredLoading = false
+  private deferredLoadingToken: number | null = null
   private deferredLoadRequested = false
   private deferredLoadToken = 0
   private deferredLoadBaseToken = 0
@@ -1991,6 +1994,10 @@ export class GoonEngine implements GoonStageHost {
     return token
   }
 
+  getGoonLoadGeneration(): number {
+    return this.goonLoadToken
+  }
+
   isCurrentGoonLoad(token: number): boolean {
     return !this.disposed && token === this.goonLoadToken
   }
@@ -2029,9 +2036,12 @@ export class GoonEngine implements GoonStageHost {
     if (this.customAvatarRoot === owner.root) this.clearLoadedGoonState()
   }
 
-  async loadGoon(url: string, guidedManifest: GoonCustomAvatarManifest | null = null, reservedGoonLoadToken?: number) {
+  async loadGoon(url: string, guidedManifest: GoonCustomAvatarManifest | null = null, reservedGoonLoadToken?: number, signal?: AbortSignal) {
     this.assertNotDisposed()
     const goonLoadToken = reservedGoonLoadToken ?? this.beginGoonLoad()
+    const onAbort = () => { if (this.isCurrentGoonLoad(goonLoadToken)) this.invalidateGoonLoads(true) }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) onAbort()
     try {
       if (!this.renderer) {
         await this.init()
@@ -2044,11 +2054,18 @@ export class GoonEngine implements GoonStageHost {
       const loader = new GLTFLoader()
       loader.register((parser: any) => {
         const mtoonMaterialPlugin = new MToonMaterialLoaderPlugin(parser, {
-          materialType: MToonNodeMaterial
+          materialType: GoonMToonNodeMaterial
         })
         return new VRMLoaderPlugin(parser, { mtoonMaterialPlugin })
       })
-      const gltf = await loader.loadAsync(url)
+      let gltf
+      if (signal) {
+        const response = await fetch(url, { signal })
+        if (!response.ok) throw new Error(`Failed to load Goon model (${response.status}).`)
+        const modelBytes = await response.arrayBuffer()
+        signal.throwIfAborted()
+        gltf = await loader.parseAsync(modelBytes, THREE.LoaderUtils.extractUrlBase(url))
+      } else gltf = await loader.loadAsync(url)
       if (!this.isCurrentGoonLoad(goonLoadToken)) {
         if (gltf?.scene) {
           this.disposeVrmScene(gltf.scene)
@@ -2108,6 +2125,7 @@ export class GoonEngine implements GoonStageHost {
       if (!this.isCurrentGoonLoad(goonLoadToken)) return
       throw error
     } finally {
+      signal?.removeEventListener('abort', onAbort)
       this.finishGoonLoad(goonLoadToken)
     }
   }
@@ -2116,6 +2134,7 @@ export class GoonEngine implements GoonStageHost {
     url: string,
     manifest: GoonCustomAvatarManifest,
     options: {
+      signal?: AbortSignal
       bodyDialValues?: Record<string, number> | null
       appearanceDialValues?: AppearanceDialValueState | null
       facialArtworkState?: FacialArtworkState | null
@@ -2136,6 +2155,10 @@ export class GoonEngine implements GoonStageHost {
     if (!this.isCurrentGoonLoad(goonLoadToken)) return
     let owner: CustomGoonLoadOwner | null = null
     let clearedPreviousGoon = false
+    const loadSignal = options.signal
+    const onAbort = () => { if (this.isCurrentGoonLoad(goonLoadToken)) this.invalidateGoonLoads(true) }
+    loadSignal?.addEventListener('abort', onAbort, { once: true })
+    if (loadSignal?.aborted) onAbort()
     try {
       const socketEyePackage = parseFirstPartySocketEyePackage(manifest)
       if (socketEyePackage) {
@@ -2154,7 +2177,16 @@ export class GoonEngine implements GoonStageHost {
       clearedPreviousGoon = true
 
       const loader = new GLTFLoader()
-      const gltf = await loader.loadAsync(url)
+      let gltf
+      if (loadSignal) {
+        // Signal-owned fetches do not enter Three's module-global same-URL
+        // FileLoader queue, so cancellation cannot abort an unrelated owner.
+        const response = await fetch(url, { signal: loadSignal })
+        if (!response.ok) throw new Error(`Failed to load Goon model (${response.status}).`)
+        const modelBytes = await response.arrayBuffer()
+        loadSignal.throwIfAborted()
+        gltf = await loader.parseAsync(modelBytes, THREE.LoaderUtils.extractUrlBase(url))
+      } else gltf = await loader.loadAsync(url)
       if (!this.isCurrentGoonLoad(goonLoadToken)) {
         if (gltf?.scene) {
           this.disposeObject3D(gltf.scene)
@@ -2294,6 +2326,7 @@ export class GoonEngine implements GoonStageHost {
       if (clearedPreviousGoon) this.clearLoadedGoonState()
       throw error
     } finally {
+      loadSignal?.removeEventListener('abort', onAbort)
       this.finishGoonLoad(goonLoadToken)
     }
   }
@@ -3352,7 +3385,8 @@ export class GoonEngine implements GoonStageHost {
       THREE.MathUtils.degToRad(transform.rotate.x),
       THREE.MathUtils.degToRad(transform.rotate.y),
       THREE.MathUtils.degToRad(transform.rotate.z),
-      'XYZ'
+      // Intake applies X, then Y, then Z to each point (Rz · Ry · Rx).
+      'ZYX'
     )
     root.scale.set(
       transform.uniformScale * transform.axisScale.x,
@@ -3407,10 +3441,12 @@ export class GoonEngine implements GoonStageHost {
     assetValue: HairAssetV1,
     state: HairStateV2,
     url = assetValue.geometry.main.ref,
-    resolveAssetUrl: (ref: string) => string = (ref) => ref
+    resolveAssetUrl: (ref: string) => string = (ref) => ref,
+    assertCurrent?: () => void
   ): Promise<HairAttachmentSummary> {
     const asset = await verifyHairAsset(assetValue)
-    return this.loadHairPreviewCandidate(url, asset, state, resolveAssetUrl)
+    assertCurrent?.()
+    return this.loadHairPreviewCandidate(url, asset, state, resolveAssetUrl, assertCurrent)
   }
 
   updateHairPreviewColors(state: HairStateV2) {
@@ -3450,8 +3486,10 @@ export class GoonEngine implements GoonStageHost {
     url: string,
     asset: HairAssetV1 | null,
     state: HairStateV2 | null,
-    resolveAssetUrl: (ref: string) => string
+    resolveAssetUrl: (ref: string) => string,
+    assertCurrent?: () => void
   ): Promise<HairAttachmentSummary> {
+    assertCurrent?.()
     this.clearHairImportMotionMap()
     const trimmedUrl = url.trim()
     if (!trimmedUrl) {
@@ -3564,6 +3602,10 @@ export class GoonEngine implements GoonStageHost {
           }
         }
       }
+      // The caller's target can change while immutable Hair files load even
+      // before the next avatar has replaced this engine's current root.
+      // Refuse before attachment/publication and dispose only this candidate.
+      assertCurrent?.()
       hairRoot.traverse((object) => {
         if (!(object instanceof THREE.Mesh)) return
         object.frustumCulled = false
@@ -4000,7 +4042,7 @@ export class GoonEngine implements GoonStageHost {
     const loader = new GLTFLoader()
     loader.register((parser: any) => {
       const mtoonMaterialPlugin = new MToonMaterialLoaderPlugin(parser, {
-        materialType: MToonNodeMaterial
+        materialType: GoonMToonNodeMaterial
       })
       return new VRMLoaderPlugin(parser, { mtoonMaterialPlugin })
     })
@@ -8426,14 +8468,32 @@ export class GoonEngine implements GoonStageHost {
     this.deferredLoadRequested = false
     this.deferredLoadToken += 1
     this.deferredLoading = false
+    this.deferredLoadingToken = null
   }
 
-  async loadAdditionalAnimations(files: GoonFileRef[] = [], token = this.loadToken) {
+  async loadAdditionalAnimations(files: GoonFileRef[] = [], token = this.loadToken, signal?: AbortSignal) {
     if (!this.vrm && !this.customAvatarRoot) return
     if (!files || files.length === 0) return
     let added = false
     let hadWarnings = false
     const loader = new GLTFLoader()
+    const load = async (ownedLoader: GLTFLoader, url: string) => {
+      if (!signal) return ownedLoader.loadAsync(url)
+      signal.throwIfAborted()
+      // Do not abort Three's global coalesced FileLoader request: another
+      // engine can be waiting on that same URL. Own this fetch and parse.
+      const response = await fetch(url, { signal })
+      if (!response.ok) throw new Error(`Failed to load Goon motion (${response.status}).`)
+      const bytes = await response.arrayBuffer()
+      signal.throwIfAborted()
+      const gltf = await ownedLoader.parseAsync(bytes, THREE.LoaderUtils.extractUrlBase(url))
+      if (signal.aborted) {
+        if (gltf.scene) this.disposeObject3D(gltf.scene)
+        signal.throwIfAborted()
+      }
+      return gltf
+    }
+
 
     const normalizedSceneNames = this.collectNormalizedSceneNames()
 
@@ -8449,7 +8509,7 @@ export class GoonEngine implements GoonStageHost {
         if (extension === '.vrma') {
           const vrmaLoader = new GLTFLoader()
           vrmaLoader.register((parser: any) => new VRMAnimationLoaderPlugin(parser))
-          const gltf = await vrmaLoader.loadAsync(file.url)
+          const gltf = await load(vrmaLoader, file.url)
           if (token !== this.loadToken) return
           const currentVrm = this.vrm
           if (!currentVrm) {
@@ -8494,7 +8554,7 @@ export class GoonEngine implements GoonStageHost {
           continue
         }
 
-        const gltf = await loader.loadAsync(file.url)
+        const gltf = await load(loader, file.url)
         if (token !== this.loadToken || (!this.vrm && !this.customAvatarRoot)) return
         if (!Array.isArray(gltf.animations) || gltf.animations.length === 0) {
           if (this.addAnimationWarning(`Animation file "${sourceLabel}" contains no animations.`)) {
@@ -8504,7 +8564,18 @@ export class GoonEngine implements GoonStageHost {
         }
 
         const analysis = this.analyzeAnimationTargets(gltf.animations, normalizedSceneNames)
-        if (analysis.totalTracks > 0) {
+        if (
+          !this.vrm && this.customAvatarRoot && analysis.totalTracks === 0 &&
+          gltf.animations.some((clip) => clip.tracks.length > 0)
+        ) {
+          if (
+            this.addAnimationWarning(
+              `Animation file "${sourceLabel}" contains no supported animation tracks.`
+            )
+          ) {
+            hadWarnings = true
+          }
+        } else if (analysis.totalTracks > 0) {
           if (analysis.matchedTracks === 0) {
             if (
               this.addAnimationWarning(
@@ -8528,6 +8599,7 @@ export class GoonEngine implements GoonStageHost {
           added = true
         }
       } catch (error) {
+        if (signal?.aborted) throw signal.reason ?? error
         if (token !== this.loadToken || (!this.vrm && !this.customAvatarRoot)) return
         console.warn('[GoonEngine] Failed to load animation file:', file.url, error)
       }
@@ -8535,11 +8607,13 @@ export class GoonEngine implements GoonStageHost {
 
     if (added || hadWarnings) {
       this.emitActiveCompatibility()
+      if (token !== this.loadToken) return
       this.syncBaseLoopAnimation()
     }
   }
 
   async syncAnimations(files: GoonFileRef[] = [], options: GoonAnimationSyncOptions = {}) {
+    options.signal?.throwIfAborted()
     if (!this.vrm && !this.customAvatarRoot) return
     this.loadToken += 1
     const token = this.loadToken
@@ -8551,12 +8625,15 @@ export class GoonEngine implements GoonStageHost {
     )
 
     if (files && files.length > 0) {
-      await this.loadAdditionalAnimations(files, token)
+      await this.loadAdditionalAnimations(files, token, options.signal)
     } else {
       this.emitActiveCompatibility()
+      if (token !== this.loadToken) return
       this.syncBaseLoopAnimation()
     }
 
+    options.signal?.throwIfAborted()
+    if (token !== this.loadToken) return
     if (options.deferredFiles && options.deferredFiles.length > 0) {
       this.queueDeferredAnimations(options.deferredFiles)
     }
@@ -8586,8 +8663,10 @@ export class GoonEngine implements GoonStageHost {
   private async loadDeferredAnimations(token: number) {
     if (this.deferredLoading) return
     this.deferredLoading = true
+    this.deferredLoadingToken = token
     this.deferredLoadRequested = false
     const baseToken = this.deferredLoadBaseToken
+    let ownsDrain = false
     try {
       while (this.deferredAnimationQueue.length > 0) {
         if (token !== this.deferredLoadToken) break
@@ -8595,12 +8674,19 @@ export class GoonEngine implements GoonStageHost {
         const next = this.deferredAnimationQueue.shift()
         if (!next) continue
         await this.loadAdditionalAnimations([next], baseToken)
+        if (token !== this.deferredLoadToken || baseToken !== this.loadToken) break
         this.resolvePendingAnimations()
         await new Promise((resolve) => setTimeout(resolve, 20))
       }
     } finally {
-      this.deferredLoading = false
+      if (this.deferredLoadingToken === token) {
+        this.deferredLoading = false
+        this.deferredLoadingToken = null
+        ownsDrain = true
+      }
     }
+
+    if (!ownsDrain) return
 
     const shouldRestart =
       this.deferredAnimationQueue.length > 0 &&
@@ -9157,7 +9243,7 @@ export class GoonEngine implements GoonStageHost {
   private rememberMaterialState(material: THREE.Material) {
     if (this.originalMaterialState.has(material.uuid)) return
     const anyMaterial = material as THREE.Material & Record<string, any>
-    const state: MaterialOriginalState = {}
+    const state: MaterialOriginalState = { visible: material.visible }
     if ('map' in anyMaterial) state.map = anyMaterial.map ?? null
     if ('shadeMultiplyTexture' in anyMaterial) {
       state.shadeMultiplyTexture = anyMaterial.shadeMultiplyTexture ?? null
@@ -9247,6 +9333,7 @@ export class GoonEngine implements GoonStageHost {
   ) {
     this.releaseMaterialOverrideTextures(material, state, disposedTextures)
     const anyMaterial = material as THREE.Material & Record<string, any>
+    if (typeof state.visible === 'boolean') material.visible = state.visible
     if ('map' in anyMaterial) anyMaterial.map = state.map ?? null
     if ('shadeMultiplyTexture' in anyMaterial) {
       anyMaterial.shadeMultiplyTexture = state.shadeMultiplyTexture ?? null
@@ -9334,9 +9421,35 @@ export class GoonEngine implements GoonStageHost {
     material.needsUpdate = true
   }
 
-  async applyMaterialTexture(materialName: string, textureUrl: string): Promise<boolean> {
+  /** Hide one Closet material without deleting geometry or relying on alpha mode. */
+  hideClosetMaterial(materialName: string): boolean {
+    if (!materialName || !this.vrm) return false
+    if (this.materialMap.size === 0) this.collectMaterials()
+    const materials = this.materialMap.get(materialName)
+    if (!materials?.length) return false
+    for (const material of materials) {
+      this.rememberMaterialState(material)
+      material.visible = false
+    }
+    return true
+  }
+
+  private restoreOriginalMaterialVisibility(material: THREE.Material) {
+    const visible = this.originalMaterialState.get(material.uuid)?.visible
+    if (typeof visible === 'boolean') material.visible = visible
+  }
+
+  async applyMaterialTexture(
+    materialName: string,
+    textureUrl: string,
+    options: { isCurrent?: () => boolean } = {}
+  ): Promise<boolean> {
     if (!materialName || !textureUrl) return false
     if (!this.vrm) return false
+    const ownerVrm = this.vrm, goonLoadToken = this.goonLoadToken
+    const isCurrent = () => this.isCurrentGoonLoad(goonLoadToken) && this.vrm === ownerVrm &&
+      (options.isCurrent?.() ?? true)
+    if (!isCurrent()) return false
     if (this.materialMap.size === 0) {
       this.collectMaterials()
     }
@@ -9357,7 +9470,18 @@ export class GoonEngine implements GoonStageHost {
       }
       texture = this.transparentTexture
     } else {
-      texture = await this.textureLoader.loadAsync(textureUrl)
+      try {
+        texture = await this.textureLoader.loadAsync(textureUrl)
+      } catch (error) {
+        if (!isCurrent()) return false
+        throw error
+      }
+      let current: boolean
+      try { current = isCurrent() } catch (error) { texture.dispose(); throw error }
+      if (!current) {
+        texture.dispose()
+        return false
+      }
       texture.flipY = false
       texture.colorSpace = THREE.SRGBColorSpace
       const image = texture.image as {
@@ -9383,6 +9507,7 @@ export class GoonEngine implements GoonStageHost {
       }
       if (!('map' in target)) continue
       this.rememberMaterialState(material)
+      this.restoreOriginalMaterialVisibility(material)
       if (target.map && target.map !== texture) {
         this.releaseMaterialRuntimeTexture(target.map, disposedTextures)
       }
@@ -9417,9 +9542,17 @@ export class GoonEngine implements GoonStageHost {
     }
   }
 
-  async applyXWearMaterial(materialName: string, xwear: GoonXWearData): Promise<boolean> {
+  async applyXWearMaterial(
+    materialName: string,
+    xwear: GoonXWearData,
+    options: { isCurrent?: () => boolean } = {}
+  ): Promise<boolean> {
     if (!materialName || !xwear) return false
     if (!this.vrm) return false
+    const ownerVrm = this.vrm, goonLoadToken = this.goonLoadToken
+    const isCurrent = () => this.isCurrentGoonLoad(goonLoadToken) && this.vrm === ownerVrm &&
+      (options.isCurrent?.() ?? true)
+    if (!isCurrent()) return false
     if (this.materialMap.size === 0) {
       this.collectMaterials()
     }
@@ -9465,40 +9598,58 @@ export class GoonEngine implements GoonStageHost {
 
     const disposedTextures = new Set<THREE.Texture>()
     for (const layer of layers) {
+      if (!isCurrent()) return false
       const textureMap = new Map<string, THREE.Texture>()
-      for (const [property, ref] of Object.entries(layer.textures ?? {})) {
-        const url = ref?.url
-        if (!url) continue
-        const texture = await this.textureLoader.loadAsync(url)
-        texture.flipY = false
-        const isColorTexture = [
-          '_MainTex',
-          '_ShadeTex',
-          '_EmissionMap',
-          '_MatcapTex',
-          '_RimTex',
-          '_OutlineWidthMultiplyTexture'
-        ].includes(property)
-        texture.colorSpace = isColorTexture ? THREE.SRGBColorSpace : THREE.NoColorSpace
-        const image = texture.image as {
-          width?: number
-          height?: number
-          naturalWidth?: number
-          naturalHeight?: number
+      let loading = false
+      try {
+        for (const [property, ref] of Object.entries(layer.textures ?? {})) {
+          const url = ref?.url
+          if (!url) continue
+          loading = true
+          const texture = await this.textureLoader.loadAsync(url)
+          loading = false
+          let current: boolean
+          try { current = isCurrent() } catch (error) { texture.dispose(); throw error }
+          if (!current) {
+            texture.dispose()
+            for (const pending of textureMap.values()) this.releaseMaterialRuntimeTexture(pending, disposedTextures)
+            return false
+          }
+          texture.flipY = false
+          const isColorTexture = [
+            '_MainTex',
+            '_ShadeTex',
+            '_EmissionMap',
+            '_MatcapTex',
+            '_RimTex',
+            '_OutlineWidthMultiplyTexture'
+          ].includes(property)
+          texture.colorSpace = isColorTexture ? THREE.SRGBColorSpace : THREE.NoColorSpace
+          const image = texture.image as {
+            width?: number
+            height?: number
+            naturalWidth?: number
+            naturalHeight?: number
+          }
+          const width = image?.width ?? image?.naturalWidth ?? 0
+          const height = image?.height ?? image?.naturalHeight ?? 0
+          if (!width || !height) {
+            texture.dispose()
+            continue
+          }
+          this.trackMaterialRuntimeTexture(texture)
+          textureMap.set(property, texture)
         }
-        const width = image?.width ?? image?.naturalWidth ?? 0
-        const height = image?.height ?? image?.naturalHeight ?? 0
-        if (!width || !height) {
-          texture.dispose()
-          continue
-        }
-        this.trackMaterialRuntimeTexture(texture)
-        textureMap.set(property, texture)
+      } catch (error) {
+        for (const pending of textureMap.values()) this.releaseMaterialRuntimeTexture(pending, disposedTextures)
+        if (loading && !isCurrent()) return false
+        throw error
       }
 
       const assignedLayerTextures = new Set<THREE.Texture>()
       for (const material of materials) {
         this.rememberMaterialState(material)
+        this.restoreOriginalMaterialVisibility(material)
         const target = material as THREE.Material & Record<string, any>
 
         for (const [property, color] of Object.entries(layer.colors ?? {})) {
@@ -9806,21 +9957,21 @@ export class GoonEngine implements GoonStageHost {
    * the joints. Enforce the contract at registration: keep quaternions and
    * root-motion translations, drop every other position/scale track.
    */
+  private isRetainedGoonClipTrack(track: THREE.KeyframeTrack) {
+    const name = track.name.toLowerCase()
+    if (name.endsWith('.position')) return this.isRootMotionTrack(track.name)
+    return !name.endsWith('.scale')
+  }
+
   private enforceGoonClipTransformContract(clip: THREE.AnimationClip) {
     let droppedPositionTracks = 0
     let droppedScaleTracks = 0
     const kept = clip.tracks.filter((track) => {
       const name = track.name.toLowerCase()
-      if (name.endsWith('.position')) {
-        if (this.isRootMotionTrack(track.name)) return true
-        droppedPositionTracks += 1
-        return false
-      }
-      if (name.endsWith('.scale')) {
-        droppedScaleTracks += 1
-        return false
-      }
-      return true
+      if (this.isRetainedGoonClipTrack(track)) return true
+      if (name.endsWith('.position')) droppedPositionTracks += 1
+      else droppedScaleTracks += 1
+      return false
     })
     if (droppedPositionTracks === 0 && droppedScaleTracks === 0) return
     clip.tracks = kept
@@ -9878,8 +10029,29 @@ export class GoonEngine implements GoonStageHost {
     animations: THREE.AnimationClip[] = [],
     normalizedSceneNames?: Set<string>
   ) {
-    if (!this.vrm || animations.length === 0) {
+    if ((!this.vrm && !this.customAvatarRoot) || animations.length === 0) {
       return { matchedTracks: 0, totalTracks: 0, matchRatio: 0 }
+    }
+
+    if (!this.vrm && this.customAvatarRoot) {
+      let matchedTracks = 0
+      let totalTracks = 0
+      for (const animationClip of animations) {
+        for (const track of animationClip.tracks) {
+          if (!this.isRetainedGoonClipTrack(track)) continue
+          totalTracks += 1
+          try {
+            const parsed = THREE.PropertyBinding.parseTrackName(track.name)
+            if (THREE.PropertyBinding.findNode(this.customAvatarRoot, parsed.nodeName)) {
+              matchedTracks += 1
+            }
+          } catch {
+            // A path Three cannot parse cannot bind to the active mixer root.
+          }
+        }
+      }
+      const matchRatio = totalTracks > 0 ? matchedTracks / totalTracks : 0
+      return { matchedTracks, totalTracks, matchRatio }
     }
 
     const sceneNames = normalizedSceneNames ?? this.collectNormalizedSceneNames()

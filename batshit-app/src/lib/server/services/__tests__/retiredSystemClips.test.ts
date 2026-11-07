@@ -63,9 +63,9 @@ describe('removeRetiredSystemClips', () => {
     expect(removeClipFromSessionStateMock).toHaveBeenCalledWith('session-b', 'batshit_guide')
     expect(redisSRemMock).toHaveBeenCalledWith('user:system:clips', 'batshit_guide')
     expect(redisDelMock).toHaveBeenCalledWith('clip:system:batshit_guide')
-    // Goon Guide is not retired and must remain untouched.
-    expect(redisSRemMock).not.toHaveBeenCalledWith('user:system:clips', 'goon_guide')
-    expect(redisDelMock).not.toHaveBeenCalledWith('clip:system:goon_guide')
+    // Goon Guide is now delivered through the Batshit plugin too.
+    expect(redisSRemMock).toHaveBeenCalledWith('user:system:clips', 'goon_guide')
+    expect(redisDelMock).toHaveBeenCalledWith('clip:system:goon_guide')
   })
 
   it('still removes a dangling membership when only the set entry remains', async () => {

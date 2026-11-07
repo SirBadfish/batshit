@@ -5,11 +5,7 @@ import {
   getActiveSessionTurn,
   getActiveStream
 } from '$lib/server/services/streamAbortRegistry'
-import {
-  enqueueSteer,
-  flushPendingSteersToTransport,
-  getSteerRun
-} from '$lib/server/services/steerInboxRegistry'
+import { enqueueSteer, getSteerRun } from '$lib/server/services/steerInboxRegistry'
 import { internalServiceHeaders } from '$lib/server/services/internalRequestAuth'
 import { waitForStreamRegistration } from '$lib/server/services/steerSetupWait'
 import {
@@ -187,9 +183,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   }
 
   // P2 (DL-114-09): the verdict comes from the RUN, not from a second reading of the agent
-  // record. Whether a Codex turn can be steered depends on the transport lane it actually
-  // got — `app-server` can, `exec` closed its stdin after the prompt — and that is a
-  // decision send-routed made when it started this run, not a field anyone can look up.
+  // record. Whether a turn can be steered is a decision send-routed made when it started this
+  // run, not a field anyone can look up.
   // Re-deriving it here is how the route would come to promise a steer the turn cannot
   // carry. `resolveSteerability` is still THE rule; this reads the answer it already gave.
   //
@@ -224,29 +219,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     )
   }
 
-  // P2: a managed CLI turn has no `prepareStep` to pull at its next step, so the text is
-  // pushed onto its wire now and the CLI holds it until its own next tool boundary — the
-  // behaviour both vendors document. Not awaited: the API lane registers no transport and
-  // returns immediately, but a Codex `turn/steer` is a JSON-RPC round trip with a 120-second
-  // ceiling, and the user's send button must not hang on a wedged app server. The server
-  // already owns the text either way — a refused write returns it to the inbox, where the
-  // end of the turn promotes it (DL-114-07).
-  //
-  // SA-119 (DL-119-05): this runs for a queued message too, and takes nothing.
-  // `takePendingSteersForTransport` skips every `deliver: 'end'` entry — that ONE skip, in
-  // the registry, is the contract, and it is the same predicate the API lane's take reads.
-  // A second guard here would be a second statement of the same rule that no test could
-  // hold honest: with the skip in place it can never change the outcome (measured — the
-  // mutation that deleted the guard left every suite green), so it could only ever drift.
-  void flushPendingSteersToTransport(sessionId, messageId).then((result) => {
-    if (result.reason === 'refused') {
-      console.warn('[SA-114] A managed CLI refused a steer; it will be promoted instead', {
-        sessionId,
-        steerId,
-        error: result.error ?? null
-      })
-    }
-  })
+  // The running turn pulls the text at its next step (`prepareStep`); nothing is pushed from
+  // here. SA-119 (DL-119-05): a queued message is skipped by that take
+  // (`takePendingSteersForDelivery`), the ONE skip in the registry, and the end of the reply
+  // promotes it.
 
   await publishSteerQueued({ request, sessionId, messageId, steerId, text, at, deliver })
 

@@ -3,6 +3,26 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 vi.unmock('ai'); vi.unmock('@ai-sdk/openai')
 vi.mock('$lib/server/services/providers', () => ({ resolveProviderAccess: async () => ({ apiKeys: { openai: 'SYNTHETIC_PAID_KEY' } }) }))
+// e177b5a85: the config PUT reads its preset through the owner's Lua read (`readModelPresetStorage`).
+// The default lane's fake deliberately has no generic EVAL, so there the owner reads the seeded preset
+// and its ownership index with the same preconditions; the real lanes run the actual owner.
+vi.mock('$lib/server/services/modelPresetSelectionOwner', async importOriginal => {
+  const actual = await importOriginal<typeof import('$lib/server/services/modelPresetSelectionOwner')>()
+  if (process.env.VITEST_USE_REAL_REDIS === 'true') return actual
+  return { ...actual, readOwnedModelPresetDependency: async (userId: string, presetId: string) => {
+    const { redis } = await import('$lib/server/redis')
+    const { captureSettingsLifecycle } = await import('$lib/server/services/appActions/settings/lifecycle')
+    const lifecycle = captureSettingsLifecycle([`model:${presetId}`])
+    const preset = await redis.get(`model:${presetId}`) as any
+    const owned = await redis.execute(client => client.sIsMember(`user:${userId}:models`, presetId))
+    if (!preset || !owned) throw new actual.ModelPresetUnavailableError('This model preset is no longer in your saved models.')
+    if (typeof preset.modelId !== 'string' || typeof preset.provider !== 'string' || typeof preset.modelName !== 'string') {
+      throw new actual.ModelPresetUnavailableError('The saved model preset cannot be read for selection.')
+    }
+    const membership = { key: `user:${userId}:models`, member: presetId, present: true as const }
+    return Object.freeze({ preset: structuredClone(preset), lifecycle, membership, memberships: [membership], checks: [] })
+  } }
+})
 import { redis } from '$lib/server/redis'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { memorySearchLaneActive, useMemorySearchTestServer } from '$lib/test-utils/memory-search-server'
@@ -22,7 +42,9 @@ describe('ChatGPT plans cannot fund memory embeddings (BL-1057)', () => {
     expect(() => resolvePresetEmbeddingTarget({ presetId: PRESET, snapshot: { provider: 'openai', modelName: paid.modelId }, preset: { ...plan, connection: candidate }, localAiServers: [], apiKeys: { openai: 'SYNTHETIC_PAID_KEY' } })).toThrow('cannot provide memory embeddings')
   })
   it.each([0, 2])('rejects new memory configuration even with caller-supplied dims=%s', async dims => {
-    await redis.set(`model:${PRESET}`, plan)
+    // A saved preset as its owner reads it: a model name, and in the user's saved models.
+    await redis.set(`model:${PRESET}`, { ...plan, modelName: 'Plan embedding fixture' })
+    await redis.sAdd(`user:${USER}:models`, PRESET)
     const http = vi.fn(); vi.stubGlobal('fetch', http)
     const response = await PUT({ locals: { user: { id: USER } }, request: new Request('http://fixture/api/memory/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ embedding: { ...embedding, preset: { ...embedding.preset, dims } } }) }) } as any)
     expect(response.status).toBe(400); expect(await response.json()).toMatchObject({ error: expect.stringContaining('cannot provide memory embeddings') })

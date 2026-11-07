@@ -1,3 +1,4 @@
+import './presetStorageScriptDouble'
 /** Plan pause: a model of a paused plan cannot be added or saved. */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 

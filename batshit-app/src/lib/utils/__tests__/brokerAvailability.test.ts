@@ -13,6 +13,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   BROKER_FABRIC_BATSHIT_TOOLS_CONTROL_IDS,
+  BROKER_BATSHIT_UTILITY_CONTROL_IDS,
+  brokerControlRef,
+  resolveBrokerControlFamilies,
   BROKER_FABRIC_FETCH_ZIP_CONTROL_ID,
   DELEGATED_RUN_BROKER_SCOPE,
   isBrokerAvailable,
@@ -20,7 +23,6 @@ import {
   resolveBrokerFabricAllowedControlIds,
   resolveBrokerFamilies,
   resolveBrokerToolToggles,
-  resolveDelegatedRunAllowedControlIds,
   resolveDelegatedRunBrokerInputs,
   type BrokerToolToggles
 } from '$lib/utils/brokerAvailability'
@@ -157,76 +159,7 @@ describe('resolveBrokerFamilies — api runtime', () => {
   })
 })
 
-describe('resolveBrokerFamilies — cli runtime', () => {
-  it('mirrors resolveEnabledMode4InternalHelperTools: fetch-zip is its own helper, not a broker family', () => {
-    const families = resolveBrokerFamilies({
-      runtime: 'cli',
-      toggles: { ...ALL_OFF, fetchZipEnabled: true },
-      hasCliTools: false
-    })
-    expect(families).toEqual([])
-  })
-
-  it('includes agent_browser on the managed CLI lane', () => {
-    const families = resolveBrokerFamilies({
-      runtime: 'cli',
-      toggles: { ...ALL_OFF, agentBrowserEnabled: true },
-      hasCliTools: false
-    })
-    expect(families).toEqual(['agent_browser'])
-  })
-
-  it('opens the fabric family from Batshit Tools', () => {
-    const families = resolveBrokerFamilies({
-      runtime: 'cli',
-      toggles: { ...ALL_OFF, batshitToolsEnabled: true },
-      hasCliTools: false
-    })
-    expect(families).toEqual(['fabric'])
-  })
-})
-
-describe('resolveBrokerFamilies — n8n runtime', () => {
-  it('advertises the CLI family from the toggle alone, since the pack resolves selections at call time', () => {
-    const families = resolveBrokerFamilies({
-      runtime: 'n8n',
-      toggles: { ...ALL_OFF, cliToolsEnabled: true },
-      hasCliTools: false
-    })
-    expect(families).toEqual(['cli'])
-  })
-
-  it('opens fabric from fetch-zip, matching the automation pack DCM', () => {
-    const families = resolveBrokerFamilies({
-      runtime: 'n8n',
-      toggles: { ...ALL_OFF, fetchZipEnabled: true }
-    })
-    expect(families).toEqual(['fabric'])
-  })
-
-  it('does not open fabric from Batshit Tools alone', () => {
-    const families = resolveBrokerFamilies({
-      runtime: 'n8n',
-      toggles: { ...ALL_OFF, batshitToolsEnabled: true }
-    })
-    expect(families).toEqual([])
-  })
-
-  it('lists families in the order the DCM prints them', () => {
-    const families = resolveBrokerFamilies({
-      runtime: 'n8n',
-      toggles: {
-        fetchZipEnabled: true,
-        dynamicMcpEnabled: true,
-        cliToolsEnabled: true,
-        artifactRuntimeEnabled: true,
-        batshitToolsEnabled: true,
-        agentBrowserEnabled: true
-      }
-    })
-    expect(families).toEqual(['mcp', 'cli', 'artifact', 'agent_browser', 'fabric'])
-  })
-})
+// SA-139 P7: the `cli` runtime went with the managed CLI lanes (R4, R5); its cases went with it.
 
 describe('isBrokerAvailable — the SA-096 P5 regressions', () => {
   it('reports the broker available with Dynamic MCP off but Fabric live', () => {
@@ -248,15 +181,11 @@ describe('isBrokerAvailable — the SA-096 P5 regressions', () => {
     // The mirror defect: ~900 tokens explaining a broker that is not registered.
     const toggles: BrokerToolToggles = { ...ALL_OFF, dynamicMcpEnabled: false }
     expect(isBrokerAvailable({ runtime: 'api', toggles, hasCliTools: false })).toBe(false)
-    expect(isBrokerAvailable({ runtime: 'cli', toggles, hasCliTools: false })).toBe(false)
-    expect(isBrokerAvailable({ runtime: 'n8n', toggles })).toBe(false)
   })
 
-  it('reports the broker available on every runtime for a default agent', () => {
+  it('reports the broker available for a default agent', () => {
     const toggles = resolveBrokerToolToggles({})
     expect(isBrokerAvailable({ runtime: 'api', toggles })).toBe(true)
-    expect(isBrokerAvailable({ runtime: 'cli', toggles })).toBe(true)
-    expect(isBrokerAvailable({ runtime: 'n8n', toggles })).toBe(true)
   })
 })
 
@@ -321,7 +250,7 @@ describe('resolveBrokerFabricAllowedControlIds', () => {
       expect(resolveBrokerFabricAllowedControlIds({ toggles: ALL_ON })).not.toContain('sys.memory.*')
     })
 
-    it('adds sys.memory.* for a memory-enabled primary even when the broad control plane is closed (n8n case)', () => {
+    it('adds sys.memory.* for a memory-enabled primary even when the broad control plane is closed (closed control plane)', () => {
       const allowed = resolveBrokerFabricAllowedControlIds({
         toggles: ALL_ON,
         allowFabricControlTools: false,
@@ -421,13 +350,6 @@ describe('resolveBrokerFamilies — DM reachability (SA-113 P2)', () => {
     ).toEqual(['fabric'])
   })
 
-  it('opens the fabric family on n8n for a DM-enabled primary with fetch-zip off', () => {
-    const toggles: BrokerToolToggles = { ...ALL_OFF, batshitToolsEnabled: true }
-    expect(
-      resolveBrokerFamilies({ runtime: 'n8n', toggles, dmControlsEnabled: true })
-    ).toEqual(['fabric'])
-  })
-
   it('DMs alone open nothing when Batshit Tools is off', () => {
     expect(
       resolveBrokerFamilies({ runtime: 'api', toggles: ALL_OFF, dmControlsEnabled: true })
@@ -436,14 +358,6 @@ describe('resolveBrokerFamilies — DM reachability (SA-113 P2)', () => {
 })
 
 describe('resolveBrokerFamilies — memory reachability (SA-104 P3)', () => {
-  it('opens the fabric family on n8n for a memory-enabled primary with fetch-zip off', () => {
-    const toggles: BrokerToolToggles = { ...ALL_OFF, batshitToolsEnabled: true }
-    expect(resolveBrokerFamilies({ runtime: 'n8n', toggles })).toEqual([])
-    expect(
-      resolveBrokerFamilies({ runtime: 'n8n', toggles, memoryControlsEnabled: true })
-    ).toEqual(['fabric'])
-  })
-
   it('opens the fabric family on api for a memory-enabled agent with fetch-zip and broad Fabric off', () => {
     const toggles: BrokerToolToggles = { ...ALL_OFF, batshitToolsEnabled: true }
     expect(
@@ -458,7 +372,7 @@ describe('resolveBrokerFamilies — memory reachability (SA-104 P3)', () => {
 
   it('memory alone opens nothing when Batshit Tools is off', () => {
     expect(
-      resolveBrokerFamilies({ runtime: 'n8n', toggles: ALL_OFF, memoryControlsEnabled: true })
+      resolveBrokerFamilies({ runtime: 'api', toggles: ALL_OFF, memoryControlsEnabled: true })
     ).toEqual([])
   })
 })
@@ -532,9 +446,9 @@ describe('Schedule controls (SA-115 P2, DL-115-10)', () => {
     expect(scheduleOnly).not.toContain('sys.memory.*')
   })
 
-  it('opens the fabric family on api and n8n for a schedule-enabled agent', () => {
+  it('opens the fabric family on api and cli for a schedule-enabled agent', () => {
     const toggles: BrokerToolToggles = { ...ALL_OFF, batshitToolsEnabled: true }
-    for (const runtime of ['api', 'n8n'] as const) {
+    for (const runtime of ['api', 'cli'] as const) {
       expect(
         resolveBrokerFamilies({
           runtime,
@@ -558,19 +472,19 @@ describe('Schedule controls (SA-115 P2, DL-115-10)', () => {
 describe('Judge controls (SA-120 P2, DL-120-06)', () => {
   const ALL_ON = resolveBrokerToolToggles({})
 
-  it('never includes sys.judge.* by default (the judgment tool is opt-in per agent)', () => {
+  it('never includes sys.judge.ask by default (the judgment tool is opt-in per agent)', () => {
     const allowed = resolveBrokerFabricAllowedControlIds({ toggles: ALL_ON })
-    expect(allowed).not.toContain('sys.judge.*')
+    expect(allowed).not.toContain('sys.judge.ask')
     expect(isControlIdAllowedByList('sys.judge.ask', allowed)).toBe(false)
   })
 
-  it('adds sys.judge.* for an enabled primary even when the broad control plane is closed', () => {
+  it('adds sys.judge.ask for an enabled primary even when the broad control plane is closed', () => {
     const allowed = resolveBrokerFabricAllowedControlIds({
       toggles: ALL_ON,
       allowFabricControlTools: false,
       judgeControlsEnabled: true
     })
-    expect(allowed).toContain('sys.judge.*')
+    expect(allowed).toContain('sys.judge.ask')
     expect(allowed).not.toContain('sys.artifact.*')
     expect(isControlIdAllowedByList('sys.judge.ask', allowed)).toBe(true)
   })
@@ -600,15 +514,15 @@ describe('Judge controls (SA-120 P2, DL-120-06)', () => {
       allowFabricControlTools: false,
       judgeControlsEnabled: true
     })
-    expect(judgeOnly).toContain('sys.judge.*')
+    expect(judgeOnly).toContain('sys.judge.ask')
     expect(judgeOnly).not.toContain('sys.dm.*')
     expect(judgeOnly).not.toContain('sys.schedule.*')
     expect(judgeOnly).not.toContain('sys.memory.*')
   })
 
-  it('opens the fabric family on api and n8n for a judge-enabled agent', () => {
+  it('opens only the neutral utility family on api and cli for a judge-enabled agent', () => {
     const toggles: BrokerToolToggles = { ...ALL_OFF, batshitToolsEnabled: true }
-    for (const runtime of ['api', 'n8n'] as const) {
+    for (const runtime of ['api', 'cli'] as const) {
       expect(
         resolveBrokerFamilies({
           runtime,
@@ -616,7 +530,7 @@ describe('Judge controls (SA-120 P2, DL-120-06)', () => {
           allowFabricControlTools: false,
           judgeControlsEnabled: true
         })
-      ).toEqual(['fabric'])
+      ).toEqual(['batshit'])
     }
     expect(
       resolveBrokerFamilies({
@@ -632,10 +546,9 @@ describe('Judge controls (SA-120 P2, DL-120-06)', () => {
 /* -------------------------------------------------------------------------- *
  * BL-81 — a Subagent or Worker run may use exactly what its DCM index offers it.
  *
- * The Subagent DCM builder (`buildManagedSubagentDynamicInfo`) and the control scope minted
- * onto a delegated CLI run's credential both read their inputs through
- * `resolveDelegatedRunBrokerInputs` and their flags from `DELEGATED_RUN_BROKER_SCOPE`, and the
- * scope is the two broker groups that index lists: Fabric and Artifact Tools.
+ * The Subagent DCM builder (`buildManagedSubagentDynamicInfo`) reads its inputs through
+ * `resolveDelegatedRunBrokerInputs` and its flags from `DELEGATED_RUN_BROKER_SCOPE`. (The control
+ * scope once minted onto a delegated CLI run's credential went with the CLI Subagent in SA-139 R5.)
  * -------------------------------------------------------------------------- */
 
 describe('the control scope of a delegated run (BL-81)', () => {
@@ -646,79 +559,45 @@ describe('the control scope of a delegated run (BL-81)', () => {
       allowArtifactRuntimeTools: true,
       allowFabricControlTools: false,
       memoryControlsEnabled: false,
+      whiteboardControlsEnabled: false,
       dmControlsEnabled: false,
       scheduleControlsEnabled: false,
       judgeControlsEnabled: false
     })
   })
 
-  it('reads the runtime from the Subagent type and the six toggles off its resolved settings', () => {
+  it('reads the six toggles off the resolved settings; every delegated run is on api (SA-139 P7)', () => {
     const scope = {
-      subagentType: 'cli',
+      subagentType: 'api',
       nativeToolSettings: { ...ALL_ON, fetchZipEnabled: false, bashEnabled: true } as any
     }
     expect(resolveDelegatedRunBrokerInputs(scope)).toEqual({
-      runtime: 'cli',
+      runtime: 'api',
       toggles: { ...ALL_ON, fetchZipEnabled: false }
     })
-    expect(resolveDelegatedRunBrokerInputs({ ...scope, subagentType: 'api' }).runtime).toBe('api')
   })
+})
 
-  it('offers Fetch Zip and the published artifact tools when their toggles are on', () => {
-    for (const runtime of ['api', 'cli'] as const) {
-      expect(resolveDelegatedRunAllowedControlIds({ runtime, toggles: ALL_ON }), runtime).toEqual([
-        BROKER_FABRIC_FETCH_ZIP_CONTROL_ID,
-        'use.artifact.*'
-      ])
-    }
-  })
 
-  it('drops Fetch Zip when its toggle is off, and the artifact tools when theirs is', () => {
-    expect(
-      resolveDelegatedRunAllowedControlIds({
-        runtime: 'cli',
-        toggles: { ...ALL_ON, fetchZipEnabled: false }
-      })
-    ).toEqual(['use.artifact.*'])
-    expect(
-      resolveDelegatedRunAllowedControlIds({
-        runtime: 'cli',
-        toggles: { ...ALL_ON, artifactRuntimeEnabled: false }
-      })
-    ).toEqual([BROKER_FABRIC_FETCH_ZIP_CONTROL_ID])
-    expect(resolveDelegatedRunAllowedControlIds({ runtime: 'cli', toggles: ALL_OFF })).toEqual([])
-  })
-
-  it('follows each runtime\'s own Fabric rule, exactly as the index does', () => {
-    // On `cli` the Fabric family follows the Batshit Tools toggle, so Fetch Zip is only offered
-    // beside it; on `api` Fetch Zip opens the family by itself.
-    const fetchZipOnly: BrokerToolToggles = { ...ALL_OFF, fetchZipEnabled: true }
-    expect(resolveDelegatedRunAllowedControlIds({ runtime: 'cli', toggles: fetchZipOnly })).toEqual([])
-    expect(resolveDelegatedRunAllowedControlIds({ runtime: 'api', toggles: fetchZipOnly })).toEqual([
-      BROKER_FABRIC_FETCH_ZIP_CONTROL_ID
+describe('utility namespace is an exact partition of resolved scope', () => {
+  const ALL_ON = resolveBrokerToolToggles({})
+  it('classifies the four API callbacks and three approved generic utility ids', () => {
+    expect(BROKER_BATSHIT_UTILITY_CONTROL_IDS).toEqual([
+      'sys.web_search.search', 'sys.workers.spawn', 'sys.skill.use', 'sys.subagent.call',
+      'sys.judge.ask', 'sys.mcp.dynamic.find', 'sys.mcp.dynamic.use'
     ])
+    for (const id of BROKER_BATSHIT_UTILITY_CONTROL_IDS) expect(brokerControlRef(id)).toBe(`batshit:${id}`)
+    for (const id of ['sys.zip.fetch', 'sys.comfyui.workflow_schema', 'sys.model_catalog.search', 'sys.judge.configure']) expect(brokerControlRef(id)).toBe(`fabric:${id}`)
+    expect(resolveBrokerControlFamilies([])).toEqual([])
+    expect(resolveBrokerControlFamilies(['sys.judge.ask'])).toEqual(['batshit'])
+    expect(resolveBrokerControlFamilies(['sys.judge.configure'])).toEqual(['fabric'])
   })
-
-  it('never offers a control a primary alone may use, whatever the toggles', () => {
+  it('never lets a default broad-control flag widen delegated utility scope', () => {
     for (const runtime of ['api', 'cli'] as const) {
-      const allowed = resolveDelegatedRunAllowedControlIds({ runtime, toggles: ALL_ON })
-      for (const controlId of [
-        'sys.skill.save',
-        'sys.skill.import',
-        'sys.dm.list',
-        'sys.memory.search',
-        'sys.schedule.list',
-        'sys.judge.ask',
-        'sys.artifact.update',
-        'artifact.artifact_1.action.run.run',
-        'sys.cli_tool.create',
-        'sys.mcp.dynamic.find',
-        'sys.runtime_addon.start',
-        'sys.voice.engine.register'
-      ]) {
-        expect(isControlIdAllowedByList(controlId, allowed), `${runtime} ${controlId}`).toBe(false)
-      }
-      expect(isControlIdAllowedByList('use.artifact.anything', allowed), runtime).toBe(true)
+      expect(resolveBrokerFamilies({ runtime, toggles: ALL_ON, ...DELEGATED_RUN_BROKER_SCOPE })).not.toContain('batshit')
     }
+    const ids = resolveBrokerFabricAllowedControlIds({ toggles: ALL_ON, judgeControlsEnabled: true })
+    expect(isControlIdAllowedByList('sys.judge.configure', ids)).toBe(false)
+    expect(resolveBrokerFamilies({ runtime: 'api', toggles: ALL_ON, judgeControlsEnabled: true })).toContain('batshit')
   })
 })

@@ -3,7 +3,8 @@
  * Compact runs (`workBusy={chatWorkBusy || compactBusy}`), and it used to call the reply's Stop
  * alone, which stopped nothing during a Compact. While only a Compact runs, the Stop ends the
  * Compact through its own route (`POST /api/messages/compact/stop`); while a reply runs, the Stop
- * is the reply's, as before (a Compact beside a reply ends early on its own).
+ * is the reply's, as before (a Compact beside a reply ends early on its own). Since BL-781 each
+ * chat's Compact is its own (`compactRuns.svelte.ts`): `compactBusy` is the chat on screen's.
  */
 export type StopTarget = 'compact' | 'reply'
 
@@ -11,54 +12,13 @@ export function resolveStopTarget(state: { compactBusy: boolean; replyBusy: bool
   return state.compactBusy && !state.replyBusy ? 'compact' : 'reply'
 }
 
-/** The Compact route's answer for a Compact its Stop ended: information, not an error. */
+/**
+ * The Compact route's answer for a Compact its Stop ended, or its chat's delete (BL-2357):
+ * information, not an error.
+ */
 export function isStoppedCompactAnswer(status: number, payload: unknown): boolean {
   const body = payload as { code?: unknown; reason?: unknown } | null
-  return status === 409 && body?.code === 'ended_early' && body?.reason === 'stopped'
-}
-
-/**
- * BL-653 (Faye's review, 2026-09-28): which chat's Compact the Stop ends, and whether a Stop came
- * while this Compact ran. `compactBusy` is one flag for the whole page, so the Stop can be pressed
- * in another chat than the Compact's; it must name the chat whose Compact runs, not the open one.
- * A Stop during the first phase (the compact plan) must not be lost: the preview answers 200 with
- * the plan and never reads its run's stop, so the page remembers the Stop and starts no summary
- * request after the preview. The Stop is remembered for this Compact only (`begin` forgets it).
- */
-export type CompactStopTracker = {
-  /** A Compact starts (before its first phase): forget a Stop of an earlier Compact. */
-  begin: () => void
-  /** A phase with a request starts in this chat (the plan, then the summary). */
-  enterPhase: (sessionId: string) => void
-  /** That phase's request ended. */
-  leavePhase: () => void
-  /** The Stop was pressed: remember it and answer the chat whose Compact runs (null: none). */
-  requestStop: () => string | null
-  /** A Stop was pressed during this Compact. */
-  readonly stopRequested: boolean
-}
-
-export function createCompactStopTracker(): CompactStopTracker {
-  let runningSessionId: string | null = null
-  let stopRequested = false
-  return {
-    begin: () => {
-      stopRequested = false
-    },
-    enterPhase: (sessionId) => {
-      runningSessionId = sessionId
-    },
-    leavePhase: () => {
-      runningSessionId = null
-    },
-    requestStop: () => {
-      stopRequested = true
-      return runningSessionId
-    },
-    get stopRequested() {
-      return stopRequested
-    }
-  }
+  return status === 409 && body?.code === 'ended_early' && (body?.reason === 'stopped' || body?.reason === 'session_deleted')
 }
 
 /** The words for a stopped Compact, the same as the Compact route's own answer. */

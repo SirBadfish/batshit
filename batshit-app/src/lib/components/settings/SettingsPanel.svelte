@@ -28,6 +28,7 @@ import { Button } from '$lib/components/ui/button'
 import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
 import LazySettingsPanelContent from './LazySettingsPanelContent.svelte'
 import { BATSHIT_SETTINGS_PANEL_OPEN_CLASS } from '$lib/components/ui/sonner/toast-scope'
+import { toast } from '$lib/components/ui/sonner/settings-toast'
 import type { UserSettingsRow } from '$lib/types/database'
 
 type SettingsPanelData = {
@@ -123,7 +124,7 @@ const actionPanels = new Map<string, LazyPanelHandle>()
 setContext(APP_ACTIONS_SETTINGS_DRAFT_SCOPE, true)
 
 function settingsActionDirty() {
-  return Boolean(goonsUnsavedState) || [...actionPanels.values()].some(handle => {
+  return hasActiveGoonsHairImport() || Boolean(goonsUnsavedState) || [...actionPanels.values()].some(handle => {
     const panel = handle.readAppActionState().panel
     return typeof panel?.readAppActionState === 'function' && panel.readAppActionState().dirty
   })
@@ -182,7 +183,6 @@ async function openSettingsAction(target: SettingsTarget, context: ActionContext
   await context.wait(() => {
     if (!open || activeTab !== target.tab) refuse('user_navigation')
     if (!settingsForm?.isConnected) return undefined
-    if (target.tab === 'theme') return true
     const lazy = actionPanels.get(target.tab)?.readAppActionState()
     if (lazy?.error) refuse('panel_load_failed')
     return lazy?.mounted ? true : undefined
@@ -263,6 +263,19 @@ function hasBlockingGoonsChanges() {
   return activeTab === '3d-goons' && Boolean(goonsUnsavedState)
 }
 
+function hasActiveGoonsHairImport() {
+  if (activeTab !== '3d-goons') return false
+  const panel = actionPanels.get('3d-goons')?.readAppActionState().panel
+  return panel?.hasActiveHairImport?.() === true
+}
+
+function refuseHairImportExit() {
+  if (!hasActiveGoonsHairImport()) return false
+  clearPendingSettingsAction()
+  toast.info('Finish or cancel the active Hair import before leaving its review.')
+  return true
+}
+
 function queueSettingsAction(action: PendingSettingsAction) {
   pendingSettingsAction = action
   settingsUnsavedDialogOpen = true
@@ -275,6 +288,7 @@ function clearPendingSettingsAction() {
 
 function runPendingSettingsAction() {
   const action = pendingSettingsAction
+  if (action && refuseHairImportExit()) return
   clearPendingSettingsAction()
   if (!action) return
   if (action.type === 'switch-tab') {
@@ -286,6 +300,7 @@ function runPendingSettingsAction() {
 }
 
 async function saveGoonsChangesAndContinue() {
+  if (refuseHairImportExit()) return
   if (!goonsUnsavedState) return
   const saved = await goonsUnsavedState.onSave()
   if (!saved) return
@@ -293,6 +308,7 @@ async function saveGoonsChangesAndContinue() {
 }
 
 function discardGoonsChangesAndContinue() {
+  if (refuseHairImportExit()) return
   if (!goonsUnsavedState) return
   goonsUnsavedState.onDiscard()
   runPendingSettingsAction()
@@ -304,6 +320,7 @@ function handleSettingsTabChange(nextTab: string, nextToolsTab?: ToolsTab) {
     return
   }
   retireAppActionNavigation()
+  if (refuseHairImportExit()) return
   if (hasBlockingGoonsChanges()) {
     queueSettingsAction({ type: 'switch-tab', nextTab, nextToolsTab })
     return
@@ -318,6 +335,7 @@ function handleSettingsOpenChange(nextOpen: boolean) {
     open = true
     return
   }
+  if (refuseHairImportExit()) return
   if (hasBlockingGoonsChanges()) {
     queueSettingsAction({ type: 'close-sheet' })
     return
@@ -449,7 +467,7 @@ const tabs: TabDefinition[] = [
   },
   {
     value: 'slash-commands',
-    label: 'Skills & Prompts',
+    label: 'Plugins & shit',
     section: 2,
     icon: { type: 'batshit', id: 'skills' },
     content: { kind: 'component', loader: () => import('./panels/SlashCommandSettingsPanel.svelte'), props: () => ({ data }) }
@@ -487,14 +505,7 @@ const tabs: TabDefinition[] = [
     label: 'Themes',
     section: 3,
     icon: { type: 'lucide', component: Palette },
-    content: {
-      kind: 'placeholder',
-      title: 'Theme Controls In Progress',
-      body: [
-        'Theme customization will manage palettes, typography presets, and layout accents.',
-        'The tab scaffolding lives here so future stories can wire in the designer-friendly UI.'
-      ]
-    }
+    content: { kind: 'component', loader: () => import('./panels/ThemeSettingsPanel.svelte') }
   },
   {
     value: 'clips',

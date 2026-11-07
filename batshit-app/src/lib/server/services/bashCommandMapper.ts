@@ -1,4 +1,4 @@
-import { extractManagedApplyPatchDocument, isManagedApplyPatchCommand } from './managedApplyPatch'
+import { extractManagedApplyPatchDocument, isManagedApplyPatchCommand } from '$lib/utils/managedApplyPatch'
 
 export interface BashToolMapping {
   toolName:
@@ -59,8 +59,9 @@ function flagFollowsShellWord(text: string, flagIndex: number): boolean {
  * The command line a shell runs from its quoted `-c` value, exactly as written between the quotes
  * (bug sweep item 6). Another program's `-c` is that program's own option (`grep -c 'foo' notes.md`
  * counts matches of `foo`; `ls -lc` lists by change time), so a value counts only when its flag
- * belongs to a shell. A `-lc` value is read first, as it always was, so Codex's `/bin/zsh -lc '…'`
- * unwraps byte for byte; a shell's `-c` in any cluster (`-ec`, `-euc`) is the same flag.
+ * belongs to a shell. A `-lc` value is read first, as it always was, so `/bin/zsh -lc '…'` (the
+ * shape saved Codex steps use) unwraps byte for byte; a shell's `-c` in any cluster (`-ec`,
+ * `-euc`) is the same flag.
  */
 function shellQuotedCommandString(text: string): string | null {
   // A flag word and its quoted value: a `-lc`, then any cluster with a `c`. Built on every call,
@@ -76,7 +77,7 @@ function shellQuotedCommandString(text: string): string | null {
 
 /**
  * The command line a shell wrapper runs (`/bin/zsh -lc '…'`, `bash -c "…"`, `su -c '…'`), or the
- * command itself. The one unwrap: the Codex event adapter reads its terse verbs through it, and the
+ * command itself. The one unwrap: the mapper reads a command's terse verbs through it, and the
  * shell policy reads what it maps (see `flagFollowsShellWord`), so a change here is a gate change.
  */
 export function extractShellCommand(command: string): string {
@@ -312,6 +313,44 @@ function extractPathFromReadCommand(shellCommand: string): string | undefined {
   if (catLikePath) return catLikePath
 
   return extractSedReadPath(readStage)
+}
+
+/**
+ * BL-2037: programs that keep only the lines matching a pattern (or pick fields out of them). A read
+ * piped into one prints search findings, not the file, so it is a Search Files result.
+ */
+const SEARCH_FILTER_PROGRAMS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'awk', 'gawk', 'mawk', 'nawk', 'jq', 'yq', 'xargs'])
+
+/**
+ * BL-2037: a `sed -n` whose script prints by a `/pattern/` address (`sed -n '/TODO/p' app.js`) is a
+ * search. A numeric window (`sed -n '2,5p'`) or a sed that prints every line is not.
+ */
+function sedSelectsByPattern(words: string[]): boolean {
+  let quiet = false
+  const scripts: string[] = []
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index]
+    if (word === '--') { if (scripts.length === 0 && words[index + 1] !== undefined) scripts.push(words[index + 1]); break }
+    if (word === '-e' || word === '--expression') { if (words[index + 1] !== undefined) scripts.push(words[index + 1]); index += 1; continue }
+    if (word.startsWith('--expression=')) { scripts.push(word.slice('--expression='.length)); continue }
+    if (word === '--quiet' || word === '--silent') { quiet = true; continue }
+    if (/^-[a-zA-Z]+$/.test(word)) { if (word.includes('n')) quiet = true; continue }
+    if (word.startsWith('-')) continue
+    if (scripts.length === 0) scripts.push(word)
+    break
+  }
+  // An address starts the script or a command (after `;`, `{` or a newline), or ends a range (`,`);
+  // an `s///p` under -n prints only the lines it changed.
+  return quiet && scripts.some((script) => /(?:^|[;{\n,])\s*\/(?:[^/\\]|\\.)+\//.test(script) ||
+    /(?:^|[;{\n])\s*s\/(?:[^/\\]|\\.)*\/(?:[^/\\]|\\.)*\/[a-zA-Z0-9]*p/.test(script))
+}
+
+/** BL-2037: a read whose output is searched (`cat a | grep x`, `sed -n '/x/p' a`) prints findings. */
+function readPrintsSearchFindings(primaryCommand: string): boolean {
+  const stages = summarizeShellSimpleCommands(primaryCommand)
+  if (stages[0]?.program && SED_PROGRAM_NAMES.has(stages[0].program) && sedSelectsByPattern(stages[0].words)) return true
+  return stages.slice(1).some((stage) => stage.program !== null &&
+    (SEARCH_FILTER_PROGRAMS.has(stage.program) || (SED_PROGRAM_NAMES.has(stage.program) && sedSelectsByPattern(stage.words))))
 }
 
 function extractLeadingCommandName(command: string): string {
@@ -1200,6 +1239,15 @@ export function mapBashCommandToRendererTool(command: string): BashToolMapping {
 
   if (commandName === 'cat' || commandName === 'sed' || commandName === 'head' || commandName === 'tail') {
     const filePath = extractPathFromReadCommand(primaryCommand)
+    // BL-2037: its output is search findings, so it follows Search Files' zip settings. A wildcard
+    // read (`cat src/*.js`) stays a Read File: it prints file text, though no refresh can name it.
+    if (filePath && readPrintsSearchFindings(primaryCommand)) {
+      return {
+        toolName: 'batshit_server_search_files',
+        args: { ...normalized, path: filePath },
+        reason: 'read-piped-into-search'
+      }
+    }
     if (filePath) {
       return {
         toolName: 'batshit_server_read_file',

@@ -94,6 +94,18 @@ describe('SteerBubble — the dropped receipt (SA-119 P3b)', () => {
     )
     expect(screen.getByTestId('steer-bubble').textContent).toContain('the words that never went')
   })
+
+  it('a send Batshit kept reads the plain "Not sent", with Send now and Dismiss (BL-903 c)', () => {
+    render(SteerBubble, {
+      props: { steer: entry({ dropReason: 'not_sent' }), onSendNow: () => {}, onDismiss: () => {}, canSendNow: true }
+    })
+    const text = screen.getByTestId('steer-bubble').textContent ?? ''
+    expect(text).toContain('Not sent')
+    expect(text).not.toContain('the reply ended')
+    expect(text).not.toContain('you stopped the reply')
+    expect(screen.getByTestId('steer-send-now')).toBeTruthy()
+    expect(screen.getByTestId('steer-dismiss')).toBeTruthy()
+  })
 })
 
 describe('SteerBubble — a queued send held at an approval card (BL-713)', () => {

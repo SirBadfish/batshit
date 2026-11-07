@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { reasoningOverrideKey } from '$lib/utils/modelReasoningControls'
 
 /**
  * BL-801: a Compact (or a nap) on the agent's "current model" runs on the preset the agent NAMES,
@@ -34,6 +35,11 @@ vi.mock('$lib/server/services/providers', () => ({
   }
 }))
 
+// SA-139: this build has the Claude plan runtime, so admission reads Claude Code; this fixture reads a signed-out
+// stand-in and never the machine's own Claude Code.
+vi.mock('$lib/server/services/claudePlanReadiness', () => ({
+  readClaudePlanReadiness: vi.fn(async () => ({ state: 'unavailable', code: 'signed_out', reason: 'Claude Code is signed out, so the Claude plan connection cannot start (test).' }))
+}))
 const { redis } = await import('$lib/server/redis')
 const { generateModelSummary } = await import('../summaryGeneration')
 const { RuntimeModelPresetError } = await import('../runtimeModelPreset')
@@ -64,8 +70,9 @@ function agentNamingPreset(overrides: Record<string, unknown> = {}) {
   }
 }
 
-function compact(agent: Record<string, unknown>, choice = { modelMode: 'current' as const, modelPresetId: null as string | null }) {
+function compact(agent: Record<string, unknown>, choice = { modelMode: 'current' as const, modelPresetId: null as string | null }, extra: Record<string, unknown> = {}) {
   return generateModelSummary({
+    ...extra,
     userId: 'bl801_user',
     agent: agent as any,
     choice,
@@ -83,9 +90,76 @@ afterEach(async () => {
   await redis.del('model:preset-compact')
   model.generateCalls = []
   model.getModelCalls = []
+  await redis.del('local_provider:bl801_user:ollama')
+  vi.unstubAllGlobals()
 })
 
 describe('a "current model" compact runs on the preset the agent names (BL-801)', () => {
+  it('SA-139 (D1, M1, P4): a Claude plan preset of any spelling is not a CLI preset, never reaches a paid client, and runs only as Compact', async () => {
+    for (const connection of [{ id: 'claude-plan:local', type: 'direct', service: 'claude-plan' }, { id: 'claude-plan:local', type: 'direct' }, { id: 'direct:claude-plan', type: 'direct' }]) {
+      await redis.set('model:preset-live', { id: 'preset-live', provider: 'anthropic', modelId: 'claude-opus-5-5', effectiveModelId: 'claude-opus-5-5', pricing: {},
+        connection, settings: { anthropicEffort: 'high' } } as any)
+      // Another summary caller (memory graduation, a nap) passes no Compact owner: refused by name.
+      const other = await compact(agentNamingPreset()).then(() => null, error => error)
+      expect(other).toMatchObject({ name: 'ClaudePlanError', status: 409, code: 'consumer_unsupported' })
+      expect(other.message).toMatch(/This summary feature cannot use the Claude plan/)
+      expect(other.message).not.toMatch(/CLI model presets/)
+      // Compact itself is admitted up to Claude Code's readiness, which refuses readably before any run.
+      const failure = await compact(agentNamingPreset(), undefined, { claudePlanCompact: { sessionId: 'bl801_session' } }).then(() => null, error => error)
+      // Admission's identity check refuses a half-named spelling; the exact one reaches the readiness check.
+      const exact = connection.id === 'claude-plan:local' && 'service' in connection
+      expect(failure).toMatchObject({ name: 'ClaudePlanError', status: 409, code: exact ? 'connection_unavailable' : 'connection_invalid' })
+      if (exact) expect(failure.message).toBe('Claude Code is signed out, so the Claude plan connection cannot start (test).')
+    }
+    expect(model.getModelCalls).toEqual([])
+  })
+
+  it('captures one selected local snapshot for current-model Compact, using the actual tag rather than its catalog ID', async () => {
+    const connection = { type: 'direct' as const, id: 'direct:ollama', service: 'ollama' }, effectiveModelId = 'qwen3.5:9b-q4_K_M'
+    const key = reasoningOverrideKey({ presetId: LIVE_PRESET.id, connection, effectiveModelId }, 'thinking')
+    await redis.set('model:preset-live', { ...LIVE_PRESET, provider: 'qwen', modelId: 'catalog/qwen-local', effectiveModelId, connection,
+      capabilities: { reasoning: false }, settings: { temperature: 0, 'ollama.options.top_k': 1 } } as any)
+    await redis.set('local_provider:bl801_user:ollama', { id: 'ollama', enabled: true, baseUrl: 'http://local-model.test', openaiPath: '/v1', imageTransport: 'auto' })
+    const http = vi.fn(async (url: string) => Response.json(url.endsWith('/api/version') ? { version: '0.40.3' }
+      : { capabilities: ['thinking'], thinking: { values: [false, true], default: true } }))
+    vi.stubGlobal('fetch', http)
+    const agent = agentNamingPreset({ model_reasoning_overrides: { [key]: { mode: 'provider-default' } } })
+    await compact(agent)
+    expect(http).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String((http.mock.calls[1] as any)[1].body))).toEqual({ model: effectiveModelId, verbose: false })
+    expect(model.getModelCalls[0].id).toBe(effectiveModelId)
+    const options = model.generateCalls[0].providerOptions
+    expect(options.ollama).toEqual({ options: { top_k: 1 } })
+    expect(options.batshit_reasoning.ollama).toMatchObject({ modelId: effectiveModelId, mode: 'provider-default', runtimeVersion: '0.40.3' })
+    expect(options.batshit_reasoning.ollama.connectionKey).toMatch(/^[a-f0-9]{64}$/)
+    expect(model.generateCalls[0].temperature).toBe(0)
+    // An explicit summary preset is independent, even when it selects the same actual tag.
+    await redis.set('model:preset-compact', { id: 'preset-compact', provider: 'qwen', modelId: 'catalog/other', effectiveModelId, connection, settings: {} } as any)
+    http.mockClear()
+    await compact(agent, { modelMode: 'preset', modelPresetId: 'preset-compact' })
+    expect(http).not.toHaveBeenCalled()
+    expect(model.generateCalls[1].providerOptions).toBeUndefined()
+    // Clearing the primary override preserves legacy omission without requiring metadata.
+    await compact(agentNamingPreset())
+    expect(http).not.toHaveBeenCalled()
+    expect(model.generateCalls[2].providerOptions).not.toHaveProperty('batshit_reasoning')
+  })
+
+  it('refuses a retained explicit local Compact choice before generation when discovery fails', async () => {
+    const connection = { type: 'direct' as const, id: 'direct:ollama', service: 'ollama' }, effectiveModelId = 'qwen3.5:9b-q4_K_M'
+    const key = reasoningOverrideKey({ presetId: LIVE_PRESET.id, connection, effectiveModelId }, 'thinking')
+    await redis.set('model:preset-live', { ...LIVE_PRESET, provider: 'qwen', modelId: 'catalog/qwen-local', effectiveModelId, connection, settings: {} } as any)
+    await redis.set('local_provider:bl801_user:ollama', { id: 'ollama', enabled: true, baseUrl: 'http://local-model.test', openaiPath: '/v1' })
+    const http = vi.fn(async () => new Response('', { status: 503 }))
+    vi.stubGlobal('fetch', http)
+    const agent = agentNamingPreset({ model_reasoning_overrides: { [key]: { mode: 'value', value: true } } })
+    await expect(compact(agent)).rejects.toThrow(/not verified|not supported/i)
+    expect(http).toHaveBeenCalledTimes(1)
+    expect(model.getModelCalls).toHaveLength(0)
+    expect(model.generateCalls).toHaveLength(0)
+    expect(agent.model_reasoning_overrides).toEqual({ [key]: { mode: 'value', value: true } })
+  })
+
   it('calls the preset\'s model on the preset\'s connection, not the agent\'s copies', async () => {
     const result = await compact(agentNamingPreset())
 
@@ -168,7 +242,7 @@ describe('a "current model" compact runs on the preset the agent names (BL-801)'
   })
 
   it.each([
-    ['Codex', { provider: 'openai-codex', modelId: 'codex/codex-cli', connection: { id: 'codex-cli', type: 'direct', service: 'codex' } }],
+    ['retired Codex', { provider: 'openai-codex', modelId: 'codex/codex-cli', connection: { id: 'codex-cli', type: 'direct', service: 'codex' } }],
     ['Claude', { provider: 'anthropic-claude-cli', modelId: 'claude/claude-cli', connection: { id: 'claude-cli', type: 'direct', service: 'claude' } }]
   ])('refuses loudly an API agent whose named preset is a %s CLI preset, and calls no model', async (_name, cli) => {
     await redis.set('model:preset-live', { ...LIVE_PRESET, ...cli, settings: {} } as any)
@@ -176,9 +250,20 @@ describe('a "current model" compact runs on the preset the agent names (BL-801)'
     const failure = await compact(agentNamingPreset()).catch((error) => error)
 
     expect(failure).toBeInstanceOf(Error)
-    expect(failure.message).toContain('Compact cannot run through CLI model presets yet')
+    expect(failure.message).toContain('Compact cannot run through CLI model presets, which Batshit no longer supports.')
     expect(model.getModelCalls).toHaveLength(0)
     expect(model.generateCalls).toHaveLength(0)
+  })
+
+  it('SA-139 R1: an API preset whose OpenAI model id contains "codex" is an ordinary API model and compacts', async () => {
+    await redis.set('model:preset-live', { ...LIVE_PRESET, provider: 'openai', modelId: 'gpt-5-codex',
+      connection: { id: 'direct:openai', type: 'direct', service: 'openai' } } as any)
+
+    const result = await compact(agentNamingPreset())
+
+    expect(model.getModelCalls[0]).toMatchObject({ id: 'gpt-5-codex', options: { transport: 'direct', service: 'openai' } })
+    expect(model.generateCalls).toHaveLength(1)
+    expect(result.modelId).toBe('gpt-5-codex')
   })
 
   it('an explicit compact preset still wins over the agent\'s named preset', async () => {

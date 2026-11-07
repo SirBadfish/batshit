@@ -283,30 +283,6 @@ describe('/api/controls/use — the click is the approval', () => {
     expect(payload.approvalRequest).toBeUndefined()
   })
 
-  it('forwards the agent credential gateway ceiling separately from model-selected gateways', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue({
-      userId: 'user-1', auth: 'agent', agentId: 'agent-1',
-      mcpGatewayScope: ['gw_allowed']
-    })
-    const response = await POST({
-      request: request({
-        controlId: 'sys.mcp.dynamic.use', input: { toolName: 'lookup' },
-        selectedGateways: ['gw_other'], mcpGatewayScope: ['gw_other']
-      }),
-      locals: {}
-    } as any)
-    expect(response.status).toBe(200)
-    expect(mocks.useControl).toHaveBeenCalledWith(expect.objectContaining({
-      agentId: 'agent-1', mcpGatewayScope: ['gw_allowed'], selectedGateways: ['gw_other']
-    }))
-  })
-
-  it('fails closed on a legacy agent credential without a gateway snapshot', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue({ userId: 'user-1', auth: 'agent', agentId: 'agent-1' })
-    await POST({ request: request({ controlId: 'sys.mcp.dynamic.find' }), locals: {} } as any)
-    expect(mocks.useControl).toHaveBeenCalledWith(expect.objectContaining({ mcpGatewayScope: [] }))
-  })
-
   it('does not turn a service caller body field into a vouched gateway ceiling', async () => {
     await POST({
       request: request({ controlId: 'sys.mcp.dynamic.use', agentId: 'agent-1', mcpGatewayScope: ['gw_other'] }),

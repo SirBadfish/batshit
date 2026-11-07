@@ -1,6 +1,6 @@
 # File Operations Safety Guidelines
 
-When agents have access to file operations (whether via Claude Code, Codex, or Batshit native bash/file tooling), follow these security protocols:
+When agents have access to file operations (whether via Claude Code or Batshit native bash/file tooling), follow these security protocols:
 
 ## 1. Authorization & Scope
 - **Never execute destructive operations** without explicit user confirmation

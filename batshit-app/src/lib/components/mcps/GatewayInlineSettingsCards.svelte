@@ -91,6 +91,10 @@
 
   let { gateway, userId = null, onGatewayUpdated = () => {} }: Props = $props()
 
+  let sourceBase = $state<string | undefined>(undefined)
+  let sourceConflict = $state(false)
+  let sourceRecoveryRead = 0
+  const sourceRevisionOf = (value: MCPGateway) => (value as MCPGateway & { sourceRevision?: string }).sourceRevision
   let hydrating = $state(false)
   let name = $state('')
   let url = $state('')
@@ -506,6 +510,42 @@
   const settingsEditable = () => settingsLane.lockedFor === null
   const groupingEditable = () => groupingLane.lockedFor === null
 
+  /** One fill owner for a clean presented read and an explicit recovery read. */
+  function installSettingsSource(value: MCPGateway) {
+        sourceBase = sourceRevisionOf(value)
+        sourceConflict = false
+        name = value.name
+        iconRef = normalizeIconRef(value.icon_ref, DEFAULT_MCP_GATEWAY_ICON_REF)
+        url = value.url || ''
+        authKeyName = value.authKeyName || ''
+        command = value.stdioConfig?.command || ''
+        argsText = Array.isArray(value.stdioConfig?.args) ? value.stdioConfig.args.join('\n') : ''
+        cwdPolicy = value.stdioConfig?.cwdPolicy || 'none'
+        cwdValue = value.stdioConfig?.cwdValue || ''
+        startupTimeoutMs = String(value.stdioConfig?.startupTimeoutMs ?? 10000)
+        toolCallTimeoutMs = String(value.stdioConfig?.toolCallTimeoutMs ?? 60000)
+        dockerProfile = getDockerProfileFromGateway(value)
+        envRefs = Array.isArray(value.stdioConfig?.envRefs)
+          ? value.stdioConfig.envRefs.map((entry) => createEnvRefRow(entry))
+          : []
+        persistedSettingsSignature = makeSettingsSignature()
+        settingsFillCount += 1
+        settingsLane.failedSignature = null
+        settingsLane.baselineUnknown = false
+  }
+  async function useSavedGatewaySource() {
+    const id = hydratedGatewayId, read = ++sourceRecoveryRead, fill = settingsFillCount
+    if (!id || flightsOf(settingsLane, id) > 0 || settingsLane.queued) return
+    try {
+      const response = await fetch(`/api/mcp/gateways/${encodeURIComponent(id)}`)
+      const answer = await response.json()
+      if (!response.ok || answer?.gateway?.id !== id || !/^source1:[a-f0-9]{64}$/.test(sourceRevisionOf(answer.gateway) ?? '')) throw new Error(answer?.error || 'The saved gateway source could not be read.')
+      if (!mounted || read !== sourceRecoveryRead || hydratedGatewayId !== id || settingsFillCount !== fill || flightsOf(settingsLane, id) > 0 || settingsLane.queued) return
+      installSettingsSource(answer.gateway)
+      settingsSaveError = null; settingsSaveState = 'idle'; onGatewayUpdated(answer.gateway)
+    } catch (error) { if (hydratedGatewayId === id) settingsSaveError = error instanceof Error ? error.message : 'The saved gateway source could not be read.' }
+  }
+
   $effect(() => {
     hydrating = true
     untrack(() => {
@@ -542,24 +582,7 @@
               makeGroupingSignature() !== baselineOf(groupingLane, persistedGroupingSignature))))
 
       if (!keepSettings) {
-        name = gateway.name
-        iconRef = normalizeIconRef(gateway.icon_ref, DEFAULT_MCP_GATEWAY_ICON_REF)
-        url = gateway.url || ''
-        authKeyName = gateway.authKeyName || ''
-        command = gateway.stdioConfig?.command || ''
-        argsText = Array.isArray(gateway.stdioConfig?.args) ? gateway.stdioConfig.args.join('\n') : ''
-        cwdPolicy = gateway.stdioConfig?.cwdPolicy || 'none'
-        cwdValue = gateway.stdioConfig?.cwdValue || ''
-        startupTimeoutMs = String(gateway.stdioConfig?.startupTimeoutMs ?? 10000)
-        toolCallTimeoutMs = String(gateway.stdioConfig?.toolCallTimeoutMs ?? 60000)
-        dockerProfile = getDockerProfileFromGateway(gateway)
-        envRefs = Array.isArray(gateway.stdioConfig?.envRefs)
-          ? gateway.stdioConfig.envRefs.map((entry) => createEnvRefRow(entry))
-          : []
-        persistedSettingsSignature = makeSettingsSignature()
-        settingsFillCount += 1
-        settingsLane.failedSignature = null
-        settingsLane.baselineUnknown = false
+        installSettingsSource(gateway)
       }
       if (!keepGrouping) {
         toolGroupings = sanitizeToolGroupingsInput(gateway.toolGroupings)
@@ -646,7 +669,7 @@
       gatewayId: gateway.id,
       gatewayName: gateway.name,
       url: `/api/mcp/gateways/${gateway.id}?userId=${userId}`,
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...payload, expectedGatewaySource: sourceBase }),
       signature,
       fillCount: settingsFillCount
     }
@@ -677,10 +700,23 @@
       status = response.status
       const body = await response.json().catch(() => ({}))
       if (!response.ok) {
+        const savedSource = body?.sourceAcknowledgement
+        if (ownForm() && body?.gatewaySaved === true && savedSource?.id === save.gatewayId && /^source1:[a-f0-9]{64}$/.test(savedSource?.sourceRevision ?? '')) {
+          // Actual saved source survives a profile/readback failure; keep the
+          // newer draft and consume only this save's exact ACK baseline.
+          sourceBase = savedSource.sourceRevision
+          persistedSettingsSignature = save.signature
+        }
+        if (ownForm() && ((response.status === 400 && body?.code === 'gateway_source_base_required') || (response.status === 409 && body?.code === 'gateway_source_changed'))) sourceConflict = true
         recordSaved = failureConfirmsGatewaySaved(body, save.gatewayId)
         throw new Error(body.error || 'Failed to update gateway')
       }
 
+      const sourceAck = body?.sourceAcknowledgement
+      if (sourceAck?.id !== save.gatewayId || !/^source1:[a-f0-9]{64}$/.test(sourceAck?.sourceRevision ?? '')) {
+        if (ownForm()) { sourceBase = undefined; sourceConflict = true }
+        throw new Error('The gateway source save acknowledgement is unconfirmed. Your draft is kept; use saved source before another choice.')
+      }
       clearOutcomeUnknown('settings', save.gatewayId, sentAt)
       const updatedGateway = (body.gateway ?? null) as MCPGateway | null
       // Stored, but with no copy (the route answers null for a gateway deleted after the write): a
@@ -696,6 +732,8 @@
         // what landed (a newer draft that is not valid) is not shown as saved either.
         settingsLane.answeredAt = sentAt
         settingsLane.baselineUnknown = false
+        // Only the SAME known source-write postimage may advance this form base.
+        sourceBase = sourceAck?.id === save.gatewayId && /^source1:[a-f0-9]{64}$/.test(sourceAck?.sourceRevision ?? "") ? sourceAck.sourceRevision : undefined
         persistedSettingsSignature = save.signature
         settingsSaveError = null
         settingsSaveState =
@@ -747,6 +785,7 @@
     // BL-1370, BL-1393: read-only while this gateway's own save is on its way, or a failed save
     // of it may have been stored and no read of the saved gateway has succeeded since.
     if (settingsLane.lockedFor === gateway.id) return
+    if (sourceConflict || !/^source1:[a-f0-9]{64}$/.test(sourceBase ?? '')) { settingsSaveError = 'Your gateway draft is kept. Use Saved Gateway Source before another choice.'; return }
     settingsLane.failedSignature = null
 
     settingsSaveState = 'saving'
@@ -899,6 +938,9 @@
       </div>
     {/snippet}
 
+    {#if sourceConflict || settingsSaveError && !sourceBase}
+      <div class="batshit-settings-action-row"><Button variant="outline" size="sm" disabled={settingsLockedUi} onclick={useSavedGatewaySource}>Use Saved Gateway Source</Button></div>
+    {/if}
     {#if settingsLockNote}
       {@render lockNote(settingsLockNote, 'Waiting for saved gateway settings…', '')}
     {/if}

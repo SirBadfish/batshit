@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { redis } from '$lib/server/redis'
@@ -6,6 +7,7 @@ import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { __resetStreamAbortRegistryForTests } from '$lib/server/services/streamAbortRegistry'
 import { __resetSteerInboxRegistryForTests, enqueueSteer } from '$lib/server/services/steerInboxRegistry'
 import { sha256Hex } from '$lib/utils/sha256'
+import { executionViewerService } from '$lib/server/services/executionViewerService'
 
 /**
  * BL-523 — a follow-up turn that fails before its stream opens writes its failure to ITS OWN
@@ -23,6 +25,8 @@ import { sha256Hex } from '$lib/utils/sha256'
  * (`VercelAIBrain`: a plain text reply, or words and then a context-limit error). Everything
  * between, including the three real refusals (`Unable to compile chat messages`,
  * `IMAGE_INPUT_UNSUPPORTED`, `PROMPT_BUDGET_EXCEEDED`), is the handler's own code.
+ * Named save/interleaving cases inject a save failure or hold the actual snapshot owner's
+ * final write, invoking its original implementation afterward; they do not replace its logic.
  */
 
 const USER = 'user-bl523'
@@ -31,7 +35,8 @@ const PRESET = 'preset-bl523'
 const FIRST_REPLY = 'msg-first-reply'
 
 type CompileAnswer = 'ok' | 'empty' | 'image' | 'huge'
-type ModelRun = 'reply' | 'context-exhausted'
+type ModelRun = 'reply' | 'context-exhausted' | 'incomplete-tool-call' | 'empty-incomplete-tool-call' | 'unrelated-stream-error'
+  | 'multi-call-error' | 'multi-call-stop' | 'multi-call-success' | 'late-finish-after-error' | 'partial-finish-before-error' | 'held-partial-finish-error' | 'raw-empty-error'
 
 const mocks = vi.hoisted(() => ({
   compileCalls: 0,
@@ -42,7 +47,10 @@ const mocks = vi.hoisted(() => ({
   /** The assistant message id of every model run, in order. */
   brainRuns: [] as string[],
   /** The promotion's own work throws once, between two runs. */
-  promotionThrows: false
+  promotionThrows: false,
+  lateFinish: null as null | (() => Promise<void>),
+  finishStorageBoundary: null as null | Promise<void>,
+  inFlightFinish: null as null | Promise<void>
 }))
 
 vi.mock('$lib/server/services/steerPromotion', async (importOriginal) => {
@@ -120,7 +128,52 @@ vi.mock('$lib/server/services/vercelBrain', () => ({
         userSources: request.imageOriginInput?.userSources ?? []
       })
       const plan = mocks.modelRuns.get(mocks.brainRuns.length) ?? 'reply'
-      const text = plan === 'reply' ? `Reply for ${request.messageId}.` : 'Partial words before the limit.'
+      if (plan === 'raw-empty-error' || plan.startsWith('multi-call-') || plan === 'late-finish-after-error' || plan === 'partial-finish-before-error' || plan === 'held-partial-finish-error') {
+        const firstUsage = { inputTokens: 10, outputTokens: 1, totalTokens: 11 }
+        const secondUsage = { inputTokens: 20, outputTokens: 2, totalTokens: 22 }
+        const aggregate = { inputTokens: 30, outputTokens: 3, totalTokens: 33 }
+        const text = 'Partial work before the last call.'
+        async function* accountingStream() {
+          yield { type: 'start' }
+          yield { type: 'start-step', request: {}, warnings: [] }
+          yield { type: 'raw', rawValue: { usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11 } } }
+          if (plan === 'raw-empty-error') throw new Error('Provider failed before output.')
+          yield { type: 'tool-call', toolCallId: 'known-call', toolName: 'native_bash_execute', input: { command: 'printf known' } }
+          yield { type: 'tool-result', toolCallId: 'known-call', toolName: 'native_bash_execute', input: { command: 'printf known' },
+            output: { success: true, exitCode: 0, stdout: 'known', stderr: '' } }
+          yield { type: 'finish-step', finishReason: 'tool-calls', usage: firstUsage, response: {} }
+          yield { type: 'start-step', request: {}, warnings: [] }
+          yield { type: 'text-start', id: 'last' }
+          yield { type: 'text-delta', id: 'last', text }
+          yield { type: 'text-end', id: 'last' }
+          if (plan === 'multi-call-success') {
+            yield { type: 'raw', rawValue: { usage: { prompt_tokens: 20, completion_tokens: 2, total_tokens: 22 } } }
+            yield { type: 'finish-step', finishReason: 'stop', usage: secondUsage, response: {} }
+            await request.onFinish?.({ text, steps: [], totalUsage: aggregate, usage: aggregate, reasoning: [], responseMessages: [] })
+            yield { type: 'finish', finishReason: 'stop', totalUsage: aggregate }
+            return
+          }
+          if (plan === 'late-finish-after-error' || plan === 'partial-finish-before-error' || plan === 'held-partial-finish-error') {
+            // Real SDK7 can end with only earlier numeric counters despite an unknown failed step.
+            mocks.lateFinish = () => request.onFinish?.({ text, steps: [
+              { finishReason: 'tool-calls', usage: firstUsage, toolCalls: [], toolResults: [] },
+              { finishReason: 'error', usage: {}, toolCalls: [], toolResults: [] }
+            ], totalUsage: firstUsage, usage: firstUsage, reasoning: [], responseMessages: [] })
+            if (plan === 'partial-finish-before-error') await mocks.lateFinish()
+            if (plan === 'held-partial-finish-error') {
+              mocks.inFlightFinish = mocks.lateFinish()
+              // The callback either reaches the actual snapshot write or is refused before it.
+              await Promise.race([mocks.finishStorageBoundary!, mocks.inFlightFinish])
+            }
+          }
+          throw Object.assign(new Error('Last call did not finish.'), { name: plan === 'multi-call-stop' ? 'AbortError' : 'Error' })
+        }
+        return { stream: accountingStream(), steps: Promise.resolve([]), response: Promise.resolve({ messages: [] }) }
+      }
+      const text = plan === 'empty-incomplete-tool-call' ? ''
+        : plan === 'reply' ? `Reply for ${request.messageId}.`
+        : plan === 'context-exhausted' ? 'Partial words before the limit.'
+        : 'Partial words before the stream failed.'
       const usage = { inputTokens: 10, outputTokens: 5, totalTokens: 15 }
       async function* stream() {
         yield { type: 'start' }
@@ -128,6 +181,14 @@ vi.mock('$lib/server/services/vercelBrain', () => ({
         yield { type: 'text-start', id: 't1' }
         yield { type: 'text-delta', id: 't1', text }
         yield { type: 'text-end', id: 't1' }
+        if (plan === 'incomplete-tool-call' || plan === 'empty-incomplete-tool-call') {
+          const { InvalidResponseDataError } = await import('@ai-sdk/provider')
+          throw new InvalidResponseDataError({
+            message: "Expected 'function.name' to be a string.",
+            data: { index: 0, id: 'unnamed', type: 'function', function: { arguments: '{"private":"never display"}' } }
+          })
+        }
+        if (plan === 'unrelated-stream-error') throw new Error('Unrelated socket failure')
         if (plan === 'context-exhausted') {
           yield { type: 'error', error: new Error("This model's maximum context length is 200000 tokens.") }
           return
@@ -145,8 +206,10 @@ useRedisTestServer()
 
 let POST: (event: any) => Promise<Response>
 let SESSION = ''
+useSendHandlerFixture({ sessionIds: () => [SESSION], postStartupMcpUsers: () => [USER] })
 let count = 0
 let forwards: any[] = []
+let savedBeforeFailureEvents: any[] = []
 
 function send(metadata?: Record<string, unknown>): Promise<Response> {
   return POST({
@@ -204,12 +267,23 @@ describe('send-routed: a follow-up turn that fails before its stream opens (BL-5
     mocks.modelRuns.clear()
     mocks.brainRuns = []
     mocks.promotionThrows = false
+    mocks.lateFinish = null
+    mocks.finishStorageBoundary = null
+    mocks.inFlightFinish = null
     __resetStreamAbortRegistryForTests()
     __resetSteerInboxRegistryForTests()
     // The `/api/sse` forwards (the promoted message, the stream events) answer at once.
     forwards = []
+    savedBeforeFailureEvents = []
     vi.stubGlobal('fetch', vi.fn(async (_url: any, init?: RequestInit) => {
-      if (typeof init?.body === 'string') forwards.push(JSON.parse(init.body))
+      if (typeof init?.body === 'string') {
+        const body = JSON.parse(init.body)
+        forwards.push(body)
+        if (body.type === 'end' || body.type === 'error') {
+          savedBeforeFailureEvents.push({ type: body.type,
+            message: ((await redis.getMessages(SESSION)) as any[]).find(message => message.id === body.messageId) })
+        }
+      }
       return new Response('{}', { status: 200 })
     }))
     // Quiet the handler's expected error lines; a test reads the stored chat, not the log.
@@ -269,6 +343,165 @@ describe('send-routed: a follow-up turn that fails before its stream opens (BL-5
     expect(firstOrigin.textHashes).toContain(sha256Hex(byId.get(FIRST_REPLY).content))
     expect(promotedOrigin).toMatchObject({ messageId: promotedReplyId, version: 1, state: 'decided' })
     expect(promotedOrigin.textHashes).toContain(sha256Hex(byId.get(promotedReplyId).content))
+  }, 30_000)
+
+  it.each(['incomplete-tool-call', 'empty-incomplete-tool-call'] as const)(
+    'explains %s in the saved failure and terminal events, without continuing (BL-1569)',
+    async (plan) => {
+      mocks.modelRuns.set(1, plan)
+      const response = await send()
+      expect(response.status).toBe(502)
+      const payload = await response.json()
+      expect(payload.code).toBe('MODEL_INCOMPLETE_TOOL_CALL')
+      expect(payload.error).toContain('model response contained an incomplete tool call')
+      expect(payload.error).toContain('Earlier tool actions may already have run')
+      expect(JSON.stringify(payload)).not.toContain('never display')
+      expect(mocks.brainRuns).toEqual([FIRST_REPLY])
+      const failed = (await chat()).byId.get(FIRST_REPLY)
+      expect(failed.metadata).toMatchObject({
+        response_failed: true, error_code: payload.code, http_status: 502,
+        error_message: payload.error, error_details: "Expected 'function.name' to be a string."
+      })
+      expect(failed.metadata.failure_kind).toBeUndefined()
+      expect(failed.content).toBe(plan === 'incomplete-tool-call'
+        ? 'Partial words before the stream failed.' : payload.error)
+      const terminal = forwards.filter(body => body.type === 'end' || body.type === 'error')
+      expect(terminal.map(body => body.type)).toEqual(plan === 'incomplete-tool-call' ? ['end', 'error'] : ['error'])
+      expect(terminal.at(-1).error).toBe(payload.error)
+      for (const event of savedBeforeFailureEvents) {
+        expect(event.message?.content).toBe(failed.content)
+        expect(event.message?.metadata).toMatchObject({ response_failed: true, error_code: payload.code })
+      }
+      expect(savedBeforeFailureEvents).toHaveLength(terminal.length)
+    }, 30_000
+  )
+
+  it('keeps unrelated stream failures unchanged (BL-1569)', async () => {
+    mocks.modelRuns.set(1, 'unrelated-stream-error')
+    const response = await send()
+    expect(response.status).toBe(500)
+    expect(await response.json()).toEqual({ error: 'Failed to stream response', details: 'Unrelated socket failure' })
+    expect((await chat()).byId.get(FIRST_REPLY)?.metadata).toMatchObject({
+      response_failed: true, error_message: 'Unrelated socket failure'
+    })
+    expect(mocks.brainRuns).toEqual([FIRST_REPLY])
+  }, 30_000)
+
+  it.each(['multi-call-error', 'multi-call-stop'] as const)('keeps whole usage unknown for %s while retaining the completed call (BL-1596)', async (plan) => {
+    mocks.modelRuns.set(1, plan)
+    const response = await send()
+    expect(response.status).toBe(plan === 'multi-call-stop' ? 499 : 500)
+    const failed = (await chat()).byId.get(FIRST_REPLY)
+    expect(failed.content).toContain('Partial work before the last call.')
+    expect(failed.metadata.zipIds).toHaveLength(1)
+    expect(failed.metadata.usage).toBeNull()
+    expect(failed.metadata[plan === 'multi-call-stop' ? 'interrupted' : 'response_failed']).toBe(true)
+    const end = forwards.find(body => body.type === 'end')
+    expect(end.metadata.usage).toBeNull()
+    const savedAtEnd = savedBeforeFailureEvents.find(event => event.type === 'end')
+    expect(savedAtEnd.message.metadata.usage).toBeNull()
+    const snapshot = await executionViewerService.getSnapshot(SESSION, FIRST_REPLY)
+    expect(snapshot?.llmCalls).toHaveLength(2)
+    expect(snapshot?.llmCalls?.[0].usage?.inputTokens.value).toBe(10)
+    expect(snapshot?.llmCalls?.[1].usage?.inputTokens.value).toBeNull()
+    expect(snapshot?.llmSummary?.totalUsage.inputTokens.value).toBeNull()
+    expect(mocks.brainRuns).toEqual([FIRST_REPLY])
+  }, 30_000)
+
+  it('writes explicit unknown usage through the empty failure and repeated POST save (BL-1596)', async () => {
+    mocks.modelRuns.set(1, 'raw-empty-error')
+    const response = await send()
+    expect(response.status).toBe(500)
+    expect((await chat()).byId.get(FIRST_REPLY)?.metadata.usage).toBeNull()
+    expect(savedBeforeFailureEvents.find(event => event.type === 'error')?.message.metadata.usage).toBeNull()
+  }, 30_000)
+
+  it.each([false, true])('keeps a complete aggregate when local finalize fails=%s (BL-1596)', async (failFinalize) => {
+    mocks.modelRuns.set(1, 'multi-call-success')
+    const save = (redis.saveMessage as any).getMockImplementation?.() ?? redis.saveMessage.bind(redis)
+    let failOnce = failFinalize
+    vi.spyOn(redis, 'saveMessage').mockImplementation(async (message: any) => {
+      if (failOnce && message.id === FIRST_REPLY && message.role === 'assistant') {
+        failOnce = false
+        throw new Error('Synthetic save failure after a complete model run.')
+      }
+      return save(message)
+    })
+    const response = await send()
+    expect(response.status).toBe(failFinalize ? 500 : 200)
+    const metadata = (await chat()).byId.get(FIRST_REPLY)?.metadata
+    expect(metadata.usage).toEqual({ inputTokens: 30, outputTokens: 3, totalTokens: 33 })
+    expect(metadata.response_failed).toBe(failFinalize ? true : undefined)
+  }, 30_000)
+
+  it('a late partial finish callback cannot restore whole usage or replace retained call evidence (BL-1596)', async () => {
+    mocks.modelRuns.set(1, 'late-finish-after-error')
+    await send()
+    const before = await executionViewerService.getSnapshot(SESSION, FIRST_REPLY)
+    expect((await chat()).byId.get(FIRST_REPLY)?.metadata.usage).toBeNull()
+    expect(mocks.lateFinish).not.toBeNull()
+    await mocks.lateFinish!()
+    const after = await executionViewerService.getSnapshot(SESSION, FIRST_REPLY)
+    expect((await chat()).byId.get(FIRST_REPLY)?.metadata.usage).toBeNull()
+    expect(after?.llmCalls).toEqual(before?.llmCalls)
+    expect(after?.llmSummary?.totalUsage.inputTokens.value).toBeNull()
+    expect(after?.responseSummary?.usage.inputTokens.value ?? null).toBeNull()
+    expect(forwards.filter(body => body.type === 'end')).toHaveLength(1)
+  }, 30_000)
+
+  it('rejects a partial SDK aggregate even when onEnd ran ahead of the consumed error (BL-1596)', async () => {
+    mocks.modelRuns.set(1, 'partial-finish-before-error')
+    const response = await send()
+    expect(response.status).toBe(500)
+    const stored = (await chat()).byId.get(FIRST_REPLY)
+    expect(stored.metadata.usage).toBeNull()
+    expect(stored.metadata.zipIds).toHaveLength(1)
+    const snapshot = await executionViewerService.getSnapshot(SESSION, FIRST_REPLY)
+    expect(snapshot?.llmCalls).toHaveLength(2)
+    expect(snapshot?.llmCalls?.[0].usage.inputTokens.value).toBe(10)
+    expect(snapshot?.llmCalls?.[1].usage.inputTokens.value).toBeNull()
+    expect(snapshot?.llmSummary?.totalUsage.inputTokens.value).toBeNull()
+    expect(snapshot?.responseSummary?.usage.inputTokens.value ?? null).toBeNull()
+  }, 30_000)
+
+  it('an in-flight partial callback cannot replace the terminal snapshot after its actual owner read it (BL-1596 review)', async () => {
+    mocks.modelRuns.set(1, 'held-partial-finish-error')
+    let entered!: () => void
+    let release!: () => void
+    mocks.finishStorageBoundary = new Promise<void>(resolve => { entered = resolve })
+    const held = new Promise<void>(resolve => { release = resolve })
+    const owner = executionViewerService as any
+    const write = owner.setSnapshotAt.bind(owner)
+    let heldCallbackWrite = false
+    vi.spyOn(owner, 'setSnapshotAt').mockImplementation(async (...args: any[]) => {
+      const [, key, , snapshot] = args
+      if (!heldCallbackWrite && key === `session:${SESSION}:execution_log` &&
+          snapshot.responseSummary && snapshot.llmCalls?.length === 2) {
+        heldCallbackWrite = true
+        entered()
+        await held
+      }
+      return write(...args)
+    })
+    let before: any
+    let after: any
+    try {
+      const response = await send()
+      expect(response.status).toBe(500)
+      before = await executionViewerService.getSnapshot(SESSION, FIRST_REPLY)
+      expect(before?.runtime?.status).toBe('failed')
+    } finally {
+      release()
+      await mocks.inFlightFinish
+      after = await executionViewerService.getSnapshot(SESSION, FIRST_REPLY)
+    }
+    expect(after?.runtime?.status).toBe('failed')
+    expect(after?.llmSummary?.totalUsage.inputTokens.value).toBeNull()
+    expect(after?.llmCalls).toHaveLength(2)
+    expect(after?.llmCalls?.[0].usage.inputTokens.value).toBe(10)
+    expect(after?.llmCalls?.[1].usage.inputTokens.value).toBeNull()
+    expect((await chat()).byId.get(FIRST_REPLY)?.metadata.usage).toBeNull()
+    expect(forwards.filter(body => body.type === 'end')).toHaveLength(1)
   }, 30_000)
 
   it.each([

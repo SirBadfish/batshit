@@ -3,6 +3,7 @@ import { redis } from '$lib/server/redis'
 import { requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
 import type { AgentRow } from '$lib/types/database'
 import { isFixedSession } from '$lib/utils/fixedSession'
+import { retiredPrimaryAgentRefusal } from '$lib/utils/primaryAgentType'
 import {
   buildCompactionTranscript,
   buildLiveProtectedItemsNote,
@@ -30,12 +31,17 @@ import {
 import { generateModelSummary } from '$lib/server/services/summaryGeneration'
 import { resolveCompiledSpeakerView } from '$lib/server/services/compiledSpeakerView'
 import { isTurnRunning } from '$lib/server/services/turnYield'
-import { hasTurnStartedAfter, lastTurnStartOf } from '$lib/server/services/streamAbortRegistry'
+import { hasTurnStartedAfter, isSessionDeleting, lastTurnStartOf } from '$lib/server/services/streamAbortRegistry'
+import { SESSION_DELETED_ABORT_REASON } from '$lib/server/services/sessionDeleteTurnStop'
 import { isMessageProtectedFromManualTrim } from '$lib/utils/tokenPanel'
 import { startCompactRun, type CompactRun } from '$lib/server/services/compactRunRegistry'
+import { readCompactId } from '$lib/utils/compactRunId'
 import type { PlanLease } from '$lib/server/services/chatgptPlanRuntime'
 import { getChatgptPlanRuntime } from '$lib/server/services/chatgptPlanHost'
 import { chatgptPlanHttpStatus } from '$lib/server/services/chatgptPlanInference'
+import { claudePlanHttpStatus } from '$lib/server/services/claudePlanAdmission'
+import { ClaudePlanRunError } from '$lib/server/services/claudePlanProtocol'
+import { ModelReasoningSettingError } from '$lib/utils/modelReasoningControls'
 import { normalizeGroupChatConfig } from '$lib/server/services/groupChatUtils'
 
 type AgentRecord = AgentRow & Record<string, any>
@@ -109,8 +115,17 @@ function buildCompactPrompt(params: {
   ].join('\n')
 }
 
-/** BL-622 (C7): the answer of a Compact its chat's Stop ended. Nothing was written. */
-function stoppedAnswer() {
+/**
+ * BL-622 (C7): the answer of a Compact its chat's Stop ended. Nothing was written. BL-2357: a Compact
+ * its chat's delete ended (or that started while the chat was being deleted) says so.
+ */
+function stoppedAnswer(reason?: unknown) {
+  if (reason === SESSION_DELETED_ABORT_REASON) {
+    return json(
+      { error: 'A delete of this chat was requested, so Compact stopped. It wrote nothing.', code: 'ended_early', reason: 'session_deleted' },
+      { status: 409 }
+    )
+  }
   return json(
     { error: 'Compact stopped. It wrote nothing.', code: 'ended_early', reason: 'stopped' },
     { status: 409 }
@@ -154,7 +169,12 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
     // BL-719: register right after the ownership check, not after the reads, the token estimate,
     // and the speaker view. A Stop pressed during that setup must be seen before the model call,
     // not only after it — the `finally` below ends this run on every exit, early or not.
-    compactRun = startCompactRun(sessionId)
+    // BL-795: the page's id for this Compact (its plan and its summary share it), so a Stop pressed
+    // for it before this line is waiting for this Compact alone.
+    compactRun = startCompactRun(sessionId, readCompactId(body?.compactId))
+    // BL-2357: a delete stops the Compacts registered when it began; one registered after that sees
+    // the delete here, before any read or model call (both steps run without a pause in between).
+    if (isSessionDeleting(sessionId)) return stoppedAnswer(SESSION_DELETED_ABORT_REASON)
 
     const [session, agent, userSettings, protections] = await Promise.all([
       redis.getSession(sessionId),
@@ -169,6 +189,10 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
     if (!agent || agent.user_id !== user.value.id) {
       return json({ error: 'Agent not found' }, { status: 404 })
     }
+    // SA-139 R4 (D14): a retired Primary type compiles and summarizes nothing, in either model
+    // mode; `generateModelSummary` refuses it too, for its other callers.
+    const retired = retiredPrimaryAgentRefusal(agent, typeof body?.agentType === 'string' ? body.agentType : undefined)
+    if (retired) return json(retired, { status: 409 })
 
     // SA-104 P6 (DL-104-07): Infinite Sessions never use plain Compact — relief happens
     // through episode graduation and naps, which preserve originals in searchable
@@ -249,7 +273,6 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
       messages,
       agent,
       userId: user.value.id,
-      agentTypeHint: typeof body?.agentType === 'string' ? body.agentType : undefined,
       trimmedMessageIds: Array.isArray(body?.trimmedMessageIds) ? body.trimmedMessageIds : [],
       eventFetch
     })
@@ -295,7 +318,7 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
     // A Stop during setup (the reads above, the token estimate, the speaker view) already aborted
     // this run's signal by the time we get here: answer as a stopped Compact does, with no model
     // call and nothing written.
-    if (compactRun.signal.aborted) return stoppedAnswer()
+    if (compactRun.signal.aborted) return stoppedAnswer(compactRun.signal.reason)
     let compactResult: Awaited<ReturnType<typeof generateModelSummary>>
     try {
       compactResult = await generateModelSummary({
@@ -308,10 +331,11 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
         prompt,
         summaryHardMaxTokens: summaryBudget.hardMaxTokens,
         abortSignal: compactRun.signal,
-        retainPlanLease: lease => { planLease = lease }
+        retainPlanLease: lease => { planLease = lease },
+        claudePlanCompact: { sessionId }
       })
     } catch (error) {
-      if (compactRun.signal.aborted) return stoppedAnswer()
+      if (compactRun.signal.aborted) return stoppedAnswer(compactRun.signal.reason)
       throw error
     }
 
@@ -345,7 +369,7 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
     // another writer added during that call (a graduation mark, a group removal, a second
     // Compact's event).
     // A Stop that came after the model answered still stops the write.
-    if (compactRun.signal.aborted) return stoppedAnswer()
+    if (compactRun.signal.aborted) return stoppedAnswer(compactRun.signal.reason)
     // BL-622 (C4): look again before the write. A message the user protected during the summary
     // call (an unzip in the Zip Manager, an active clip) must stay live, so it cannot be inside
     // this summary. The event list's look is C2's conditional append below.
@@ -356,7 +380,7 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
     // New pending cards (including an in-place resume's replacement) are saved inside a
     // registered turn. Settlement cannot create one, and browser assistant saves are refused.
     // The final watermark below covers those turns even if they already ended; no second scan.
-    if (compactRun.signal.aborted) return stoppedAnswer()
+    if (compactRun.signal.aborted) return stoppedAnswer(compactRun.signal.reason)
     // The turn look comes last, with no I/O between it and the write's dispatch (the append's
     // only await is the client handle, which runs no new I/O): the user's
     // message goes first, and a turn that started since this Compact started (running now or
@@ -389,7 +413,6 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
       messages,
       agent,
       userId: user.value.id,
-      agentTypeHint: typeof body?.agentType === 'string' ? body.agentType : undefined,
       trimmedMessageIds: Array.isArray(body?.trimmedMessageIds) ? body.trimmedMessageIds : [],
       eventFetch
     })
@@ -417,7 +440,9 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
     console.error('[context-compact] Failed to compact context:', error)
     return json(
       { error: error instanceof Error ? error.message : 'Failed to compact context' },
-      { status: chatgptPlanHttpStatus(error) ?? 500 }
+      // A preset setting the model cannot take is the user's to fix (400), never a 500.
+      // SA-139 P4: a Claude plan run that refused (Claude Code's own startup checks) answers readably too.
+      { status: chatgptPlanHttpStatus(error) ?? claudePlanHttpStatus(error) ?? (error instanceof ClaudePlanRunError ? 409 : error instanceof ModelReasoningSettingError ? error.status : 500) }
     )
   } finally {
     planLease?.release()

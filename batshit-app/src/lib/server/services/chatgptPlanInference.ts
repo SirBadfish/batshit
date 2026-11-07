@@ -2,8 +2,10 @@ import type { ModelConnectionInfo } from '$lib/types/savedModels'
 import { chatgptPlanAccountId, isChatgptPlanConnection, CHATGPT_PLAN_PARAMETERS } from '$lib/utils/chatgptPlanConnection'
 import { isAgentRuntimeSettingKey } from '$lib/utils/modelSettingsMapper'
 import { getChatgptPlanRuntime } from './chatgptPlanHost'
+import { preserveApiUtilitySdkOptions } from './apiUtilityRuntime'
 import { ChatgptPlanError } from './chatgptPlanVault'
 import type { PlanLease } from './chatgptPlanRuntime'
+import { RUN_ABORT_SIGNAL, runAbortSignalOf } from './lateToolResults'
 
 export function isPlanSelection(connection?: ModelConnectionInfo | null) { return connection?.service === 'chatgpt-plan' || isChatgptPlanConnection(connection?.id) }
 
@@ -24,7 +26,7 @@ export function assertPlanSettings(settings?: Record<string, unknown> | null) {
 
 export function planModelForLease(lease: PlanLease | undefined, userId: string | null | undefined, connection: ModelConnectionInfo | null | undefined, modelId: string) {
   const accountId = chatgptPlanAccountId(connection?.id)
-  if (!lease || !accountId || connection?.type !== 'direct' || connection.service !== 'chatgpt-plan' || lease.userId !== userId || lease.accountId !== accountId) throw new ChatgptPlanError('consumer_unsupported', 'This feature has no server-owned ChatGPT plan request. Choose an eligible API agent or Compact.')
+  if (!lease || !accountId || connection?.type !== 'direct' || connection.service !== 'chatgpt-plan' || lease.userId !== userId || lease.accountId !== accountId) throw new ChatgptPlanError('consumer_unsupported', 'This feature has no server-owned ChatGPT plan request. Choose an eligible agent or Compact.')
   return getChatgptPlanRuntime().model(lease, modelId)
 }
 
@@ -45,7 +47,13 @@ export function planClientTools(tools: Record<string, any> | undefined, lease: P
     return [name, { ...definition, providerOptions: { ...definition.providerOptions, openai: { ...definition.providerOptions?.openai, namespace: { name: 'batshit', description: 'Batshit client tools' } } },
       ...(execute ? { execute: async (input: unknown, options: any) => {
         getChatgptPlanRuntime().assertLease(lease)
-        return execute(input, { ...options, abortSignal: options?.abortSignal ? AbortSignal.any([lease.signal, options.abortSignal]) : lease.signal })
+        // BL-1959: the run's own Stop signal goes on beside the merged one, so a Stop during the call
+        // still records it (`lateToolResults.ts`).
+        return execute(input, {
+          ...preserveApiUtilitySdkOptions(options),
+          abortSignal: options?.abortSignal ? AbortSignal.any([lease.signal, options.abortSignal]) : lease.signal,
+          [RUN_ABORT_SIGNAL]: runAbortSignalOf(options)
+        })
       } } : {}) }]
   }))
 }

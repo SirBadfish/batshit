@@ -13,6 +13,10 @@ vi.mock('$lib/server/redis', () => ({ redis: redisMock }))
 vi.mock('$lib/server/services/agentWakeups', () => ({
   abortWokenTurnForInterrupt: vi.fn(() => false)
 }))
+const heldRuns = vi.hoisted(() => ({ ended: 0 }))
+vi.mock('$lib/server/services/claudePlanRunRegistry', () => ({
+  endHeldClaudePlanRuns: vi.fn(async () => ({ ended: heldRuns.ended, unsettled: 0 }))
+}))
 
 /**
  * Stop, pressed while a turn is still SETTING UP (2026-09-18).
@@ -71,6 +75,29 @@ describe('POST /api/messages/interrupt', () => {
     expect(answer.reason).toBe('aborted')
     expect(stream.signal.reason).toBe('user')
     expect(getActiveStream('session-1')).not.toBeNull()
+  })
+
+  it('SA-139 D6: Stop in the gap after a reply that ended at a card ends the chat\'s held Claude plan run', async () => {
+    const { endHeldClaudePlanRuns } = await import('$lib/server/services/claudePlanRunRegistry')
+    heldRuns.ended = 1
+    const answer = await stop()
+    heldRuns.ended = 0
+    expect(endHeldClaudePlanRuns).toHaveBeenCalledWith({ sessionId: 'session-1' }, expect.stringContaining('approval card'))
+    expect(answer).toMatchObject({ success: true, reason: 'no_active_stream', endedHeldClaudePlanRuns: 1 })
+  })
+
+  it('SA-139 D6 (review B S3): Stop while a card\'s reply is over but its request still holds the lock ends the held run too', async () => {
+    const { endHeldClaudePlanRuns } = await import('$lib/server/services/claudePlanRunRegistry')
+    vi.mocked(endHeldClaudePlanRuns).mockClear()
+    const turn = registerSessionTurn('session-1', 'single', 'msg-1')
+    if (!turn.ok) throw new Error('registration refused')
+    registerStreamAbort('session-1', 'msg-1', new AbortController())
+    clearStreamAbort('session-1', 'msg-1')
+    heldRuns.ended = 1
+    const answer = await stop()
+    heldRuns.ended = 0
+    expect(endHeldClaudePlanRuns).toHaveBeenCalledWith({ sessionId: 'session-1' }, expect.stringContaining('approval card'))
+    expect(answer).toMatchObject({ success: true, reason: 'stale_turn_cleared', endedHeldClaudePlanRuns: 1 })
   })
 
   it('keeps clearing a lock whose reply is already over', async () => {

@@ -85,10 +85,11 @@ test('an operator from an older login item is restarted, which rewrites the item
   const plistPath = '/Users/x/Library/LaunchAgents/ai.batshit.sandbox-operator.plist'
   const current = {
     hostVoiceControls: ['start', 'stop', 'write-reference-audio'],
-    sandboxRevision: 12,
+    sandboxRevision: 13,
     watch: { enabled: true, launchAgent: plistPath, startedByOldLoginItem: false }
   }
   assert.equal(operatorIsCurrent(current, { platform: 'darwin', plistPath }), true)
+  assert.equal(operatorIsCurrent({ ...current, sandboxRevision: 12 }, { platform: 'darwin', plistPath }), false)
   assert.equal(operatorIsCurrent({ ...current, sandboxRevision: 10 }, { platform: 'darwin', plistPath }), false)
   // BL-1277: an operator still running revision 11 keeps the policy list it started with.
   assert.equal(operatorIsCurrent({ ...current, sandboxRevision: 11 }, { platform: 'darwin', plistPath }), false)

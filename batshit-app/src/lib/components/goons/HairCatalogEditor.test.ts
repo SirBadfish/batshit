@@ -1,7 +1,9 @@
 import { fireEvent, render, screen } from '@testing-library/svelte'
 import { describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 
-import { createHairState } from '$lib/goons/hairAssets'
+import { createHairState, hairAssetRevisionSha256, hairFitReceiptSha256, verifyHairAsset, type HairAssetV1 } from '$lib/goons/hairAssets'
 import { HAIR_REFIT_SOURCE_CONTRACT } from '$lib/goons/hairAssets'
 import {
   createHairAssetFixture,
@@ -56,7 +58,131 @@ async function fixture() {
   })
 }
 
+async function fittedVariant(source: RecipeSourceIdentity, revision: number) {
+  const asset = await createHairAssetFixture({ recipeSource: { identities: source } as RecipeSource,
+    mainBytes: createRigidHairGlbFixture(), headNode: 'head' })
+  asset.revision = revision
+  asset.revisionId = `${asset.assetId}-r${revision}`
+  asset.attachment.fitReceipt.receiptId = `${asset.assetId}-fit-r${revision}`
+  asset.attachment.fitReceipt.assetRevisionId = asset.revisionId
+  asset.revisionSha256 = '0'.repeat(64)
+  asset.attachment.fitReceipt.assetRevisionSha256 = '0'.repeat(64)
+  asset.attachment.fitReceipt.fitSha256 = '0'.repeat(64)
+  asset.revisionSha256 = await hairAssetRevisionSha256(asset)
+  asset.attachment.fitReceipt.assetRevisionSha256 = asset.revisionSha256
+  asset.attachment.fitReceipt.fitSha256 = await hairFitReceiptSha256(asset.attachment.fitReceipt)
+  return verifyHairAsset(asset)
+}
+
 describe('HairCatalogEditor', () => {
+  it('shows one shared style card and selects its exact current Goon fit', async () => {
+    const female = await fixture()
+    const maleSource = { ...SOURCE, baseId: 'base-male', fitFamily: 'fit-male', definitionSha256: 'b'.repeat(64) }
+    const male = await fittedVariant(maleSource, 2)
+    const onSelect = vi.fn()
+    const props = { assets: [female, male], valueState: createHairState(null), recipeSource: SOURCE,
+      supported: true, onRefresh: vi.fn(), onSelect, onColorsChange: vi.fn() }
+    const view = render(HairCatalogEditor, props)
+    expect(screen.getAllByRole('button', { name: 'H1 Test Hair. Ready' })).toHaveLength(1)
+    await fireEvent.click(screen.getByRole('button', { name: 'H1 Test Hair. Ready' }))
+    expect(onSelect).toHaveBeenLastCalledWith(female)
+    await view.rerender({ ...props, recipeSource: maleSource })
+    expect(screen.getAllByRole('button', { name: 'H1 Test Hair. Ready' })).toHaveLength(1)
+    await fireEvent.click(screen.getByRole('button', { name: 'H1 Test Hair. Ready' }))
+    expect(onSelect).toHaveBeenLastCalledWith(male)
+    const duplicate = await fittedVariant(maleSource, 3)
+    onSelect.mockClear()
+    await view.rerender({ ...props, assets: [female, male, duplicate], recipeSource: maleSource })
+    expect(screen.getByRole('button', { name: 'H1 Test Hair. Fit unavailable' })).toBeDisabled()
+    expect(onSelect).not.toHaveBeenCalled()
+  })
+  it('shows a saved historical fit without offering it as a second style or rewriting its state', async () => {
+    const catalog = JSON.parse(readFileSync(resolve(process.cwd(), 'static/goon-assets/hair/v2/catalog.json'), 'utf8')) as {
+      assets: HairAssetV1[]
+    }
+    const r1 = catalog.assets.find((asset) => asset.revisionId === 'batshit-style-01-r1')!
+    const r2 = catalog.assets.find((asset) => asset.revisionId === 'batshit-style-01-r2')!
+    const fit = r1.attachment.fitReceipt
+    const source = {
+      ...SOURCE, baseId: r1.compatibility.baseId, fitFamily: r1.compatibility.fitFamily,
+      definitionSha256: fit.appearanceDefinitionSha256, physicalBasisSha256: fit.physicalBasisSha256,
+      topologySha256: fit.topologySha256, skeletonHierarchySha256: fit.skeletonHierarchySha256
+    }
+    const state = createHairState(r1, {
+      baseColor: '#123456', highlightColor: '#abcdef',
+      motionSettings: { enabled: false, intensity: 0.42 }
+    })
+    const before = JSON.stringify(state)
+    const onSelect = vi.fn()
+    const props = {
+      assets: [r2], retainedBuiltinAssets: [r1], valueState: state, recipeSource: source,
+      supported: true, onRefresh: vi.fn(), onSelect, onColorsChange: vi.fn(),
+      motionTuning: { enabled: false, intensity: 0.42 }, onMotionTuningChange: vi.fn()
+    }
+    const view = render(HairCatalogEditor, props)
+
+    expect(screen.getByText('Currently selected: Style 01 · Shaggy Layers (saved fit)')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Style 01 · Shaggy Layers. Refit required' })).toBeDisabled()
+    expect(screen.getAllByRole('button', { name: /Style 01 · Shaggy Layers\./ })).toHaveLength(1)
+    expect((screen.getByLabelText('Hair Base Color') as HTMLInputElement).value).toBe('#123456')
+    expect((screen.getByLabelText('Hair Highlight Color') as HTMLInputElement).value).toBe('#abcdef')
+    expect(screen.getByText('Motion Settings')).toBeTruthy()
+    expect(screen.queryByText(/saved Hair style is missing/i)).toBeNull()
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(JSON.stringify(state)).toBe(before)
+
+    await view.rerender({ ...props, recipeSource: { ...source, definitionSha256: 'f'.repeat(64) } })
+    expect(screen.getByText(/fitted to an older head definition/)).toBeTruthy()
+    expect(screen.queryByText('Two-color Hair Palette')).toBeNull()
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(JSON.stringify(state)).toBe(before)
+  })
+
+  it('restores the previous exact historical fit and palette after an explicit No Hair toggle', async () => {
+    const catalog = JSON.parse(readFileSync(resolve(process.cwd(), 'static/goon-assets/hair/v2/catalog.json'), 'utf8')) as {
+      assets: HairAssetV1[]
+    }
+    const r1 = catalog.assets.find((asset) => asset.revisionId === 'batshit-style-01-r1')!
+    const r2 = catalog.assets.find((asset) => asset.revisionId === 'batshit-style-01-r2')!
+    const fit = r1.attachment.fitReceipt
+    const source = {
+      ...SOURCE, baseId: r1.compatibility.baseId, fitFamily: r1.compatibility.fitFamily,
+      definitionSha256: fit.appearanceDefinitionSha256, physicalBasisSha256: fit.physicalBasisSha256,
+      topologySha256: fit.topologySha256, skeletonHierarchySha256: fit.skeletonHierarchySha256
+    }
+    const state = createHairState(r1, {
+      baseColor: '#123456', highlightColor: '#abcdef',
+      motionSettings: { enabled: false, intensity: 0.42 }
+    })
+    const none = createHairState(null, { baseColor: state.baseColor, highlightColor: state.highlightColor })
+    const onSelect = vi.fn()
+    const props = {
+      assets: [r2], retainedBuiltinAssets: [r1], ownerId: 'goon-a', stateOwnerId: 'goon-a',
+      valueState: state, recipeSource: source, supported: true, onRefresh: vi.fn(), onSelect,
+      onColorsChange: vi.fn(), motionTuning: { enabled: false, intensity: 0.42 }, onMotionTuningChange: vi.fn()
+    }
+    const view = render(HairCatalogEditor, props)
+    await fireEvent.click(screen.getByRole('switch', { name: 'No Hair' }))
+    expect(onSelect).toHaveBeenLastCalledWith(null)
+    await view.rerender({ ...props, valueState: none })
+    await fireEvent.click(screen.getByRole('switch', { name: 'No Hair' }))
+    expect(onSelect).toHaveBeenLastCalledWith(r1, state)
+    expect(screen.getAllByRole('button', { name: /Style 01 · Shaggy Layers\./ })).toHaveLength(1)
+
+    await view.rerender({ ...props, valueState: state })
+    await fireEvent.click(screen.getByRole('switch', { name: 'No Hair' }))
+    onSelect.mockClear()
+    await view.rerender({ ...props, valueState: none, recipeSource: { ...source, definitionSha256: 'f'.repeat(64) } })
+    await fireEvent.click(screen.getByRole('switch', { name: 'No Hair' }))
+    expect(screen.getByText('The previous Hair fit is unavailable for this Goon. Choose an available style.')).toBeTruthy()
+    expect(onSelect).not.toHaveBeenCalled()
+
+    await view.rerender({ ...props, ownerId: 'goon-b', stateOwnerId: 'goon-a', valueState: state, disabled: true })
+    await view.rerender({ ...props, ownerId: 'goon-b', stateOwnerId: 'goon-b', valueState: none })
+    expect(screen.getByRole('switch', { name: 'No Hair' })).toBeDisabled()
+    expect(onSelect).not.toHaveBeenCalled()
+  })
+
   it('renders the real catalog groups and selects a compatible style', async () => {
     const asset = await fixture()
     const onSelect = vi.fn()
@@ -324,7 +450,7 @@ describe('HairCatalogEditor', () => {
       screen.getByRole('button', { name: 'About Two-color Hair Palette' })
     )
     expect(screen.getByText(/Base controls the main tone/)).toBeTruthy()
-    await fireEvent.input(screen.getByLabelText('Hair Base Color'), {
+    await fireEvent.change(screen.getByLabelText('Hair Base Color'), {
       target: { value: '#101820' }
     })
     expect(onColorsChange).toHaveBeenCalledWith({
@@ -336,6 +462,31 @@ describe('HairCatalogEditor', () => {
     expect(onColorsChange).toHaveBeenLastCalledWith({
       baseColor: '#21142f',
       highlightColor: '#68468f'
+    })
+  })
+
+  it('coalesces picker dragging and commits the final Hair color when the picker closes', async () => {
+    const asset = await fixture()
+    const onColorsChange = vi.fn()
+    render(HairCatalogEditor, {
+      assets: [asset],
+      valueState: createHairState(asset),
+      recipeSource: SOURCE,
+      supported: true,
+      onRefresh: vi.fn(),
+      onSelect: vi.fn(),
+      onColorsChange
+    })
+    const picker = screen.getByLabelText('Hair Base Color')
+    for (const color of ['#112233', '#223344', '#334455']) {
+      await fireEvent.input(picker, { target: { value: color } })
+    }
+    expect(onColorsChange).not.toHaveBeenCalled()
+    await fireEvent.change(picker)
+    await fireEvent.blur(picker)
+    expect(onColorsChange).toHaveBeenCalledExactlyOnceWith({
+      baseColor: '#334455',
+      highlightColor: '#6f4a8e'
     })
   })
 

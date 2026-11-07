@@ -1,6 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import { enrichMessagesWithTrustedZipMetadata } from '$lib/server/services/messageZipTrust'
+import { withoutServerReplayFields } from '$lib/utils/serverReplayFields'
 
 // GET /api/messages/[sessionId] - Get messages for a session
 export const GET: RequestHandler = async ({ params, url, locals }) => {
@@ -26,8 +27,11 @@ export const GET: RequestHandler = async ({ params, url, locals }) => {
     // chat has messages or reads its latest reply.
     const messages = await redis.getRecentMessages(params.sessionId!, limit)
     const trustedMessages = await enrichMessagesWithTrustedZipMetadata(messages, locals.user.id)
-    
-    return json(trustedMessages)
+
+    // SA-137 (D7, R1): a paused reply's replay fields (the whiteboard fragment, the live-file-read
+    // snapshot) stay on the server. Stripped here, at the tab's door, not in the shared list
+    // readers: server writers read records through those lists and write them back whole.
+    return json(trustedMessages.map(withoutServerReplayFields))
   } catch (error) {
     console.error('Error getting messages:', error)
     return json({ error: 'Failed to get messages' }, { status: 500 })

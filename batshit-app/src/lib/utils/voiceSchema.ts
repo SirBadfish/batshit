@@ -364,18 +364,20 @@ function normalizeByoTtsDefaults(value: unknown): VoiceEngineTtsDefaults | undef
     speed: normalizeNumber(commonSource.speed),
     volume: normalizeNumber(commonSource.volume),
     language: normalizeString(commonSource.language),
-    instructions: normalizeString(commonSource.instructions)
+    instructions: normalizeString(commonSource.instructions),
+    endpoint: normalizeString(commonSource.endpoint)
   }
 
   const providerOptions = normalizeProviderOptionBlock(value.providerOptions)
   const normalized: VoiceEngineTtsDefaults = {}
 
-  if (common.speed !== undefined || common.volume !== undefined || common.language || common.instructions) {
+  if (common.speed !== undefined || common.volume !== undefined || common.language || common.instructions || common.endpoint) {
     normalized.common = {
       ...(common.speed !== undefined ? { speed: common.speed } : {}),
       ...(common.volume !== undefined ? { volume: common.volume } : {}),
       ...(common.language ? { language: common.language } : {}),
-      ...(common.instructions ? { instructions: common.instructions } : {})
+      ...(common.instructions ? { instructions: common.instructions } : {}),
+      ...(common.endpoint ? { endpoint: common.endpoint } : {})
     }
   }
 
@@ -823,7 +825,8 @@ export function normalizeVoiceTtsConfig(value: unknown): VoiceTtsConfig | undefi
         speed: normalizeNumber(source.common.speed),
         volume: normalizeNumber(source.common.volume),
         language: normalizeString(source.common.language),
-        instructions: normalizeString(source.common.instructions)
+        instructions: normalizeString(source.common.instructions),
+        endpoint: normalizeString(source.common.endpoint)
       }
     : undefined
 
@@ -833,6 +836,7 @@ export function normalizeVoiceTtsConfig(value: unknown): VoiceTtsConfig | undefi
     if (commonFromShape?.volume !== undefined) merged.volume = commonFromShape.volume
     if (commonFromShape?.language) merged.language = commonFromShape.language
     if (commonFromShape?.instructions) merged.instructions = commonFromShape.instructions
+    if (commonFromShape?.endpoint) merged.endpoint = commonFromShape.endpoint
 
     if (isObject(source.style)) {
       const legacy = legacyStyleToCommon(source.style)
@@ -1174,6 +1178,7 @@ export function mergeVoiceCommon(
     if (block.volume !== undefined) merged.volume = block.volume
     if (block.language) merged.language = block.language
     if (block.instructions) merged.instructions = block.instructions
+    if (block.endpoint) merged.endpoint = block.endpoint
   }
   return Object.keys(merged).length > 0 ? merged : undefined
 }

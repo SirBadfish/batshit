@@ -1,3 +1,4 @@
+import './presetStorageScriptDouble'
 // @vitest-environment node
 import { beforeEach, expect, it, vi } from 'vitest'
 const host = vi.hoisted(() => ({ ready: true, accountId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }))

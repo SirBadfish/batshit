@@ -69,7 +69,7 @@ describe('send-routed: a chat being deleted takes no new turn', () => {
     // Then the pre-run sandbox sweep, which stands aside while another request of the chat
     // still runs (BL-198).
     expect(afterTry).toMatch(
-      /^\n {4}try \{\n(?: {6}\/\/[^\n]*\n)*? {6}if \(!\(await redis\.getSession\(sessionId\)\)\) \{\n {8}return sessionDeletedResponse\(\)\n {6}\}\n(?: {6}\/\/[^\n]*\n)* {6}if \(isAnotherRequestRunning\(sessionId, sessionTurnId\)\) \{\n[\s\S]*?\n {6}\} else \{\n {8}try \{\n {10}const sandboxCleanupWarnings =\n/
+      /^\n {4}try \{\n(?: {6}\/\/[^\n]*\n)*? {6}const ownedSessionUnderLock = await redis\.getSession\(sessionId\)\n {6}if \(!ownedSessionUnderLock\) \{\n {8}return sessionDeletedResponse\(\)\n {6}\}\n(?: {6}\/\/[^\n]*\n)* {6}if \(isAnotherRequestRunning\(sessionId, sessionTurnId\)\) \{\n[\s\S]*?\n {6}\} else \{\n {8}try \{\n {10}const sandboxCleanupWarnings =\n/
     )
     expect(source.split('releaseSessionTurn(').length - 1).toBe(1)
   })
@@ -110,7 +110,7 @@ describe('send-routed: a reply stopped because its chat was deleted', () => {
     expect(earlyStop).toContain('await streamAdapter.emitComplete({')
 
     const replyStart = source.indexOf('    if (isAbortError) {', earlyEnd)
-    const replyEnd = source.indexOf('\n    const errorStatus = getFailureStatus(error)', replyStart)
+    const replyEnd = source.indexOf('\n    const errorStatus = incompleteToolCallFailure?.status ?? getFailureStatus(error)', replyStart)
     const midReplyStop = source.slice(replyStart, replyEnd)
     expect(replyStart).toBeGreaterThan(earlyEnd)
     expect(replyEnd).toBeGreaterThan(replyStart)

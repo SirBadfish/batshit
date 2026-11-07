@@ -1027,7 +1027,7 @@ describe('messageCompiler – cool_tool inline payloads', () => {
       'The final answer.',
       0,
       1,
-      { id: 'agent-a', preserve_reasoning: true },
+      { id: 'agent-a', api_reasoning_retention: 'preserve', preserve_reasoning: true },
       message,
       {}
     )
@@ -1041,7 +1041,7 @@ describe('messageCompiler – cool_tool inline payloads', () => {
       'The final answer.',
       0,
       1,
-      { id: 'agent-b', preserve_reasoning: true },
+      { id: 'agent-b', api_reasoning_retention: 'preserve', preserve_reasoning: true },
       message,
       {}
     )
@@ -1154,6 +1154,7 @@ describe('messageCompiler – onZipCompressed (SA-120 P5)', () => {
         rezippedBy: null,
         groupUnshared: false,
         deadCopy: null,
+        deadCopyNamed: false,
         messagesFromEnd: 4
       }
     ])
@@ -1203,7 +1204,9 @@ describe('messageCompiler – onZipCompressed (SA-120 P5)', () => {
     const expected = buildCoolToolAiContentWithSources(zipId, { content: JSON.stringify(payload) }, payload)
     const marker = `{{batshit-zip:${zipId}}}`
     const inlinePieces: any[] = []
-    const inline = await compileForAI(marker, 4, 5, {}, undefined, {}, {
+    // Bash is Auto by default (SA-126 C6); a Normal row keeps this open result in view.
+    const bashNormal = { auto_zip_execute_command: false }
+    const inline = await compileForAI(marker, 4, 5, bashNormal, undefined, {}, {
       zipResolver,
       onDeliveredSource: (piece) => inlinePieces.push(piece)
     })
@@ -1214,7 +1217,7 @@ describe('messageCompiler – onZipCompressed (SA-120 P5)', () => {
     expect(inlinePieces.filter((piece) => piece.source === 'tool_result').map((piece) => piece.text).join('')).not.toContain(commandUrl)
 
     const appended: any[] = []
-    const appendedPrompt = await compileForAI(marker, 4, 5, {}, undefined, {}, {
+    const appendedPrompt = await compileForAI(marker, 4, 5, bashNormal, undefined, {}, {
       zipResolver,
       zipViewMode: 'appended',
       onZipExposure: (exposure) => appended.push(exposure)
@@ -1425,10 +1428,10 @@ describe('messageCompiler – dead copies and the compression hint (SA-129 P1)',
     const early = await compileForAI(marker, 0, 5, lane, undefined, {}, { zipResolver, agentMessagesFromEnd: 1 })
     expect(early).toContain('export const app = 1\n```\nCompresses 4 replies after it was read.')
     const last = await compileForAI(marker, 0, 5, lane, undefined, {}, { zipResolver, agentMessagesFromEnd: 3 })
-    expect(last.endsWith('```\nCompresses after this reply. Note what you need or hold the file.')).toBe(true)
+    expect(last.endsWith('```\nCompresses after this reply. Save what you need in Tool Notes, or Hold the file.')).toBe(true)
   })
 
-  it('a dead copy compiles to its reference, which says why, and the observer is told', async () => {
+  it('a dead copy compiles to its plain reference (BL-1541: history is frozen), and the observer is told why', async () => {
     const seen: any[] = []
     const compiled = await compileForAI(marker, 0, 5, lane, undefined, {}, {
       zipResolver,
@@ -1436,17 +1439,20 @@ describe('messageCompiler – dead copies and the compression hint (SA-129 P1)',
       deadCopies: new Map([[zipId, { reason: 'stale' as const, repliesUntilDead: 1 }]]),
       onZipCompressed: (entry) => seen.push(entry)
     })
-    expect(compiled).toBe(`{{batshit-zip:${zipId}:::read_file: src/app.js - 1 line - stale, edited since}}`)
-    expect(seen).toMatchObject([{ zipId, deadCopy: 'stale' }])
+    expect(compiled).toBe(marker)
+    expect(seen).toMatchObject([{ zipId, deadCopy: 'stale', deadCopyNamed: true }])
   })
 
-  it('a dead copy that died after the buffer compressioned it keeps its plain reference', async () => {
+  it('a dead copy that died after the buffer compressed it keeps its plain reference and is not named', async () => {
+    const seen: any[] = []
     const compiled = await compileForAI(marker, 0, 9, lane, undefined, {}, {
       zipResolver,
       agentMessagesFromEnd: 8,
-      deadCopies: new Map([[zipId, { reason: 'superseded' as const, repliesUntilDead: 6 }]])
+      deadCopies: new Map([[zipId, { reason: 'superseded' as const, repliesUntilDead: 6 }]]),
+      onZipCompressed: (entry) => seen.push(entry)
     })
     expect(compiled).toBe(marker)
+    expect(seen).toMatchObject([{ zipId, deadCopy: 'superseded', deadCopyNamed: false }])
   })
 
   it("a user's unzip keeps a dead copy open; an agent's does not", async () => {
@@ -1460,7 +1466,7 @@ describe('messageCompiler – dead copies and the compression hint (SA-129 P1)',
     expect(user.endsWith('```\nHeld by the user: stays open until they release it.')).toBe(true)
     vi.mocked(zippingService.getUnzippedInfo).mockReturnValue({ source: 'agent' } as never)
     const agent = await compileForAI(marker, 0, 5, lane, undefined, {}, { zipResolver, deadCopies })
-    expect(agent).toBe(`{{batshit-zip:${zipId}:::read_file: src/app.js - 1 line - superseded by a later read}}`)
+    expect(agent).toBe(marker)
   })
 
   it("a group compile gives no compression hint to another agent's result", async () => {
@@ -1517,7 +1523,7 @@ describe('messageCompiler – dead copies and the compression hint (SA-129 P1)',
         agentMessagesFromEnd: 0,
         deadCopies: new Map([[zipId, { reason: 'stale' as const, repliesUntilDead: 0 }]])
       })
-      expect(compiled).toBe(`{{batshit-zip:${zipId}:::read_file: src/app.js - 1 line - stale, edited since}}`)
+      expect(compiled).toBe(marker)
     })
   })
 })

@@ -1,11 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {
-  buildClaudeLlmCapture,
-  buildCodexLlmCapture,
-  buildVercelLlmCapture,
-  reportedUsageConfidence,
-  sanitizeRuntimeEventLogForCapture,
-} from '../executionViewerLlmCapture'
+import { buildVercelLlmCapture } from '../executionViewerLlmCapture'
 import { summarizeContextUsage } from '$lib/utils/tokenPanel'
 import type { ExecutionSnapshot } from '$lib/types/executionViewer'
 
@@ -214,98 +208,6 @@ describe('executionViewerLlmCapture redaction', () => {
     expect(serialized).not.toContain(thoughtSignature)
   })
 
-  it('redacts data image URLs in Codex capture payloads', () => {
-    const rawBase64 =
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII='
-    const capture = buildCodexLlmCapture({
-      developerInstructions: 'Stable developer data:image/png;base64,notreallybase64',
-      prompt: `Describe this: data:image/png;base64,${rawBase64}`,
-      images: [{ url: `data:image/png;base64,${rawBase64}` }],
-      tools: null,
-      toolMetadata: null,
-      totalUsage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
-    })
-
-    const serialized = JSON.stringify(capture)
-    expect(capture.llmCalls[0]?.requestConfidence).toBe('near')
-    expect(capture.llmCalls[0]?.requestPayload).toMatchObject({
-      developerInstructions: expect.stringContaining('Stable developer'),
-      prompt: expect.stringContaining('Describe this:'),
-    })
-    expect(serialized).toContain('redacted image/png data URL')
-    expect(serialized).not.toContain(rawBase64)
-  })
-
-  it('builds a Claude-specific Mode 4 capture instead of falling back to Vercel metadata', () => {
-    const capture = buildClaudeLlmCapture({
-      prompt: 'Summarize the repo state.',
-      tools: null,
-      toolMetadata: null,
-      totalUsage: { inputTokens: 9, outputTokens: 4, totalTokens: 13 },
-    })
-
-    expect(capture.llmCalls).toHaveLength(1)
-    expect(capture.llmCalls[0]?.runtime).toBe('claude')
-    expect(capture.llmSummary.totalUsage.totalTokens.value).toBe(13)
-    expect(JSON.stringify(capture)).toContain(
-      'Claude Code CLI does not expose a raw provider response object',
-    )
-  })
-
-  /**
-   * BL-503 / BL-1361: the CLI lanes' finish callback also runs for a run that failed, was stopped,
-   * or was ended by the context guard, and such a run's CLI reported no usage. Its counts are
-   * unknown (`value: null`), never `exact` and never zero; a run whose CLI reported them is exact.
-   */
-  it.each([
-    ['claude', (totalUsage: any) => buildClaudeLlmCapture({ prompt: 'p', tools: null, toolMetadata: null, totalUsage })],
-    ['codex', (totalUsage: any) => buildCodexLlmCapture({ prompt: 'p', tools: null, toolMetadata: null, totalUsage })],
-  ] as const)('labels %s CLI usage exact only when the CLI reported it', (_lane, build) => {
-    for (const missing of [null, undefined, {}]) {
-      const capture = build(missing)
-      for (const usage of [capture.llmCalls[0]!.usage, capture.llmSummary.totalUsage]) {
-        for (const stat of [usage.inputTokens, usage.outputTokens, usage.totalTokens]) {
-          expect(stat).toMatchObject({ value: null, confidence: 'estimated' })
-        }
-      }
-    }
-
-    const reported = build({ inputTokens: 9, outputTokens: 4, totalTokens: 13 })
-    expect(reported.llmCalls[0]!.usage.totalTokens).toMatchObject({ value: 13, confidence: 'exact' })
-    expect(reported.llmSummary.totalUsage.inputTokens).toMatchObject({ value: 9, confidence: 'exact' })
-  })
-
-  it('treats a reported zero as reported, and nothing reported as unknown', () => {
-    expect(reportedUsageConfidence({ inputTokens: 0 })).toBe('exact')
-    expect(reportedUsageConfidence({ outputTokens: 12 })).toBe('exact')
-    expect(reportedUsageConfidence({})).toBe('estimated')
-    expect(reportedUsageConfidence(null)).toBe('estimated')
-    expect(reportedUsageConfidence(undefined)).toBe('estimated')
-  })
-
-  it('preserves Claude cache-read and cache-creation breakdown while showing total processed input', () => {
-    const capture = buildClaudeLlmCapture({
-      prompt: 'Reply with the cached total.',
-      tools: null,
-      toolMetadata: null,
-      totalUsage: {
-        inputTokens: 18987,
-        outputTokens: 15,
-        totalTokens: 19002,
-        cachedInputTokens: 6297,
-        cacheCreationInputTokens: 12687,
-      },
-    })
-
-    expect(capture.llmSummary.totalUsage.inputTokens.value).toBe(18987)
-    expect(capture.llmSummary.totalUsage.outputTokens.value).toBe(15)
-    expect(capture.llmSummary.totalUsage.totalTokens.value).toBe(19002)
-    expect(capture.llmSummary.totalUsage.cachedInputTokens?.value).toBe(6297)
-    expect(capture.llmSummary.totalUsage.cacheCreationInputTokens?.value).toBe(
-      12687,
-    )
-  })
-
   it('normalizes AI SDK v6 cache counters in Vercel capture usage', () => {
     const capture = buildVercelLlmCapture({
       steps: [
@@ -445,64 +347,6 @@ describe('Vercel capture local cache provenance', () => {
     }
     expect(buildVercelLlmCapture({ ...params, providerId: 'openai' }))
       .toEqual(buildVercelLlmCapture(params))
-  })
-})
-
-describe('sanitizeRuntimeEventLogForCapture (SA-105 P3)', () => {
-  const rawBase64 =
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII='
-
-  it('redacts MCP image content blocks in the raw CLI transport trace', () => {
-    // The exact shape the P3 live probe found sitting in a real execution log:
-    // an untouched Codex `item.completed` carrying the delivered recall photo.
-    const events = [
-      {
-        type: 'item.completed',
-        item: {
-          id: 'call_1',
-          type: 'mcp_tool_call',
-          tool: 'batshit_tool_use',
-          result: {
-            content: [
-              { type: 'text', text: '{"result":{"recalled":[]}}' },
-              { type: 'image', data: rawBase64, mimeType: 'image/png' },
-            ],
-          },
-        },
-      },
-    ]
-
-    const sanitized = sanitizeRuntimeEventLogForCapture(events)
-    const serialized = JSON.stringify(sanitized)
-
-    expect(serialized).not.toContain(rawBase64)
-    expect(serialized).toContain('[redacted image/png bytes')
-    // Everything else in the trace survives — this is a redaction, not a drop.
-    expect(sanitized[0].item.result.content[0]).toEqual({
-      type: 'text',
-      text: '{"result":{"recalled":[]}}',
-    })
-    expect(sanitized[0].item.tool).toBe('batshit_tool_use')
-  })
-
-  it('does not mutate the live event array it was handed', () => {
-    const events = [
-      { item: { result: { content: [{ type: 'image', data: rawBase64, mimeType: 'image/png' }] } } },
-    ]
-    sanitizeRuntimeEventLogForCapture(events)
-    expect(events[0].item.result.content[0].data).toBe(rawBase64)
-  })
-
-  it('still covers the older shapes any raw event could carry', () => {
-    const sanitized = sanitizeRuntimeEventLogForCapture([
-      { note: `inline data:image/png;base64,${rawBase64}` },
-      { base64: rawBase64 },
-    ])
-    const serialized = JSON.stringify(sanitized)
-
-    expect(serialized).not.toContain(rawBase64)
-    expect(serialized).toContain('[redacted image/png data URL')
-    expect(serialized).toContain('[redacted base64 payload')
   })
 })
 

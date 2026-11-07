@@ -1,6 +1,8 @@
 {
-	"extends": "./.svelte-kit/tsconfig.json",
+	"extends": "$app/tsconfig",
+	"include": ["src/**/*.js", "src/**/*.ts", "src/**/*.svelte", "vite.config.js", "vite.config.ts"],
 	"compilerOptions": {
+		"paths": { "$lib": ["./src/lib"], "$lib/*": ["./src/lib/*"] },
 		// === JavaScript Support ===
 		"allowJs": true,
 		"checkJs": true,
@@ -39,8 +41,7 @@
 		"**/__tests__/**",
 		"tests/**"
 	]
-	// Path aliases are handled by https://svelte.dev/docs/kit/configuration#alias
-	// except $lib which is handled by https://svelte.dev/docs/kit/configuration#files
+	// Preserve Batshit's established $lib module contract alongside Vite's explicit alias.
 	//
 	// If you want to overwrite includes/excludes, make sure to copy over the relevant includes/excludes
 	// from the referenced tsconfig.json - TypeScript does not merge them in

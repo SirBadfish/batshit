@@ -1,4 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { decodeMemoryOwner } from '../memoryOwnership'
+import { redis } from '$lib/server/redis'
+import { listMemories } from '../memoryStore'
+import { readMemoryMutationSnapshot } from '../memoryMutation'
+import { describe, expect, it, vi } from 'vitest'
 import {
   BUILTIN_EMBEDDING_MODELS,
   DEFAULT_MEMORY_EMBEDDING_CONFIG,
@@ -279,5 +283,54 @@ describe('memory key namespace', () => {
     expect(memorySegmentIndexName()).toBe('batshit_memseg_idx_run42')
     if (previous === undefined) delete process.env.BATSHIT_MEMORY_INDEX_SUFFIX
     else process.env.BATSHIT_MEMORY_INDEX_SUFFIX = previous
+  })
+})
+
+
+// Opaque read-only RESP fixture through the existing execute seam; this does not
+// execute or simulate Lua publication. Actual JSON/Search proof remains separate.
+describe('atomic snapshot presentation', () => {
+  it('matches ordinary newest/id ordering without mixing raw CAS key/value preimages', async () => {
+    const agentId = 'agent_snapshot_order'
+    const records = [
+      { id: 'mem_old', saved_ts: 100 },
+      { id: 'mem_a', saved_ts: 200 },
+      { id: 'mem_z', saved_ts: 200 }
+    ].map(record => ({ ...record, agent_id: agentId, user_id: 'user_snapshot', lane: 'awareness', content: record.id, media: [], embedding: [0.25, 0.75] }))
+    const pairs = records.map(record => [`memory:${agentId}:${record.id}`, JSON.stringify(record)] as const)
+    const values = new Map(pairs)
+    const rows = pairs.map(([key, raw]) => [key, 'full', raw, 'ReJSON-RL'])
+    const reply = ['1792886400', '0', '["revision"]', [...rows,
+      [`agent:${agentId}`, 'full', JSON.stringify({ id: agentId, user_id: 'user_snapshot' }), 'ReJSON-RL'],
+      [`memfold:${agentId}`, 'full', '{"mutation_revision":"revision"}', 'ReJSON-RL']
+    ], [], 'ReJSON-RL']
+    const originalReply = structuredClone(reply)
+    const execute = vi.spyOn(redis, 'execute').mockImplementation(async operation => operation({
+      eval: async () => reply,
+      keys: async () => pairs.map(([key]) => key),
+      json: { get: async (key: string) => values.has(key) ? JSON.parse(values.get(key)!) : null }
+    } as never))
+    try {
+      const ordinary = await listMemories(agentId)
+      const snapshot = await readMemoryMutationSnapshot(agentId)
+      expect(snapshot.records.map(record => record.id)).toEqual(['mem_z', 'mem_a', 'mem_old'])
+      expect(snapshot.records.map(record => record.id)).toEqual(ordinary.map(record => record.id))
+      for (const [key, raw] of pairs) expect(snapshot.raw.get(key)).toBe(raw)
+      expect(reply).toEqual(originalReply)
+    } finally { execute.mockRestore() }
+  })
+})
+
+
+describe('strict supported owner storage', () => {
+  it('decodes legacy STRING and JSON owner shapes without converting the original text', () => {
+    const raw = '{"id":"legacy_agent","user_id":"owner","memory_enabled":true,"created_at":"old"}'
+    const legacy = decodeMemoryOwner('string', raw, 'legacy_agent', 'memory agent')
+    expect(legacy.raw).toBe(raw)
+    expect(legacy.proof).toMatchObject({ id: 'legacy_agent', userId: 'owner', storage: 'string' })
+    expect(decodeMemoryOwner('ReJSON-RL', raw, 'legacy_agent', 'memory agent').record).toEqual(legacy.record)
+  })
+  it.each([['hash', '{}'], ['string', 'invalid-json'], ['string', '[]'], ['ReJSON-RL', 'null']])('refuses unsupported or malformed %s owner data', (kind, raw) => {
+    expect(() => decodeMemoryOwner(kind, raw, 'legacy_agent', 'memory agent')).toThrow()
   })
 })

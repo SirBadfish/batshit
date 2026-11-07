@@ -4,6 +4,8 @@ Batshit backup/restore is an Admin feature. It exports Batshit-owned data into a
 
 Restore is not a merge. It's a fresh-instance restore or an explicit replace of current Batshit data.
 
+For a failed [automatic backup](../admin/backup-and-restore.md#automatic-backups), check the error and saved folder in Settings → Admin → Backup and Restore. Batshit keeps the existing verified copies when a new backup fails.
+
 ## What a backup includes
 
 Normal Batshit backups include Batshit-owned records and uploaded files, such as:
@@ -93,9 +95,7 @@ Batshit backups don't include external n8n workflows or credentials. After resto
 1. Restore/import workflows in n8n.
 2. Recreate n8n credentials.
 3. Activate workflows.
-4. Update Batshit agent/subagent webhook URLs if they changed.
-5. Make sure current templates forward `x-batshit-native-tool-token`.
-6. Test a small n8n chat.
+4. Test a small n8n workflow.
 
 ## Project files are missing after restore
 

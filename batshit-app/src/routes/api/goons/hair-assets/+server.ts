@@ -3,6 +3,7 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 import {
   HairAssetRepositoryError,
   listHairAssets,
+  listRetainedHairBuiltinAssets,
   listHairRefitSources,
   putUserHairAssetRevision
 } from '$lib/server/services/hairAssetRepository.server'
@@ -12,11 +13,12 @@ export const GET: RequestHandler = async ({ locals }) => {
   const user = requireUser(locals)
   if (!user.ok) return user.response
   try {
-    const [assets, refitSources] = await Promise.all([
+    const [assets, retainedBuiltinAssets, refitSources] = await Promise.all([
       listHairAssets(user.value.id),
+      listRetainedHairBuiltinAssets(),
       listHairRefitSources(user.value.id)
     ])
-    return json({ assets, refitSources })
+    return json({ assets, retainedBuiltinAssets, refitSources })
   } catch (error) {
     console.error('[hair-assets] list failed:', error)
     return json(

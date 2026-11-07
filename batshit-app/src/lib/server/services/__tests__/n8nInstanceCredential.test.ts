@@ -13,10 +13,8 @@ import { inspect } from 'node:util'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const profileSync = vi.hoisted(() => ({
-  codex: vi.fn(async () => undefined),
   claude: vi.fn(async () => ({}))
 }))
-vi.mock('$lib/server/services/codexProfileManager', () => ({ syncAgentCodexProfiles: profileSync.codex }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({ syncAgentClaudeProfiles: profileSync.claude }))
 vi.mock('$lib/server/services/workflowDiscovery', () => ({
   workflowDiscovery: { discoverDirectMCPClients: vi.fn(async () => []) }
@@ -28,7 +26,7 @@ vi.mock('$lib/server/services/mcpGatewayDiscovery', () => ({
 import { env } from '$env/dynamic/private'
 import { redis } from '$lib/server/redis'
 import { apiKeyService } from '$lib/services/apiKey.server'
-import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
+import { humanGatewaySourceRevision, mcpGatewayService } from '$lib/server/services/mcpGatewayService'
 import { migrateLegacyN8nInstanceMcpTokens } from '$lib/server/services/mcpGatewayTokenMigration'
 import { GET as listRoute, POST as createRoute } from '../../../../routes/api/mcp/gateways/+server'
 import { GET as getRoute, PUT as putRoute } from '../../../../routes/api/mcp/gateways/[id]/+server'
@@ -101,7 +99,17 @@ const routeEvent = (id: string, body?: unknown) => ({
   url: new URL(`http://localhost/api/mcp/gateways/${id}`)
 })
 
-const put = (id: string, body: Record<string, unknown>) => putRoute(routeEvent(id, body) as any) as Promise<Response>
+async function put(id: string, body: Record<string, unknown>): Promise<Response> {
+  // Model the human form's confirmed source preimage without consuming the service/GET hooks
+  // these cases use for races. The real source assertion and element CAS remain in the route.
+  if (!Object.hasOwn(body, 'expectedGatewaySource')) {
+    const registry = await redis.json.get(REGISTRY) as { gateways?: Array<{ id: string }> } | null
+    const source = registry?.gateways?.find(gateway => gateway.id === id)
+    if (!source) throw new Error(`Missing n8n credential gateway fixture: ${id}`)
+    body = { ...body, expectedGatewaySource: humanGatewaySourceRevision(USER, source as any) }
+  }
+  return putRoute(routeEvent(id, body) as any) as Promise<Response>
+}
 const deleteKey = () =>
   deleteKeyRoute({
     request: new Request('http://localhost/api/settings/api-keys', { method: 'DELETE', body: JSON.stringify({ service: SERVICE }) }),
@@ -139,7 +147,6 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
     expectNoTokenPrinted()
     for (const spy of consoleSpies) spy.mockRestore()
     for (const [name, implementation] of originals) json[name].mockImplementation(implementation)
-    profileSync.codex.mockReset().mockImplementation(async () => undefined)
     profileSync.claude.mockReset().mockImplementation(async () => ({}))
   })
 
@@ -242,13 +249,13 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
     expect(await storedMeta('gw-n')).toEqual({})
   })
 
-  it('with both CLI profile syncs doing nothing (providers off), an edit still moves the copy', async () => {
+  // SA-139 R4: no profile sync runs after a gateway save any more; the guarded move still does.
+  it('an edit moves the copy, with no profile sync after the save', async () => {
     await seed([n8nInstance('gw-n', { authToken: L })])
 
     const response = await put('gw-n', { name: 'Renamed' })
 
     expect(response.status).toBe(200)
-    expect(profileSync.codex).toHaveBeenCalledTimes(1)
     expect(await savedValue()).toBe(L)
     expect(await storedMeta('gw-n')).toEqual({})
   })
@@ -294,7 +301,6 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
       expect(await redis.get(REGISTRY)).toEqual(before.registry)
       expect(json.deleteN8nToken).not.toHaveBeenCalled()
       expect(bareDelete).not.toHaveBeenCalled()
-      expect(profileSync.codex).not.toHaveBeenCalled()
       expect(profileSync.claude).not.toHaveBeenCalled()
     } finally {
       bareDelete.mockRestore()
@@ -405,7 +411,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
 
   it('a profile sync failure after a completed delete still answers deleted', async () => {
     await apiKeyService.store(SERVICE, K, USER)
-    profileSync.codex.mockRejectedValueOnce(new Error('sync down'))
+    profileSync.claude.mockRejectedValueOnce(new Error('sync down'))
 
     const response = await deleteKey()
 
@@ -514,6 +520,14 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
     'The gateway settings were saved, but Batshit could not confirm saving the n8n Instance MCP token. Save the token again, or save it in Settings → API Keys.'
   const N8N_URL = 'http://localhost:5678/mcp-server/http'
 
+  function expectSavedFailure(body: Record<string, any>, error: unknown, name: string) {
+    expect(body).toEqual({ error, gatewaySaved: true, gatewayId: 'gw-n',
+      sourceAcknowledgement: expect.objectContaining({ id: 'gw-n', name,
+        sourceRevision: expect.stringMatching(/^source1:[a-f0-9]{64}$/) }) })
+    expect(body.sourceAcknowledgement).not.toHaveProperty('metadata.authToken')
+    for (const token of TOKENS) expect(JSON.stringify(body)).not.toContain(token)
+  }
+
   const post = (body: Record<string, unknown>) =>
     createRoute({
       request: new Request('http://localhost/api/mcp/gateways', { method: 'POST', body: JSON.stringify(body) }),
@@ -523,6 +537,24 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
   async function storedGateway(id: string) {
     const registry = (await redis.json.get(REGISTRY)) as { gateways: any[] }
     return registry.gateways.find((gateway) => gateway.id === id) ?? null
+  }
+
+  /**
+   * SA-139 R4 removed the Primary profile sync that ran after a stored gateway PUT, the step these
+   * cases failed on purpose. The PUT's read back after the save (`mcpGatewaySave.ts`) is the step
+   * that fails now: the first `get` once `afterSave()` says the save is stored throws `error`.
+   */
+  function failReadBackOnce(afterSave: () => boolean | Promise<boolean>, error: Error) {
+    const realGet = mcpGatewayService.get.bind(mcpGatewayService)
+    let failed = false
+    const spy = vi.spyOn(mcpGatewayService, 'get').mockImplementation(async (userId: string, gatewayId: string) => {
+      if (!failed && await afterSave()) {
+        failed = true
+        throw error
+      }
+      return realGet(userId, gatewayId)
+    })
+    return { failed: () => failed, restore: () => spy.mockRestore() }
   }
 
   /** `apiKeyService.store` that writes the key, then throws as if its answer was lost. */
@@ -547,7 +579,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
     expect(json.setIfUnchanged.mock.calls.map((call: any[]) => call[1])).toEqual(Array(3).fill('$.gateways[0]'))
     expect(await savedRaw()).toBe(before)
     expect(await storedMeta('gw-n')).toEqual({ authToken: L, base: 'x' })
-    expect(profileSync.codex).not.toHaveBeenCalled()
+    expect(profileSync.claude).not.toHaveBeenCalled()
   })
 
   it('changes: a save of a gateway deleted after the route read it (404) stores no token', async () => {
@@ -592,10 +624,12 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
     expect(await redis.json.getRaw(REGISTRY, '$')).toBe(registryBefore)
   })
 
-  it('changes: a gateway write with no answer (500 before it is confirmed) runs no side effect', async () => {
+  it('changes: a gateway write refused before issue (500) runs no side effect', async () => {
     await apiKeyService.store(SERVICE, K, USER)
     await seed([n8nInstance('gw-n', { authToken: L })])
     const before = await savedRaw()
+    // This stand-in throws before invoking the owner's beforeIssue callback: a pre-issue
+    // failure, not a lost answer from an issued write (which has a different outcome owner).
     json.setIfUnchanged.mockRejectedValueOnce(new Error('socket closed before the answer'))
 
     const response = await put('gw-n', { metadata: { authToken: F } })
@@ -604,7 +638,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
     expect((await response.json()).error).toBe('Failed to update gateway')
     expect(await savedRaw()).toBe(before)
     expect(json.moveLegacyN8nToken).not.toHaveBeenCalled()
-    expect(profileSync.codex).not.toHaveBeenCalled()
+    expect(profileSync.claude).not.toHaveBeenCalled()
   })
 
   it('changes: a token store that fails before writing answers the 500 that says the gateway was saved; the next save stores it', async () => {
@@ -616,13 +650,12 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
       const response = await put('gw-n', { name: 'Renamed', metadata: { authToken: F } })
 
       expect(response.status).toBe(500)
-      expect(await response.json()).toEqual({ error: TOKEN_NOT_CONFIRMED, gatewaySaved: true, gatewayId: 'gw-n' })
+      expectSavedFailure(await response.json(), TOKEN_NOT_CONFIRMED, 'Renamed')
       expect((await storedGateway('gw-n')).name).toBe('Renamed')
       // Not retried, not undone. The readable saved key wins by the move's own rule: the copy leaves.
       expect(store).toHaveBeenCalledTimes(1)
       expect(await savedRaw()).toBe(before)
       expect(await storedMeta('gw-n')).toEqual({ base: 'x' })
-      expect(profileSync.codex).toHaveBeenCalledTimes(1)
       expect(printedText()).toContain('connection reset')
 
       // The repair is the user's next save, never a retry by the route.
@@ -644,7 +677,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
       const response = await put('gw-n', { metadata: { authToken: F } })
 
       expect(response.status).toBe(500)
-      expect(await response.json()).toEqual({ error: TOKEN_NOT_CONFIRMED, gatewaySaved: true, gatewayId: 'gw-n' })
+      expectSavedFailure(await response.json(), TOKEN_NOT_CONFIRMED, 'n8n gw-n')
       expect(store).toHaveBeenCalledTimes(1)
       expect(await savedValue()).toBe(F)
       // The move reads F as the readable saved key: the copy leaves as superseded.
@@ -661,7 +694,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
       const response = await put('gw-n', { metadata: { authToken: F } })
 
       expect(response.status).toBe(500)
-      expect(await response.json()).toEqual({ error: TOKEN_NOT_CONFIRMED, gatewaySaved: true, gatewayId: 'gw-n' })
+      expectSavedFailure(await response.json(), TOKEN_NOT_CONFIRMED, 'n8n gw-n')
       // The gateway write kept the copy; the guarded move then took it into the absent key.
       expect(await savedValue()).toBe(L)
       expect(await storedMeta('gw-n')).toEqual({})
@@ -672,30 +705,43 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
 
   it('changes: after the gateway write is stored, an error that says "not found" or "Invalid" is a 500 that says it was saved', async () => {
     await seed([n8nInstance('gw-n', {})])
-    profileSync.codex.mockRejectedValueOnce(new Error('Agent profile not found'))
-    const first = await put('gw-n', { name: 'One' })
-    profileSync.claude.mockRejectedValueOnce(new Error('Invalid managed profile'))
-    const second = await put('gw-n', { name: 'Two' })
+    const responses: Response[] = []
+    for (const [name, error] of [['One', new Error('Gateway gw-n not found')], ['Two', new Error('Invalid gateway record')]] as const) {
+      const readBack = failReadBackOnce(async () => (await storedGateway('gw-n'))?.name === name, error)
+      try {
+        responses.push(await put('gw-n', { name }))
+        expect(readBack.failed()).toBe(true)
+      } finally {
+        readBack.restore()
+      }
+    }
 
-    for (const response of [first, second]) {
+    for (const [index, response] of responses.entries()) {
       expect(response.status).toBe(500)
-      expect(await response.json()).toEqual({ error: expect.stringMatching(/^The gateway settings were saved, but /), gatewaySaved: true, gatewayId: 'gw-n' })
+      expectSavedFailure(await response.json(), expect.stringMatching(/^The gateway settings were saved, but /), ['One', 'Two'][index])
     }
     expect((await storedGateway('gw-n')).name).toBe('Two')
   })
 
   it('a token store failure and a later failure after the save are both named', async () => {
     await seed([n8nInstance('gw-n', {})])
-    const store = vi.spyOn(apiKeyService, 'store').mockRejectedValueOnce(new Error('connection reset'))
-    profileSync.codex.mockRejectedValueOnce(new Error('sync down'))
+    // The token store follows the stored gateway write; the read back fails after it.
+    let storeTried = false
+    const store = vi.spyOn(apiKeyService, 'store').mockImplementationOnce(async () => {
+      storeTried = true
+      throw new Error('connection reset')
+    })
+    const readBack = failReadBackOnce(() => storeTried, new Error('read back down'))
     try {
       const response = await put('gw-n', { metadata: { authToken: F } })
 
+      expect(readBack.failed()).toBe(true)
       expect(response.status).toBe(500)
       const { error } = await response.json()
       expect(error.startsWith(TOKEN_NOT_CONFIRMED)).toBe(true)
       expect(error.length).toBeGreaterThan(TOKEN_NOT_CONFIRMED.length)
     } finally {
+      readBack.restore()
       store.mockRestore()
     }
   })
@@ -748,13 +794,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1397: n8n Insta
     expect(await savedValue()).toBe(F)
   })
 
-  it('changes: after POST created the gateway, an error that says "Invalid" is a 500 that says it was saved', async () => {
-    profileSync.codex.mockRejectedValueOnce(new Error('Invalid managed profile'))
-
-    const response = await post({ id: 'gw-5', name: 'Fifth', type: 'n8n-instance-mcp', url: N8N_URL })
-
-    expect(response.status).toBe(500)
-    expect(await response.json()).toEqual({ error: expect.stringMatching(/^The gateway settings were saved, but /), gatewaySaved: true, gatewayId: 'gw-5' })
-    expect(await storedGateway('gw-5')).not.toBeNull()
-  })
+  // SA-139 R4: "after POST created the gateway, an error that says Invalid is a 500" went with the
+  // Primary profile sync, the one step after a create that could throw; the token store and the
+  // Docker profile file after it each answer their own named 500 (the POST cases above).
 })

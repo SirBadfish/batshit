@@ -1,20 +1,34 @@
 import { getBatshitHomeDir } from './batshitHome'
+import { normalizeNativeBashAccessMode, nativeBashApprovalCardsEnabled, nativeBashApprovalRequestsEnabled, nativeBashCommandsAfterPatchRun } from '$lib/utils/nativeBashAfterPatch'
+import { buildSchemaSummary, getDefaultSchemaHintCaps, getSchemaHintText } from './dynamicMcpSchema'
+import { BUILTIN_PLUGIN_SKILLS } from './systemPluginPackage'
 import { spawnOwnedCommandGroup } from './ownedCommandGroup'
+import { relayAbort } from './turnAbortRelay'
 import { pinHostCommandOwner, type HostCommandOwner, type HostCommandPin } from './hostCommandOwnership'
-import { tool } from 'ai'
+import { ANCHORED_WRITE_MAX_BYTES, AnchoredProjectWriter, AnchoredWriteError, type AnchoredEntryStat } from './anchoredProjectWriter'
+import { tool, type ToolExecutionOptions } from 'ai'
+import {
+  assertApiUtilityScope, captureApiUtilityInvocation, formatApiUtilityOutput, isApiSkillUtilityFormatting, markApiUtilityCandidate, markUtilityOnlyApiBroker, readApiUtilities, readApiUtilityInvocationTarget,
+  type ApiUtilityScope, type ApiUtilityInvocation
+} from './apiUtilityRuntime'
+import { API_UTILITY_CONTROL_IDS, formatApiSkillReadMore, isApiUtilityControlId } from '$lib/utils/apiUtilityControls'
 import { load as loadHtml } from 'cheerio'
 import { spawn } from 'node:child_process'
+import { assertAgentBrowserTestShell, spawnAgentBrowserCliProcess } from './agentBrowserCliProcess'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, readdirSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { lstat, mkdir, open, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, open, realpath, stat, unlink } from 'node:fs/promises'
 import { env } from '$env/dynamic/private'
 import { z } from 'zod'
 import type { AgentDcmDisplaySettings, MCPToolSelections } from '$lib/types/database'
 import type { ToolApprovalMode } from '$lib/types/tool-approvals'
 import { buildControlApprovalPauseGuidance } from '$lib/utils/controlApprovalPresentation'
+import { isRetiredSubagentType, normalizeSubagentType, type SubagentLike } from '$lib/utils/subagentType'
 import { redis } from '$lib/server/redis'
+import { readToolOperationalSettings } from '$lib/server/toolOperationalSettingsOwner'
+import type { AgentBrowserOperationalSettings } from '$lib/utils/toolOperationalSettings'
 import { fetchZipForModel, MAX_FETCH_ZIP_CHARS } from './fetchZipForModel'
 import {
   getInternalBatshitServerUrl,
@@ -36,7 +50,29 @@ import {
   splitShellCommandSegments,
   shellHeredocMarker
 } from './bashCommandMapper'
+import {
+  lexShellCommands,
+  shellDialectsFor,
+  substitutionsInExpandedText,
+  type ShellLexCommand,
+  type ShellLexDialect
+} from '$lib/utils/shellCommandLexer'
 import { buildSnapshotEditPreview, extractManagedPatchFromSource } from '$lib/utils/editDiff'
+import {
+  emulateFileReadView,
+  matchShellReadSplit,
+  planShellReadSplit,
+  planSingleFileRead,
+  readSplitViews,
+  readsWithoutShellWrapper,
+  type FileReadView,
+  type ShellReadSplit,
+  type ShellReadSplitPlan
+} from '$lib/utils/shellReadSplit'
+import { FILE_READ_SOURCE_VERSION, isFileReadLocator, type FileReadProof } from '$lib/utils/fileReadSource'
+import { resolveBashWorkspaceRoot, resolveExistingDirectory } from './bashWorkspaceRoot'
+import { sealFileReadProof } from './fileReadProofSeal'
+import { liveReadBackendMountsHostWorkspace } from './liveFileReadSnapshot.server'
 import { resolveDefaultNativeExecutionBackend } from './nativeExecutionDefaults'
 import { resolveLocalCommandShell } from './localCommandShell'
 import { stripHostOperatorAuthorityFromChildEnv, stripNativeCommandAuthorityFromChildEnv } from './cliChildEnv'
@@ -46,6 +82,8 @@ import { formatBashResultForModel, isBashResultForModel } from './bashResultMode
 import {
   BROKER_FABRIC_FETCH_ZIP_CONTROL_ID,
   BROKER_TOOL_FAMILIES,
+  isBatshitUtilityControlId,
+  resolveBrokerControlFamilies,
   isControlIdAllowedByList,
   resolveBrokerFabricAllowedControlIds,
   resolveBrokerFamilies,
@@ -65,6 +103,9 @@ import {
   type ControlUseErrorCode
 } from './fabricRegistry'
 import { settingsControlAdmission } from './appActions/settingsAdmission'
+import { prepareSettingsControl, settingsNativeApprovalPreview, settingsOperationRegistry } from './appActions/settings/managementRuntime'
+import { SETTINGS_MANAGEMENT_CONTROL_IDS } from './appActions/settings/managementActor'
+import type { AppActionsApprovalPreview } from '$lib/appActions/settings/managementContract'
 import {
   hasScopedRiskWindow,
   type ControlApprovalGrant,
@@ -102,7 +143,6 @@ import {
   skillReadOffsetPastEndError
 } from './skillReadWindow'
 import { resolveSkillAccessForActor } from './slashCommandCapabilities'
-import { CLI_LANE_GETS_BATSHIT_BASH } from './mode4InternalTools'
 import {
   resolveScreenshotUploadModelUrl,
   resolveUploadConfigForScreenshot
@@ -120,6 +160,9 @@ import {
   recoverAppleContainerSandbox
 } from './appleContainerSandbox'
 import { createSandboxLifecycleGate } from './sandboxLifecycleGate'
+import { assertSandboxMountRootsSafe } from './sandboxHomeMounts'
+import { typedContainerWorkspaceRoot, typedHostWorkspaceRoot } from './typedFileWorkspaceAdmission.server'
+import { normalizeContainerizedDockerSandboxDriver, type ContainerizedDockerSandboxDriver } from '$lib/utils/dockerSandboxDriver'
 import {
   SBX_COMMAND,
   buildSbxSandboxName,
@@ -140,6 +183,7 @@ import {
   sbxSandboxHasWorkspace,
   sbxStopArgs,
   sbxVersionArgs,
+  sbxWorkspaceMounts,
   type SbxSandboxEntry
 } from './dockerSandboxSbx'
 import { recordSbxDaemonStart, sbxCallStartedDaemon } from './sbxDaemonRecord'
@@ -150,15 +194,16 @@ import {
 } from './commandEnd'
 import { bytesToBlob } from '$lib/utils/binary'
 import {
-  APPLY_PATCH_BEGIN_MARKER,
-  APPLY_PATCH_END_MARKER,
   applyManagedPatchHunks,
+  describeAfterPatchForApproval,
   extractManagedApplyPatchDocument,
   isManagedApplyPatchCommand,
+  managedApplyPatchPolicySource,
   parseManagedApplyPatchCommand,
   parseManagedApplyPatchDocument,
+  type AfterPatchNotRunReason,
   type ManagedApplyPatchOperation
-} from './managedApplyPatch'
+} from '$lib/utils/managedApplyPatch'
 import {
   normalizeNativeExecutionBackend,
   type NativeExecutionBackend
@@ -173,6 +218,14 @@ import {
   type ToolResultImageDeliveryDecision
 } from './toolResultImageDelivery'
 import { loadMemoryMedia } from './memory/memoryMedia'
+import { noteToolProgress, runAbortSignalOf } from './lateToolResults'
+import { parseCommandPattern } from './commandPatterns'
+import { readTypedFileToolsHost } from './typedFileToolsHost.server'
+import { typedFileToolsUnavailableReason } from '$lib/utils/typedFileToolsGrant'
+import {
+  agentTypedFileToolsValue,
+  buildTypedFileTools
+} from './typedFileTools'
 import {
   applyRecallMediaDelivery as applyRecallMediaDeliveryForLane,
   MEMORY_RECALL_CONTROL_ID
@@ -207,6 +260,7 @@ export type BatshitToolFamily = (typeof BATSHIT_TOOL_FAMILIES)[number]
 type BatshitToolSchemaMode = 'compact' | 'full' | 'none'
 
 type BatshitToolSearchInput = {
+  domain?: 'agent-settings'
   query?: string
   family?: BatshitToolFamily
   families?: BatshitToolFamily[]
@@ -264,16 +318,29 @@ type BatshitToolUseResponse = Record<string, any> & {
     | 'fabric_use'
     | 'agent_browser_use'
     | 'fetch_zip'
-  rendererFamily: 'generic_tool' | 'cli_tool'
+    | 'web_search'
+    | 'workers'
+    | 'skill_read'
+    | 'unknown_tool'
+    | 'subagent'
+  rendererFamily: 'generic_tool' | 'cli_tool' | 'web_search' | 'workers' | 'skill_read' | 'subagent'
 }
 
 export interface NativeToolContext {
+  /** Actual Primary only; never inherited by delegated tools or serialized. */
+  skillReadDelivery?: import('./skillReadDelivery').SkillReadDelivery
+  /** Fixed actual streaming Primary only; stripped from broker/model payloads. */
+  p5ApiRun?: import('./appActions/mcp/originalTask').P5ApiOriginalRun
   /** Originating API reply Stop, forwarded by the brain; not model or request data. */
   abortSignal?: AbortSignal
   /** Physical command owner, separate from the parent audit/approval identity. */
   processOwner?: HostCommandOwner
   /** Delegated record's own Bash grant, independent of merged model-preset settings. */
   delegatedBashEnabled?: boolean
+  /**
+   * A delegated record's materialized `typedFileToolsEnabled`; missing/null never grants access. Absent on a delegated run means its caller did not say, and the typed tools stay off.
+   */
+  delegatedTypedFileToolsValue?: boolean | null
   userId: string
   agentId?: string | null
   sessionId?: string
@@ -286,6 +353,15 @@ export interface NativeToolContext {
   allowFabricControlTools?: boolean
   /** SA-104 P3: PRIMARY actor + agent `memory_enabled`. Default false (memory is opt-in). */
   memoryControlsEnabled?: boolean
+  whiteboardControlsEnabled?: boolean
+  whiteboardSettingsSnapshot?: import('$lib/utils/reasoningRetention').ResolvedReasoningRetention
+  /** SA-137: the API Primary's resolved `live_file_reads`; only its own Bash proves reads (never a delegated run). */
+  liveFileReadsEnabled?: boolean
+  /**
+   * This turn runs Refreshed File Reads (the compile's `refreshedFileReadsTurn`, the same answer its
+   * zip rules follow): `edit_file` then leaves out its "fresh read" sentence. Unset everywhere else.
+   */
+  refreshedFileReadsTurn?: boolean
   /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. Default false. */
   dmControlsEnabled?: boolean
   /** SA-115 P2 (DL-115-10): PRIMARY actor + agent `dms_enabled`. Default false. */
@@ -390,13 +466,12 @@ const NATIVE_AUTOMATION_ACTIONS = [
 ] as const
 type NativeAutomationAction = (typeof NATIVE_AUTOMATION_ACTIONS)[number]
 type NativeAutomationMode = 'mode1' | 'mode2' | 'mode3' | 'mode4'
-type PublicPrimaryAgentType = 'n8n' | 'api' | 'cli'
+// Retired Primary types map to no mode and are refused by the context schema.
+type PublicPrimaryAgentType = 'api'
 type NativeAutomationActorType = 'primary' | 'subagent'
 
 const PUBLIC_PRIMARY_AGENT_TYPE_TO_NATIVE_MODE: Record<PublicPrimaryAgentType, NativeAutomationMode> = {
-  n8n: 'mode2',
-  api: 'mode3',
-  cli: 'mode4'
+  api: 'mode3'
 }
 
 const NATIVE_AUTOMATION_ERROR_CODES = [
@@ -477,10 +552,11 @@ const CONTROL_USE_INPUT_SCHEMA = z
 type ControlFindInput = z.infer<typeof CONTROL_FIND_INPUT_SCHEMA>
 type ControlUseInput = z.infer<typeof CONTROL_USE_INPUT_SCHEMA>
 
-const BATSHIT_TOOL_FAMILY_SCHEMA = z.enum(BATSHIT_TOOL_FAMILIES)
+const BATSHIT_TOOL_FAMILY_SCHEMA = z.preprocess((value) => normalizeBatshitToolFamily(value) ?? value, z.enum(BATSHIT_TOOL_FAMILIES))
 const BATSHIT_TOOL_SCHEMA_MODE_SCHEMA = z.enum(['compact', 'full', 'none'])
 
 const BATSHIT_TOOL_SEARCH_INPUT_SCHEMA = z.object({
+  domain: z.literal('agent-settings').optional(),
   query: z.string().optional(),
   family: BATSHIT_TOOL_FAMILY_SCHEMA.optional(),
   families: z.array(BATSHIT_TOOL_FAMILY_SCHEMA).optional(),
@@ -503,11 +579,35 @@ const BATSHIT_TOOL_USE_INPUT_SCHEMA = z
   })
   .passthrough()
 
+/**
+ * Josh (2026-10-23): what the API lane's model is offered, without the fields it almost never needs.
+ * `selectedToolIds` is server plumbing there (`withoutBrokerPlumbing` drops it); `selectedGateways`
+ * only narrows the turn's own MCP gateways and no bench run sent it; `allowRisky` is ignored on
+ * every chat lane (risk approval is server-owned consent); `params` and `includeSchema` repeat
+ * `input` and `schemaMode: "full"`. Tool Use stays pass-through, so a model that still sends
+ * `params` or `selectedGateways` is read as before. Tool Search is a plain object, so it now drops
+ * a sent `includeSchema` (compact results) and `selectedGateways` (no narrowing); neither widens. The dispatch keeps the full schemas
+ * (`NATIVE_AUTOMATION_INPUT_SCHEMAS`), where a caller's `selectedGateways` and `selectedToolIds`
+ * narrow the scope (BL-686).
+ */
+const BATSHIT_TOOL_SEARCH_API_INPUT_SCHEMA = BATSHIT_TOOL_SEARCH_INPUT_SCHEMA.omit({
+  includeSchema: true,
+  selectedGateways: true,
+  selectedToolIds: true
+})
+const BATSHIT_TOOL_USE_API_INPUT_SCHEMA = BATSHIT_TOOL_USE_INPUT_SCHEMA.omit({
+  params: true,
+  allowRisky: true,
+  selectedGateways: true,
+  selectedToolIds: true
+})
+
 const BATSHIT_TOOL_FAMILY_LABELS: Record<BatshitToolFamily, string> = {
   mcp: 'MCP',
   cli: 'CLI',
   artifact: 'Artifact',
   fabric: 'Fabric',
+  batshit: 'Utilities',
   agent_browser: 'Agent Browser'
 }
 
@@ -519,6 +619,7 @@ const BATSHIT_TOOL_OPERATION_KIND_BY_FAMILY: Record<
   cli: 'cli_tool',
   artifact: 'artifact_use',
   fabric: 'fabric_use',
+  batshit: 'fabric_use',
   agent_browser: 'agent_browser_use'
 }
 
@@ -675,24 +776,12 @@ function containerizedDockerSandboxLocalCliExplicitlyAllowed() {
   return resolveContainerizedDockerSandboxDriver() === 'local-cli'
 }
 
-type ContainerizedDockerSandboxDriver = 'operator' | 'local-cli' | 'disabled'
-
 function resolveContainerizedDockerSandboxDriver(): ContainerizedDockerSandboxDriver {
-  const raw = (
+  return normalizeContainerizedDockerSandboxDriver(
     env.BATSHIT_NATIVE_DOCKER_SANDBOX_DRIVER ??
     process.env.BATSHIT_NATIVE_DOCKER_SANDBOX_DRIVER ??
     ''
   )
-    .trim()
-    .toLowerCase()
-
-  if (raw === 'local-cli') return 'local-cli'
-  if (['disabled', 'disable', 'off', 'none', 'unavailable'].includes(raw)) return 'disabled'
-
-  // Dockerized Batshit treats Docker Sandbox as core infrastructure. The app
-  // still cannot run host Docker/Sandbox commands directly, so the built-in
-  // route is the authenticated host operator unless explicitly disabled.
-  return 'operator'
 }
 
 function containerizedDockerSandboxOperatorEnabled() {
@@ -1135,16 +1224,6 @@ type AgentBrowserBashCommandParts = {
   rest: string
 }
 
-const BASH_ACCESS_MODE_ALIASES: Record<string, NativeBashAccessMode> = {
-  plan: 'plan',
-  read_only: 'plan',
-  readonly: 'plan',
-  agent: 'agent',
-  workspace: 'agent',
-  dangerous: 'dangerous',
-  unrestricted: 'dangerous'
-}
-
 const DEFAULT_BASH_ACCESS_MODE: NativeBashAccessMode = 'agent'
 
 interface ManagedApplyPatchExecutionResult {
@@ -1152,6 +1231,31 @@ interface ManagedApplyPatchExecutionResult {
   operationsApplied: number
   touchedPaths: string[]
   message?: string
+  /** What the message adds to the count: the temporary copies Batshit could not remove. */
+  note?: string
+}
+
+/**
+ * BL-1916: a write failed part way through a patch and Batshit could not put every file back.
+ * `changedPaths` (absolute) are the files and folders left changed, so the result can name them
+ * and the dead-copy ledger can count them as edited.
+ */
+class ManagedApplyPatchPartialWriteError extends Error {
+  constructor(message: string, readonly changedPaths: string[]) {
+    super(message)
+    this.name = 'ManagedApplyPatchPartialWriteError'
+  }
+}
+
+/**
+ * BL-1987: the Stop came while the patch was being planned (paths resolved, files read, new
+ * contents computed), so nothing was written: the caller answers it as a Stop before any write.
+ */
+class ManagedApplyPatchStoppedError extends Error {
+  constructor() {
+    super('The patch was stopped before any write.')
+    this.name = 'ManagedApplyPatchStoppedError'
+  }
 }
 
 const SUBAGENT_NATIVE_TOOLS_BLOCKED_OVERRIDE_KEYS = new Set([
@@ -1231,10 +1335,9 @@ function normalizeBatshitToolFamily(value: unknown): BatshitToolFamily | null {
     case 'fabric':
     case 'control':
     case 'controls':
-    case 'batshit':
-    case 'batshit_tool':
-    case 'batshit_tools':
       return 'fabric'
+    case 'batshit':
+      return 'batshit'
     case 'agent_browser':
     case 'agentbrowser':
     case 'browser':
@@ -1268,17 +1371,24 @@ function resolveBatshitToolSearchFamilies(input: {
   unavailableFamilies: Array<{ family: BatshitToolFamily; reason: string }>
 } {
   const requested = new Set<BatshitToolFamily>()
-  const singleFamily = normalizeBatshitToolFamily(input.family)
-  if (singleFamily) requested.add(singleFamily)
+  const addRequested = (value: unknown) => {
+    const family = normalizeBatshitToolFamily(value)
+    if (!family) throw new Error('Invalid Batshit tool family. Use mcp, cli, artifact, fabric, batshit, or agent_browser; batshit_tool(s) aliases are retired.')
+    requested.add(family)
+  }
+  if (input.family !== undefined) addRequested(input.family)
+  if (input.families !== undefined && !Array.isArray(input.families)) {
+    throw new Error('Invalid Batshit tool families: expected an array.')
+  }
   if (Array.isArray(input.families)) {
     for (const entry of input.families) {
-      const family = normalizeBatshitToolFamily(entry)
-      if (family) requested.add(family)
+      addRequested(entry)
     }
   }
 
   const allowed = new Set(input.allowedFamilies)
-  const sourceFamilies = requested.size > 0 ? Array.from(requested) : input.allowedFamilies
+  const sourceFamilies = input.family !== undefined || input.families !== undefined
+    ? Array.from(requested) : input.allowedFamilies
   const unavailableFamilies: Array<{ family: BatshitToolFamily; reason: string }> = []
   const families = sourceFamilies.filter((family) => {
     if (allowed.has(family)) return true
@@ -1297,15 +1407,21 @@ export function parseBatshitToolRef(ref: string): { family: BatshitToolFamily; t
   const separatorIndex = trimmed.indexOf(':')
   if (separatorIndex <= 0 || separatorIndex === trimmed.length - 1) {
     throw new Error(
-      'Invalid Batshit tool ref. Expected an exact typed ref such as mcp:tool_name, cli:tool_id, artifact:use.artifact.slug, fabric:sys.artifact.apply_patch, or agent_browser:open.'
+      'Invalid Batshit tool ref. Expected an exact typed ref such as mcp:tool_name, cli:tool_id, artifact:use.artifact.slug, fabric:sys.artifact.apply_patch, batshit:sys.judge.ask, or agent_browser:open.'
     )
   }
   const family = normalizeBatshitToolFamily(trimmed.slice(0, separatorIndex))
   const target = trimmed.slice(separatorIndex + 1).trim()
   if (!family || !target) {
     throw new Error(
-      'Invalid Batshit tool ref. The ref must start with mcp:, cli:, artifact:, fabric:, or agent_browser: and include a non-empty target.'
+      'Invalid Batshit tool ref. The ref must start with mcp:, cli:, artifact:, fabric:, batshit:, or agent_browser: and include a non-empty target; batshit_tool(s): aliases are retired.'
     )
+  }
+  if (family === 'fabric' && isBatshitUtilityControlId(target)) {
+    throw new Error(`This utility requires the canonical ref batshit:${target}; fabric: and control(s): do not target utilities.`)
+  }
+  if (family === 'batshit' && !isBatshitUtilityControlId(target)) {
+    throw new Error('Invalid batshit: ref. Utilities are exactly sys.judge.ask, sys.mcp.dynamic.find, and sys.mcp.dynamic.use; use fabric: for Batshit controls.')
   }
   return { family, target }
 }
@@ -1314,61 +1430,9 @@ function buildBatshitToolRef(family: BatshitToolFamily, target: string): string 
   return `${family}:${target}`
 }
 
-function stringifyForCompactHint(value: unknown): string {
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return String(value ?? '')
-  }
-}
-
-function schemaTypeLabel(schema: Record<string, any> | undefined): string {
-  if (!schema || typeof schema !== 'object') return 'value'
-  if (Array.isArray(schema.enum) && schema.enum.length > 0) {
-    return schema.enum.map((entry) => stringifyForCompactHint(entry)).join(' | ')
-  }
-  if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
-    return schema.oneOf
-      .map((entry: unknown) => schemaTypeLabel(entry as Record<string, any>))
-      .filter(Boolean)
-      .join(' | ')
-  }
-  if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
-    return schema.anyOf
-      .map((entry: unknown) => schemaTypeLabel(entry as Record<string, any>))
-      .filter(Boolean)
-      .join(' | ')
-  }
-  if (schema.type === 'array') {
-    return `array<${schemaTypeLabel(schema.items as Record<string, any> | undefined)}>`
-  }
-  return typeof schema.type === 'string' ? schema.type : 'value'
-}
-
 function buildCompactJsonSchemaHint(inputSchema: unknown): string | undefined {
   if (!inputSchema || typeof inputSchema !== 'object' || Array.isArray(inputSchema)) return undefined
-  const schema = inputSchema as Record<string, any>
-  const properties =
-    schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
-      ? (schema.properties as Record<string, any>)
-      : {}
-  const required = new Set(
-    Array.isArray(schema.required)
-      ? schema.required.filter((entry: unknown): entry is string => typeof entry === 'string')
-      : []
-  )
-  const fields = Object.entries(properties).slice(0, 8).map(([fieldName, field]) => {
-    const fieldSchema = field && typeof field === 'object' ? (field as Record<string, any>) : {}
-    const requiredMarker = required.has(fieldName) ? 'required' : 'optional'
-    return `${fieldName}: ${schemaTypeLabel(fieldSchema)} ${requiredMarker}`
-  })
-  if (fields.length === 0) {
-    return schema.type === 'object'
-      ? 'input: object; use schemaMode="full" if the fields are unclear.'
-      : undefined
-  }
-  const suffix = Object.keys(properties).length > fields.length ? ', ...' : ''
-  return `input: { ${fields.join(', ')}${suffix} }`
+  return getSchemaHintText(buildSchemaSummary(inputSchema, getDefaultSchemaHintCaps())) ?? 'full schema required'
 }
 
 /**
@@ -1384,6 +1448,7 @@ function buildCompactJsonSchemaHint(inputSchema: unknown): string | undefined {
  * server adds its own. A new server-set key goes here, or the model can set it.
  */
 const BATSHIT_BROKER_PLUMBING_KEYS = [
+  'p5ApiRun',
   'selectedGateways',
   'mcpGatewayScope',
   'mcp_gateway_scope',
@@ -1411,6 +1476,22 @@ const BATSHIT_BROKER_PLUMBING_KEYS = [
   // SA-117 / PR #106 review F-1: the lane and the delegated flag are server-set plumbing
   // too — leaving them out of this list shipped `actorType` into every MCP tool's input.
   'actorType',
+  'apiUtilityScope',
+  'apiUtilityInvocation',
+  'controlActorType',
+  'ownedPrimaryPreview',
+  'primarySettingsActor',
+  'portableSettingsActor',
+  'settingsNativeGate',
+  'settingsAuthorityFence',
+  'settingsAuthorityCheck',
+  'settingsPolicyConsent',
+  'settingsPreview',
+  'originatingReply',
+  'whiteboardControlsEnabled',
+  'whiteboardSettingsSnapshot',
+  'liveFileReadsEnabled',
+  'refreshedFileReadsTurn',
   'delegatedRun',
   'processOwner',
   // BL-186: a delegated run's scope id is server-set plumbing too, never a control's payload.
@@ -2334,43 +2415,11 @@ function normalizeExaSearchType(value: unknown): ExaSearchType | null {
 }
 
 function normalizeBashAccessMode(value: unknown): NativeBashAccessMode | null {
-  if (typeof value !== 'string') return null
-  const normalized = value.trim().toLowerCase()
-  if (!normalized) return null
-  return BASH_ACCESS_MODE_ALIASES[normalized] ?? null
+  return normalizeNativeBashAccessMode(value)
 }
 
 function toLegacyBashPolicyMode(mode: NativeBashAccessMode): LegacyNativeToolPolicyMode {
   return mode === 'plan' ? 'read_only' : 'workspace'
-}
-
-function parseCommandPattern(pattern: string): RegExp | null {
-  const trimmed = pattern.trim()
-  if (!trimmed) return null
-
-  if (trimmed.startsWith('re:')) {
-    try {
-      return new RegExp(trimmed.slice(3).trim(), 'i')
-    } catch {
-      return null
-    }
-  }
-
-  if (trimmed.startsWith('/') && trimmed.lastIndexOf('/') > 0) {
-    const lastSlash = trimmed.lastIndexOf('/')
-    const source = trimmed.slice(1, lastSlash)
-    const flags = trimmed.slice(lastSlash + 1)
-    try {
-      return new RegExp(source, flags || 'i')
-    } catch {
-      return null
-    }
-  }
-
-  const escaped = trimmed
-    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    .replace(/\\\*/g, '.*')
-  return new RegExp(`^\\s*${escaped}(\\s|$)`, 'i')
 }
 
 function commandMatchesPattern(command: string, pattern: string): boolean {
@@ -2382,6 +2431,110 @@ function commandMatchesPattern(command: string, pattern: string): boolean {
 function commandMatchesAnyPattern(command: string, patterns?: string[] | null): boolean {
   if (!patterns || patterns.length === 0) return false
   return patterns.some((pattern) => commandMatchesPattern(command, pattern))
+}
+
+function commandMatchesAnyDenyPattern(command: string, patterns?: string[] | null): boolean {
+  if (commandMatchesAnyPattern(command, patterns)) return true
+  const componentPatterns = patterns?.filter((pattern) => {
+    const trimmed = pattern.trim()
+    return trimmed.length > 0 && !trimmed.startsWith('re:') &&
+      !(trimmed.startsWith('/') && trimmed.lastIndexOf('/') > 0)
+  })
+  if (!componentPatterns?.length) return false
+
+  // Deny simple patterns at real command boundaries without widening Auto Allow
+  // or changing explicit regex semantics. Shell data is never split into lines.
+  const source = isManagedApplyPatchCommand(command)
+    ? buildManagedApplyPatchPolicyScanText(command, '')
+    : command
+  return componentsMatchDenyPattern(source, componentPatterns, 0)
+}
+
+/** Nesting deeper than any real command uses is refused rather than left unread (BL-1981). */
+const DENY_SCAN_MAX_DEPTH = 16
+
+/**
+ * BL-1981 (2026-10-21): a deny pattern is checked on every command the shell runs, not only the
+ * top-level ones: each component as written and as the shell reads it, and, recursively, the
+ * commands inside its command substitutions. Before, `echo $(touch ran.txt)` ran past a plain
+ * Never Allow entry `touch ran.txt` (as did backticks, and `'touch' ran.txt`, `\touch ran.txt` or
+ * `X=1 touch ran.txt`, whose text does not start with the program the shell runs). Deny only:
+ * Auto Allow keeps its whole-input matching (`isAgentModeAutoAllowedCommand`).
+ */
+function componentsMatchDenyPattern(source: string, patterns: string[], depth: number): boolean {
+  if (depth > DENY_SCAN_MAX_DEPTH) return true
+  // BL-1992: bash and zsh quote two forms differently (`ShellLexDialect`), and each reading can hide
+  // a command the other runs, so a command either shell would run counts. A substitution both
+  // readings find is read once, so the two readings never double the work at each level.
+  const inner = new Set<string>()
+  for (const dialect of shellDialectsFor(source)) {
+    for (const component of lexShellCommands(source, { dialect })) {
+      if (denyComponentTexts(source, component).some((text) => commandMatchesAnyPattern(text, patterns))) return true
+      for (const text of commandsInsideSubstitutions(component, dialect)) inner.add(text)
+    }
+  }
+  return [...inner].some((text) => componentsMatchDenyPattern(text, patterns, depth + 1))
+}
+
+/**
+ * The shell's own words that can stand before the program a component runs (BL-1981 review):
+ * `! touch x`, `time touch x`, `{ touch x; }`, `if touch x; then`, `do touch x`. Quoted ones are
+ * skipped too: a quoted `'time'` runs `/usr/bin/time`, which runs the program after it, and the
+ * others are no program at all.
+ */
+const DENY_LEADING_RESERVED_WORDS = new Set(['!', 'time', 'coproc', '{', 'if', 'then', 'else', 'elif', 'while', 'until', 'do'])
+/** Reserved words that take one more word before the program: `function NAME {`, zsh `repeat N`. */
+const DENY_LEADING_RESERVED_WORDS_WITH_ARGUMENT = new Set(['function', 'repeat'])
+
+/**
+ * One component as written, and as the shell reads it: from the program it runs (after `NAME=value`
+ * assignments and the reserved words before it), with quotes and backslashes removed, words joined
+ * by one space; and, for a program given by a path (`/usr/bin/touch`, `./touch`, zsh `=touch`), the
+ * same with the program's own name.
+ */
+function denyComponentTexts(source: string, component: ShellLexCommand): string[] {
+  const written = source.slice(component.start, component.end)
+  const words = component.words
+  // BL-1992 review: zsh ends a command at a bare `}` anywhere and opens a group at a bare `{` after
+  // a condition (`{ :; } always { touch x }`, `while [[ 1 ]] { touch x }`, `{ touch x }`), so the
+  // words after each one are read as a command too. In bash they are arguments, read in excess.
+  const starts = [0, ...words.flatMap((word, at) => (/^[{}]$/.test(source.slice(word.start, word.end)) ? [at + 1] : []))]
+  const reads = new Set(starts.flatMap((start) => programReads(words, start)))
+  return [written, ...[...reads].filter((text) => text !== written)]
+}
+
+/** The words from `start` as the shell reads them (`denyComponentTexts`); none when no program follows. */
+function programReads(words: ShellLexCommand['words'], start: number): string[] {
+  let index = start
+  while (index < words.length) {
+    const word = words[index].text
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) index += 1
+    else if (word === 'time' && words[index + 1]?.text === '-p') index += 2
+    // bash `coproc NAME { … }`: the name is not the program.
+    else if (word === 'coproc' && words[index + 2]?.text === '{') index += 2
+    else if (DENY_LEADING_RESERVED_WORDS.has(word)) index += 1
+    else if (DENY_LEADING_RESERVED_WORDS_WITH_ARGUMENT.has(word) && index + 1 < words.length) index += 2
+    else break
+  }
+  if (index >= words.length) return []
+  const run = words.slice(index).map((word) => word.text)
+  const program = run[0]
+  const named = program.startsWith('=') ? program.slice(1) : program.includes('/') ? program.slice(program.lastIndexOf('/') + 1) : ''
+  return [run.join(' '), ...(named ? [[named, ...run.slice(1)].join(' ')] : [])]
+}
+
+/**
+ * The commands the shell runs inside a component's words: its `$(…)` and backtick substitutions
+ * (in any word, an assignment, or a redirect target, double-quoted or not) and those in the body
+ * of a heredoc whose delimiter is unquoted. A process substitution (`<(…)`) is a component of its
+ * own already; single-quoted and quoted-heredoc text is data, never read.
+ */
+function commandsInsideSubstitutions(component: ShellLexCommand, dialect: ShellLexDialect): string[] {
+  const words = [...component.words, ...component.redirects.flatMap((redirect) => (redirect.target ? [redirect.target] : []))]
+  return [
+    ...words.flatMap((word) => word.substitutions),
+    ...component.heredocs.filter((heredoc) => !heredoc.quoted).flatMap((heredoc) => substitutionsInExpandedText(heredoc.body, { dialect }))
+  ]
 }
 
 function getPythonSafetyViolationReason(command: string): string | null {
@@ -2413,6 +2566,8 @@ function isMarkdownPath(filePath: string | undefined | null): boolean {
 }
 
 const PROTECTED_SYSTEM_SKILL_PATH_SEGMENTS = [
+  '/batshit-app/src/lib/server/system-plugins/',
+  '/src/lib/server/system-plugins/',
   '/batshit-app/src/lib/server/system-skills/',
   '/src/lib/server/system-skills/'
 ]
@@ -2642,15 +2797,16 @@ function resolveProtectedSystemSkillCacheRoots(seedPaths: Array<string | null | 
   const roots = new Set<string>()
 
   for (const repoRoot of protectedRepoRoots) {
-    const systemSkillsRoot = path.join(repoRoot, 'batshit-app', 'src', 'lib', 'server', 'system-skills')
+    const systemSkillsRoot = path.join(repoRoot, 'batshit-app', 'src', 'lib', 'server', 'system-plugins', 'batshit', 'skills')
     if (!existsSync(systemSkillsRoot)) continue
 
     for (const entry of readdirSync(systemSkillsRoot, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue
-
+      const builtin = BUILTIN_PLUGIN_SKILLS.find((skill) => skill.directory === entry.name)
       const candidates = new Set<string>([
         entry.name,
-        normalizeSystemSkillRuntimeId(entry.name)
+        normalizeSystemSkillRuntimeId(entry.name),
+        ...(builtin ? [builtin.skillId, builtin.legacyDirectory, normalizeSystemSkillRuntimeId(builtin.legacyDirectory)] : [])
       ])
 
       for (const candidate of candidates) {
@@ -2706,6 +2862,225 @@ async function captureMappedTextFileSnapshot(options: {
   } catch {
     return null
   }
+}
+
+/** BL-1652: the mapper's answers a multi-file read can hide behind (its last command decides). */
+const SHELL_READ_SPLIT_REASONS = new Set(['read-command', 'read-piped-into-search', 'list-command', 'search-command', 'fallback-command'])
+/** A file larger than this is never re-read for a split (a run keeps at most 120,000 characters). */
+const MAX_SHELL_READ_SPLIT_FILE_BYTES = 4 * MAX_BASH_OUTPUT_CHARS
+
+type ShellReadSplitFile = { file: string; realPath: string; signature: string }
+type PreparedShellReadSplit = { plan: ShellReadSplitPlan; files: ShellReadSplitFile[] }
+
+/** What a file was before the run: a change by the command itself (an append, a rewrite) shows here. */
+async function shellReadFileSignature(realPath: string): Promise<string | null> {
+  try {
+    const details = await stat(realPath, { bigint: true })
+    if (!details.isFile()) return null
+    return [details.dev, details.ino, details.size, details.mtimeNs, details.ctimeNs].join(':')
+  } catch {
+    return null
+  }
+}
+
+/**
+ * BL-1652, before the run: the plan for splitting a multi-file read's output (`shellReadSplit.ts`)
+ * and, for every file it names, the real path and what the file is now. Null when there is nothing
+ * to split or a file is not a regular file inside the workspace.
+ */
+async function prepareShellReadSplit(options: {
+  command: string
+  cwd: string
+  workspaceRoot: string
+}): Promise<PreparedShellReadSplit | null> {
+  const plan = planShellReadSplit(options.command)
+  if (!plan) return null
+  const lexicalRoot = path.resolve(options.workspaceRoot)
+  const resolvedRoot = (await getSafeRealPath(lexicalRoot)) ?? lexicalRoot
+  const base = plan.cdDir ? path.resolve(options.cwd, plan.cdDir) : options.cwd
+  const files: ShellReadSplitFile[] = []
+  for (const file of plan.files) {
+    const realPath = await getSafeRealPath(path.resolve(base, file))
+    if (!realPath || !isPathWithinRoot(realPath, resolvedRoot)) return null
+    const signature = await shellReadFileSignature(realPath)
+    if (!signature) return null
+    files.push({ file, realPath, signature })
+  }
+  return { plan, files }
+}
+
+/**
+ * BL-1652, after the run: which part of a clean run's stdout each file it read is, proven against
+ * the files, or undefined. Only a run that exited 0, was not cut, timed out or stopped, and printed
+ * nothing on stderr is split, and only when every file is unchanged since before the run (the
+ * command did not write to what it printed), is text, and is no larger than the cap. The zip
+ * adapter stores one zip per part. The API lane's model never sees the offsets
+ * (`formatBashResultForModel`); only the in-process API tool asks for them, so the Workflow
+ * Subagent dispatch and the skill script runner return results without them.
+ */
+async function finishShellReadSplit(
+  prepared: PreparedShellReadSplit | null,
+  run: { exitCode: number | null; timedOut: boolean; stopped?: boolean; truncated?: boolean; stdout: string; stderr: string },
+  /** SA-137: told each file's text as read, for the live-read proof of the parts. */
+  onContents?: (contents: ReadonlyMap<string, string | null>) => void
+): Promise<ShellReadSplit | undefined> {
+  if (!prepared) return undefined
+  if (run.exitCode !== 0 || run.timedOut || run.stopped || run.truncated || run.stderr || !run.stdout) return undefined
+  const contents = new Map<string, string | null>()
+  for (const { file, realPath, signature } of prepared.files) {
+    if ((await shellReadFileSignature(realPath)) !== signature) return undefined
+    try {
+      const details = await stat(realPath)
+      if (details.size === 0) {
+        contents.set(file, '')
+        continue
+      }
+      const bytes = await readFileWithinLimit(realPath, MAX_SHELL_READ_SPLIT_FILE_BYTES)
+      if (!bytes || bytes.includes(0)) return undefined
+      // And still unchanged after the read, so the text is the file's text at the run.
+      if ((await shellReadFileSignature(realPath)) !== signature) return undefined
+      contents.set(file, bytes.toString('utf8'))
+    } catch {
+      return undefined
+    }
+  }
+  const split = matchShellReadSplit(prepared.plan, run.stdout, contents) ?? undefined
+  if (split) onContents?.(contents)
+  return split
+}
+
+// ---------------------------------------------------------------------------------------------
+// SA-137: live file reads. When the agent's `live_file_reads` is on, the API lane's Bash tool also
+// proves which file and form each read showed, so a later turn start can show that file again
+// (`fileReadSource`, written by the zip adapter). With the setting off nothing is proven, read or
+// added to the result.
+
+/** The live-read envelope (SA-137): the split's byte cap and a run's character cap. */
+const MAX_FILE_READ_PROOF_CHARS = MAX_BASH_OUTPUT_CHARS
+
+type PreparedFileReadProof = {
+  workspaceRoot: string
+  rootIdentity: string
+  cwd: string
+  /** A one-file read, found before the run; null when the run is a split. */
+  single: { file: string; base: string; realPath: string; signature: string; locator: string; view: FileReadView } | null
+}
+
+/** `<dev>:<ino>` of the workspace root: continuity evidence for a later compile, never permission. */
+async function workspaceRootIdentity(root: string): Promise<string | null> {
+  try {
+    const details = await stat(root, { bigint: true })
+    return details.isDirectory() ? `${details.dev}:${details.ino}` : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The file's path inside the root, or null. The file's own path holds no link: its real path is
+ * its path from the (real) folder the command read it from, so a later refresh reads the same
+ * place and never follows a link the read went through.
+ */
+async function fileReadLocator(root: string, base: string, file: string, realPath: string): Promise<string | null> {
+  const realBase = await getSafeRealPath(base)
+  if (!realBase || path.resolve(realBase, file) !== realPath || !isPathWithinRoot(realPath, root)) return null
+  const locator = path.relative(root, realPath).split(path.sep).join('/')
+  return isFileReadLocator(locator) ? locator : null
+}
+
+async function prepareFileReadProof(options: {
+  command: string
+  cwd: string
+  workspaceRoot: string
+  split: PreparedShellReadSplit | null
+}): Promise<PreparedFileReadProof | null> {
+  const lexicalRoot = path.resolve(options.workspaceRoot)
+  const root = (await getSafeRealPath(lexicalRoot)) ?? lexicalRoot
+  const rootIdentity = await workspaceRootIdentity(root)
+  if (!rootIdentity) return null
+  if (options.split) {
+    return readsWithoutShellWrapper(options.command) ? { workspaceRoot: root, rootIdentity, cwd: options.cwd, single: null } : null
+  }
+  const plan = planSingleFileRead(options.command)
+  if (!plan) return null
+  const base = plan.cdDir ? path.resolve(options.cwd, plan.cdDir) : options.cwd
+  const realPath = await getSafeRealPath(path.resolve(base, plan.file))
+  if (!realPath) return null
+  const locator = await fileReadLocator(root, base, plan.file, realPath)
+  const signature = locator ? await shellReadFileSignature(realPath) : null
+  if (!locator || !signature) return null
+  return { workspaceRoot: root, rootIdentity, cwd: options.cwd, single: { file: plan.file, base, realPath, signature, locator, view: plan.view } }
+}
+
+/** A file's text for the proof: UTF-8 with no NUL or replacement character, within the envelope. */
+function proofText(text: string | null | undefined): text is string {
+  return typeof text === 'string' && text.length <= MAX_FILE_READ_PROOF_CHARS && !/[\0\uFFFD]/.test(text)
+}
+
+/**
+ * After the run: each read whose output is exactly what its view prints of the file's text, read
+ * after the run with the file unchanged from before it to after the read. Only a clean run counts
+ * (exit 0, not cut, timed out or stopped, nothing on stderr). Undefined when no read is proven.
+ */
+async function finishFileReadProof(
+  prepared: PreparedFileReadProof | null,
+  run: { exitCode: number | null; timedOut: boolean; stopped?: boolean; truncated?: boolean; stdout: string; stderr: string },
+  owner: { userId: string; agentId: string; sessionId: string; messageId: string; toolCallId: string },
+  backend: string,
+  split: { prepared: PreparedShellReadSplit; result: ShellReadSplit; contents: ReadonlyMap<string, string | null> } | null
+): Promise<FileReadProof | undefined> {
+  if (!prepared) return undefined
+  if (run.exitCode !== 0 || run.timedOut || run.stopped || run.truncated || run.stderr) return undefined
+  const reads: FileReadProof['reads'] = []
+
+  if (prepared.single) {
+    const { file, realPath, signature, locator, view } = prepared.single
+    try {
+      if ((await shellReadFileSignature(realPath)) !== signature) return undefined
+      const details = await stat(realPath)
+      let text = ''
+      if (details.size > 0) {
+        const bytes = await readFileWithinLimit(realPath, MAX_SHELL_READ_SPLIT_FILE_BYTES)
+        if (!bytes || bytes.includes(0)) return undefined
+        text = bytes.toString('utf8')
+      }
+      if ((await shellReadFileSignature(realPath)) !== signature) return undefined
+      if (!proofText(text) || emulateFileReadView(view, text) !== run.stdout) return undefined
+    } catch {
+      return undefined
+    }
+    reads.push({ part: null, file, locator, view })
+  } else if (split) {
+    // The split proved each part with the same emulation; each part is checked again by its view.
+    const views = readSplitViews(split.prepared.plan)
+    const base = split.prepared.plan.cdDir ? path.resolve(prepared.cwd, split.prepared.plan.cdDir) : prepared.cwd
+    let readIndex = 0
+    for (const [part, entry] of split.result.parts.entries()) {
+      if (entry.kind !== 'read') continue
+      const planned = views[readIndex++]
+      if (!planned?.view || planned.file !== entry.path) continue
+      const text = split.contents.get(entry.path)
+      const realPath = split.prepared.files.find((candidate) => candidate.file === entry.path)?.realPath
+      if (!realPath || !proofText(text)) continue
+      if (emulateFileReadView(planned.view, text) !== run.stdout.slice(entry.start, entry.end)) continue
+      const locator = await fileReadLocator(prepared.workspaceRoot, base, entry.path, realPath)
+      if (locator) reads.push({ part, file: entry.path, locator, view: planned.view })
+    }
+  }
+
+  if (reads.length === 0) return undefined
+  if (backend !== 'local' && backend !== 'apple_container' && backend !== 'docker_sandbox') return undefined
+  return sealFileReadProof({
+    version: FILE_READ_SOURCE_VERSION,
+    ...owner,
+    backend,
+    workspaceRoot: prepared.workspaceRoot,
+    rootIdentity: prepared.rootIdentity,
+    cwd: prepared.cwd,
+    reads,
+    // A Bash read is proven only while live file reads are on (`proveFileReadSource`).
+    liveReadsOn: true
+  })
 }
 
 function isProtectedSystemSkillPath(
@@ -2774,7 +3149,7 @@ function getProtectedSystemSkillWriteViolationReason(options: {
     if (isProtectedSystemSkillPath(targetPath, options.cwd, [options.workspaceRoot])) {
       return (
         'Batshit system skill bundles are protected from in-app bash edits, including any stale runtime cache copies. ' +
-        'Update files under batshit-app/src/lib/server/system-skills/ from the external coding workspace instead.'
+        'Update files under batshit-app/src/lib/server/system-plugins/batshit/ from the external coding workspace instead.'
       )
     }
   }
@@ -2788,7 +3163,7 @@ function getProtectedSystemSkillWriteViolationReason(options: {
   if (shellViolationRoot) {
     return (
       'Batshit system skill bundles are protected from in-app bash edits, including any stale runtime cache copies. ' +
-      'Update files under batshit-app/src/lib/server/system-skills/ from the external coding workspace instead.'
+      'Update files under batshit-app/src/lib/server/system-plugins/batshit/ from the external coding workspace instead.'
     )
   }
 
@@ -3249,153 +3624,611 @@ function getReadOnlyShellCommandViolation(command: string): string | null {
   return getReadOnlyShellWordsViolation(tokenizeShellPolicyWords(command))
 }
 
+/**
+ * BL-2006: each read and write of a managed patch goes through the anchored writer; this bounds one
+ * step (a 64 MiB file included).
+ */
+const MANAGED_PATCH_HELPER_CALL = { timeoutMs: 60_000 }
+
+/**
+ * The real path of `target` as far as it exists: the nearest existing folder's real path plus the
+ * names below it that do not exist yet. Planning only: it follows links inside the workspace, and
+ * every read and write then names the real path to the anchored writer, which follows nothing.
+ */
+async function realPathAsFarAsItExists(target: string, rawPath: string): Promise<string> {
+  let existingAncestor = target
+  const missingSegments: string[] = []
+  for (;;) {
+    const resolvedAncestor = await getSafeRealPath(existingAncestor)
+    if (resolvedAncestor) return path.resolve(resolvedAncestor, ...missingSegments)
+    const unresolvedInfo = await lstat(existingAncestor).catch(() => null)
+    // One message for both: a sandboxed agent must not learn whether a host path exists.
+    if (unresolvedInfo) throw new Error(managedPatchOutsideMessage(rawPath))
+    const parent = path.dirname(existingAncestor)
+    if (parent === existingAncestor) return target
+    missingSegments.unshift(path.basename(existingAncestor))
+    existingAncestor = parent
+  }
+}
+
+function managedPatchOutsideMessage(rawPath: string): string {
+  return `Patch target "${rawPath}" is outside the allowed workspace root or cannot be resolved safely.`
+}
+
+/** `candidate` relative to `root` with `/` separators, or null when it is the root or outside it. */
+function relativeBeneathRoot(candidate: string, root: string): string | null {
+  if (candidate === root || !isPathWithinRoot(candidate, root)) return null
+  return path.relative(root, candidate).split(path.sep).join('/')
+}
+
+interface ManagedPatchPath {
+  /** The path as the patch names it (lexical), for messages and the result. */
+  absolutePath: string
+  relativePath: string
+  /** The real path a read or write reaches (through a link, the link's target). */
+  realPath: string
+  /**
+   * BL-2006: relative to the admitted root, with no link in them: `entry` is the entry itself (a
+   * removal moves a link, never its target), `content` what reading or writing it reaches.
+   */
+  entry: string
+  content: string
+}
+
 async function resolveManagedPatchPath(options: {
   rawPath: string
   cwd: string
   workspaceRoot: string
-}): Promise<{ absolutePath: string; relativePath: string; exists: boolean }> {
+  /** The real path of the root the anchored writer admitted. */
+  resolvedRoot: string
+}): Promise<ManagedPatchPath> {
   const lexicalRoot = path.resolve(options.workspaceRoot)
-  const resolvedRoot = (await getSafeRealPath(lexicalRoot)) ?? lexicalRoot
   const absolutePath = path.resolve(options.cwd, options.rawPath)
-  let existingAncestor = absolutePath
-  const missingSegments: string[] = []
-  let realTargetPath: string | null = null
-  for (;;) {
-    const resolvedAncestor = await getSafeRealPath(existingAncestor)
-    if (resolvedAncestor) {
-      realTargetPath = path.resolve(resolvedAncestor, ...missingSegments)
-      break
-    }
-    const unresolvedInfo = await lstat(existingAncestor).catch(() => null)
-    if (unresolvedInfo) {
-      throw new Error(
-        `Patch target "${options.rawPath}" contains an existing path that cannot be resolved safely.`
-      )
-    }
-    const parent = path.dirname(existingAncestor)
-    if (parent === existingAncestor) break
-    missingSegments.unshift(path.basename(existingAncestor))
-    existingAncestor = parent
+  const realTargetPath = await realPathAsFarAsItExists(absolutePath, options.rawPath)
+  if (realTargetPath === options.resolvedRoot) {
+    throw new Error(`Patch target "${options.rawPath}" is the workspace folder itself, not a file.`)
   }
-  realTargetPath ??= absolutePath
-  if (!isPathWithinRoot(realTargetPath, resolvedRoot)) {
-    throw new Error(`Patch target "${options.rawPath}" is outside the allowed workspace root.`)
-  }
-
-  let exists = false
-  try {
-    await stat(absolutePath)
-    exists = true
-  } catch {
-    exists = false
-  }
+  const content = relativeBeneathRoot(realTargetPath, options.resolvedRoot)
+  const realEntryPath = path.join(
+    await realPathAsFarAsItExists(path.dirname(absolutePath), options.rawPath),
+    path.basename(absolutePath)
+  )
+  const entry = relativeBeneathRoot(realEntryPath, options.resolvedRoot)
+  if (content === null || entry === null) throw new Error(managedPatchOutsideMessage(options.rawPath))
 
   const relativeRaw = path.relative(lexicalRoot, absolutePath)
   const relativePath = (relativeRaw || path.basename(absolutePath)).split(path.sep).join('/')
 
-  return {
-    absolutePath,
-    relativePath,
-    exists
+  return { absolutePath, relativePath, realPath: realTargetPath, entry, content }
+}
+
+/**
+ * BL-1916: what a patch target held before the patch. `bytes` is the file's content (through the
+ * link, for a link) when the patch reads it to update it, so a write in place can be undone; a
+ * removal moves the file or link itself aside, so nothing else is read (a large file is never
+ * loaded to delete it).
+ */
+type ManagedPatchOriginal = { kind: 'absent' } | { kind: 'file' | 'symlink'; bytes: Buffer | null }
+
+interface ManagedPatchTarget {
+  absolutePath: string
+  relativePath: string
+  /** BL-2006: the real paths relative to the admitted root (`ManagedPatchPath`). */
+  entry: string
+  content: string
+  original: ManagedPatchOriginal
+}
+
+type ManagedPatchWriteStep =
+  | { kind: 'write'; target: ManagedPatchTarget; content: string }
+  | { kind: 'remove'; target: ManagedPatchTarget }
+
+const MANAGED_PATCH_NOTHING_WRITTEN = 'Nothing was written: Batshit applies a patch only when all of it applies.'
+
+function fileErrorCode(error: unknown): string | undefined {
+  return error && typeof error === 'object' ? (error as NodeJS.ErrnoException).code : undefined
+}
+
+/** BL-2006: what an anchored refusal means, in words a model can act on. */
+function describeAnchoredRefusal(error: unknown): string {
+  if (error instanceof AnchoredWriteError) {
+    switch (error.code) {
+      case 'ELOOP':
+      case 'EXDEV':
+      case 'confined-open':
+        return 'a folder in its path changed into a link, or it leads outside the workspace or onto another disk'
+      case 'ordinary-bounded-file':
+        return 'it is not a regular file, or it is over 64 MiB'
+      case 'changed-or-oversize':
+        return 'it changed while Batshit read it'
+      case 'ENOTDIR':
+        return 'a folder in its path is now a file'
+      case 'ENOTREG':
+        return 'it is not a regular file'
+      case 'EFBIG':
+        return error.stage === 'request' ? 'it is over 64 MiB' : 'it is too large for the disk or a file size limit'
+      case 'EEXIST':
+        return 'a file is already at that name: one that appeared after the patch was planned, or the same name in another letter case'
+      case 'ENOSPC':
+      case 'EDQUOT':
+        return 'the disk is full'
+      case 'EOTHER':
+        return 'the disk refused it'
+      case 'EAGAIN':
+        return 'its folders changed while Batshit resolved them; send the patch again'
+      case 'relative-path':
+      case 'write-input':
+      case 'rename-input':
+        return 'the path is not a plain path inside the workspace'
+      default:
+        return error.code
+    }
+  }
+  return error instanceof Error && error.message ? error.message : String(error)
+}
+
+/** Every path a rollback would have put back, when no writer can do it: all are left changed. */
+function managedPatchLoggedPaths(log: ManagedPatchWriteLog): string[] {
+  const left = [
+    ...log.created.map(({ target }) => target.absolutePath),
+    ...log.uncertain.map(({ target }) => target.absolutePath),
+    ...log.createdFolders.map((folder) => folder.absolutePath),
+    ...log.asides.flatMap(({ target, absolutePath }) => [target.absolutePath, absolutePath]),
+    ...log.written.filter((target) => target.original.kind !== 'absent' && target.original.bytes).map((target) => target.absolutePath)
+  ]
+  return [...new Set(left)]
+}
+
+/** The anchored writer refused at the folders or at the last name: nothing at the path changed. */
+function refusedBeforeAnyByte(error: unknown): boolean {
+  return error instanceof AnchoredWriteError && ['request', 'input', 'parent', 'leaf'].includes(error.stage)
+}
+
+/**
+ * `not-a-file`: a folder, a device or a socket; `parent-is-a-file`: a folder in the path is a file.
+ * `entry` is the entry as the anchored writer saw it while the patch was planned.
+ */
+async function readManagedPatchOriginal(
+  writer: AnchoredProjectWriter,
+  entry: AnchoredEntryStat,
+  resolved: ManagedPatchPath,
+  rawPath: string,
+  readContent: boolean
+): Promise<ManagedPatchOriginal | 'not-a-file' | 'parent-is-a-file'> {
+  if (entry.type === 'parent-not-a-folder') return 'parent-is-a-file'
+  if (entry.type === 'absent') return { kind: 'absent' }
+  if (entry.type !== 'file' && entry.type !== 'link') return 'not-a-file'
+  let bytes: Buffer | null = null
+  if (readContent) {
+    try {
+      bytes = (await writer.readFile(resolved.content, ANCHORED_WRITE_MAX_BYTES, MANAGED_PATCH_HELPER_CALL)).bytes
+    } catch (error) {
+      throw new Error(`Cannot read "${rawPath}": ${describeAnchoredRefusal(error)}.`)
+    }
+  }
+  return { kind: entry.type === 'link' ? 'symlink' : 'file', bytes }
+}
+
+/** A hidden sibling name a removed file or link waits under until the patch has fully applied. */
+function managedPatchAsideName(entry: string): string {
+  return `.${path.posix.basename(entry)}.batshit-patch-${randomUUID().slice(0, 8)}`
+}
+
+/** The folder a relative path is in ('' for the root). */
+function managedPatchParent(relative: string): string {
+  const parent = path.posix.dirname(relative)
+  return parent === '.' ? '' : parent
+}
+
+interface ManagedPatchWriteLog {
+  /** Every target a step started on, in order. */
+  written: ManagedPatchTarget[]
+  /**
+   * Files the patch made at a vacant name (never one that appeared meanwhile), with the path it made:
+   * a target that was not there, or one whose name an earlier step moved aside.
+   */
+  created: Array<{ target: ManagedPatchTarget; path: string }>
+  /**
+   * A new file whose write ended with the helper gone (closed, timed out): it may or may not have been
+   * made. The rollback names it as left changed when something is at its path, and removes nothing.
+   */
+  uncertain: Array<{ target: ManagedPatchTarget; path: string }>
+  /** Folders the patch's writes made: real (for the writer) and as the patch names them. */
+  createdFolders: Array<{ real: string; absolutePath: string }>
+  /** Removed files and links, waiting beside their path. */
+  asides: Array<{ target: ManagedPatchTarget; aside: string; absolutePath: string }>
+}
+
+/**
+ * The folders a write of `target` needs that are not there, outermost first, made one by one. A
+ * folder that appeared meanwhile is used, not counted as made; anything else at its name fails the
+ * write (and the patch is put back).
+ */
+async function makeManagedPatchFolders(
+  writer: AnchoredProjectWriter,
+  target: ManagedPatchTarget,
+  log: ManagedPatchWriteLog,
+  roots: { lexical: string; real: string }
+): Promise<void> {
+  const missing: string[] = []
+  for (let folder = managedPatchParent(target.content); folder; folder = managedPatchParent(folder)) {
+    if ((await writer.lstat(folder, MANAGED_PATCH_HELPER_CALL)).type !== 'absent') break
+    missing.unshift(folder)
+  }
+  // The folders that do not exist hold no link, so they are the last names of the patch's own path.
+  let lexical = path.dirname(target.absolutePath)
+  const lexicalFolders: string[] = []
+  for (let index = 0; index < missing.length; index += 1) {
+    lexicalFolders.unshift(lexical)
+    lexical = path.dirname(lexical)
+  }
+  for (const [index, folder] of missing.entries()) {
+    try {
+      await writer.mkdir(folder, MANAGED_PATCH_HELPER_CALL)
+      // Through a link inside the workspace the patch's own names may not reach this far; the real
+      // name then stands in (it only names the folder in a "left changed" message).
+      const lexicalName = lexicalFolders[index]
+      log.createdFolders.push({
+        real: folder,
+        absolutePath: isPathWithinRoot(lexicalName, roots.lexical) ? lexicalName : path.join(roots.real, folder)
+      })
+    } catch (error) {
+      if (fileErrorCode(error) !== 'EEXIST') throw error
+      if ((await writer.lstat(folder, MANAGED_PATCH_HELPER_CALL)).type !== 'folder') throw error
+    }
   }
 }
 
+/**
+ * BL-1916: put every path the patch wrote back the way it was: remove the files it created, then
+ * the folders it made (deepest first, only while empty), then move each removed file or link back
+ * (newest first; one that did not exist before is removed instead), then write back the content
+ * of every file it changed in place. Returns the paths it could not put back (as the patch names
+ * them). BL-2006: through the same anchored writer as the writes.
+ */
+async function rollBackManagedPatch(writer: AnchoredProjectWriter, log: ManagedPatchWriteLog): Promise<string[]> {
+  const left: string[] = []
+  const call = MANAGED_PATCH_HELPER_CALL
+  const gone = (error: unknown) => fileErrorCode(error) === 'ENOENT' || fileErrorCode(error) === 'ENOTDIR'
+  for (const { target, path: made } of [...log.created].reverse()) {
+    await writer.unlink(made, call).catch((error) => {
+      if (!gone(error)) left.push(target.absolutePath)
+    })
+  }
+  for (const { target, path: maybe } of log.uncertain) {
+    const there = await writer.lstat(maybe, call).then((entry) => entry.type !== 'absent', () => true)
+    if (there) left.push(target.absolutePath)
+  }
+  for (const folder of [...log.createdFolders].reverse()) {
+    await writer.rmdir(folder.real, call).catch((error) => {
+      if (!gone(error)) left.push(folder.absolutePath)
+    })
+  }
+  for (const { target, aside, absolutePath } of [...log.asides].reverse()) {
+    const putBack = target.original.kind === 'absent' ? writer.unlink(aside, call) : writer.rename(aside, target.entry, call)
+    await putBack.catch(() => left.push(target.absolutePath, absolutePath))
+  }
+  for (const target of log.written) {
+    if (target.original.kind === 'absent' || !target.original.bytes) continue
+    await writer
+      .writeFile(target.content, target.original.bytes, { create: 'replace' }, call)
+      .catch(() => left.push(target.absolutePath))
+  }
+  return [...new Set(left)]
+}
+
+/**
+ * BL-1916 (2026-10-21): a managed patch is applied whole or not at all. Every path is resolved,
+ * every original read and every new content computed before the first write, so a hunk that does
+ * not match, a target that is missing or already there, or a path outside the workspace writes
+ * nothing. Before, operations were written one by one and a later failure left the earlier files
+ * written while the result said `success:false` (which tells the model nothing happened), so the
+ * resent patch then failed on "already exists". A write that fails part way (a full disk, a
+ * permission) puts every path back; when that is not possible the error names the paths left
+ * changed (`ManagedApplyPatchPartialWriteError`).
+ *
+ * BL-2006 (2026-10-21): every read and write goes through one anchored writer that holds the
+ * workspace folder for the whole patch (`AnchoredProjectWriter`). Planning follows links inside
+ * the workspace to find each real path; the writer then acts on that path relative to the held
+ * folder and follows nothing, so a folder swapped for a link meanwhile (by a sandboxed command in
+ * the same step, say) makes the patch fail, never read or write outside the workspace. Where the
+ * writer cannot run, the patch writes nothing.
+ */
 async function executeManagedApplyPatch(options: {
   operations: ManagedApplyPatchOperation[]
   cwd: string
   workspaceRoot: string
+  /** BL-1987: a Stop during the planning means nothing is written (checked before the first write). */
+  abortSignal?: AbortSignal | null
 }): Promise<ManagedApplyPatchExecutionResult> {
+  const lexicalRoot = path.resolve(options.workspaceRoot)
+  let writer: AnchoredProjectWriter
+  try {
+    writer = await AnchoredProjectWriter.open(lexicalRoot, MANAGED_PATCH_HELPER_CALL)
+  } catch (error) {
+    throw new Error(`Batshit could not hold the workspace folder to apply the patch safely (${describeWriterOpenFailure(error)}). ${MANAGED_PATCH_NOTHING_WRITTEN}`)
+  }
+  try {
+    return await applyManagedPatchWithWriter(options, writer)
+  } finally {
+    await writer.close().catch((error) => console.error('[nativeTools] managed apply_patch writer release', error))
+  }
+}
+
+/** Why the anchored writer did not start, from its own exit line where it left one. */
+function describeWriterOpenFailure(error: unknown): string {
+  const message = error instanceof Error && error.message ? error.message : String(error)
+  if (message.includes('anchored-reader:openat2-unavailable')) {
+    return 'this Linux kernel has no openat2, which Batshit needs to write a patch safely (Linux 5.6 or later)'
+  }
+  if (message.includes('anchored-reader:root-path') || message.includes('anchored-reader:usage')) {
+    return 'the native file helper predates its writer mode; restart Batshit so it rebuilds the helper'
+  }
+  // A spawn error names the helper's absolute path on this host; the model gets the cause only.
+  if (/\bspawn\b/.test(message) && /\bENOENT\b/.test(message)) {
+    return 'the native file helper is missing; restart Batshit so it builds the helper'
+  }
+  if (/\bspawn\b/.test(message)) return 'the native file helper could not start'
+  return message
+}
+
+/**
+ * The writer for a rollback: the patch's own while it still serves requests; after a deadline or a
+ * crash, a new one, admitted to the same folder (by identity), or null when that is not possible.
+ */
+async function writerForRollback(writer: AnchoredProjectWriter, workspaceRoot: string): Promise<AnchoredProjectWriter | null> {
+  if (!writer.failed) return writer
+  const fresh = await AnchoredProjectWriter.open(workspaceRoot, MANAGED_PATCH_HELPER_CALL).catch(() => null)
+  if (fresh && fresh.rootIdentity === writer.rootIdentity) return fresh
+  await fresh?.close().catch(() => {})
+  return null
+}
+
+async function applyManagedPatchWithWriter(
+  options: Parameters<typeof executeManagedApplyPatch>[0],
+  writer: AnchoredProjectWriter
+): Promise<ManagedApplyPatchExecutionResult> {
+  const call = MANAGED_PATCH_HELPER_CALL
+  const stopIfStopped = () => {
+    if (options.abortSignal?.aborted) throw new ManagedApplyPatchStoppedError()
+  }
+  const lexicalRoot = path.resolve(options.workspaceRoot)
   const touchedPaths = new Set<string>()
-  let operationsApplied = 0
+  const targets = new Map<string, ManagedPatchTarget>()
+  const entries = new Map<string, AnchoredEntryStat>()
+  const realPaths = new Map<string, string>()
+  /** What the patch leaves at a path so far: its content, or null when it leaves no file there. */
+  const pending = new Map<string, string | null>()
+  const steps: ManagedPatchWriteStep[] = []
+  let resolvedRoot = lexicalRoot
 
-  for (const operation of options.operations) {
-    if (operation.type === 'add') {
-      const target = await resolveManagedPatchPath({
-        rawPath: operation.filePath,
-        cwd: options.cwd,
-        workspaceRoot: options.workspaceRoot
-      })
-      if (target.exists) {
-        throw new Error(`Cannot add file "${operation.filePath}" because it already exists.`)
-      }
-
-      await mkdir(path.dirname(target.absolutePath), { recursive: true })
-      const content = operation.contentLines.length > 0 ? `${operation.contentLines.join('\n')}\n` : ''
-      await writeFile(target.absolutePath, content, 'utf8')
-      touchedPaths.add(target.relativePath)
-      operationsApplied += 1
-      continue
+  const resolve = async (rawPath: string) => {
+    const resolved = await resolveManagedPatchPath({ rawPath, cwd: options.cwd, workspaceRoot: options.workspaceRoot, resolvedRoot })
+    // Two names for one file (a link and its target, or one name in another letter case on a
+    // case-insensitive disk) would be planned as two files.
+    const named = realPaths.get(resolved.realPath)
+    if (named !== undefined && named !== resolved.absolutePath) {
+      throw new Error(`Patch target "${rawPath}" is the same file as another path in this patch (a link, or the same name in another letter case); name each file by one path.`)
     }
-
-    if (operation.type === 'delete') {
-      const target = await resolveManagedPatchPath({
-        rawPath: operation.filePath,
-        cwd: options.cwd,
-        workspaceRoot: options.workspaceRoot
-      })
-      if (!target.exists) {
-        throw new Error(`Cannot delete "${operation.filePath}" because it does not exist.`)
+    realPaths.set(resolved.realPath, resolved.absolutePath)
+    if (!entries.has(resolved.absolutePath)) {
+      try {
+        entries.set(resolved.absolutePath, await writer.lstat(resolved.entry, call))
+      } catch (error) {
+        throw new Error(`Cannot check "${rawPath}": ${describeAnchoredRefusal(error)}.`)
       }
-
-      await unlink(target.absolutePath)
-      touchedPaths.add(target.relativePath)
-      operationsApplied += 1
-      continue
     }
-
-    const source = await resolveManagedPatchPath({
-      rawPath: operation.filePath,
-      cwd: options.cwd,
-      workspaceRoot: options.workspaceRoot
-    })
-    if (!source.exists) {
-      throw new Error(`Cannot update "${operation.filePath}" because it does not exist.`)
+    return resolved
+  }
+  const exists = (resolved: ManagedPatchPath) => {
+    if (pending.has(resolved.absolutePath)) return pending.get(resolved.absolutePath) !== null
+    const type = entries.get(resolved.absolutePath)?.type
+    return type !== undefined && type !== 'absent' && type !== 'parent-not-a-folder'
+  }
+  const targetFor = async (
+    resolved: ManagedPatchPath,
+    rawPath: string,
+    readContent: boolean
+  ): Promise<ManagedPatchTarget | null> => {
+    const known = targets.get(resolved.absolutePath)
+    if (known) return known
+    const original = await readManagedPatchOriginal(writer, entries.get(resolved.absolutePath)!, resolved, rawPath, readContent)
+    if (original === 'parent-is-a-file') throw new Error(`Cannot write "${rawPath}": a folder in its path is a file.`)
+    if (original === 'not-a-file') return null
+    const target = {
+      absolutePath: resolved.absolutePath,
+      relativePath: resolved.relativePath,
+      entry: resolved.entry,
+      content: resolved.content,
+      original
     }
-
-    const originalContent = await readFile(source.absolutePath, 'utf8')
-    const nextContent =
-      operation.hunks.length > 0
-        ? applyManagedPatchHunks({
-            content: originalContent,
-            hunks: operation.hunks,
-            filePath: operation.filePath
-          })
-        : originalContent
-
-    if (operation.moveToPath) {
-      const destination = await resolveManagedPatchPath({
-        rawPath: operation.moveToPath,
-        cwd: options.cwd,
-        workspaceRoot: options.workspaceRoot
-      })
-
-      if (destination.exists && destination.absolutePath !== source.absolutePath) {
-        throw new Error(
-          `Cannot move "${operation.filePath}" to "${operation.moveToPath}" because destination already exists.`
-        )
-      }
-
-      await mkdir(path.dirname(destination.absolutePath), { recursive: true })
-      await writeFile(destination.absolutePath, nextContent, 'utf8')
-      if (destination.absolutePath !== source.absolutePath) {
-        await unlink(source.absolutePath)
-      }
-      touchedPaths.add(source.relativePath)
-      touchedPaths.add(destination.relativePath)
-      operationsApplied += 1
-      continue
-    }
-
-    await writeFile(source.absolutePath, nextContent, 'utf8')
-    touchedPaths.add(source.relativePath)
-    operationsApplied += 1
+    targets.set(resolved.absolutePath, target)
+    return target
+  }
+  const contentOf = (target: ManagedPatchTarget): string => {
+    const planned = pending.get(target.absolutePath)
+    if (typeof planned === 'string') return planned
+    if (target.original.kind !== 'absent' && target.original.bytes) return target.original.bytes.toString('utf8')
+    throw new Error(`Cannot read "${target.relativePath}".`)
   }
 
+  try {
+    // The real paths are planned against the folder the writer holds, by its identity: a root that
+    // was swapped between the writer's admission and this check is refused.
+    resolvedRoot = (await getSafeRealPath(lexicalRoot)) ?? lexicalRoot
+    if ((await workspaceRootIdentity(resolvedRoot)) !== writer.rootIdentity) {
+      throw new Error('The workspace folder changed while the patch was being planned.')
+    }
+    for (const operation of options.operations) {
+      // BL-1987: each operation's planning awaits the disk; a Stop meanwhile ends it here.
+      stopIfStopped()
+      if (operation.type === 'add') {
+        const resolved = await resolve(operation.filePath)
+        if (exists(resolved)) {
+          throw new Error(`Cannot add file "${operation.filePath}" because it already exists; use \`*** Update File\` to change it.`)
+        }
+        const target = await targetFor(resolved, operation.filePath, false)
+        if (!target) throw new Error(`Cannot add file "${operation.filePath}": the path is not a file.`)
+        const content = operation.contentLines.length > 0 ? `${operation.contentLines.join('\n')}\n` : ''
+        pending.set(resolved.absolutePath, content)
+        steps.push({ kind: 'write', target, content })
+        touchedPaths.add(resolved.relativePath)
+        continue
+      }
+
+      if (operation.type === 'delete') {
+        const resolved = await resolve(operation.filePath)
+        if (!exists(resolved)) {
+          throw new Error(`Cannot delete "${operation.filePath}" because it does not exist.`)
+        }
+        const target = await targetFor(resolved, operation.filePath, false)
+        if (!target) throw new Error(`Cannot delete "${operation.filePath}" because it is not a file.`)
+        pending.set(resolved.absolutePath, null)
+        steps.push({ kind: 'remove', target })
+        touchedPaths.add(resolved.relativePath)
+        continue
+      }
+
+      const source = await resolve(operation.filePath)
+      if (!exists(source)) {
+        throw new Error(`Cannot update "${operation.filePath}" because it does not exist.`)
+      }
+      const sourceTarget = await targetFor(source, operation.filePath, true)
+      if (!sourceTarget) throw new Error(`Cannot update "${operation.filePath}" because it is not a file.`)
+      const originalContent = contentOf(sourceTarget)
+      const nextContent =
+        operation.hunks.length > 0
+          ? applyManagedPatchHunks({
+              content: originalContent,
+              hunks: operation.hunks,
+              filePath: operation.filePath
+            })
+          : originalContent
+
+      if (operation.moveToPath) {
+        const destination = await resolve(operation.moveToPath)
+        if (exists(destination) && destination.absolutePath !== source.absolutePath) {
+          throw new Error(
+            `Cannot move "${operation.filePath}" to "${operation.moveToPath}" because destination already exists.`
+          )
+        }
+        const destinationTarget = await targetFor(destination, operation.moveToPath, false)
+        if (!destinationTarget) throw new Error(`Cannot move "${operation.filePath}" to "${operation.moveToPath}": the destination is not a file.`)
+        pending.set(destination.absolutePath, nextContent)
+        steps.push({ kind: 'write', target: destinationTarget, content: nextContent })
+        if (destination.absolutePath !== source.absolutePath) {
+          pending.set(source.absolutePath, null)
+          steps.push({ kind: 'remove', target: sourceTarget })
+        }
+        touchedPaths.add(source.relativePath)
+        touchedPaths.add(destination.relativePath)
+        continue
+      }
+
+      pending.set(source.absolutePath, nextContent)
+      steps.push({ kind: 'write', target: sourceTarget, content: nextContent })
+      touchedPaths.add(source.relativePath)
+    }
+  } catch (error) {
+    if (error instanceof ManagedApplyPatchStoppedError) throw error
+    const reason = error instanceof Error && error.message ? error.message : 'Managed apply_patch could not be applied.'
+    throw new Error(`${reason} ${MANAGED_PATCH_NOTHING_WRITTEN}`)
+  }
+
+  // BL-1987: the last moment a Stop can still mean "nothing written". Once the writes start they all
+  // run (or roll back together): the patch is applied whole or not at all (BL-1916).
+  stopIfStopped()
+
+  // Only now write, in the order the operations name (a move writes its destination, then removes
+  // its source), and put everything back if any step fails.
+  const log: ManagedPatchWriteLog = { written: [], created: [], uncertain: [], createdFolders: [], asides: [] }
+  /** Targets an earlier step moved aside: their name is vacant until a write makes a new file there. */
+  const vacated = new Set<ManagedPatchTarget>()
+  /**
+   * Targets whose name a step refilled with a new file: every later write of them goes to that name,
+   * never to what a link that stood there led to.
+   */
+  const refilled = new Set<ManagedPatchTarget>()
+  for (const step of steps) {
+    const firstStep = !log.written.includes(step.target)
+    if (firstStep) log.written.push(step.target)
+    try {
+      if (step.kind === 'remove') {
+        const name = managedPatchAsideName(step.target.entry)
+        const parent = managedPatchParent(step.target.entry)
+        const aside = parent ? `${parent}/${name}` : name
+        await writer.rename(step.target.entry, aside, call)
+        log.asides.push({ target: step.target, aside, absolutePath: path.join(path.dirname(step.target.absolutePath), name) })
+        vacated.add(step.target)
+        // BL-2022: a file this patch made and now moved aside is the aside's to undo, not the name's;
+        // a rollback that unlinked the name for it as well could remove a file that appeared there since.
+        log.created = log.created.filter((made) => made.target !== step.target)
+        continue
+      }
+      await makeManagedPatchFolders(writer, step.target, log, { lexical: lexicalRoot, real: resolvedRoot })
+      // The first write of a path that was not there creates it (`new`): a file that appeared since
+      // the plan (or one name in another letter case) is never overwritten, nor removed on rollback.
+      // A name an earlier step moved aside gets a new file at the name itself, never through the
+      // link that stood there (a Delete then an Add of a link writes the name, not the link's target).
+      const refills = vacated.has(step.target)
+      const creates = refills || (step.target.original.kind === 'absent' && !log.created.some((made) => made.target === step.target))
+      const writePath = refills || refilled.has(step.target) ? step.target.entry : step.target.content
+      try {
+        await writer.writeFile(writePath, step.content, { create: creates ? 'new' : 'replace' }, call)
+      } catch (error) {
+        // A new file is made when the helper opens it, before its bytes: one that failed later is the
+        // patch's to remove; one whose helper went away may or may not be there.
+        if (creates && error instanceof AnchoredWriteError && !refusedBeforeAnyByte(error)) {
+          log.created.push({ target: step.target, path: writePath })
+        } else if (creates && !(error instanceof AnchoredWriteError) && writer.failed) {
+          log.uncertain.push({ target: step.target, path: writePath })
+        }
+        throw error
+      }
+      if (creates) log.created.push({ target: step.target, path: writePath })
+      if (refills) refilled.add(step.target)
+      vacated.delete(step.target)
+    } catch (error) {
+      // BL-2006: refused at the folders or at the name, the step touched nothing; when no earlier
+      // step touched this target either, there is nothing of it to put back (a folder swapped for a
+      // link would make putting it back fail too, and name it as left changed when it is not).
+      if (firstStep && refusedBeforeAnyByte(error)) log.written.pop()
+      const cause = describeAnchoredRefusal(error)
+      const rollbackWriter = await writerForRollback(writer, lexicalRoot)
+      const left = rollbackWriter
+        ? await rollBackManagedPatch(rollbackWriter, log)
+        : managedPatchLoggedPaths(log)
+      if (rollbackWriter && rollbackWriter !== writer) {
+        await rollbackWriter.close().catch((closeError) => console.error('[nativeTools] managed apply_patch rollback writer release', closeError))
+      }
+      const failed = `${step.kind === 'remove' ? 'Removing' : 'Writing'} "${step.target.relativePath}" failed (${cause})`
+      if (left.length === 0) {
+        throw new Error(`${failed}. Batshit put back every file the patch had changed, so nothing was written.`)
+      }
+      const names = left.map((entry) => path.relative(lexicalRoot, entry).split(path.sep).join('/') || entry)
+      throw new ManagedApplyPatchPartialWriteError(
+        `${failed}, and Batshit could not put back ${names.join(', ')}: ${left.length === 1 ? 'that path is' : 'those paths are'} left changed. Read ${left.length === 1 ? 'it' : 'them'} before you patch again.`,
+        left
+      )
+    }
+  }
+
+  // The patch applied: the removed files go for good.
+  const stranded: string[] = []
+  for (const { aside, absolutePath } of log.asides) {
+    await writer.unlink(aside, call).catch((error) => {
+      if (fileErrorCode(error) !== 'ENOENT') stranded.push(absolutePath)
+    })
+  }
+  const strandedNote = stranded.length
+    ? ` Batshit could not remove its temporary ${stranded.length === 1 ? 'copy' : 'copies'} of removed files: ${stranded.map((entry) => path.relative(lexicalRoot, entry).split(path.sep).join('/')).join(', ')}.`
+    : ''
   return {
     success: true,
-    operationsApplied,
+    operationsApplied: options.operations.length,
     touchedPaths: Array.from(touchedPaths),
-    message: `Managed apply_patch applied ${operationsApplied} operation(s).`
+    message: `Managed apply_patch applied ${options.operations.length} operation(s).${strandedNote}`,
+    ...(strandedNote ? { note: strandedNote.trim() } : {})
   }
 }
 
@@ -3457,9 +4290,17 @@ function isPlanModeAllowedCommand(command: string): boolean {
   return false
 }
 
-function isAgentModeAutoAllowedCommand(command: string, customAllowList?: string[] | null): boolean {
+function isAgentModeAutoAllowedCommand(
+  command: string,
+  customAllowList?: string[] | null,
+  options: { commandsAfterPatchRun?: boolean } = {}
+): boolean {
   const trimmed = command.trim()
   if (!trimmed) return false
+
+  // SA-126 item 2: where the command after a patch runs, the call always asks, before any allow
+  // pattern: a pattern that matches the whole text (`apply_patch*`) would cover that command too.
+  if (options.commandsAfterPatchRun === true && managedPatchAfterCommand(trimmed) !== null) return false
 
   const explicitlyAllowed = commandMatchesAnyPattern(trimmed, customAllowList)
   if (explicitlyAllowed) return true
@@ -3469,7 +4310,10 @@ function isAgentModeAutoAllowedCommand(command: string, customAllowList?: string
   // approval instead of hiding command/process substitution there.
   if (hasUnquotedHeredoc(trimmed)) return false
   if (getReadOnlyShellSideEffectViolation(trimmed)) return explicitlyAllowed
-  if (isManagedApplyPatchCommand(trimmed) && extractManagedApplyPatchDocument(trimmed)) return true
+  // A patch alone is automatic. With commands after it (BL-1915: applied, the commands never run)
+  // it still asks, as the whole command did before (Faye, 2026-10-20: no consent path changes).
+  const managedPatch = parseManagedApplyPatchCommand(trimmed)
+  if (managedPatch.kind === 'managed' && managedPatch.document && !managedPatch.notRun) return true
 
   const operations = getPolicyInspectionCommandLines(trimmed).flatMap((line) =>
     summarizeShellSimpleCommands(line)
@@ -3545,64 +4389,6 @@ function isAgentModeAutoAllowedCommand(command: string, customAllowList?: string
   return false
 }
 
-async function getAdminDefaultWebSearchProvider(
-  userId?: string
-): Promise<NativeWebSearchProvider | null> {
-  if (!userId) return null
-  try {
-    const settings = await redis.getUserSettings(userId)
-    const adminSettings = (settings?.admin_settings as Record<string, any>) ?? {}
-    return normalizeWebSearchProvider(
-      adminSettings.web_search_default_provider ?? adminSettings.webSearchDefaultProvider
-    )
-  } catch (error) {
-    console.error('[Native Tools] Failed loading admin web search default:', error)
-    return null
-  }
-}
-
-async function getAdminDefaultWebSearchOptions(userId?: string): Promise<{
-  exaSearchType: ExaSearchType | null
-  perplexityMaxTokensPerPage: number | null
-}> {
-  if (!userId) {
-    return {
-      exaSearchType: null,
-      perplexityMaxTokensPerPage: null
-    }
-  }
-
-  try {
-    const settings = await redis.getUserSettings(userId)
-    const adminSettings = (settings?.admin_settings as Record<string, any>) ?? {}
-    const exaSearchType = normalizeExaSearchType(
-      adminSettings.web_search_exa_type ?? adminSettings.webSearchExaType
-    )
-    const perplexityMaxTokensPerPageRaw = parseInteger(
-      adminSettings.web_search_perplexity_max_tokens_per_page ??
-        adminSettings.webSearchPerplexityMaxTokensPerPage
-    )
-
-    return {
-      exaSearchType,
-      perplexityMaxTokensPerPage:
-        perplexityMaxTokensPerPageRaw === undefined
-          ? null
-          : clamp(
-              perplexityMaxTokensPerPageRaw,
-              MIN_PERPLEXITY_MAX_TOKENS_PER_PAGE,
-              MAX_PERPLEXITY_MAX_TOKENS_PER_PAGE
-            )
-    }
-  } catch (error) {
-    console.error('[Native Tools] Failed loading admin web search options:', error)
-    return {
-      exaSearchType: null,
-      perplexityMaxTokensPerPage: null
-    }
-  }
-}
-
 async function providerHasRequiredApiKey(
   provider: NativeWebSearchProvider,
   userId?: string
@@ -3627,16 +4413,15 @@ function providerMissingKeyReason(
 
 async function resolveWebSearchProvider(options: {
   requestedProvider?: unknown
-  agentDefaultProvider?: unknown
+  globalDefaultProvider: NativeWebSearchProvider
   userId?: string
 }): Promise<WebSearchProviderResolution> {
   const requestedProvider = normalizeWebSearchProvider(options.requestedProvider)
-  const agentDefaultProvider = normalizeWebSearchProvider(options.agentDefaultProvider)
-  const adminDefaultProvider = await getAdminDefaultWebSearchProvider(options.userId)
+  const agentDefaultProvider = null
+  const adminDefaultProvider = options.globalDefaultProvider
 
   const preferredOrder: NativeWebSearchProvider[] = [
     ...(requestedProvider ? [requestedProvider] : []),
-    ...(agentDefaultProvider ? [agentDefaultProvider] : []),
     ...(adminDefaultProvider ? [adminDefaultProvider] : []),
     'duckduckgo-html'
   ]
@@ -3717,24 +4502,12 @@ export interface ResolvedNativeToolSettings {
   automationBashAllowList: string[]
   automationBashDenyList: string[]
   agentBrowserEnabled: boolean
-  agentBrowserLiveViewEnabled: boolean
-  agentBrowserRuntimeMode: AgentBrowserRuntimeMode
-  agentBrowserProvider: AgentBrowserProvider
-  agentBrowserCdpPort: number
-  agentBrowserSession?: string
-  agentBrowserProfilePath?: string
-  agentBrowserExecutablePath?: string
-  agentBrowserExtraFlags: string[]
-  agentBrowserTimeoutMs: number
   bashTimeoutMs: number
   bashAccessMode: NativeBashAccessMode
   bashPolicyMode: LegacyNativeToolPolicyMode
   bashCommandAllowList: string[]
   bashNeverAllowList: string[]
   bashAgentApprovalCardsEnabled: boolean
-  webSearchProvider?: NativeWebSearchProvider
-  webSearchExaSearchType?: ExaSearchType
-  webSearchPerplexityMaxTokensPerPage?: number
 }
 
 export function resolveNativeToolSettings(providerSettings?: Record<string, any> | null): ResolvedNativeToolSettings {
@@ -3765,22 +4538,6 @@ export function resolveNativeToolSettings(providerSettings?: Record<string, any>
     (nested as any).bashTimeoutMs ??
       (nested as any).nativeBashTimeoutMs ??
       (settings as any).nativeBashTimeoutMs
-  )
-  const webSearchProvider = normalizeWebSearchProvider(
-    (nested as any).webSearchProvider ??
-      (nested as any).nativeWebSearchProvider ??
-      (settings as any).nativeWebSearchProvider
-  )
-  const webSearchExaSearchType = normalizeExaSearchType(
-    (nested as any).webSearchExaSearchType ??
-      (nested as any).webSearchExaType ??
-      (nested as any).nativeWebSearchExaSearchType ??
-      (settings as any).nativeWebSearchExaSearchType
-  )
-  const webSearchPerplexityMaxTokensPerPage = parseInteger(
-    (nested as any).webSearchPerplexityMaxTokensPerPage ??
-      (nested as any).nativeWebSearchPerplexityMaxTokensPerPage ??
-      (settings as any).nativeWebSearchPerplexityMaxTokensPerPage
   )
   const bashAccessMode = normalizeBashAccessMode(
     (nested as any).bashAccessMode ??
@@ -3822,70 +4579,11 @@ export function resolveNativeToolSettings(providerSettings?: Record<string, any>
       (nested as any).nativeAutomationBashDenyList ??
       (settings as any).nativeAutomationBashDenyList
   )
-  const bashAgentApprovalCardsEnabled =
-    getToggle(
-      'bashAgentApprovalCardsEnabled',
-      'bashApprovalCardsEnabled',
-      'nativeBashAgentApprovalCardsEnabled',
-      'nativeBashApprovalCardsEnabled'
-    ) ?? false
+  const bashAgentApprovalCardsEnabled = nativeBashApprovalCardsEnabled(providerSettings)
   // SA-096: the six broker-relevant toggles are resolved by the shared util so the compile
   // the compile path reads agent settings exactly the way tool registration does.
   const brokerToggles = resolveBrokerToolToggles(providerSettings)
   const agentBrowserEnabled = brokerToggles.agentBrowserEnabled
-  const agentBrowserRuntimeMode = normalizeAgentBrowserRuntimeMode(
-    (nested as any).agentBrowserRuntimeMode ??
-      (nested as any).nativeAgentBrowserRuntimeMode ??
-      (nested as any).agentBrowserMode ??
-      (settings as any).nativeAgentBrowserRuntimeMode
-  )
-  const agentBrowserProvider = normalizeAgentBrowserProvider(
-    (nested as any).agentBrowserProvider ??
-      (nested as any).nativeAgentBrowserProvider ??
-      (settings as any).nativeAgentBrowserProvider
-  )
-  const agentBrowserCdpPort = parseInteger(
-    (nested as any).agentBrowserCdpPort ??
-      (nested as any).nativeAgentBrowserCdpPort ??
-      (settings as any).nativeAgentBrowserCdpPort
-  )
-  const agentBrowserTimeoutMs = parseInteger(
-    (nested as any).agentBrowserTimeoutMs ??
-      (nested as any).nativeAgentBrowserTimeoutMs ??
-      (settings as any).nativeAgentBrowserTimeoutMs
-  )
-  const agentBrowserExecutablePathRaw =
-    (nested as any).agentBrowserExecutablePath ??
-    (nested as any).nativeAgentBrowserExecutablePath ??
-    (settings as any).nativeAgentBrowserExecutablePath
-  const agentBrowserExecutablePath =
-    typeof agentBrowserExecutablePathRaw === 'string' && agentBrowserExecutablePathRaw.trim().length > 0
-      ? agentBrowserExecutablePathRaw.trim()
-      : null
-  const agentBrowserSessionRaw =
-    (nested as any).agentBrowserSession ??
-    (nested as any).nativeAgentBrowserSession ??
-    (settings as any).nativeAgentBrowserSession
-  const agentBrowserSession =
-    typeof agentBrowserSessionRaw === 'string' && agentBrowserSessionRaw.trim().length > 0
-      ? agentBrowserSessionRaw.trim()
-      : null
-  const agentBrowserProfilePathRaw =
-    (nested as any).agentBrowserProfilePath ??
-    (nested as any).agentBrowserProfile ??
-    (nested as any).nativeAgentBrowserProfilePath ??
-    (nested as any).nativeAgentBrowserProfile ??
-    (settings as any).nativeAgentBrowserProfilePath ??
-    (settings as any).nativeAgentBrowserProfile
-  const agentBrowserProfilePath =
-    typeof agentBrowserProfilePathRaw === 'string' && agentBrowserProfilePathRaw.trim().length > 0
-      ? agentBrowserProfilePathRaw.trim()
-      : null
-  const agentBrowserExtraFlags = normalizeStringList(
-    (nested as any).agentBrowserExtraFlags ??
-      (nested as any).nativeAgentBrowserExtraFlags ??
-      (settings as any).nativeAgentBrowserExtraFlags
-  )
   const mergedBashAllowList = mergeCommandPatternLists(
     bashCommandAllowList,
     agentBrowserEnabled ? AGENT_BROWSER_BASH_AUTO_ALLOW_PATTERNS : undefined
@@ -3903,24 +4601,6 @@ export function resolveNativeToolSettings(providerSettings?: Record<string, any>
     automationBashAllowList: automationBashAllowList ?? [],
     automationBashDenyList: automationBashDenyList ?? [],
     agentBrowserEnabled,
-    agentBrowserLiveViewEnabled:
-      getToggle('agentBrowserLiveViewEnabled', 'nativeAgentBrowserLiveViewEnabled') ?? true,
-    agentBrowserRuntimeMode: agentBrowserRuntimeMode ?? DEFAULT_AGENT_BROWSER_RUNTIME_MODE,
-    agentBrowserProvider: agentBrowserProvider ?? DEFAULT_AGENT_BROWSER_PROVIDER,
-    agentBrowserCdpPort: clamp(
-      agentBrowserCdpPort ?? DEFAULT_AGENT_BROWSER_CDP_PORT,
-      1,
-      65535
-    ),
-    agentBrowserSession: agentBrowserSession ?? undefined,
-    agentBrowserProfilePath: agentBrowserProfilePath ?? undefined,
-    agentBrowserExecutablePath: agentBrowserExecutablePath ?? undefined,
-    agentBrowserExtraFlags: agentBrowserExtraFlags ?? [],
-    agentBrowserTimeoutMs: clamp(
-      agentBrowserTimeoutMs ?? DEFAULT_AGENT_BROWSER_TIMEOUT_MS,
-      MIN_AGENT_BROWSER_TIMEOUT_MS,
-      MAX_AGENT_BROWSER_TIMEOUT_MS
-    ),
     bashTimeoutMs: clamp(
       bashTimeout ?? DEFAULT_BASH_TIMEOUT_MS,
       MIN_BASH_TIMEOUT_MS,
@@ -3930,17 +4610,7 @@ export function resolveNativeToolSettings(providerSettings?: Record<string, any>
     bashPolicyMode: toLegacyBashPolicyMode(bashAccessMode ?? DEFAULT_BASH_ACCESS_MODE),
     bashCommandAllowList: mergedBashAllowList ?? [],
     bashNeverAllowList: bashNeverAllowList ?? [],
-    bashAgentApprovalCardsEnabled,
-    webSearchProvider: webSearchProvider ?? undefined,
-    webSearchExaSearchType: webSearchExaSearchType ?? undefined,
-    webSearchPerplexityMaxTokensPerPage:
-      webSearchPerplexityMaxTokensPerPage === undefined
-        ? undefined
-        : clamp(
-            webSearchPerplexityMaxTokensPerPage,
-            MIN_PERPLEXITY_MAX_TOKENS_PER_PAGE,
-            MAX_PERPLEXITY_MAX_TOKENS_PER_PAGE
-          )
+    bashAgentApprovalCardsEnabled
   }
 }
 
@@ -4011,19 +4681,43 @@ async function resolveSessionProjectPath(sessionId?: string | null): Promise<str
 const MAX_BASH_COMMAND_CHARS = 4_000
 const MAX_MANAGED_APPLY_PATCH_COMMAND_CHARS = 200_000
 
-function buildManagedApplyPatchPolicyScanText(command: string): string {
-  // Managed apply_patch payloads are parsed and applied in-process, never run
-  // through a shell, so shell-safety rules only inspect the command envelope.
-  const beginIndex = command.indexOf(APPLY_PATCH_BEGIN_MARKER)
-  const endIndex = command.lastIndexOf(APPLY_PATCH_END_MARKER)
-  if (beginIndex < 0 || endIndex <= beginIndex) return command
-  return `${command.slice(0, beginIndex)}[managed apply_patch payload]${command.slice(endIndex + APPLY_PATCH_END_MARKER.length)}`
+function buildManagedApplyPatchPolicyScanText(command: string, payloadText = '[managed apply_patch payload]'): string {
+  return managedApplyPatchPolicySource(command, payloadText)
+}
+
+/**
+ * SA-126 item 2: what a managed patch runs after itself (`parseManagedApplyPatchCommand`'s
+ * `afterPatch`: the `&&` part of its line and the lines after it), for a caller that runs it.
+ */
+function managedPatchAfterCommand(command: string): Readonly<{ command: string; tail: string }> | null {
+  const parsed = parseManagedApplyPatchCommand(command)
+  return parsed.kind === 'managed' && parsed.document && parsed.afterPatch ? parsed.afterPatch : null
+}
+
+/** A command after a patch as a reason or the model text shows it: its first line, clipped. */
+function showAfterPatch(tail: string): string {
+  const { firstLine, moreLines } = describeAfterPatchForApproval(tail)
+  const shown = firstLine.length > 120 ? `${firstLine.slice(0, 119)}…` : firstLine
+  return moreLines > 0 ? `\`${shown}\` (+${moreLines} more line${moreLines === 1 ? '' : 's'})` : `\`${shown}\``
+}
+
+/** A refusal's words when the command after a patch is what the rule refused (SA-126 item 2). */
+function namingAfterPatchCommand(
+  reason: string,
+  afterPatch: Readonly<{ command: string; tail: string }> | null,
+  refusesIt: (text: string) => boolean
+): string {
+  if (!afterPatch || !refusesIt(afterPatch.command)) return reason
+  // Live proof (2026-10-21): a refusal that named only the command left the model unsure whether
+  // the patch before it was written.
+  return `${reason.replace(/\.$/, '')} (the command after the patch: ${showAfterPatch(afterPatch.tail)}). Nothing was written and nothing ran.`
 }
 
 function evaluateBashPolicy(
   command: string,
   mode: NativeBashAccessMode,
-  neverAllowList?: string[]
+  neverAllowList?: string[],
+  options: { commandsAfterPatchRun?: boolean } = {}
 ): NativeToolExecutionResult {
   const trimmed = command.trim()
   if (!trimmed) {
@@ -4035,10 +4729,24 @@ function evaluateBashPolicy(
     ? MAX_MANAGED_APPLY_PATCH_COMMAND_CHARS
     : MAX_BASH_COMMAND_CHARS
   if (trimmed.length > commandLengthLimit) {
+    // BL-1915: a refused heredoc write was resent as the same heredoc or a broken patch; the reason
+    // says exactly how to send the file instead.
     return {
       success: false,
       blocked: true,
-      reason: `Command is too long (${trimmed.length} characters; limit ${commandLengthLimit}). For large file writes or edits, send a managed apply_patch command as the whole command, optionally after \`cd <folder> &&\` (a heredoc with "*** Begin Patch" / "*** End Patch"), which allows up to ${MAX_MANAGED_APPLY_PATCH_COMMAND_CHARS} characters. Otherwise split the work into smaller commands.`
+      reason: managedPatchCommand
+        ? `Command is too long (${trimmed.length} characters; limit ${commandLengthLimit}). Split the patch into smaller patches, each sent on its own.`
+        : `Command is too long (${trimmed.length} characters; limit ${commandLengthLimit}). To write a file, send it as \`apply_patch\` \`*** Add File\`, every line prefixed with \`+\`; do not resend the heredoc. A patch may be ${MAX_MANAGED_APPLY_PATCH_COMMAND_CHARS} characters long. Split any other work into smaller commands.`
+    }
+  }
+
+  // SA-126 item 2: the command a patch runs after itself is a plain command, with the plain limit.
+  const afterPatch = managedPatchCommand && options.commandsAfterPatchRun === true ? managedPatchAfterCommand(trimmed) : null
+  if (afterPatch !== null && afterPatch.command.length > MAX_BASH_COMMAND_CHARS) {
+    return {
+      success: false,
+      blocked: true,
+      reason: `The command after the patch is too long (${afterPatch.command.length} characters; limit ${MAX_BASH_COMMAND_CHARS}). Nothing was written and nothing ran.`
     }
   }
 
@@ -4048,20 +4756,24 @@ function evaluateBashPolicy(
 
   for (const rule of DANGEROUS_BASH_RULES) {
     if (rule.pattern.test(policyScanText)) {
-      return { success: false, blocked: true, reason: rule.reason }
+      return { success: false, blocked: true, reason: namingAfterPatchCommand(rule.reason, afterPatch, (text) => rule.pattern.test(text)) }
     }
   }
 
   const pythonSafetyViolation = getPythonSafetyViolationReason(policyScanText)
   if (pythonSafetyViolation) {
-    return { success: false, blocked: true, reason: pythonSafetyViolation }
-  }
-
-  if (commandMatchesAnyPattern(trimmed, neverAllowList)) {
     return {
       success: false,
       blocked: true,
-      reason: 'Blocked by your bash Never Allow list.'
+      reason: namingAfterPatchCommand(pythonSafetyViolation, afterPatch, (text) => getPythonSafetyViolationReason(text) !== null)
+    }
+  }
+
+  if (commandMatchesAnyDenyPattern(trimmed, neverAllowList)) {
+    return {
+      success: false,
+      blocked: true,
+      reason: namingAfterPatchCommand('Blocked by your bash Never Allow list.', afterPatch, (text) => commandMatchesAnyDenyPattern(text, neverAllowList))
     }
   }
 
@@ -4073,7 +4785,7 @@ function evaluateBashPolicy(
       return {
         success: false,
         blocked: true,
-        reason: 'Command chaining is blocked in Plan mode.'
+        reason: namingAfterPatchCommand('Command chaining is blocked in Plan mode.', afterPatch, () => true)
       }
     }
 
@@ -4081,7 +4793,7 @@ function evaluateBashPolicy(
       return {
         success: false,
         blocked: true,
-        reason: 'Multiple shell command lines are blocked in Plan mode.'
+        reason: namingAfterPatchCommand('Multiple shell command lines are blocked in Plan mode.', afterPatch, () => true)
       }
     }
 
@@ -4133,86 +4845,6 @@ async function getSafeRealPath(targetPath: string): Promise<string | null> {
     return await realpath(targetPath)
   } catch {
     return null
-  }
-}
-
-async function resolveExistingDirectory(candidatePath: string): Promise<string | null> {
-  const trimmed = candidatePath.trim()
-  if (!trimmed) return null
-
-  const resolved = path.resolve(trimmed)
-  try {
-    const info = await stat(resolved)
-    if (!info.isDirectory()) return null
-    return (await getSafeRealPath(resolved)) ?? resolved
-  } catch {
-    return null
-  }
-}
-
-async function resolveBashWorkspaceRoot(options: {
-  userId?: string
-  projectPath?: string | null
-  workspaceRoot?: string | null
-}): Promise<{ workspaceRoot: string } | { blocked: true; reason: string }> {
-  const explicitWorkspaceRoot =
-    typeof options.workspaceRoot === 'string' ? options.workspaceRoot.trim() : ''
-  if (explicitWorkspaceRoot) {
-    const resolved = await resolveExistingDirectory(explicitWorkspaceRoot)
-    if (!resolved) {
-      return {
-        blocked: true,
-        reason: `Configured workspace root is not a valid directory: ${path.resolve(explicitWorkspaceRoot)}`
-      }
-    }
-    return { workspaceRoot: resolved }
-  }
-
-  const explicitProjectPath =
-    typeof options.projectPath === 'string' ? options.projectPath.trim() : ''
-  if (explicitProjectPath) {
-    const resolved = await resolveExistingDirectory(explicitProjectPath)
-    if (!resolved) {
-      return {
-        blocked: true,
-        reason:
-          `Active project path is invalid: ${path.resolve(explicitProjectPath)}. ` +
-          'Select a valid project in the Projects sidebar.'
-      }
-    }
-    return { workspaceRoot: resolved }
-  }
-
-  if (options.userId) {
-    try {
-      const preferences = await redis.getProjectPreferences(options.userId)
-      const defaultWorkspacePath = preferences?.default_workspace_path?.trim() ?? ''
-      if (defaultWorkspacePath) {
-        const resolved = await resolveExistingDirectory(defaultWorkspacePath)
-        if (!resolved) {
-          return {
-            blocked: true,
-            reason:
-              `Default Project Directory is invalid: ${path.resolve(defaultWorkspacePath)}. ` +
-              'Update it in Settings -> Projects.'
-          }
-        }
-        return { workspaceRoot: resolved }
-      }
-    } catch (error) {
-      console.error('[Native Tools] Failed to load project preferences for bash workspace:', error)
-      return {
-        blocked: true,
-        reason: 'Unable to load Project preferences for bash workspace resolution.'
-      }
-    }
-  }
-
-  return {
-    blocked: true,
-    reason:
-      'No active project is selected and no Default Project Directory is configured. ' +
-      'Set a Default Project Directory in Settings -> Projects, or select a project in the sidebar.'
   }
 }
 
@@ -4322,6 +4954,8 @@ type CommandRunResult = {
   truncated: boolean
   /** Ended by the model run's abort signal (a Stop), not by itself or the timeout. */
   stopped?: boolean
+  /** A Stop reached it before it started: it never ran (`stoppedBeforeStartRun`). */
+  neverStarted?: boolean
 }
 
 /**
@@ -4329,31 +4963,104 @@ type CommandRunResult = {
  * stopped command read "Tool execution failed."). The bash tool and Agent Browser say the same.
  */
 const STOPPED_COMMAND_REASON = 'The command was stopped.'
+/**
+ * BL-1987: a managed patch the Stop reached before its first write (before it started, or while
+ * its paths were resolved, its files read and the new contents computed). Nothing changed, so the
+ * result says so, and the card stays "Edit Not Applied" (`shellCommandCutFields` skips a patch).
+ */
+const STOPPED_PATCH_BEFORE_WRITE_REASON = 'The command was stopped before the patch wrote anything: no file changed.'
+const STOPPED_PATCH_TAIL_NOT_RUN = ' The commands after the patch did not run.'
 
 /**
- * What a bash tool tells the model about a Stop and a timeout (Agent Docs, 2026-09-18): both end
- * the command's managed group (`commandEnd.ts`), and how to leave a program running.
- * Every reply removes the chat's sandboxes when it ends, which is the sandbox limit. The API
- * lane's `native_bash_execute` and the managed CLI helper's `batshit_server_bash_execute`
- * (`scripts/mode4-controls-mcp.cjs`, which holds a copy of this exact text) both say it; a test
- * holds the copy to this constant.
+ * What a bash tool tells the model about leaving a program running (Agent Docs, 2026-09-18): the
+ * command must end, and a Stop or timeout of it ends what it started too (`commandEnd.ts`; since
+ * Josh's trim of 2026-10-23 that is one clause, without the managed-group mechanics). Every reply
+ * removes the chat's sandboxes when it ends, which is the sandbox limit. The API
+ * lane's `native_bash_execute` says it (the managed CLI helper's copy went with that helper in
+ * SA-139 R5).
  */
 export const NATIVE_BASH_STOP_GUIDANCE =
-  "A Stop or a timeout ends programs still in the command's managed group. A program that leaves that group or creates a new session can survive cleanup. To leave a program running, start it in the background with its output sent to a file (`cmd > log 2>&1 &`) and let the command finish; programs remaining in the managed group are ended when Batshit quits (in a sandbox, at most until this reply ends)."
+  'To leave a program running, start it in the background with its output in a file (`cmd > log 2>&1 &`) and let the command end; a Stop or timeout of that command ends it too. In a sandbox it lasts at most until this reply ends.'
 
 /**
  * What a bash tool tells the model about the managed `apply_patch` (BL-244, 2026-09-25): it is
  * built in, so a `which` probe finds nothing and must not be the model's test, and it must be
  * the whole command (`parseManagedApplyPatchCommand`). In SA-126 B0 agents probed for it 37 times
  * in 32 chats and lost 39 patches to `cd <folder> && apply_patch` before that form was accepted.
- * The API lane's `native_bash_execute` and the managed CLI helper's `batshit_server_bash_execute`
- * (`scripts/mode4-controls-mcp.cjs`, which holds a copy of this exact text) both say it.
+ * The API lane's `native_bash_execute` says it (the managed CLI helper's copy went with that
+ * helper in SA-139 R5).
+ * BL-1915 (2026-10-21): on Claude Opus 5.5 in SA-126 Set 10, file writes the model had to resend
+ * were 14 percent of Batshit's output (a heredoc over 4,000 characters refused, then resent as a
+ * patch; Add File lines without `+`), so the text says how to write a large file the first time.
+ * SA-126 item 2 (2026-10-21): the API lane runs one command joined to the `apply_patch` line by
+ * `&&` after the whole patch applied, so its text says how; where such a call can never run, the
+ * separate-call text below keeps the separate-call sentence. Both share every other sentence.
+ * Josh (2026-10-23): the description was 1,811 characters (Pi's Bash tool, 248) and said nothing about
+ * small diffs. It now says how to send a patch, to keep each change small (as Pi steers its edit
+ * tool), and how to write a long file; the rare refusals (`||` after a patch, a heredoc of its own,
+ * the patch size limit) are said by the refusal when they happen. "Just enough unchanged lines to
+ * match only one place" leans on BL-2156: a hunk that matches more than once is placed only when
+ * its `@@` lines pick one match, and is refused otherwise. The sentence says apply_patch is built
+ * in, not "edit files with it": with typed file tools on, the prompt prefers `edit_file` for one file.
  */
+const APPLY_PATCH_GUIDANCE_HOW =
+  "apply_patch is built in (not a program on the PATH): send `apply_patch <<'PATCH'`, the patch from `*** Begin Patch` to `*** End Patch`, then `PATCH`. "
+/**
+ * Josh (2026-10-23): small changes, small diffs. Josh (2026-11-05, SA-126 marathon pilot): "Keep
+ * each change small" first read as "make small patches" (DeepSeek: 157 of 250 patches one hunk,
+ * 43 patches of the file it had just patched), so the text leads with one patch for the planned
+ * changes and keeps the precision rule for each change in it.
+ */
+const APPLY_PATCH_GUIDANCE_PRECISE =
+  'Put all the changes you have planned into one patch, even across several files. Keep each change precise: only the lines that change, with just enough unchanged lines around them to match one place. Never rewrite a whole file to change a few lines. '
+const APPLY_PATCH_GUIDANCE_SIZE =
+  'To create a file, use `*** Add File: <path>` with every line, blank lines included, starting with `+`. A plain command over 4,000 characters is refused, so write a long file this way.'
+/** SA-126 item 2: the API lane's sentence about commands after the patch (`readAfterPatch`). */
+export const NATIVE_BASH_AFTER_PATCH_GUIDANCE =
+  "To test after it, add `&& npm test` on the apply_patch line (`apply_patch <<'PATCH' && npm test`). "
 export const NATIVE_BASH_APPLY_PATCH_GUIDANCE =
-  "apply_patch is built into this tool, not a program on the PATH, so there is no need to check for it. Send it as the whole command, optionally after `cd <folder> &&`: `apply_patch <<'PATCH'`, the patch from `*** Begin Patch` to `*** End Patch`, then `PATCH`. Run anything else, such as tests, in a separate call. A patch may be 200,000 characters long; other commands 4,000."
+  APPLY_PATCH_GUIDANCE_HOW + NATIVE_BASH_AFTER_PATCH_GUIDANCE + APPLY_PATCH_GUIDANCE_PRECISE + APPLY_PATCH_GUIDANCE_SIZE
+/**
+ * The text where commands after a patch never run: the API lane's own Bash tool
+ * where such a call can never be approved (deep review of SA-126 item 2: Plan mode, Agent mode
+ * with no approval card, a group chat), so the model is not told to send what is always refused.
+ */
+export const NATIVE_BASH_APPLY_PATCH_GUIDANCE_SEPARATE_CALL =
+  APPLY_PATCH_GUIDANCE_HOW + 'Run anything else, such as tests, in a separate call. ' + APPLY_PATCH_GUIDANCE_PRECISE + APPLY_PATCH_GUIDANCE_SIZE
 
-export const NATIVE_BASH_SHELL_GUIDANCE =
-  'Local commands use system zsh when installed, otherwise bash; the result records the selected shell. Use common shell syntax until the result identifies it. '
+/**
+ * BL-1915: the line a managed patch's result adds for the commands written after the patch, which
+ * Batshit never runs (`parseManagedApplyPatchCommand`'s `notRun`). Empty when there are none.
+ * SA-126 item 2: where commands after a patch do run (`afterPatchRuns`), the line says which ones
+ * would have, and never suggests sending the patch again: it applied (Faye, 2026-10-21).
+ */
+function describeManagedPatchNotRun(
+  notRun: string[],
+  afterPatchRuns = false,
+  reason: AfterPatchNotRunReason = 'grammar'
+): string {
+  if (notRun.length === 0) return ''
+  const one = notRun.length === 1
+  const send = `the patch applied, so send ${one ? 'that command' : 'those commands'} on ${one ? 'its' : 'their'} own.`
+  const named = `Not run: ${notRun.map((command) => `\`${command}\``).join(', ')}.`
+  if (!afterPatchRuns) {
+    return `${named} Batshit applies a patch by itself and runs nothing after it in the same command; send ${one ? 'that command' : 'those commands'} on ${one ? 'its' : 'their'} own.`
+  }
+  // Deep review of SA-126 item 2: the line says the real reason, never one that is not so.
+  if (reason === 'quoted-patch') {
+    return `${named} Batshit runs commands after a patch only when the patch is a heredoc (\`apply_patch <<'PATCH'\`); ${send}`
+  }
+  if (reason === 'agent-browser') {
+    return `${named} Batshit does not run an Agent Browser command after a patch; ${send}`
+  }
+  if (reason === 'or-after-patch') {
+    // Review of item 2b: nothing after the patch ran, the lines after `PATCH` included.
+    return `${named} A command after \`||\` right after the patch runs, in a shell, only when the patch fails, and this patch applied, so nothing after the patch ran; send any you still need on their own.`
+  }
+  return `${named} After a patch Batshit runs the commands that follow it as plain shell text, except a background \`&\`, a heredoc of their own, a \`\\\` that joins the apply_patch line to the patch, or a chain left open, and here one has one of those; ${send}`
+}
+
+export const NATIVE_BASH_SHELL_GUIDANCE = 'Local commands use zsh when installed, else bash. '
 
 /** A command a Stop reached before it started: it never ran. */
 function stoppedBeforeStartRun(command: string): CommandRunResult {
@@ -4366,7 +5073,8 @@ function stoppedBeforeStartRun(command: string): CommandRunResult {
     timedOut: false,
     durationMs: 0,
     truncated: false,
-    stopped: true
+    stopped: true,
+    neverStarted: true
   }
 }
 
@@ -4546,12 +5254,12 @@ async function fetchDockerSandboxOperatorJson<TPayload = Record<string, any>>(
       signal: controller.signal
     })
     const healthPayload = await health.json().catch(() => null)
-    if (!health.ok || !Number.isInteger(healthPayload?.sandboxRevision) || healthPayload.sandboxRevision < 12) {
+    if (!health.ok || !Number.isInteger(healthPayload?.sandboxRevision) || healthPayload.sandboxRevision < 13) {
       return {
         ok: false,
         statusCode: health.status,
         payload: null,
-        reason: 'Docker Sandbox operator must be updated to revision 12 or later. Run start-docker again to update its sandbox protection and output limits.'
+        reason: 'Docker Sandbox operator must be updated to revision 13 or later. Run start-docker again to update its workspace admission and sandbox protection.'
       }
     }
     const response = await fetch(`${config.url}${pathname}`, {
@@ -4598,6 +5306,34 @@ async function fetchDockerSandboxOperatorJson<TPayload = Record<string, any>>(
   } finally {
     clearTimeout(timer)
     callerSignal?.removeEventListener('abort', forwardCallerAbort)
+  }
+}
+
+/** Container-only typed preflight; expected roots compare configuration, never select authority. */
+async function admitTypedDockerWorkspace(realRoot: string, realCwd: string, signal?: AbortSignal | null): Promise<void> {
+  const containerRoot = typedContainerWorkspaceRoot()
+  const configuredHostRoot = typedHostWorkspaceRoot()
+  if (!containerizedDockerSandboxOperatorEnabled() || containerizedDockerSandboxLocalCliExplicitlyAllowed()) {
+    throw new Error('Typed file tools with Docker Sandbox require the normal host operator.')
+  }
+  const config = resolveDockerSandboxOperatorConfig()
+  if (!config.ok) throw new Error(config.reason)
+  const result = await fetchDockerSandboxOperatorJson('/v1/sandbox/workspace/admit', {
+    method: 'POST', signal,
+    body: JSON.stringify({ v: 1, workspaceRoot: realRoot, cwd: realCwd, expectedContainerRoot: containerRoot, expectedHostRoot: configuredHostRoot })
+  }, Math.min(config.timeoutMs, 60_000))
+  if (!result.ok) throw new Error(result.reason)
+  const value = result.payload
+  const keys = ['ok', 'admitted', 'v', 'hostPlatform', 'requestedWorkspaceRoot', 'requestedCwd', 'containerRoot', 'configuredHostRoot', 'hostRoot', 'hostWorkspaceRoot', 'hostCwd']
+  const exactShape = value && typeof value === 'object' && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key))
+  const canonical = (candidate: unknown): candidate is string => typeof candidate === 'string' && !candidate.includes('\0') && path.posix.isAbsolute(candidate) && path.posix.normalize(candidate) === candidate
+  if (!exactShape || value.ok !== true || value.admitted !== true || value.v !== 1 || value.hostPlatform !== 'darwin' ||
+      value.requestedWorkspaceRoot !== realRoot || value.requestedCwd !== realCwd ||
+      value.containerRoot !== containerRoot || value.configuredHostRoot !== configuredHostRoot ||
+      !canonical(value.hostRoot) || !canonical(value.hostWorkspaceRoot) || !canonical(value.hostCwd) ||
+      value.hostWorkspaceRoot !== path.posix.resolve(value.hostRoot, path.posix.relative(containerRoot, realRoot)) ||
+      value.hostCwd !== path.posix.resolve(value.hostRoot, path.posix.relative(containerRoot, realCwd))) {
+    throw new Error('Docker Sandbox operator did not confirm this exact app workspace mapping and protected-root admission.')
   }
 }
 
@@ -5149,6 +5885,14 @@ async function startDockerSandbox(options: {
     return { ok: false, code: 'SANDBOX_UNAVAILABLE', reason: CONTAINERIZED_DOCKER_SANDBOX_DISABLED_REASON }
   }
   const { sandboxName } = options
+  // Revalidate even a current reusable sandbox before any lifecycle mutation. Typed tools use
+  // this same strict policy before admitting their own host writer; no lexical fallback.
+  if (process.platform === 'darwin' || process.platform === 'linux') {
+    try { await assertSandboxMountRootsSafe([options.workspaceRoot]) }
+    catch (error) {
+      return { ok: false, code: 'POLICY_BLOCKED', reason: error instanceof Error ? error.message : 'Docker Sandbox workspace could not be admitted.' }
+    }
+  }
   const usable = (entry: SbxSandboxEntry | undefined) =>
     Boolean(entry) &&
     isReusableSbxSandbox(entry as SbxSandboxEntry) &&
@@ -5176,6 +5920,12 @@ async function startDockerSandbox(options: {
       !isPathInsideSandboxRoot(options.workspaceRoot, batshitHomeMount)
         ? [batshitHomeMount]
         : []
+    if (process.platform === 'darwin' || process.platform === 'linux') {
+      try { await assertSandboxMountRootsSafe(sbxWorkspaceMounts({ workspaceRoot: options.workspaceRoot, extraWorkspaces })) }
+      catch (error) {
+        return { ok: false, code: 'POLICY_BLOCKED', reason: error instanceof Error ? error.message : 'Docker Sandbox mounts could not be admitted.' }
+      }
+    }
     const createRun = await runSbx(
       sbxCreateArgs({ sandboxName, workspaceRoot: options.workspaceRoot, extraWorkspaces }),
       { timeoutMs: DOCKER_SANDBOX_CREATE_TIMEOUT_MS, maxOutputChars: 120_000 }
@@ -5545,7 +6295,7 @@ async function runAgentBrowserCli(
   const start = Date.now()
 
   return await new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = spawnAgentBrowserCliProcess(command, args, {
       cwd: request.cwd ?? process.cwd(),
       env: stripNativeCommandAuthorityFromChildEnv({
         ...process.env,
@@ -6626,7 +7376,7 @@ async function nativeFetchZip(input: {
   maxChars?: number
   offset?: number
 }): Promise<Record<string, any>> {
-  if (input.actorType !== 'agent' && input.actorType !== 'in-process') {
+  if (input.actorType !== 'in-process') {
     return {
       found: false,
       zipId: input.zipId,
@@ -6638,6 +7388,7 @@ async function nativeFetchZip(input: {
 }
 
 async function nativeDynamicMcpFind(input: {
+  p5ApiRun?: import('./appActions/mcp/originalTask').P5ApiOriginalRun
   userId: string
   agentId?: string | null
   agentMetadata?: Record<string, any> | null
@@ -6654,6 +7405,7 @@ async function nativeDynamicMcpFind(input: {
   gatewayToolsCache?: GatewayToolsCache
 }): Promise<Record<string, any>> {
   return executeSharedDynamicMcpFind({
+    p5ApiRun: input.p5ApiRun,
     userId: input.userId,
     agentId: input.agentId ?? null,
     agentMetadata: input.agentMetadata ?? null,
@@ -6672,6 +7424,8 @@ async function nativeDynamicMcpFind(input: {
 }
 
 async function nativeDynamicMcpUse(input: {
+  p5ApiRun?: import('./appActions/mcp/originalTask').P5ApiOriginalRun
+
   userId: string
   agentId?: string | null
   agentMetadata?: Record<string, any> | null
@@ -6686,6 +7440,7 @@ async function nativeDynamicMcpUse(input: {
   abortSignal?: AbortSignal | null
 }): Promise<Record<string, any>> {
   return executeSharedDynamicMcpUse({
+    p5ApiRun: input.p5ApiRun,
     userId: input.userId,
     agentId: input.agentId ?? null,
     agentMetadata: input.agentMetadata ?? null,
@@ -6764,7 +7519,8 @@ function buildBatshitToolUseExample(ref: string, inputHint: string): string {
   if (inputHint.includes('no input')) {
     return `native_batshit_tool_use({ ref: "${ref}" })`
   }
-  const objectHintMatch = inputHint.match(/input:\s*\{\s*([^}]+?)\s*\}/i)
+  const objectHintMatch = inputHint.match(/input:\s*\{\s*([^}]+?)\s*\}/i) ??
+    inputHint.match(/\brequired:\s*([^;]+)/i)
   if (objectHintMatch?.[1]) {
     const fields = objectHintMatch[1]
       .split(',')
@@ -6804,8 +7560,9 @@ function mapMcpSearchResult(entry: Record<string, any>, schemaMode: BatshitToolS
   const hint =
     schemaMode === 'none'
       ? undefined
-      : buildCompactJsonSchemaHint(inputSchema) ??
-        'input: MCP params object. Use schemaMode="full" if this tool needs exact fields.'
+      : typeof entry.schemaHint === 'string' && entry.schemaHint.trim()
+        ? entry.schemaHint.trim()
+        : buildCompactJsonSchemaHint(inputSchema) ?? 'input schema unavailable'
   const ref = buildBatshitToolRef('mcp', toolName)
   return {
     ref,
@@ -6837,9 +7594,9 @@ function mapCliSearchResult(entry: Record<string, any>, schemaMode: BatshitToolS
     schemaMode === 'none'
       ? undefined
       : typeof entry.schemaHint === 'string' && entry.schemaHint.trim().length > 0
-        ? `input: { ${entry.schemaHint.trim()} }`
+        ? entry.schemaHint.trim()
         : buildCompactJsonSchemaHint(inputSchema) ??
-          'input: CLI manifest fields go inside input, not beside ref.'
+          'input schema unavailable'
   const ref = buildBatshitToolRef('cli', toolId)
   return {
     ref,
@@ -6855,7 +7612,7 @@ function mapCliSearchResult(entry: Record<string, any>, schemaMode: BatshitToolS
 }
 
 function mapControlSearchResult(
-  family: 'artifact' | 'fabric',
+  family: 'artifact' | 'fabric' | 'batshit',
   entry: Record<string, any>,
   schemaMode: BatshitToolSchemaMode
 ): BatshitToolSearchResult {
@@ -6874,9 +7631,9 @@ function mapControlSearchResult(
     schemaMode === 'none'
       ? undefined
       : schemaHint
-        ? `input: ${schemaHint}`
+        ? schemaHint
         : buildCompactJsonSchemaHint(inputSchema) ??
-          'input: structured control fields. Use schemaMode="full" if unclear.'
+          'input schema unavailable'
   const ref = buildBatshitToolRef(family, controlId)
   const risk =
     entry.riskLevel === 'confirm' || entry.riskLevel === 'restricted' ? entry.riskLevel : 'safe'
@@ -7002,13 +7759,27 @@ function findNativeFabricHelperControls(input: {
 
 function resolveBrokerPresentation(
   family: BatshitToolFamily,
-  target: string
+  target: string,
+  payload?: Record<string, any>
 ): { operationKind: BatshitToolUseResponse['operationKind']; rendererFamily: BatshitToolUseResponse['rendererFamily'] } {
   if (family === 'fabric' && target === FABRIC_FETCH_ZIP_CONTROL_ID) {
     return {
       operationKind: 'fetch_zip',
       rendererFamily: 'generic_tool'
     }
+  }
+  if (family === 'batshit' && target === API_UTILITY_CONTROL_IDS.webSearch) {
+    return { operationKind: 'web_search', rendererFamily: 'web_search' }
+  }
+  if (family === 'batshit' && target === API_UTILITY_CONTROL_IDS.workers) {
+    return { operationKind: 'workers', rendererFamily: 'workers' }
+  }
+  if (family === 'batshit' && target === API_UTILITY_CONTROL_IDS.skill) {
+    return payload?.action === 'list' ? { operationKind: 'unknown_tool', rendererFamily: 'generic_tool' }
+      : { operationKind: 'skill_read', rendererFamily: 'skill_read' }
+  }
+  if (family === 'batshit' && target === API_UTILITY_CONTROL_IDS.subagent) {
+    return { operationKind: 'subagent', rendererFamily: 'subagent' }
   }
 
   return {
@@ -7095,6 +7866,10 @@ function mapAgentBrowserSearchResult(
 }
 
 async function nativeBatshitToolSearch(input: BatshitToolSearchInput & {
+  apiUtilityScope?: ApiUtilityScope
+  p5ApiRun?: import('./appActions/mcp/originalTask').P5ApiOriginalRun
+  actorType?: ControlActorType
+  delegatedRun?: boolean
   userId: string
   agentId?: string | null
   /** BL-186 — a delegated run's own id: the artifact family's allowlists are judged by it. */
@@ -7108,7 +7883,6 @@ async function nativeBatshitToolSearch(input: BatshitToolSearchInput & {
   runtimeMode: ControlRuntimeMode
   fabricAllowedControlIds?: string[]
   allowArtifactRuntimeTools?: boolean
-  agentBrowserSettings?: Parameters<typeof nativeAgentBrowserFind>[0]['settings']
   projectPath?: string | null
   gatewayToolsCache?: GatewayToolsCache
 }): Promise<BatshitToolSearchResponse> {
@@ -7116,11 +7890,16 @@ async function nativeBatshitToolSearch(input: BatshitToolSearchInput & {
   const query = typeof input.query === 'string' ? input.query.trim() : ''
   const schemaMode = normalizeBatshitToolSchemaMode(input)
   const includeSchema = schemaMode !== 'none'
-  const { families, unavailableFamilies } = resolveBatshitToolSearchFamilies({
+  const resolvedFamilies = resolveBatshitToolSearchFamilies({
     family: input.family,
     families: input.families,
     allowedFamilies: input.allowedFamilies
   })
+  // Domain narrows the caller's existing family ceiling before any provider/helper
+  // search, count or limit. It cannot enable a family the caller did not have.
+  const families = input.domain === 'agent-settings'
+    ? resolvedFamilies.families.filter(family => family === 'fabric' || family === 'batshit') : resolvedFamilies.families
+  const { unavailableFamilies } = resolvedFamilies
 
   const results: BatshitToolSearchResult[] = []
   let totalMatches = 0
@@ -7128,6 +7907,7 @@ async function nativeBatshitToolSearch(input: BatshitToolSearchInput & {
   for (const family of families) {
     if (family === 'mcp') {
       const found = await nativeDynamicMcpFind({
+        p5ApiRun: input.p5ApiRun,
         userId: input.userId,
         agentId: input.agentId ?? null,
         agentMetadata: input.agentMetadata ?? null,
@@ -7177,35 +7957,35 @@ async function nativeBatshitToolSearch(input: BatshitToolSearchInput & {
       continue
     }
 
-    if (family === 'fabric') {
-      const helperFound = findNativeFabricHelperControls({
+    if (family === 'fabric' || family === 'batshit') {
+      // Both namespaces share one scoped registry search. Filter before its count/limit.
+      if (families.indexOf(family) !== families.findIndex((entry) => entry === 'fabric' || entry === 'batshit')) continue
+      const controlFamilies = families.filter((entry): entry is 'fabric' | 'batshit' => entry === 'fabric' || entry === 'batshit')
+      const helperFound = input.domain !== 'agent-settings' && controlFamilies.includes('fabric')
+        ? findNativeFabricHelperControls({ query, schemaMode, allowedControlIds: input.fabricAllowedControlIds, limit: normalizedLimit })
+        : { results: [], totalMatches: 0 }
+      const shouldSearchRegistry = (input.fabricAllowedControlIds ?? []).some((entry) => !allowedControlEntryIsNativeFabricHelperOnly(entry))
+      const found = shouldSearchRegistry ? await findControls({
+        apiUtilityScope: input.apiUtilityScope,
+        p5McpOwner: input.p5ApiRun,
+        actorType: input.actorType,
+        delegatedRun: input.delegatedRun,
+        ...(input.delegatedRun && input.apiUtilityScope ? { delegatedAllowedControlIds:
+          readApiUtilities(input.apiUtilityScope, input).map(entry => entry.controlId) } : {}),
+        domain: input.domain,
+        userId: input.userId,
+        agentId: input.agentId ?? undefined,
         query,
-        schemaMode,
-        allowedControlIds: input.fabricAllowedControlIds,
-        limit: normalizedLimit
-      })
-      const shouldSearchRegistry =
-        !Array.isArray(input.fabricAllowedControlIds) ||
-        input.fabricAllowedControlIds.length === 0 ||
-        input.fabricAllowedControlIds.some((entry) => !allowedControlEntryIsNativeFabricHelperOnly(entry))
-
-      if (shouldSearchRegistry) {
-        const found = await findControls({
-          userId: input.userId,
-          agentId: input.agentId ?? undefined,
-          query,
-          runtimeMode: input.runtimeMode,
-          includeSchema,
-          limit: normalizedLimit + helperFound.results.length,
-          allowedControlIds: input.fabricAllowedControlIds
-        })
-        const entries = (Array.isArray(found.results) ? found.results : []).filter(
-          (entry) => !isNativeFabricHelperControlId(entry.controlId)
-        )
-        totalMatches += entries.length
-        results.push(...entries.map((entry) => mapControlSearchResult(family, entry, schemaMode)))
-      }
-      totalMatches += helperFound.totalMatches
+        runtimeMode: input.runtimeMode,
+        includeSchema,
+        limit: normalizedLimit,
+        allowedControlIds: input.fabricAllowedControlIds ?? [],
+        brokerFamilies: controlFamilies,
+        excludedControlIds: NATIVE_FABRIC_HELPER_CONTROL_META.map((entry) => entry.controlId)
+      }) : { results: [], totalMatches: 0 }
+      const entries = Array.isArray(found.results) ? found.results : []
+      totalMatches += found.totalMatches + helperFound.totalMatches
+      results.push(...entries.map((entry) => mapControlSearchResult(isBatshitUtilityControlId(entry.controlId) ? 'batshit' : 'fabric', entry, schemaMode)))
       results.push(...helperFound.results)
       continue
     }
@@ -7215,7 +7995,6 @@ async function nativeBatshitToolSearch(input: BatshitToolSearchInput & {
         userId: input.userId,
         query,
         limit: normalizedLimit,
-        settings: input.agentBrowserSettings
       })
       const entries = Array.isArray(found.results) ? found.results : []
       totalMatches += typeof found.totalMatches === 'number' ? found.totalMatches : entries.length
@@ -7237,6 +8016,10 @@ async function nativeBatshitToolSearch(input: BatshitToolSearchInput & {
 }
 
 async function nativeBatshitToolUse(input: BatshitToolUseInput & {
+  apiUtilityScope?: ApiUtilityScope
+  apiUtilityInvocation?: ApiUtilityInvocation
+  p5ApiRun?: import('./appActions/mcp/originalTask').P5ApiOriginalRun
+
   /** Server-owned identity; never accepted from model input. */
   processOwner?: HostCommandOwner
   userId: string
@@ -7253,7 +8036,6 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
   runtimeMode: ControlRuntimeMode
   fabricAllowedControlIds?: string[]
   executionBackend?: NativeExecutionBackend
-  agentBrowserSettings?: Parameters<typeof nativeAgentBrowserUse>[0]['settings']
   gatewayToolsCache?: GatewayToolsCache
   /**
    * SA-116 P2 — the server-owned approval this call is spending, or null.
@@ -7270,9 +8052,9 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
    * `/api/controls/use`); the in-process broker passes `'in-process'`. Never defaulted here.
    */
   actorType: ControlActorType
-  /** SA-117 F-P2-1 — the call arrived on a Subagent or Worker run's credential. */
+  /** A server-owned in-process Subagent or Worker run. */
   delegatedRun?: boolean
-  /** BL-186 — that run's own id (the credential's `scopeAgentId`), whose allowlists apply. */
+  /** BL-186 — that delegated run's own id, whose allowlists apply. */
   scopeAgentId?: string | null
   /**
    * The server-owned Stop of the reply this call belongs to. Agent Browser and saved CLI
@@ -7285,6 +8067,11 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
   ) => Promise<Record<string, any>>
 }): Promise<BatshitToolUseResponse> {
   const parsed = parseBatshitToolRef(input.ref)
+  if (input.apiUtilityScope && parsed.family === 'batshit' && isApiUtilityControlId(parsed.target) && input.ref !== `batshit:${parsed.target}`) {
+    return { success: false, ref: input.ref, family: parsed.family, target: parsed.target,
+      operationKind: 'fabric_use', rendererFamily: 'generic_tool', code: 'OUT_OF_SCOPE',
+      error: `This API utility requires the exact ref batshit:${parsed.target}.` }
+  }
   if (!input.allowedFamilies.includes(parsed.family)) {
     return {
       success: false,
@@ -7293,16 +8080,24 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
       target: parsed.target,
       operationKind: BATSHIT_TOOL_OPERATION_KIND_BY_FAMILY[parsed.family],
       rendererFamily: parsed.family === 'cli' ? 'cli_tool' : 'generic_tool',
+      code: 'OUT_OF_SCOPE',
       error: `${BATSHIT_TOOL_FAMILY_LABELS[parsed.family]} tools are not enabled for this actor/runtime.`
     }
   }
 
-  const payload = normalizeBatshitToolUsePayload(input)
-  const { operationKind, rendererFamily } = resolveBrokerPresentation(parsed.family, parsed.target)
+  // Exact private API utilities share one canonical argument owner with their
+  // formatter and saved semantic event. Legacy generic brokers keep their
+  // historical top-level/params normalization; those aliases cannot feed a
+  // migrated callback when its raw nested input was absent or incomplete.
+  const payload = parsed.family === 'batshit' && isApiUtilityControlId(parsed.target) && input.apiUtilityScope
+    ? input.input ?? {}
+    : normalizeBatshitToolUsePayload(input)
+  const { operationKind, rendererFamily } = resolveBrokerPresentation(parsed.family, parsed.target, payload)
   let routed: Record<string, any>
 
   if (parsed.family === 'mcp') {
     routed = await nativeDynamicMcpUse({
+      p5ApiRun: input.p5ApiRun,
       userId: input.userId,
       agentId: input.agentId ?? null,
       agentMetadata: input.agentMetadata ?? null,
@@ -7330,7 +8125,7 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
       actorType: input.actorType,
       abortSignal: input.abortSignal
     })
-  } else if (parsed.family === 'artifact' || parsed.family === 'fabric') {
+  } else if (parsed.family === 'artifact' || parsed.family === 'fabric' || parsed.family === 'batshit') {
     const controlInput: ControlUseInput = {
       controlId: parsed.target,
       input: payload,
@@ -7341,7 +8136,7 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
       parsed.family === 'artifact'
         ? Array.from(ARTIFACT_RUNTIME_ALLOWED_CONTROL_IDS)
         : input.fabricAllowedControlIds ?? []
-    if (parsed.family === 'fabric' && !isControlIdAllowedByList(parsed.target, allowedControlIds)) {
+    if ((parsed.family === 'fabric' || parsed.family === 'batshit') && !isControlIdAllowedByList(parsed.target, allowedControlIds)) {
       return {
         success: false,
         ref: input.ref,
@@ -7350,7 +8145,7 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
         operationKind,
         rendererFamily,
         code: 'OUT_OF_SCOPE',
-        error: `Fabric tools are not enabled for this actor/runtime; control "${parsed.target}" is out of scope.`
+        error: `${BATSHIT_TOOL_FAMILY_LABELS[parsed.family]} tools are not enabled for this actor/runtime; control "${parsed.target}" is out of scope.`
       }
     }
     const nativeHelperResult =
@@ -7378,6 +8173,8 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
       routed = input.executeControlUse
         ? await input.executeControlUse(controlInput, allowedControlIds)
         : await useControl({
+            apiUtilityScope: input.apiUtilityScope,
+            apiUtilityInvocation: input.apiUtilityInvocation,
             userId: input.userId,
             agentId: input.agentId ?? undefined,
             sessionId: input.sessionId,
@@ -7404,18 +8201,25 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
       sessionId: input.sessionId,
       toolName: parsed.target,
       params: payload,
-      settings: input.agentBrowserSettings,
       // The model's input is spread into this call and its schema passes unknown keys through,
       // so only a real signal counts.
       abortSignal: input.abortSignal instanceof AbortSignal ? input.abortSignal : undefined
     })
   }
 
+  if (isApiUtilityControlId(parsed.target) && input.apiUtilityScope) {
+    const details = routed?.error && typeof routed.error === 'object' ? routed.error.details : undefined
+    const raw = routed?.result ?? (details?.success === false && typeof details.error === 'string' ? details : undefined)
+    if (raw && typeof raw === 'object') routed = { ...routed, result: raw }
+  }
   return propagateCommandModelCapture(routed, {
     ...(routed ?? {}),
     ref: input.ref,
     family: parsed.family,
     target: parsed.target,
+    ...(isApiUtilityControlId(parsed.target) && input.apiUtilityScope ? { controlId: parsed.target } : {}),
+    ...(parsed.target === API_UTILITY_CONTROL_IDS.subagent
+      ? readApiUtilityInvocationTarget(input.apiUtilityScope, input.apiUtilityInvocation) ?? {} : {}),
     operationKind,
     rendererFamily
   })
@@ -7621,20 +8425,12 @@ function formatSpecializedBrokerUseModelValue(output: Record<string, any>): stri
   )
 }
 
-/**
- * SA-105 — bind the shared recall-media finalizer to the API path.
- *
- * The lane decision, the per-memory notes and the byte-free Execution Viewer
- * record all live in `memory/memoryRecallDelivery.ts` so the managed CLI route
- * (P3) produces identical wording from the same code. Only two things differ per
- * caller: where the lane comes from, and how bytes are authorized. Here the lane
- * is the resolved provider/model pair and bytes come straight from
- * `loadMemoryMedia`, because the run is already inside an authorized send.
- */
+/** The API recall finalizer uses its resolved image lane and owned media loader. */
 async function applyRecallMediaDelivery(output: any, context: NativeToolContext) {
   const agentId = typeof context.agentId === 'string' ? context.agentId : ''
   return applyRecallMediaDeliveryForLane(output, {
     lane: context.imageDelivery?.lane ?? 'synthetic_user',
+    actor: { userId: context.userId, agentId, sessionId: context.sessionId ?? '' },
     loadBytes: ({ memoryId, mediaId }) => loadMemoryMedia(agentId, memoryId, mediaId)
   })
 }
@@ -7766,6 +8562,7 @@ function formatBatshitToolUseModelOutput(context: NativeToolContext) {
       // SA-105 P2: two delivery channels for recalled memory images.
       if (recall && recall.images.length > 0) {
         if (context.imageDelivery?.lane === 'tool_result') {
+          if (context.p5ApiRun && context.ephemeralImages && toolCallId) context.ephemeralImages.register(toolCallId, MEMORY_RECALL_CONTROL_ID, recall.images, 'recalled memory media', 'tool_result')
           return buildToolResultImageContentOutput({ text, images: recall.images })
         }
         if (context.imageDelivery?.lane === 'synthetic_user' && context.ephemeralImages) {
@@ -7817,73 +8614,85 @@ async function readSearchProviderError(response: Response): Promise<string | nul
   return null
 }
 
+async function runWebSearchRequest(
+  input: { timeoutMs: number; abortSignal?: AbortSignal },
+  run: (signal: AbortSignal) => Promise<Record<string, any>>
+): Promise<Record<string, any>> {
+  const controller = new AbortController()
+  const finished = new AbortController()
+  relayAbort({ from: input.abortSignal, to: controller, reason: (source: AbortSignal) => source.reason, until: finished.signal })
+  const timer = setTimeout(() => controller.abort(), input.timeoutMs)
+  try {
+    controller.signal.throwIfAborted()
+    const result = await run(controller.signal)
+    controller.signal.throwIfAborted()
+    return result
+  } catch (error) {
+    if (input.abortSignal?.aborted) return { success: false, stopped: true, error: 'Search stopped.' }
+    const isAbort = controller.signal.aborted || error instanceof DOMException && error.name === 'AbortError'
+    return { success: false, error: isAbort ? `Search timed out after ${input.timeoutMs}ms.`
+      : `Search request failed: ${error instanceof Error ? error.message : 'Unknown error.'}` }
+  } finally {
+    clearTimeout(timer)
+    finished.abort()
+  }
+}
+
 async function nativeWebSearchDuckDuckGo(input: {
   query: string
   maxResults: number
   region: string
   safeSearch: 'strict' | 'moderate' | 'off'
   timeoutMs: number
+  abortSignal?: AbortSignal
 }): Promise<Record<string, any>> {
   const safeSearch = input.safeSearch === 'off' ? '-2' : input.safeSearch === 'strict' ? '1' : '-1'
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), input.timeoutMs)
   const searchUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(input.query)}&kl=${encodeURIComponent(input.region)}&kp=${safeSearch}`
-  let response: Response
-  try {
-    response = await fetch(searchUrl, {
+  return runWebSearchRequest(input, async signal => {
+    const response = await fetch(searchUrl, {
       headers: {
         'User-Agent': 'BatshitRoomNativeSearch/1.0 (+https://batshit.ai)'
       },
-      signal: controller.signal
+      signal
     })
-  } catch (error) {
-    const isAbort = error instanceof DOMException && error.name === 'AbortError'
-    return {
-      success: false,
-      error: isAbort
-        ? `Search timed out after ${input.timeoutMs}ms.`
-        : `Search request failed: ${error instanceof Error ? error.message : 'Unknown error.'}`
+
+    if (!response.ok) {
+      return {
+        success: false,
+        error: `Search provider returned ${response.status}.`
+      }
     }
-  } finally {
-    clearTimeout(timer)
-  }
 
-  if (!response.ok) {
-    return {
-      success: false,
-      error: `Search provider returned ${response.status}.`
-    }
-  }
+    const html = await response.text()
+    const $ = loadHtml(html)
+    const results: Array<{ title: string; url: string; snippet: string }> = []
 
-  const html = await response.text()
-  const $ = loadHtml(html)
-  const results: Array<{ title: string; url: string; snippet: string }> = []
+    $('.result').each((index, element) => {
+      if (results.length >= input.maxResults) return
+      if (index > 50) return
 
-  $('.result').each((index, element) => {
-    if (results.length >= input.maxResults) return
-    if (index > 50) return
+      const link = $(element).find('.result__a').first()
+      const rawHref = link.attr('href') || ''
+      const title = link.text().trim()
+      const snippet = $(element).find('.result__snippet').first().text().trim()
 
-    const link = $(element).find('.result__a').first()
-    const rawHref = link.attr('href') || ''
-    const title = link.text().trim()
-    const snippet = $(element).find('.result__snippet').first().text().trim()
+      if (!title || !rawHref) return
 
-    if (!title || !rawHref) return
-
-    results.push({
-      title,
-      url: decodeDuckDuckGoUrl(rawHref),
-      snippet
+      results.push({
+        title,
+        url: decodeDuckDuckGoUrl(rawHref),
+        snippet
+      })
     })
+
+    return {
+      success: true,
+      query: input.query,
+      provider: 'duckduckgo-html',
+      fetchedAt: new Date().toISOString(),
+      results
+    }
   })
-
-  return {
-    success: true,
-    query: input.query,
-    provider: 'duckduckgo-html',
-    fetchedAt: new Date().toISOString(),
-    results
-  }
 }
 
 async function nativeWebSearchExa(input: {
@@ -7892,6 +8701,7 @@ async function nativeWebSearchExa(input: {
   maxResults: number
   timeoutMs: number
   searchType: ExaSearchType
+  abortSignal?: AbortSignal
 }): Promise<Record<string, any>> {
   const apiKey = await apiKeyService.retrieve('exa', input.userId)
   if (!apiKey) {
@@ -7901,11 +8711,8 @@ async function nativeWebSearchExa(input: {
     }
   }
 
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), input.timeoutMs)
-  let response: Response
-  try {
-    response = await fetch('https://api.exa.ai/search', {
+  return runWebSearchRequest(input, async signal => {
+    const response = await fetch('https://api.exa.ai/search', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -7916,57 +8723,47 @@ async function nativeWebSearchExa(input: {
         numResults: input.maxResults,
         type: input.searchType
       }),
-      signal: controller.signal
+      signal
     })
-  } catch (error) {
-    const isAbort = error instanceof DOMException && error.name === 'AbortError'
-    return {
-      success: false,
-      error: isAbort
-        ? `Search timed out after ${input.timeoutMs}ms.`
-        : `Search request failed: ${error instanceof Error ? error.message : 'Unknown error.'}`
-    }
-  } finally {
-    clearTimeout(timer)
-  }
 
-  if (!response.ok) {
-    const providerError = await readSearchProviderError(response)
-    return {
-      success: false,
-      error: providerError
-        ? `Exa returned ${response.status}: ${providerError}`
-        : `Exa returned ${response.status}.`
-    }
-  }
-
-  const payload = await response.json().catch(() => null)
-  const rawResults = Array.isArray(payload?.results) ? payload.results : []
-  const results = rawResults
-    .slice(0, input.maxResults)
-    .map((entry: any) => {
-      const title = typeof entry?.title === 'string' ? entry.title.trim() : ''
-      const url = typeof entry?.url === 'string' ? entry.url.trim() : ''
-      const snippetSource =
-        entry?.text ??
-        entry?.snippet ??
-        (Array.isArray(entry?.highlights) ? entry.highlights.join(' ') : '')
+    if (!response.ok) {
+      const providerError = await readSearchProviderError(response)
       return {
-        title: title || url || 'Untitled result',
-        url,
-        snippet: truncateSnippet(snippetSource)
+        success: false,
+        error: providerError
+          ? `Exa returned ${response.status}: ${providerError}`
+          : `Exa returned ${response.status}.`
       }
-    })
-    .filter((entry: { url: string }) => entry.url.length > 0)
+    }
 
-  return {
-    success: true,
-    query: input.query,
-    provider: 'exa',
-    searchType: input.searchType,
-    fetchedAt: new Date().toISOString(),
-    results
-  }
+    const payload = await response.json().catch(() => null)
+    const rawResults = Array.isArray(payload?.results) ? payload.results : []
+    const results = rawResults
+      .slice(0, input.maxResults)
+      .map((entry: any) => {
+        const title = typeof entry?.title === 'string' ? entry.title.trim() : ''
+        const url = typeof entry?.url === 'string' ? entry.url.trim() : ''
+        const snippetSource =
+          entry?.text ??
+          entry?.snippet ??
+          (Array.isArray(entry?.highlights) ? entry.highlights.join(' ') : '')
+        return {
+          title: title || url || 'Untitled result',
+          url,
+          snippet: truncateSnippet(snippetSource)
+        }
+      })
+      .filter((entry: { url: string }) => entry.url.length > 0)
+
+    return {
+      success: true,
+      query: input.query,
+      provider: 'exa',
+      searchType: input.searchType,
+      fetchedAt: new Date().toISOString(),
+      results
+    }
+  })
 }
 
 async function nativeWebSearchPerplexity(input: {
@@ -7975,6 +8772,7 @@ async function nativeWebSearchPerplexity(input: {
   maxResults: number
   timeoutMs: number
   maxTokensPerPage: number
+  abortSignal?: AbortSignal
 }): Promise<Record<string, any>> {
   const apiKey = await apiKeyService.retrieve('perplexity', input.userId)
   if (!apiKey) {
@@ -7984,11 +8782,8 @@ async function nativeWebSearchPerplexity(input: {
     }
   }
 
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), input.timeoutMs)
-  let response: Response
-  try {
-    response = await fetch('https://api.perplexity.ai/search', {
+  return runWebSearchRequest(input, async signal => {
+    const response = await fetch('https://api.perplexity.ai/search', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -7999,69 +8794,58 @@ async function nativeWebSearchPerplexity(input: {
         max_results: input.maxResults,
         max_tokens_per_page: input.maxTokensPerPage
       }),
-      signal: controller.signal
+      signal
     })
-  } catch (error) {
-    const isAbort = error instanceof DOMException && error.name === 'AbortError'
-    return {
-      success: false,
-      error: isAbort
-        ? `Search timed out after ${input.timeoutMs}ms.`
-        : `Search request failed: ${error instanceof Error ? error.message : 'Unknown error.'}`
-    }
-  } finally {
-    clearTimeout(timer)
-  }
 
-  if (!response.ok) {
-    const providerError = await readSearchProviderError(response)
-    return {
-      success: false,
-      error: providerError
-        ? `Perplexity returned ${response.status}: ${providerError}`
-        : `Perplexity returned ${response.status}.`
-    }
-  }
-
-  const payload = await response.json().catch(() => null)
-  const rawResults = Array.isArray(payload?.results) ? payload.results : []
-  const results = rawResults
-    .slice(0, input.maxResults)
-    .map((entry: any) => {
-      const title = typeof entry?.title === 'string' ? entry.title.trim() : ''
-      const url = typeof entry?.url === 'string' ? entry.url.trim() : ''
-      const snippetSource =
-        entry?.snippet ??
-        entry?.content ??
-        entry?.text ??
-        (Array.isArray(entry?.highlights) ? entry.highlights.join(' ') : '')
+    if (!response.ok) {
+      const providerError = await readSearchProviderError(response)
       return {
-        title: title || url || 'Untitled result',
-        url,
-        snippet: truncateSnippet(snippetSource)
+        success: false,
+        error: providerError
+          ? `Perplexity returned ${response.status}: ${providerError}`
+          : `Perplexity returned ${response.status}.`
       }
-    })
-    .filter((entry: { url: string }) => entry.url.length > 0)
+    }
 
-  return {
-    success: true,
-    query: input.query,
-    provider: 'perplexity',
-    maxTokensPerPage: input.maxTokensPerPage,
-    fetchedAt: new Date().toISOString(),
-    results
-  }
+    const payload = await response.json().catch(() => null)
+    const rawResults = Array.isArray(payload?.results) ? payload.results : []
+    const results = rawResults
+      .slice(0, input.maxResults)
+      .map((entry: any) => {
+        const title = typeof entry?.title === 'string' ? entry.title.trim() : ''
+        const url = typeof entry?.url === 'string' ? entry.url.trim() : ''
+        const snippetSource =
+          entry?.snippet ??
+          entry?.content ??
+          entry?.text ??
+          (Array.isArray(entry?.highlights) ? entry.highlights.join(' ') : '')
+        return {
+          title: title || url || 'Untitled result',
+          url,
+          snippet: truncateSnippet(snippetSource)
+        }
+      })
+      .filter((entry: { url: string }) => entry.url.length > 0)
+
+    return {
+      success: true,
+      query: input.query,
+      provider: 'perplexity',
+      maxTokensPerPage: input.maxTokensPerPage,
+      fetchedAt: new Date().toISOString(),
+      results
+    }
+  })
 }
 
 async function nativeWebSearch(input: {
-  userId?: string
+  /** Server-owned run Stop, never a search argument. */
+  abortSignal?: AbortSignal
+  userId: string
   query: string
   provider?: string
-  agentDefaultProvider?: string
   exaSearchType?: string
-  agentDefaultExaSearchType?: string
   perplexityMaxTokensPerPage?: number
-  agentDefaultPerplexityMaxTokensPerPage?: number
   maxResults?: number
   region?: string
   safeSearch?: 'strict' | 'moderate' | 'off'
@@ -8090,22 +8874,20 @@ async function nativeWebSearch(input: {
     MAX_WEB_SEARCH_TIMEOUT_MS
   )
 
+  if (input.abortSignal?.aborted) return { success: false, stopped: true, error: 'Search stopped.' }
+  const defaults = await readToolOperationalSettings(input.userId)
+  if (input.abortSignal?.aborted) return { success: false, stopped: true, error: 'Search stopped.' }
   const providerResolution = await resolveWebSearchProvider({
     requestedProvider: input.provider,
-    agentDefaultProvider: input.agentDefaultProvider,
+    globalDefaultProvider: defaults.webSearchProvider,
     userId: input.userId
   })
-  const adminDefaults = await getAdminDefaultWebSearchOptions(input.userId)
   const exaSearchType =
     normalizeExaSearchType(input.exaSearchType) ??
-    normalizeExaSearchType(input.agentDefaultExaSearchType) ??
-    adminDefaults.exaSearchType ??
-    DEFAULT_EXA_SEARCH_TYPE
+    defaults.webSearchExaSearchType
   const perplexityMaxTokensPerPage = clamp(
     parseInteger(input.perplexityMaxTokensPerPage) ??
-      parseInteger(input.agentDefaultPerplexityMaxTokensPerPage) ??
-      adminDefaults.perplexityMaxTokensPerPage ??
-      DEFAULT_PERPLEXITY_MAX_TOKENS_PER_PAGE,
+      defaults.webSearchPerplexityMaxTokensPerPage,
     MIN_PERPLEXITY_MAX_TOKENS_PER_PAGE,
     MAX_PERPLEXITY_MAX_TOKENS_PER_PAGE
   )
@@ -8123,7 +8905,8 @@ async function nativeWebSearch(input: {
         query,
         maxResults,
         timeoutMs,
-        searchType: exaSearchType
+        searchType: exaSearchType,
+        abortSignal: input.abortSignal
       })
     }
   } else if (providerResolution.resolvedProvider === 'perplexity') {
@@ -8138,7 +8921,8 @@ async function nativeWebSearch(input: {
         query,
         maxResults,
         timeoutMs,
-        maxTokensPerPage: perplexityMaxTokensPerPage
+        maxTokensPerPage: perplexityMaxTokensPerPage,
+        abortSignal: input.abortSignal
       })
     }
   } else {
@@ -8147,7 +8931,8 @@ async function nativeWebSearch(input: {
       maxResults,
       region,
       safeSearch,
-      timeoutMs
+      timeoutMs,
+      abortSignal: input.abortSignal
     })
   }
 
@@ -9029,12 +9814,12 @@ async function nativeBashExecute(input: {
   approved?: boolean
   maxOutputChars?: number
   backend?: NativeExecutionBackend | null
-  agentBrowserSettings?: AgentBrowserBashSettings | null
+  agentBrowserSettings?: Pick<AgentBrowserBashSettings, 'enabled'> | null
   /**
    * SA-105 P5: the run's tool-result image lane, when the caller is a model run.
    * It makes the persisted screenshot payload's `modelVisibleInLoop` honest
-   * (a `none` lane never shows the image). Absent for Workflow Subagent
-   * dispatch, where the flag keeps meaning "an image payload exists".
+   * (a `none` lane never shows the image). Absent for a dispatch call with no
+   * model loop, where the flag keeps meaning "an image payload exists".
    */
   imageDelivery?: ToolResultImageDeliveryDecision | null
   /**
@@ -9042,6 +9827,32 @@ async function nativeBashExecute(input: {
    * command, and a command it reaches before it starts never runs.
    */
   abortSignal?: AbortSignal | null
+  /**
+   * BL-1652: prove the per-file parts of a multi-file read (`readSplit`) for the zip adapter. Only
+   * the API lane's own Bash tool asks; every other caller gets the result exactly as before.
+   */
+  splitMultiFileReads?: boolean
+  /**
+   * SA-137: prove which file and form each read showed (`fileReadProof`), for the zip adapter's
+   * `fileReadSource`. Only the API lane's own Bash tool asks, and only while the agent's
+   * `live_file_reads` is on; off, nothing extra is read or returned.
+   */
+  proveFileReadSource?: boolean
+  /** SA-137: the model's call id, which the read proof binds (a proof never describes another call). */
+  toolCallId?: string
+  /**
+   * SA-126 item 2: run the command a managed patch names after itself (`apply_patch <<'PATCH' &&
+   * <command>`) once the whole patch applied. Only the API lane's own Bash tool asks; every other
+   * caller names that command as not run (BL-1915).
+   */
+  runCommandAfterPatch?: boolean
+  /**
+   * BL-1978: told once the whole patch applied, just before the commands after it run, with the
+   * facts the result will carry about the patch. The API lane's Bash tool hands them to BL-1959's
+   * Stop rule (`noteToolProgress`), so a call whose commands outlast the Stop's wait (a sandbox
+   * backend's end) is still saved with its applied edit.
+   */
+  onPatchApplied?: (facts: Record<string, unknown>) => void
 }): Promise<Record<string, any>> {
   const agentId = typeof input.agentId === 'string' ? input.agentId.trim() : ''
   const ownerPin = process.platform === 'win32' ? undefined : pinHostCommandOwner(input.processOwner ?? (
@@ -9082,7 +9893,9 @@ async function nativeBashExecute(input: {
     }
   }
 
-  const policy = evaluateBashPolicy(command, accessMode, neverAllowList)
+  const policy = evaluateBashPolicy(command, accessMode, neverAllowList, {
+    commandsAfterPatchRun: input.runCommandAfterPatch === true
+  })
   if (policy.blocked) {
     return {
       success: false,
@@ -9129,6 +9942,17 @@ async function nativeBashExecute(input: {
     }
   }
 
+  let agentBrowserDefaults: AgentBrowserOperationalSettings | undefined
+  if (wantsAgentBrowserRuntime && (backend === 'local' || backend === 'docker_sandbox')) {
+    if (!input.userId) throw new Error('Agent Browser defaults require an authenticated user context.')
+    const stoppedBeforeDefaults = () => ({ ...stoppedBeforeStartRun(command), success: false, blocked: false,
+      reason: STOPPED_COMMAND_REASON, policyMode, accessMode, backend,
+      backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[backend] })
+    if (abortSignal?.aborted) return stoppedBeforeDefaults()
+    agentBrowserDefaults = (await readToolOperationalSettings(input.userId)).agentBrowser
+    if (abortSignal?.aborted) return stoppedBeforeDefaults()
+  }
+
   if (wantsAgentBrowserRuntime && backend === 'docker_sandbox') {
     const availability = await checkAgentBrowserAvailability()
     if (availability.available && availability.command) {
@@ -9165,7 +9989,9 @@ async function nativeBashExecute(input: {
 
   const useAgentBrowserDefaults = effectiveBackend === 'local' && wantsAgentBrowserRuntime
 
-  if (useAgentBrowserDefaults && agentBrowserSettings) {
+  if (useAgentBrowserDefaults) {
+    if (!agentBrowserDefaults) throw new Error('Global Agent Browser defaults are unavailable.')
+    const agentBrowserSettings = { enabled: true, ...agentBrowserDefaults }
     const transformed = applyAgentBrowserBashDefaults(commandToRun, agentBrowserSettings)
     if (transformed.matched) {
       commandToRun = transformed.command
@@ -9281,6 +10107,100 @@ async function nativeBashExecute(input: {
     }
   }
 
+  // Resolve on the machine executing the command, once for this call (including any browser
+  // recovery commands). A command failure never selects another shell and repeats side effects.
+  let localShell: string | undefined
+  const executeWithBackend = async (
+    commandValue: string,
+    // SA-126 item 2: the command after a managed patch runs in the patch's folder.
+    runCwd: string = cwdResolution.cwd
+  ): Promise<
+    | { ok: true; run: CommandRunResult; sandboxName?: string }
+    | { ok: false; code: NativeAutomationErrorCode; reason: string; sandboxName?: string }
+  > => {
+    // Stopped before it began: no sandbox is started for it either.
+    if (abortSignal?.aborted) return { ok: true, run: stoppedBeforeStartRun(commandValue) }
+
+    if (effectiveBackend === 'docker_sandbox') {
+      const sandboxRun = await runDockerSandboxCommand({
+        userId: input.userId,
+        sessionId: input.sessionId,
+        workspaceRoot: workspaceResolution.workspaceRoot,
+        cwd: runCwd,
+        command: commandValue,
+        timeoutMs: effectiveTimeoutMs,
+        maxOutputChars,
+        env: commandEnv,
+        abortSignal
+      })
+      if (!sandboxRun.ok) return sandboxRun
+      return {
+        ok: true,
+        run: sandboxRun.run,
+        sandboxName: sandboxRun.sandboxName
+      }
+    }
+
+    if (effectiveBackend === 'apple_container') {
+      const sandboxRun = await executeAppleContainerSandboxCommand({
+        userId: input.userId,
+        sessionId: input.sessionId,
+        workspaceRoot: workspaceResolution.workspaceRoot,
+        cwd: runCwd,
+        command: commandValue,
+        timeoutMs: effectiveTimeoutMs,
+        maxOutputChars,
+        env: commandEnv,
+        abortSignal
+      })
+      if (!sandboxRun.ok) {
+        return {
+          ok: false,
+          code: 'SANDBOX_UNAVAILABLE',
+          reason: sandboxRun.reason,
+          sandboxName: sandboxRun.sandboxName
+        }
+      }
+      if (sandboxRun.cleanupWarnings.length > 0) {
+        console.warn(
+          '[Native Tools] Apple Container sandbox cleanup warnings:',
+          sandboxRun.cleanupWarnings.join(' | ')
+        )
+      }
+      return {
+        ok: true,
+        run: sandboxRun.run,
+        sandboxName: sandboxRun.sandboxName
+      }
+    }
+
+    try {
+      localShell ??= await resolveLocalCommandShell()
+      // The original lexical browser request survives managed launcher/default rewriting.
+      // Test isolation applies even when Browser operational defaults are absent or disabled.
+      if (isLikelyAgentBrowserBashCommand(command)) assertAgentBrowserTestShell(localShell)
+      const run = await runBashCommand({
+        command: commandValue,
+        shell: localShell,
+        cwd: runCwd,
+        timeoutMs: effectiveTimeoutMs,
+        maxOutputChars,
+        env: commandEnv,
+        abortSignal,
+        ownerPin,
+        sessionId: input.sessionId,
+        messageId: input.messageId
+      })
+      return { ok: true, run }
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'BACKEND_UNAVAILABLE',
+        reason: `Local command could not start${localShell ? ` with ${localShell}` : ''}: ${error instanceof Error ? error.message : String(error)}`
+      }
+    }
+  }
+
   const mapping = mapBashCommandToRendererTool(command)
   const beforeEditSnapshot = await captureMappedTextFileSnapshot({
     mapping,
@@ -9360,7 +10280,9 @@ async function nativeBashExecute(input: {
       patchCwd = folder.cwd
     }
 
-    const parsedPatch = parseManagedApplyPatchDocument(managedPatchDocument)
+    // BL-1915: an Add File section without `+` prefixes is read as the file as written here; the
+    // artifact patch keeps the strict grammar.
+    const parsedPatch = parseManagedApplyPatchDocument(managedPatchDocument, { lenientAddFile: true })
     if (!parsedPatch.success) {
       const reason = parsedPatch.message || 'Invalid apply_patch payload.'
       return {
@@ -9446,50 +10368,90 @@ async function nativeBashExecute(input: {
       }
     }
 
-    const managedStartedAt = Date.now()
-    try {
-      const execution = await executeManagedApplyPatch({
-        operations: parsedPatch.operations,
-        cwd: patchCwd,
-        workspaceRoot: workspaceResolution.workspaceRoot
-      })
-      const mapping = mapBashCommandToRendererTool(command)
-      const primaryTouchedPath = execution.touchedPaths[0]
-      return {
-        success: true,
-        blocked: false,
-        command,
-        stdout: execution.message || '',
-        stderr: '',
-        exitCode: 0,
-        signal: null,
-        timedOut: false,
-        durationMs: Date.now() - managedStartedAt,
-        truncated: false,
-        policyMode,
-        accessMode,
-        backend: effectiveBackend,
-        backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
-        cwd: patchCwd,
-        workspaceRoot: workspaceResolution.workspaceRoot,
-        mappedToolName: mapping.toolName,
-        mappedToolInput: {
-          ...(mapping.args ?? {}),
-          ...(primaryTouchedPath ? { filePath: primaryTouchedPath, path: primaryTouchedPath } : {}),
-          touchedPaths: execution.touchedPaths
-        },
-        mappedReason: mapping.reason,
-        managedApplyPatch: {
-          managed: true,
-          operationsApplied: execution.operationsApplied,
-          touchedPaths: execution.touchedPaths
+    // SA-126 item 2 (Ashe's execution contract): the command after the patch, decided with every
+    // check before the first write. Only the API lane runs it. A command the Agent Browser runtime
+    // would rewrite keeps BL-1915's not-run (`readAfterPatch` leaves out an Agent Browser tail).
+    const afterPatch =
+      input.runCommandAfterPatch === true &&
+      managedPatch.afterPatch &&
+      !wantsAgentBrowserRuntime
+        ? managedPatch.afterPatch
+        : null
+    if (afterPatch !== null) {
+      // The command's own write checks as a plain command, in the folder it runs in.
+      const afterPatchProtectedReason =
+        getProtectedSystemSkillWriteViolationReason({
+          command: afterPatch.command,
+          cwd: patchCwd,
+          workspaceRoot: workspaceResolution.workspaceRoot
+        }) ??
+        getProtectedBatshitRepoWriteViolationReason({
+          command: afterPatch.command,
+          cwd: patchCwd,
+          workspaceRoot: workspaceResolution.workspaceRoot
+        })
+      if (afterPatchProtectedReason) {
+        return {
+          success: false,
+          blocked: true,
+          errorCode: 'POLICY_BLOCKED',
+          reason: namingAfterPatchCommand(afterPatchProtectedReason, afterPatch, () => true),
+          command,
+          policyMode,
+          accessMode,
+          backend: effectiveBackend,
+          backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
+          cwd: patchCwd,
+          workspaceRoot: workspaceResolution.workspaceRoot
         }
       }
+    }
+
+    // A Stop that came before the first write: nothing is written, nothing runs. BL-1987: the same
+    // answer when the Stop comes while the patch is being planned (`executeManagedApplyPatch`).
+    const hasCommandsAfterPatch = Boolean(managedPatch.afterPatch) || (managedPatch.notRun?.length ?? 0) > 0
+    const stoppedBeforeWrite = (durationMs = 0) => ({
+      success: false,
+      blocked: false,
+      command,
+      stdout: '',
+      stderr: '',
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      stopped: true,
+      reason: STOPPED_PATCH_BEFORE_WRITE_REASON + (hasCommandsAfterPatch ? STOPPED_PATCH_TAIL_NOT_RUN : ''),
+      durationMs,
+      truncated: false,
+      policyMode,
+      accessMode,
+      backend: effectiveBackend,
+      backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
+      cwd: patchCwd,
+      workspaceRoot: workspaceResolution.workspaceRoot
+    })
+    if (abortSignal?.aborted) return stoppedBeforeWrite()
+
+    const managedStartedAt = Date.now()
+    let execution: ManagedApplyPatchExecutionResult
+    try {
+      execution = await executeManagedApplyPatch({
+        operations: parsedPatch.operations,
+        cwd: patchCwd,
+        workspaceRoot: workspaceResolution.workspaceRoot,
+        abortSignal
+      })
     } catch (error) {
-      const reason =
+      if (error instanceof ManagedApplyPatchStoppedError) return stoppedBeforeWrite(Date.now() - managedStartedAt)
+      const failure =
         error instanceof Error && error.message
           ? error.message
           : 'Managed apply_patch execution failed.'
+      // The command after the patch runs only after the whole patch applied (SA-126 item 2).
+      const reason =
+        afterPatch !== null
+          ? `${failure} Not run: ${showAfterPatch(afterPatch.tail)} (it runs only after the whole patch applies).`
+          : failure
       return {
         success: false,
         blocked: false,
@@ -9502,9 +10464,111 @@ async function nativeBashExecute(input: {
         backend: effectiveBackend,
         backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
         cwd: patchCwd,
-        workspaceRoot: workspaceResolution.workspaceRoot
+        workspaceRoot: workspaceResolution.workspaceRoot,
+        // BL-1916: a write that could not be undone names what it left changed, for the model
+        // text and the dead-copy ledger (`zipDeadCopies.ts` counts these paths as edited).
+        ...(error instanceof ManagedApplyPatchPartialWriteError
+          ? { managedApplyPatch: { managed: true, partial: true, changedPaths: error.changedPaths } }
+          : {})
       }
     }
+
+    const primaryTouchedPath = execution.touchedPaths[0]
+    const appliedFields = {
+      policyMode,
+      accessMode,
+      backend: effectiveBackend,
+      backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
+      cwd: patchCwd,
+      workspaceRoot: workspaceResolution.workspaceRoot,
+      mappedToolName: mapping.toolName,
+      mappedToolInput: {
+        ...(mapping.args ?? {}),
+        ...(primaryTouchedPath ? { filePath: primaryTouchedPath, path: primaryTouchedPath } : {}),
+        touchedPaths: execution.touchedPaths
+      },
+      mappedReason: mapping.reason
+    }
+    const appliedPatch = {
+      managed: true,
+      applied: true,
+      operationsApplied: execution.operationsApplied,
+      touchedPaths: execution.touchedPaths
+    }
+
+    if (afterPatch === null) {
+      const notRun = managedPatch.notRun ?? []
+      return {
+        success: true,
+        blocked: false,
+        command,
+        stdout: [
+          execution.message || '',
+          describeManagedPatchNotRun(
+            notRun,
+            input.runCommandAfterPatch === true,
+            managedPatch.notRunReason
+          )
+        ].filter(Boolean).join('\n'),
+        stderr: '',
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        durationMs: Date.now() - managedStartedAt,
+        truncated: false,
+        ...appliedFields,
+        managedApplyPatch: { ...appliedPatch, ...(notRun.length > 0 ? { notRun } : {}) }
+      }
+    }
+
+    // The whole patch applied: now, and only now, the command after it, as a plain command in the
+    // patch's folder on this call's backend (the same runner, environment, limits and Stop). A
+    // failed, stopped or timed-out command leaves the patch applied; nothing is retried or undone.
+    const patchFacts = {
+      ...appliedPatch,
+      ...(execution.note ? { note: execution.note } : {}),
+      afterPatch: { command: afterPatch.command, tail: afterPatch.tail }
+    }
+    // BL-1978: the patch is on disk now, whatever the commands after it do or how long they take.
+    input.onPatchApplied?.({ command, ...appliedFields, managedApplyPatch: patchFacts })
+    const afterPatchRun = await executeWithBackend(afterPatch.command, patchCwd)
+    const afterPatchFacts = {
+      ...patchFacts,
+      afterPatchStarted: afterPatchRun.ok && afterPatchRun.run.neverStarted !== true
+    }
+    if (!afterPatchRun.ok) {
+      const reason = `The patch applied; the command after it could not start: ${afterPatchRun.reason}`
+      return {
+        success: false,
+        blocked: false,
+        errorCode: afterPatchRun.code,
+        reason,
+        error: reason,
+        command,
+        durationMs: Date.now() - managedStartedAt,
+        ...appliedFields,
+        ...(afterPatchRun.sandboxName ? { sandboxName: afterPatchRun.sandboxName } : {}),
+        managedApplyPatch: afterPatchFacts
+      }
+    }
+    const run = afterPatchRun.run
+    return propagateCommandModelCapture(run, {
+      success: run.exitCode === 0 && run.timedOut === false && !run.stopped,
+      blocked: false,
+      command,
+      ...(run.shell ? { shell: run.shell } : {}),
+      stdout: run.stdout,
+      stderr: run.stderr,
+      exitCode: run.exitCode,
+      signal: run.signal,
+      timedOut: run.timedOut,
+      ...(run.stopped ? { stopped: true, reason: STOPPED_COMMAND_REASON } : {}),
+      durationMs: Date.now() - managedStartedAt,
+      truncated: run.truncated,
+      ...appliedFields,
+      ...(afterPatchRun.sandboxName ? { sandboxName: afterPatchRun.sandboxName } : {}),
+      managedApplyPatch: afterPatchFacts
+    })
   }
 
   const protectedSystemSkillReason = getProtectedSystemSkillWriteViolationReason({
@@ -9549,96 +10613,40 @@ async function nativeBashExecute(input: {
     }
   }
 
-  // Resolve on the machine executing the command, once for this call (including any browser
-  // recovery commands). A command failure never selects another shell and repeats side effects.
-  let localShell: string | undefined
-  const executeWithBackend = async (
-    commandValue: string
-  ): Promise<
-    | { ok: true; run: CommandRunResult; sandboxName?: string }
-    | { ok: false; code: NativeAutomationErrorCode; reason: string; sandboxName?: string }
-  > => {
-    // Stopped before it began: no sandbox is started for it either.
-    if (abortSignal?.aborted) return { ok: true, run: stoppedBeforeStartRun(commandValue) }
-
-    if (effectiveBackend === 'docker_sandbox') {
-      const sandboxRun = await runDockerSandboxCommand({
-        userId: input.userId,
-        sessionId: input.sessionId,
-        workspaceRoot: workspaceResolution.workspaceRoot,
-        cwd: cwdResolution.cwd,
-        command: commandValue,
-        timeoutMs: effectiveTimeoutMs,
-        maxOutputChars,
-        env: commandEnv,
-        abortSignal
-      })
-      if (!sandboxRun.ok) return sandboxRun
-      return {
-        ok: true,
-        run: sandboxRun.run,
-        sandboxName: sandboxRun.sandboxName
-      }
-    }
-
-    if (effectiveBackend === 'apple_container') {
-      const sandboxRun = await executeAppleContainerSandboxCommand({
-        userId: input.userId,
-        sessionId: input.sessionId,
-        workspaceRoot: workspaceResolution.workspaceRoot,
-        cwd: cwdResolution.cwd,
-        command: commandValue,
-        timeoutMs: effectiveTimeoutMs,
-        maxOutputChars,
-        env: commandEnv,
-        abortSignal
-      })
-      if (!sandboxRun.ok) {
-        return {
-          ok: false,
-          code: 'SANDBOX_UNAVAILABLE',
-          reason: sandboxRun.reason,
-          sandboxName: sandboxRun.sandboxName
-        }
-      }
-      if (sandboxRun.cleanupWarnings.length > 0) {
-        console.warn(
-          '[Native Tools] Apple Container sandbox cleanup warnings:',
-          sandboxRun.cleanupWarnings.join(' | ')
-        )
-      }
-      return {
-        ok: true,
-        run: sandboxRun.run,
-        sandboxName: sandboxRun.sandboxName
-      }
-    }
-
-    try {
-      localShell ??= await resolveLocalCommandShell()
-      const run = await runBashCommand({
-        command: commandValue,
-        shell: localShell,
-        cwd: cwdResolution.cwd,
-        timeoutMs: effectiveTimeoutMs,
-        maxOutputChars,
-        env: commandEnv,
-        abortSignal,
-        ownerPin,
-        sessionId: input.sessionId,
-        messageId: input.messageId
-      })
-      return { ok: true, run }
-    } catch (error) {
-      return {
-        ok: false,
-        code: 'BACKEND_UNAVAILABLE',
-        reason: `Local command could not start${localShell ? ` with ${localShell}` : ''}: ${error instanceof Error ? error.message : String(error)}`
-      }
-    }
-  }
-
   let sandboxName: string | null = null
+  const preparedReadSplit =
+    input.splitMultiFileReads === true &&
+    effectiveBackend === 'local' &&
+    commandToRun === command &&
+    SHELL_READ_SPLIT_REASONS.has(mapping.reason)
+      ? await prepareShellReadSplit({ command, cwd: cwdResolution.cwd, workspaceRoot: workspaceResolution.workspaceRoot })
+      : null
+  // SA-137: which file and form each read showed, proven like the split (only with the setting on).
+  const fileReadOwner =
+    typeof input.userId === 'string' && input.userId &&
+    typeof input.agentId === 'string' && input.agentId.trim() &&
+    typeof input.sessionId === 'string' && input.sessionId &&
+    typeof input.messageId === 'string' && input.messageId &&
+    typeof input.toolCallId === 'string' && input.toolCallId
+      ? { userId: input.userId, agentId: input.agentId.trim(), sessionId: input.sessionId, messageId: input.messageId, toolCallId: input.toolCallId }
+      : null
+  // SA-137 Round 2 (R2-6): a sandbox that mounts the host workspace at the same path (Apple
+  // Container `--volume <root>:<root>`, Docker Sandbox `sbx create … <root>`, each with `--workdir`
+  // the same cwd) runs the read; the proof is still the host's: the file's signature before the run
+  // and after, its text re-read on the host, and the run's stdout equal to that view of it.
+  const preparedFileReadProof =
+    input.proveFileReadSource === true &&
+    fileReadOwner &&
+    liveReadBackendMountsHostWorkspace(effectiveBackend) &&
+    commandToRun === command &&
+    SHELL_READ_SPLIT_REASONS.has(mapping.reason)
+      ? await prepareFileReadProof({
+          command,
+          cwd: cwdResolution.cwd,
+          workspaceRoot: workspaceResolution.workspaceRoot,
+          split: preparedReadSplit
+        })
+      : null
   const initialRunResult = await executeWithBackend(commandToRun)
   if (!initialRunResult.ok) {
     return {
@@ -9724,6 +10732,19 @@ async function nativeBashExecute(input: {
           workspaceRoot: workspaceResolution.workspaceRoot
         })
       : null
+  const readSplitTexts: { contents: ReadonlyMap<string, string | null> | null } = { contents: null }
+  const readSplit = await finishShellReadSplit(preparedReadSplit, run, (contents) => { readSplitTexts.contents = contents })
+  const fileReadProof = fileReadOwner
+    ? await finishFileReadProof(
+        preparedFileReadProof,
+        run,
+        fileReadOwner,
+        effectiveBackend,
+        preparedReadSplit && readSplit && readSplitTexts.contents
+          ? { prepared: preparedReadSplit, result: readSplit, contents: readSplitTexts.contents }
+          : null
+      )
+    : undefined
   // The edit's diff is built HERE, where its two copies are read, and only the diff leaves: the
   // model reads this result in its loop, the n8n dispatch and the SSE event carry it, and the
   // Execution Viewer stores it. The copies themselves (up to 24,000 bytes each) went to all of
@@ -9778,8 +10799,8 @@ async function nativeBashExecute(input: {
     // SA-105 P5 (AMD-105-14): the helper owns the visibility vocabulary and this
     // payload adapts to it. With a resolved lane the flag is honest per lane —
     // `tool_result` and `synthetic_user` both show the image during the run,
-    // `none` never does. Without a lane (Workflow Subagent dispatch, no model
-    // loop here) it keeps its older meaning: an image payload exists.
+    // `none` never does. Without a lane (a dispatch call, no model loop here)
+    // it keeps its older meaning: an image payload exists.
     const deliveryPayload = input.imageDelivery
       ? buildToolResultImageDeliveryPayload(input.imageDelivery, {
           modelVisibleInLoop:
@@ -9824,7 +10845,7 @@ async function nativeBashExecute(input: {
     signal: run.signal,
     timedOut: run.timedOut,
     // The stored step's words: without a reason, a stopped command read "Tool execution failed."
-    ...(run.stopped ? { stopped: true, reason: STOPPED_COMMAND_REASON } : {}),
+    ...(run.stopped ? { stopped: true, reason: STOPPED_COMMAND_REASON, ...(run.neverStarted ? { neverStarted: true } : {}) } : {}),
     durationMs: run.durationMs,
     truncated: run.truncated,
     policyMode,
@@ -9837,6 +10858,8 @@ async function nativeBashExecute(input: {
     mappedToolName: mapping.toolName,
     mappedToolInput: mapping.args,
     mappedReason: mapping.reason,
+    ...(readSplit ? { readSplit } : {}),
+    ...(fileReadProof ? { fileReadProof } : {}),
     ...(editDiff !== undefined ? { diff: editDiff } : {}),
     ...(commandToRun !== command ? { requestedCommand: command } : {}),
     ...(agentBrowserMetadata ? { agentBrowser: agentBrowserMetadata } : {}),
@@ -9848,15 +10871,6 @@ async function nativeAgentBrowserFind(input: {
   userId: string
   query?: string
   limit?: number
-  settings?: {
-    liveViewEnabled?: boolean
-    runtimeMode?: AgentBrowserRuntimeMode
-    cdpPort?: number
-    provider?: AgentBrowserProvider
-    executablePath?: string
-    extraFlags?: string[]
-    timeoutMs?: number
-  }
 }): Promise<Record<string, any>> {
   const normalizedLimit = clamp(
     parseInteger(input.limit) ?? DEFAULT_AGENT_BROWSER_RESULTS,
@@ -9865,6 +10879,7 @@ async function nativeAgentBrowserFind(input: {
   )
   const query = typeof input.query === 'string' ? input.query.trim().toLowerCase() : ''
 
+  const defaults = (await readToolOperationalSettings(input.userId)).agentBrowser
   const availability = await checkAgentBrowserAvailability()
   const ranked = AGENT_BROWSER_COMMANDS.map((command) => ({
     ...command,
@@ -9895,17 +10910,17 @@ async function nativeAgentBrowserFind(input: {
       liveViewEnabled:
         availability.supportLevel === 'docker-sidecar'
           ? false
-          : input.settings?.liveViewEnabled ?? true,
+          : defaults.liveViewEnabled,
       runtimeMode:
         availability.supportLevel === 'docker-sidecar'
           ? DEFAULT_AGENT_BROWSER_RUNTIME_MODE
-          : input.settings?.runtimeMode ?? DEFAULT_AGENT_BROWSER_RUNTIME_MODE,
-      cdpPort: input.settings?.cdpPort ?? DEFAULT_AGENT_BROWSER_CDP_PORT,
-      provider: input.settings?.provider ?? DEFAULT_AGENT_BROWSER_PROVIDER,
+          : defaults.runtimeMode,
+      cdpPort: defaults.cdpPort,
+      provider: defaults.provider,
       executablePath:
-        availability.supportLevel === 'docker-sidecar' ? null : input.settings?.executablePath ?? null,
-      extraFlags: input.settings?.extraFlags ?? [],
-      timeoutMs: input.settings?.timeoutMs ?? DEFAULT_AGENT_BROWSER_TIMEOUT_MS
+        availability.supportLevel === 'docker-sidecar' ? null : defaults.executablePath ?? null,
+      extraFlags: defaults.extraFlags,
+      timeoutMs: defaults.timeoutMs
     },
     results: ranked.slice(0, normalizedLimit).map((entry) => ({
       toolName: entry.id,
@@ -9950,15 +10965,6 @@ async function nativeAgentBrowserUse(input: {
   sessionId?: string
   toolName: string
   params?: AgentBrowserUseParams
-  settings?: {
-    liveViewEnabled?: boolean
-    runtimeMode?: AgentBrowserRuntimeMode
-    cdpPort?: number
-    provider?: AgentBrowserProvider
-    executablePath?: string
-    extraFlags?: string[]
-    timeoutMs?: number
-  }
   /**
    * The Stop of the reply this call belongs to (2026-09-18). It ends the running CLI call, and a
    * call it reaches first never starts. Absent (the n8n dispatch), the call runs to its own time
@@ -9990,6 +10996,11 @@ async function nativeAgentBrowserUse(input: {
     }
   }
 
+  const stoppedBeforeAdmission = () => ({ success: false, stopped: true, reason: STOPPED_COMMAND_REASON,
+    error: STOPPED_COMMAND_REASON, toolName: command.id })
+  if (abortSignal?.aborted) return stoppedBeforeAdmission()
+  const defaults = (await readToolOperationalSettings(input.userId)).agentBrowser
+  if (abortSignal?.aborted) return stoppedBeforeAdmission()
   const availability = await checkAgentBrowserAvailability()
   if (!availability.available || !availability.command) {
     return {
@@ -10016,38 +11027,33 @@ async function nativeAgentBrowserUse(input: {
   const sidecarHearsStop = dockerSidecar && agentBrowserSidecarHearsStop(availability.sidecarRevision)
   const requestedRuntimeMode =
     normalizeAgentBrowserRuntimeMode(params.runtimeMode) ??
-    input.settings?.runtimeMode ??
-    DEFAULT_AGENT_BROWSER_RUNTIME_MODE
+    defaults.runtimeMode
   const runtimeMode = dockerSidecar ? DEFAULT_AGENT_BROWSER_RUNTIME_MODE : requestedRuntimeMode
   const provider =
     normalizeAgentBrowserProvider(params.provider) ??
-    input.settings?.provider ??
-    DEFAULT_AGENT_BROWSER_PROVIDER
+    defaults.provider
   const requestedLiveView =
     parseBoolean(params.liveView) ??
-    input.settings?.liveViewEnabled ??
-    true
+    defaults.liveViewEnabled
   const liveView = dockerSidecar ? false : requestedLiveView
   const cdpPort = clamp(
     parseInteger(params.cdpPort) ??
-      input.settings?.cdpPort ??
-      DEFAULT_AGENT_BROWSER_CDP_PORT,
+      defaults.cdpPort,
     1,
     65535
   )
   const requestedExecutablePath =
     (typeof params.executablePath === 'string' && params.executablePath.trim().length > 0
       ? params.executablePath.trim()
-      : input.settings?.executablePath) ?? null
+      : defaults.executablePath) ?? null
   const executablePath = dockerSidecar ? null : requestedExecutablePath
   const extraFlags = [
-    ...(input.settings?.extraFlags ?? []),
+    ...(defaults.extraFlags),
     ...toAgentBrowserArgArray(params.extraFlags)
   ]
   const timeoutMs = clamp(
     parseInteger(params.timeoutMs) ??
-      input.settings?.timeoutMs ??
-      DEFAULT_AGENT_BROWSER_TIMEOUT_MS,
+      defaults.timeoutMs,
     MIN_AGENT_BROWSER_TIMEOUT_MS,
     MAX_AGENT_BROWSER_TIMEOUT_MS
   )
@@ -10591,49 +11597,16 @@ function resolveBatshitToolBrokerFamiliesForAutomation(
   if (settings.cliToolsEnabled) families.push('cli')
   if (settings.artifactRuntimeEnabled) families.push('artifact')
   if (settings.agentBrowserEnabled) families.push('agent_browser')
-  if (settings.fetchZipEnabled && context.actor_type === 'primary') families.push('fabric')
-  if (
-    settings.batshitToolsEnabled &&
-    context.actor_type === 'primary' &&
-    (context.mode === 'mode3' || context.mode === 'mode4')
-  ) {
-    if (!families.includes('fabric')) families.push('fabric')
-  }
-  // SA-104 P3: memory controls open the fabric family for PRIMARY actors. After
-  // SA-106, live Primary Agents are mode3/mode4 only; mode1/mode2 remain Category 2
-  // n8n wire values for subagent/tool callers. The per-agent memory_enabled flag is
-  // resolved by the caller from the governing agent record.
-  if (
-    settings.batshitToolsEnabled &&
-    context.actor_type === 'primary' &&
-    options?.memoryControlsEnabled === true
-  ) {
-    if (!families.includes('fabric')) families.push('fabric')
-  }
-  // SA-113 P2: the Agent DM family opens the fabric family under the same conditions.
-  if (
-    settings.batshitToolsEnabled &&
-    context.actor_type === 'primary' &&
-    options?.dmControlsEnabled === true
-  ) {
-    if (!families.includes('fabric')) families.push('fabric')
-  }
-  // SA-115 P2: the schedule family opens `fabric` under the same conditions.
-  if (
-    settings.batshitToolsEnabled &&
-    context.actor_type === 'primary' &&
-    options?.scheduleControlsEnabled === true
-  ) {
-    if (!families.includes('fabric')) families.push('fabric')
-  }
-  // SA-120 P2: the Judge Juice judgment tool opens `fabric` under the same conditions.
-  if (
-    settings.batshitToolsEnabled &&
-    context.actor_type === 'primary' &&
-    options?.judgeControlsEnabled === true
-  ) {
-    if (!families.includes('fabric')) families.push('fabric')
-  }
+  const allowedControls = resolveBrokerFabricAllowedControlIds({
+    toggles: settings,
+    allowFetchZip: context.actor_type === 'primary',
+    allowFabricControlTools: context.actor_type === 'primary' && (context.mode === 'mode3' || context.mode === 'mode4'),
+    memoryControlsEnabled: context.actor_type === 'primary' && options?.memoryControlsEnabled === true,
+    dmControlsEnabled: context.actor_type === 'primary' && options?.dmControlsEnabled === true,
+    scheduleControlsEnabled: context.actor_type === 'primary' && options?.scheduleControlsEnabled === true,
+    judgeControlsEnabled: context.actor_type === 'primary' && options?.judgeControlsEnabled === true
+  })
+  families.push(...resolveBrokerControlFamilies(allowedControls))
   return families
 }
 
@@ -10656,7 +11629,7 @@ function parseNativeAutomationContext(
 function normalizePublicPrimaryAgentType(value: unknown): PublicPrimaryAgentType | null {
   if (typeof value !== 'string') return null
   const normalized = value.trim().toLowerCase()
-  if (normalized === 'n8n' || normalized === 'api' || normalized === 'cli') {
+  if (normalized === 'api') {
     return normalized
   }
   return null
@@ -11323,7 +12296,7 @@ function evaluateNonInteractiveAutomationBashPolicy(options: {
   }
 
   const denyList = normalizeCommandPatternList(options.denyList) ?? []
-  if (commandMatchesAnyPattern(command, denyList)) {
+  if (commandMatchesAnyDenyPattern(command, denyList)) {
     return {
       allowed: false,
       code: 'POLICY_BLOCKED' as const,
@@ -11361,26 +12334,14 @@ function evaluateNonInteractiveAutomationBashPolicy(options: {
 }
 
 /**
- * BL-878 — what the dispatch tells a Codex or Claude agent whose call it refuses. Two doors start
- * a process under Batshit's rules, and the managed CLI lane is offered neither (the named rule is
- * `CLI_LANE_GETS_BATSHIT_BASH`, in `mode4InternalTools.ts`): each sentence names the cause and the
- * next step. The Bash sentence is also pinned by the helper's own end-to-end proofs.
- */
-export const CLI_LANE_BASH_REFUSAL_MESSAGE =
-  "Batshit's Bash helper is not offered to Codex and Claude agents. Use your own shell tool."
-export const CLI_LANE_SKILL_SCRIPT_REFUSAL_MESSAGE =
-  'Batshit does not run skill scripts for Codex and Claude agents. Read the skill with native_skill (invoke or read), then run its script with your own shell tool.'
-
-/**
  * BL-686 — the saved CLI tools one dispatch call may reach, resolved once at the door.
  *
- * The scope is the server's: a managed run's credential list on the `agent` lane (`[]` when an
- * old credential carries none), a Subagent actor's own saved list, or the governing agent's
+ * The scope is the server's: a Subagent actor's own saved list, or the governing agent's
  * saved list (then the user's Tool Grid list). The payload's `selectedToolIds` only narrows it.
  * The broker and the CLI helpers below take the answer as a bound list, never the model's.
  */
 async function resolveDispatchCliToolScope(
-  input: { userId: string; actorType?: ControlActorType; cliToolScope?: string[] | null },
+  input: { userId: string; cliToolScope?: string[] | null },
   context: { actor_type?: unknown },
   options: {
     governingAgentId?: string | null
@@ -11393,11 +12354,7 @@ async function resolveDispatchCliToolScope(
     ...(context.actor_type === 'subagent'
       ? { agentMetadata: options.subagentRecord ?? null }
       : { agentId: options.governingAgentId || null }),
-    ...(input.actorType === 'agent'
-      ? { cliToolScope: input.cliToolScope ?? [] }
-      : input.cliToolScope !== undefined
-        ? { cliToolScope: input.cliToolScope }
-        : {}),
+    ...(input.cliToolScope !== undefined ? { cliToolScope: input.cliToolScope } : {}),
     selectedToolIds: options.selectedToolIds
   })
 }
@@ -11424,10 +12381,7 @@ export async function dispatchNativeAutomationPackAction(input: {
   delegatedRun?: boolean
   /** Delegated run's own Bash toggle from its authenticated credential. */
   delegatedBashEnabled?: boolean
-  /**
-   * BL-75 — the run credential's `scopeAgentId` on the `agent` lane: the Subagent or Worker
-   * whose skill access governs a delegated run's `native_skill`. Absent on every other lane.
-   */
+  /** Server-owned delegated scope; never a payload identity. */
   scopeAgentId?: string | null
   /**
    * The Stop of the reply running in the context's chat (2026-09-18,
@@ -11479,19 +12433,14 @@ export async function dispatchNativeAutomationPackAction(input: {
   }
   const context = parsedContext.value
 
-  // BL-878 (Josh, 2026-09-28): the managed CLI lane has its own Bash, so Batshit's is refused for
-  // it, before any settings read that could grant it. The lane is the run credential's: `input
-  // .actorType` is `auth.auth` from the route, and only `CodexBridge` and `ClaudeBridge` mint an
-  // agent-lane credential. `context.mode` and every other body field are claims, never the test.
-  // Session and service callers, the n8n Workflow Subagent automation pack, and the API lane's own
-  // tool are not on this lane and are not changed.
-  if (action === 'bash_execute' && input.actorType === 'agent' && !CLI_LANE_GETS_BATSHIT_BASH) {
+  // A stale internal caller cannot revive the retired HTTP agent lane by supplying its name.
+  if ((input.actorType as string | undefined) === 'agent') {
     return buildNativeAutomationResult({
       success: false,
       action,
       backend: getDefaultNativeExecutionBackend(),
       context,
-      error: { code: 'ACTION_DISABLED', message: CLI_LANE_BASH_REFUSAL_MESSAGE }
+      error: { code: 'ACTION_DISABLED', message: 'The retired agent credential lane is not available.' }
     })
   }
 
@@ -11531,6 +12480,11 @@ export async function dispatchNativeAutomationPackAction(input: {
       rawSubagentRecord && typeof rawSubagentRecord === 'object'
         ? (rawSubagentRecord as Record<string, any> & { user_id?: string })
         : null
+    // SA-139 R2/R5 (D14): a record of a removed Subagent type (n8n, or the CLI Subagent) owns nothing, like a missing one:
+    // its settings never merge, it is never the process owner and never a skill actor.
+    if (subagentRecord && isRetiredSubagentType(normalizeSubagentType(subagentRecord as SubagentLike, subagentRecord.subagentType))) {
+      subagentRecord = null
+    }
 
     if (subagentRecord && subagentRecord.user_id === input.userId) {
       effectiveProviderSettings = mergeSubagentNativeToolProviderSettings(
@@ -11594,49 +12548,6 @@ export async function dispatchNativeAutomationPackAction(input: {
     })
   }
 
-  // BL-878: a skill `script_run` starts a process under Batshit's rules, the second door, so the
-  // agent lane is refused here too, before any skill runtime, cache, or process work (Cooper's
-  // condition). It reads the action AS PARSED: `parseNativeAutomationInput` has already folded the
-  // wrapped forms (`input`, `arguments`, `value`, a JSON text) and the aliases (`run`,
-  // `run_script`, `script-run`, in any case) into `script_run` through `normalizeNativeSkillToolAction`,
-  // which is also what `executeNativeSkillToolAction` acts on. There is no second parser here.
-  if (
-    action === 'native_skill' &&
-    input.actorType === 'agent' &&
-    !CLI_LANE_GETS_BATSHIT_BASH &&
-    normalizeNativeSkillToolAction(parsedInput.value.action) === 'script_run'
-  ) {
-    return buildNativeAutomationResult({
-      success: false,
-      action,
-      backend,
-      context,
-      error: { code: 'ACTION_DISABLED', message: CLI_LANE_SKILL_SCRIPT_REFUSAL_MESSAGE }
-    })
-  }
-
-  // BL-933: managed CLI credentials must use the existing Fabric consent path. This
-  // legacy automation action has no verified approval-card/resume context. Keep its
-  // toggle and input checks above, and its session/service/n8n contract unchanged.
-  // actorType is supplied by authentication; payload approval flags cannot grant this.
-  if (
-    input.actorType === 'agent' &&
-    (action === 'runtime_addon_start' || action === 'runtime_addon_stop')
-  ) {
-    const controlRef = `fabric:sys.runtime_addon.${action === 'runtime_addon_start' ? 'start' : 'stop'}`
-    return buildNativeAutomationResult({
-      success: false,
-      action,
-      backend,
-      context,
-      error: {
-        code: 'ACTION_DISABLED',
-        message: `Managed CLI runs cannot ${action === 'runtime_addon_start' ? 'start' : 'stop'} runtime add-ons directly. A Primary Agent must request ${controlRef} through Batshit Tools and wait for the user's approval.`,
-        details: { controlRef }
-      }
-    })
-  }
-
   const resolvedProjectPath =
     (typeof input.projectPath === 'string' && input.projectPath.trim().length > 0
       ? input.projectPath.trim()
@@ -11648,11 +12559,11 @@ export async function dispatchNativeAutomationPackAction(input: {
       userId: input.userId,
       agentId: context.actor_type === 'subagent' ? undefined : governingAgentId,
       agentMetadata: context.actor_type === 'subagent' ? subagentRecord ?? null : undefined,
-      mcpGatewayScope: input.actorType === 'agent' ? input.mcpGatewayScope ?? [] : input.mcpGatewayScope,
+      mcpGatewayScope: input.mcpGatewayScope,
       selectedGateways: parsedInput.value.selectedGateways
     })
     // BL-686: the model's `selectedToolIds` only narrows the governing agent's (or the
-    // Subagent's) saved list, or a managed run's credential list; it never replaces it.
+    // Subagent's) saved list or the server-owned run ceiling; it never replaces it.
     const brokerCliScope = await resolveDispatchCliToolScope(input, context, {
       governingAgentId,
       subagentRecord,
@@ -11710,6 +12621,8 @@ export async function dispatchNativeAutomationPackAction(input: {
 
     if (action === 'batshit_tool_search') {
       const result = await nativeBatshitToolSearch({
+        actorType: input.actorType,
+        delegatedRun: input.delegatedRun,
         ...withoutBrokerPlumbing(parsedInput.value as BatshitToolSearchInput),
         userId: input.userId,
         agentId: context.actor_type === 'subagent' ? context.agent_id : governingAgentId || null,
@@ -11722,15 +12635,6 @@ export async function dispatchNativeAutomationPackAction(input: {
         runtimeMode: context.mode,
         fabricAllowedControlIds: Array.from(brokerFabricAllowedControlIds),
         projectPath: resolvedProjectPath,
-        agentBrowserSettings: {
-          liveViewEnabled: nativeSettings.agentBrowserLiveViewEnabled,
-          runtimeMode: nativeSettings.agentBrowserRuntimeMode,
-          cdpPort: nativeSettings.agentBrowserCdpPort,
-          provider: nativeSettings.agentBrowserProvider,
-          executablePath: nativeSettings.agentBrowserExecutablePath,
-          extraFlags: nativeSettings.agentBrowserExtraFlags,
-          timeoutMs: nativeSettings.agentBrowserTimeoutMs
-        }
       })
       return buildNativeAutomationResult({
         success: true,
@@ -11761,15 +12665,6 @@ export async function dispatchNativeAutomationPackAction(input: {
         runtimeMode: context.mode,
         fabricAllowedControlIds: Array.from(brokerFabricAllowedControlIds),
         executionBackend: backend,
-        agentBrowserSettings: {
-          liveViewEnabled: nativeSettings.agentBrowserLiveViewEnabled,
-          runtimeMode: nativeSettings.agentBrowserRuntimeMode,
-          cdpPort: nativeSettings.agentBrowserCdpPort,
-          provider: nativeSettings.agentBrowserProvider,
-          executablePath: nativeSettings.agentBrowserExecutablePath,
-          extraFlags: nativeSettings.agentBrowserExtraFlags,
-          timeoutMs: nativeSettings.agentBrowserTimeoutMs
-        },
         abortSignal
       })
       // A stopped call, and a CLI timeout, are command data rather than backend failures.
@@ -11934,7 +12829,9 @@ export async function dispatchNativeAutomationPackAction(input: {
               : {}),
             ...(typeof result.exitCode === 'number' ? { exitCode: result.exitCode } : {}),
             ...(result.timedOut === true ? { timedOut: true } : {}),
-            ...(typeof result.sandboxName === 'string' ? { sandboxName: result.sandboxName } : {})
+            ...(typeof result.sandboxName === 'string' ? { sandboxName: result.sandboxName } : {}),
+            // BL-1916: a patch Batshit could not fully put back names what it left changed.
+            ...(result.managedApplyPatch?.partial === true ? { managedApplyPatch: result.managedApplyPatch } : {})
           }
         }
       })
@@ -12026,15 +12923,6 @@ export async function dispatchNativeAutomationPackAction(input: {
       userId: input.userId,
       query: parsedInput.value.query,
       limit: parsedInput.value.limit,
-      settings: {
-        liveViewEnabled: nativeSettings.agentBrowserLiveViewEnabled,
-        runtimeMode: nativeSettings.agentBrowserRuntimeMode,
-        cdpPort: nativeSettings.agentBrowserCdpPort,
-        provider: nativeSettings.agentBrowserProvider,
-        executablePath: nativeSettings.agentBrowserExecutablePath,
-        extraFlags: nativeSettings.agentBrowserExtraFlags,
-        timeoutMs: nativeSettings.agentBrowserTimeoutMs
-      }
     })
 
     if (result.dockerUnsupported === true) {
@@ -12069,15 +12957,6 @@ export async function dispatchNativeAutomationPackAction(input: {
       sessionId: context.session_id,
       toolName: parsedInput.value.toolName,
       params: parsedInput.value.params,
-      settings: {
-        liveViewEnabled: nativeSettings.agentBrowserLiveViewEnabled,
-        runtimeMode: nativeSettings.agentBrowserRuntimeMode,
-        cdpPort: nativeSettings.agentBrowserCdpPort,
-        provider: nativeSettings.agentBrowserProvider,
-        executablePath: nativeSettings.agentBrowserExecutablePath,
-        extraFlags: nativeSettings.agentBrowserExtraFlags,
-        timeoutMs: nativeSettings.agentBrowserTimeoutMs
-      },
       abortSignal
     })
 
@@ -12280,8 +13159,6 @@ export async function dispatchNativeAutomationPackAction(input: {
   if (action === 'native_skill') {
     const skillActor = resolveDispatchSkillActor({
       lane: input.actorType ?? 'unknown',
-      delegatedRun: input.delegatedRun === true,
-      scopeAgentId: input.scopeAgentId ?? null,
       contextActorType: context.actor_type,
       contextAgentId: context.agent_id,
       governingAgentId,
@@ -12355,16 +13232,13 @@ export async function dispatchNativeAutomationPackAction(input: {
       userId: input.userId,
       query: parsedInput.value.query,
       provider: parsedInput.value.provider,
-      agentDefaultProvider: nativeSettings.webSearchProvider,
       exaSearchType: parsedInput.value.exaSearchType,
-      agentDefaultExaSearchType: nativeSettings.webSearchExaSearchType,
       perplexityMaxTokensPerPage: parsedInput.value.perplexityMaxTokensPerPage,
-      agentDefaultPerplexityMaxTokensPerPage:
-        nativeSettings.webSearchPerplexityMaxTokensPerPage,
       maxResults: parsedInput.value.maxResults,
       region: parsedInput.value.region,
       safeSearch: parsedInput.value.safeSearch,
-      timeoutMs: parsedInput.value.timeoutMs
+      timeoutMs: parsedInput.value.timeoutMs,
+      abortSignal
     })
     if (result.success === false) {
       return buildNativeAutomationResult({
@@ -12413,44 +13287,19 @@ export const NATIVE_FABRIC_USE_TOP_LEVEL_INPUT_KEYS = [
  * BL-75 — whose skill access governs a `native_skill` call that arrived through
  * `/api/native-tools/dispatch`, by the lane it authenticated on (see `actingAgentIdentity.ts`).
  *
- * - `agent`: the run credential. The route already bound the context's governing field to it;
- *   a delegated run's credential also carries the Subagent or Worker it runs as.
- * - `session`, `in-process`, `n8n-callback`: the context, as those lanes are trusted for it. A
- *   subagent-shaped context (an n8n Workflow Subagent) names the subagent, whose own list
- *   governs, and only when that subagent is this user's.
+ * - `session`, `in-process`: the context, as those lanes are trusted for it. A subagent-shaped
+ *   context names the subagent, whose own list governs, and only when that subagent is this
+ *   user's.
  * - `service`, `portable-skill`, `unknown`: no agent identity, so no skill loads.
  */
 function resolveDispatchSkillActor(args: {
   lane: ControlActorType
-  delegatedRun: boolean
-  scopeAgentId: string | null
   contextActorType: 'primary' | 'subagent'
   contextAgentId: string
   governingAgentId: string
   subagentOwnedByUser: boolean
 }): { ok: true; actor: SkillRuntimeActor } | { ok: false; message: string } {
-  if (args.lane === 'agent') {
-    const scoped = args.scopeAgentId?.trim() || ''
-    return {
-      ok: true,
-      actor: {
-        kind: 'agent',
-        agentId: scoped || args.governingAgentId,
-        delegated: args.delegatedRun
-      }
-    }
-  }
-  if (args.lane === 'n8n-callback' && args.contextActorType !== 'subagent') {
-    // n8n is never a Primary Agent type. BL-78 binds the workflow identity in the callback
-    // token and validates dispatch fields; skill access still requires a subagent actor,
-    // so primary-shaped callbacks cannot load the parent's skills.
-    return {
-      ok: false,
-      message:
-        'An n8n workflow loads skills only as a Workflow Subagent: send context actor_type "subagent" with its own agent_id.'
-    }
-  }
-  if (args.lane === 'session' || args.lane === 'in-process' || args.lane === 'n8n-callback') {
+  if (args.lane === 'session' || args.lane === 'in-process') {
     if (args.contextActorType === 'subagent') {
       if (!args.subagentOwnedByUser) {
         return {
@@ -12483,6 +13332,8 @@ async function executeNativeSkillToolAction(input: {
   bashApprovalRequestsEnabled: boolean
   /** BL-410: a group member run, where a script that is not allow-listed gets the group reason. */
   groupMemberRun?: boolean
+  /** BL-2182: the Agent-mode refusal for this run (a delegated run's names what works for it). */
+  agentModePolicyRefusal?: string
   skillId: string
   /**
    * BL-75: whose skill access decides this load. Required, so every caller names one; see
@@ -12602,6 +13453,7 @@ async function executeNativeSkillToolAction(input: {
       contentTruncated: decoded.truncated,
       originalChars: decoded.originalChars,
       returnedChars: decoded.content.length,
+      sourceSha256: decoded.sourceSha256,
       operationKind: 'skill_read',
       rendererFamily: 'skill_read',
       ...partialSkillReadFields({
@@ -12650,7 +13502,7 @@ async function executeNativeSkillToolAction(input: {
       errorCode: 'POLICY_BLOCKED',
       error: input.groupMemberRun
         ? GROUP_APPROVAL_UNAVAILABLE_REASON
-        : 'Blocked by Agent mode policy. Add this command to the allow list, switch Approval Policy to On Failure, or switch to Dangerous mode.',
+        : input.agentModePolicyRefusal ?? AGENT_MODE_POLICY_REFUSAL,
       command,
       policyMode: input.settings.bashPolicyMode,
       accessMode: input.settings.bashAccessMode
@@ -12671,18 +13523,7 @@ async function executeNativeSkillToolAction(input: {
     commandAllowList: input.settings.bashCommandAllowList,
     neverAllowList: input.settings.bashNeverAllowList,
     maxOutputChars: input.maxOutputChars,
-    agentBrowserSettings: {
-      enabled: input.settings.agentBrowserEnabled,
-      liveViewEnabled: input.settings.agentBrowserLiveViewEnabled,
-      runtimeMode: input.settings.agentBrowserRuntimeMode,
-      cdpPort: input.settings.agentBrowserCdpPort,
-      provider: input.settings.agentBrowserProvider,
-      session: input.settings.agentBrowserSession,
-      profilePath: input.settings.agentBrowserProfilePath,
-      executablePath: input.settings.agentBrowserExecutablePath,
-      extraFlags: input.settings.agentBrowserExtraFlags,
-      timeoutMs: input.settings.agentBrowserTimeoutMs
-    },
+    agentBrowserSettings: { enabled: input.settings.agentBrowserEnabled },
     abortSignal: input.abortSignal
   })
 
@@ -12703,6 +13544,7 @@ async function executeNativeSkillToolAction(input: {
 type NativeFabricUseTopLevelInputKey = (typeof NATIVE_FABRIC_USE_TOP_LEVEL_INPUT_KEYS)[number]
 
 const NATIVE_FABRIC_USE_PASSTHROUGH_BLOCKLIST = new Set<string>([
+  'p5ApiRun',
   'controlId',
   'control_id',
   'input',
@@ -12764,6 +13606,8 @@ export function normalizeNativeControlUseInput(
  * Approve click would silently earn a second card.
  */
 export interface BrokerRiskApprovalTarget {
+  p5ApiHeldRecipe?: import('./appActions/mcp/originalTask').P5HeldMcpRecipe
+  settingsPreview?: AppActionsApprovalPreview
   ref: string
   family: BatshitToolFamily
   controlId: string
@@ -12791,6 +13635,11 @@ function readBrokerRefInput(raw: unknown): {
 }
 
 export async function resolveBrokerRiskApprovalTarget(options: {
+  apiUtilityScope?: ApiUtilityScope
+  p5ApiRun?: import('./appActions/mcp/originalTask').P5ApiOriginalRun
+  abortSignal?: AbortSignal
+  messageId?: string | null
+  sessionId?: string | null
   userId: string
   agentId?: string | null
   /**
@@ -12856,7 +13705,7 @@ export async function resolveBrokerRiskApprovalTarget(options: {
     }
   }
 
-  if (parsed.family !== 'fabric' && parsed.family !== 'artifact') return null
+  if (parsed.family !== 'fabric' && parsed.family !== 'batshit' && parsed.family !== 'artifact') return null
 
   const allowedControlIds =
     parsed.family === 'artifact'
@@ -12865,7 +13714,7 @@ export async function resolveBrokerRiskApprovalTarget(options: {
         ? options.fabricAllowedControlIds
         : null
   if (
-    parsed.family === 'fabric' &&
+    (parsed.family === 'fabric' || parsed.family === 'batshit') &&
     Array.isArray(allowedControlIds) &&
     !isControlIdAllowedByList(parsed.target, allowedControlIds)
   ) {
@@ -12881,8 +13730,10 @@ export async function resolveBrokerRiskApprovalTarget(options: {
   const normalized = normalizeNativeControlUseInput(controlInput as Record<string, any>) ?? {}
 
   const profile = await resolveControlRiskProfile({
+    apiUtilityScope: options.apiUtilityScope,
     userId: options.userId,
-    agentId: options.controlScopeAgentId ?? options.agentId ?? null,
+    agentId: isApiUtilityControlId(parsed.target) && options.apiUtilityScope
+      ? options.agentId ?? null : options.controlScopeAgentId ?? options.agentId ?? null,
     runtimeMode: 'mode3',
     controlId: parsed.target,
     input: normalized,
@@ -12890,8 +13741,16 @@ export async function resolveBrokerRiskApprovalTarget(options: {
   })
   if (!profile) return null
 
+  const settingsPreview = profile.controlId === SETTINGS_MANAGEMENT_CONTROL_IDS.nativeChange
+    ? settingsNativeApprovalPreview(options.userId, options.agentId ?? '', options.sessionId ?? '', normalized) : undefined
+
   return {
     ref: parsedInput.ref,
+    ...(settingsPreview ? { settingsPreview } : {}),
+    ...(settingsPreview && options.p5ApiRun ? { p5ApiHeldRecipe: await settingsOperationRegistry.bindP5ApiMcpOperation({
+      userId: options.userId, agentId: options.agentId, sessionId: options.sessionId, messageId: options.messageId,
+      actorType: 'in-process', abortSignal: options.abortSignal, p5ApiRun: options.p5ApiRun
+    }, normalized) } : {}),
     family: parsed.family,
     controlId: profile.controlId,
     controlTitle: profile.controlTitle,
@@ -12913,6 +13772,9 @@ export async function resolveBrokerRiskApprovalTarget(options: {
  * (AMD-116-01), because the SDK asks this question again on the approval resume.
  */
 export async function needsBrokerRiskApproval(options: {
+  apiUtilityScope?: ApiUtilityScope
+  p5ApiRun?: import('./appActions/mcp/originalTask').P5ApiOriginalRun
+  messageId?: string | null
   userId: string
   agentId?: string | null
   /** BL-186 review — a delegated run's own id, for the risk profile only (see the target). */
@@ -12937,10 +13799,31 @@ export async function needsBrokerRiskApproval(options: {
   // A refused Settings call reaches execute for its typed refusal, never a
   // consent card. This does not treat it as an approved/safe mutation.
   if (settingsRefused()) return false
+  const settingsInput = readBrokerRefInput(options.input)
+  if (settingsInput && !settingsInput.dryRun) {
+    try {
+      const ref = parseBatshitToolRef(settingsInput.ref)
+      if (ref.family === 'fabric') {
+        if (options.allowedFamilies && !options.allowedFamilies.includes('fabric') ||
+          options.fabricAllowedControlIds && !isControlIdAllowedByList(ref.target, options.fabricAllowedControlIds)) return false
+        const prepared = await prepareSettingsControl({ userId: options.userId, agentId: options.agentId, sessionId: options.sessionId,
+          actorType: 'in-process', delegatedRun: Boolean(options.controlScopeAgentId), abortSignal: options.abortSignal, p5ApiRun: options.p5ApiRun, messageId: options.messageId }, ref.target, settingsInput.payload)
+        if (prepared?.noEffect) return false
+        if (prepared?.standingConsent) {
+          const woken = await resolveWokenTurnState(options.sessionId ?? null, { userId: options.userId, agentId: options.agentId ?? null })
+          return woken.woken
+        }
+      }
+    } catch { return false } // Execution returns the typed refusal; never issue an unbound Settings approval.
+  }
   let target: BrokerRiskApprovalTarget | null = null
   try {
     target = await resolveBrokerRiskApprovalTarget(options)
   } catch (error) {
+    if (settingsInput) {
+      try { if (parseBatshitToolRef(settingsInput.ref).target === SETTINGS_MANAGEMENT_CONTROL_IDS.nativeChange) return false }
+      catch { return false }
+    }
     // Fail closed: an unresolvable risk question pauses. `execute` then answers whatever it
     // was going to answer anyway, and the worst case is a card for a call that fails.
     console.warn('[NativeTools] Risk-approval policy could not resolve the ref:', error)
@@ -12982,11 +13865,44 @@ export const GROUP_APPROVAL_UNAVAILABLE_REASON =
   'Not run: this command needs the user\'s approval, and approval cards are not available in group chats. ' +
   'Tell the user they can run it in a one-agent chat with this agent, or add the command to the allow list in Agent Settings.'
 
+/**
+ * A Primary Agent's Agent-mode refusal of a command that is not on its allow list, where no
+ * approval card can be raised (Approval Policy Never). BL-2374: it names the Approval Policy's
+ * label (On Failure since Josh's rename, 2026-10-27), and the file routes Agent mode runs without a card (a managed `apply_patch`
+ * sent alone, and the typed file tools where the agent has them), so a model refused on a shell
+ * write such as `printf > file` learns which route works. Batshit Agent Docs: Josh owns the words
+ * (2026-10-27: "Batshit Crazy mode", the Work Mode's label, and "default Agent mode").
+ */
+export const AGENT_MODE_POLICY_REFUSAL =
+  'Blocked by Agent mode policy. Add this command to the allow list, switch Approval Policy to On Failure, or switch to Batshit Crazy mode. ' +
+  'To create or edit a file, send an apply_patch by itself, or use write_file or edit_file if you have them: default Agent mode runs these without an approval card.'
+
+/**
+ * BL-2182: an API Subagent or Worker runs with `toolApprovalMode: 'off'` (`subagentRunner.ts`), so
+ * it can never raise an approval card, and switching the Approval Policy cannot help it. Its
+ * refusal names only what works: the allow list or Dangerous mode of the record whose Work Mode
+ * the run uses (its own for a Subagent, the Primary's for a built-in Worker, the copied Subagent's
+ * for a `base` clone, whose `scopeAgentId` is that Subagent's id; a built-in Worker's is
+ * `worker_…`).
+ */
+export function delegatedAgentModePolicyRefusal(run: { scopeAgentId: string; processOwnerKind?: HostCommandOwner['kind'] }): string {
+  if (run.scopeAgentId.startsWith('worker_')) {
+    return 'Blocked by Agent mode policy. A Worker run cannot ask the user for approval. A built-in Worker uses the Primary Agent\'s Work Mode, so to allow this command, add it to the Primary Agent\'s allow list, or switch the Primary Agent to Dangerous mode.'
+  }
+  if (run.processOwnerKind === 'agent') {
+    return 'Blocked by Agent mode policy. A Worker run cannot ask the user for approval. To allow this command, add it to the allow list of the Subagent this Worker copies, or switch that Subagent to Dangerous mode.'
+  }
+  return 'Blocked by Agent mode policy. A Subagent run cannot ask the user for approval. To allow this command, add it to this Subagent\'s allow list, or switch this Subagent to Dangerous mode.'
+}
+
 export type NativeToolApprovalPolicy = (
   input: unknown
 ) => Promise<'user-approval' | undefined>
 
 export interface Mode3NativeToolSet {
+  /** Bound once from final eligible registrations after Plan/provider decoration. */
+  bindApiUtilityScope?: (scope?: ApiUtilityScope) => void
+  utilityBrokerOnly?: boolean
   tools: Record<string, any>
   /** The final server-resolved broker scope for this turn, before any model output is cut. */
   fetchZipAvailable: boolean
@@ -13000,16 +13916,30 @@ export interface Mode3NativeToolSet {
 
 export async function buildMode3NativeTools(context: NativeToolContext): Promise<Mode3NativeToolSet> {
   const settings = resolveNativeToolSettings(context.providerSettings)
-  if (context.processOwner || normalizeOptionalString(context.scopeAgentId)) {
+  const delegatedRun = Boolean(context.processOwner || normalizeOptionalString(context.scopeAgentId))
+  let delegatedParentRecord: Record<string, any> | null = null
+  if (delegatedRun) {
     // API Subagents and Workers keep the parent as their audit identity. Their own
     // saved Bash grant and the parent's restriction must both allow commands; a
     // model preset, missing grant or missing parent record cannot supply authority.
     const parentId = normalizeOptionalString(context.agentId)
     const parentRecord = parentId ? await redis.get(`agent:${parentId}`) as Record<string, any> | null : null
+    delegatedParentRecord = parentRecord?.user_id === context.userId ? parentRecord : null
     settings.bashEnabled = settings.bashEnabled && !!context.processOwner &&
       context.delegatedBashEnabled === true &&
       parentRecord?.user_id === context.userId &&
       resolveNativeToolSettings(parentRecord.provider_specific_settings ?? null).bashEnabled
+  }
+  // Startup/create/restore materialize explicit choices. No runtime global inheritance remains.
+  // Bash, the delegated record AND parent, physical owner and qualified host stay upper bounds.
+  let typedFileToolsEnabled = false
+  if (settings.bashEnabled && typedFileToolsUnavailableReason(settings.executionBackend, readTypedFileToolsHost()) === null) {
+    const ownValue = delegatedRun ? context.delegatedTypedFileToolsValue : agentTypedFileToolsValue(context.providerSettings)
+    const parentValue = delegatedRun && delegatedParentRecord
+      ? agentTypedFileToolsValue(delegatedParentRecord.provider_specific_settings ?? null)
+      : null
+    const delegatedGate = !delegatedRun || (!!context.processOwner && ownValue !== undefined && !!delegatedParentRecord)
+    typedFileToolsEnabled = delegatedGate && ownValue === true && (!delegatedRun || parentValue === true)
   }
   const selectedGateways = normalizeStringArray(context.selectedGateways) ?? []
   const cliToolScope = await resolveCliToolSelectionScope({
@@ -13028,6 +13958,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   // artifact allowlists are judged by this id, the one its DCM index lists them by.
   const delegatedScopeAgentId = normalizeOptionalString(context.scopeAgentId)
   const gatewayToolsCache: GatewayToolsCache = new Map()
+  let apiUtilityScope: ApiUtilityScope | undefined
+  let utilityScopeBound = false
 
   /* ---------------------------------------------------------------- *
    * SA-116 P2 — the click is the approval, and the retry cache is gone.
@@ -13075,14 +14007,20 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     wrapperAllowedControlIds: string[],
     approval?: ControlApprovalGrant | null,
     abortSignal?: AbortSignal,
-    gatewayFilter?: string[]
+    gatewayFilter?: string[],
+    utilityInvocation?: ApiUtilityInvocation
   ) => {
     return await useControl({
+      apiUtilityScope,
+      apiUtilityInvocation: utilityInvocation,
       abortSignal,
       userId: context.userId,
       agentId: context.agentId ?? undefined,
       sessionId: context.sessionId,
       runtimeMode: 'mode3',
+      messageId: context.messageId,
+      p5ApiRun: context.p5ApiRun,
+      whiteboardSettingsSnapshot: context.whiteboardSettingsSnapshot,
       // The API lane's broker never crosses a request boundary: its `agentId` is the turn's own.
       actorType: 'in-process',
       controlId: input.controlId,
@@ -13108,12 +14046,11 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   // BL-410: a group member run raises no approval card (see `GROUP_APPROVAL_UNAVAILABLE_REASON`),
   // so Agent mode there is policy-only: an allow-listed command runs, anything else is refused.
   const groupMemberRun = context.groupMemberRun === true
-  const bashApprovalRequestsEnabled =
-    !groupMemberRun &&
-    settings.bashAccessMode === 'agent' &&
-    (context.toolApprovalMode
-      ? context.toolApprovalMode === 'all'
-      : settings.bashAgentApprovalCardsEnabled === true)
+  // BL-2182: a delegated run's Agent-mode refusal names what works for it, not the Approval Policy.
+  const agentModePolicyRefusal = delegatedScopeAgentId
+    ? delegatedAgentModePolicyRefusal({ scopeAgentId: delegatedScopeAgentId, processOwnerKind: context.processOwner?.kind })
+    : AGENT_MODE_POLICY_REFUSAL
+  const bashApprovalRequestsEnabled = nativeBashApprovalRequestsEnabled(settings, context)
 
   const nativeSkillNeedsApproval = async (input: unknown) => {
     if (!input || typeof input !== 'object') return false
@@ -13135,7 +14072,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       (await nativeSkillNeedsApproval(input)) ? 'user-approval' : undefined
   }
 
-  tools.native_skill = tool({
+  tools.native_skill = markApiUtilityCandidate(tool({
     description:
       'Invoke/list/read skill docs and list/read/run bundled skill scripts. Script runs are mediated through native bash safety policy.',
     inputSchema: z.object({
@@ -13154,8 +14091,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       timeoutMs: z.number().int().min(MIN_BASH_TIMEOUT_MS).max(MAX_BASH_TIMEOUT_MS).optional(),
       maxOutputChars: z.number().int().min(1_000).max(MAX_BASH_OUTPUT_CHARS).optional()
     }),
-    execute: async (input, options) =>
-      executeNativeSkillToolAction({
+    execute: async (input, options) => {
+      const run = () => executeNativeSkillToolAction({
         userId: context.userId,
         processOwner: context.processOwner ?? (context.agentId
           ? { userId: context.userId, kind: 'agent', id: context.agentId }
@@ -13166,6 +14103,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         projectPath: context.projectPath ?? null,
         bashApprovalRequestsEnabled,
         groupMemberRun,
+        agentModePolicyRefusal,
         skillId: input.skillId,
         action: input.action ?? 'invoke',
         path: input.path,
@@ -13176,8 +14114,16 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         timeoutMs: input.timeoutMs,
         maxOutputChars: input.maxOutputChars,
         abortSignal: options?.abortSignal
-      }),
-    toModelOutput: async ({ output }: { output: any }) => {
+      })
+      return context.skillReadDelivery && !context.scopeAgentId
+        ? context.skillReadDelivery.execute(input, run) : run()
+    },
+    toModelOutput: async (options: { output: any }) => {
+      const { output } = options
+      const utility = isApiSkillUtilityFormatting(options)
+      const note = (result: Record<string, unknown>) => utility
+        ? skillReadNoteLine({ ...result, readMore: formatApiSkillReadMore(result) ?? '' })
+        : skillReadNoteLine(result)
       if (output && typeof output === 'object' && (output as any).success === true) {
         if ((output as any).action === 'invoke') {
           const skillMarkdown = typeof (output as any).skillMarkdown === 'string' ? (output as any).skillMarkdown : ''
@@ -13197,6 +14143,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
             value: [
               `==== SKILL: ${skillName} (${skillId}) ====`,
               skillMarkdown,
+              note(output as Record<string, unknown>),
               '==== END SKILL ====',
               '',
               'skill_references:',
@@ -13208,7 +14155,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
                 ? ['', 'skill_warnings:', ...warnings.map((entry: string) => `- ${entry}`)]
                 : []),
               '',
-              'Use `native_skill` with action="read" and the skillId to load references on demand.',
+              utility ? 'Use `native_batshit_tool_use` with ref="batshit:sys.skill.use", input.action="read" and input.skillId to load references on demand.'
+                : 'Use `native_skill` with action="read" and the skillId to load references on demand.',
               'Use `native_skill` with action="script_run" only when bundled skill script execution is necessary.'
             ]
               .filter((line) => line !== '')
@@ -13237,7 +14185,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
             value: [
               `==== SKILL REFERENCE (${pathLabel}) ====`,
               content,
-              skillReadNoteLine(output as Record<string, unknown>),
+              note(output as Record<string, unknown>),
               '==== END SKILL REFERENCE ===='
             ]
               .filter((line) => line !== '')
@@ -13312,7 +14260,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         return {
           type: 'text',
           value: [
-            `native_skill failed: ${error}`,
+            `${utility ? 'native_batshit_tool_use (batshit:sys.skill.use)' : 'native_skill'} failed: ${error}`,
             ...(availableReferences.length > 0
               ? ['', 'Available references:', buildSkillPathListForModelOutput(availableReferences)]
               : []),
@@ -13328,12 +14276,13 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         value: output ?? null
       }
     }
-  })
+  }), 'skill', context)
 
   const allowArtifactRuntimeTools = context.allowArtifactRuntimeTools !== false
   const allowFabricControlTools = context.allowFabricControlTools !== false
   // SA-104 P3: opt-in per agent; subagent callers leave this unset/false.
   const memoryControlsEnabled = context.memoryControlsEnabled === true
+  const whiteboardControlsEnabled = context.groupMemberRun !== true && !delegatedScopeAgentId && context.whiteboardControlsEnabled === true
   // SA-113 P2: same shape for the Agent DM family.
   const dmControlsEnabled = context.dmControlsEnabled === true
   // SA-115 P2: and the schedule family, on the same per-agent switch.
@@ -13351,6 +14300,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     allowArtifactRuntimeTools,
     allowFabricControlTools,
     memoryControlsEnabled,
+    whiteboardControlsEnabled,
     dmControlsEnabled,
     scheduleControlsEnabled,
     judgeControlsEnabled
@@ -13361,6 +14311,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       toggles: brokerToggles,
       allowFabricControlTools,
       memoryControlsEnabled,
+      whiteboardControlsEnabled,
       dmControlsEnabled,
       scheduleControlsEnabled,
       judgeControlsEnabled
@@ -13368,14 +14319,20 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   )
   const fetchZipAvailable = apiBrokerAllowedFamilies.includes('fabric') &&
     apiBrokerFabricAllowedControlIds.has(FABRIC_FETCH_ZIP_CONTROL_ID)
+  const hasUtilityCandidate = Boolean(tools.native_skill) || settings.webSearchEnabled || context.workers?.enabled === true
+  const utilityBrokerOnly = apiBrokerAllowedFamilies.length === 0 && hasUtilityCandidate
 
-  if (apiBrokerAllowedFamilies.length > 0) {
+  if (apiBrokerAllowedFamilies.length > 0 || hasUtilityCandidate) {
     tools.native_batshit_tool_search = tool({
       description:
-        'Search Batshit MCP, CLI, artifact, and Fabric capability families through one compact typed-ref broker. Use family to filter when you know the lane.',
-      inputSchema: BATSHIT_TOOL_SEARCH_INPUT_SCHEMA,
+        'Search MCP, CLI, artifact, Fabric, and Batshit utility capability families through one compact typed-ref broker. Use family to filter when you know the lane.',
+      inputSchema: BATSHIT_TOOL_SEARCH_API_INPUT_SCHEMA,
       execute: async (input: BatshitToolSearchInput) =>
         nativeBatshitToolSearch({
+          apiUtilityScope,
+          p5ApiRun: context.p5ApiRun,
+          actorType: 'in-process',
+          delegatedRun: Boolean(delegatedScopeAgentId),
           ...withoutBrokerPlumbing(input),
           userId: context.userId,
           agentId: context.agentId ?? null,
@@ -13409,6 +14366,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     if (context.groupMemberRun !== true) {
       toolApprovals.native_batshit_tool_use = async (input) =>
         (await needsBrokerRiskApproval({
+          apiUtilityScope,
+          p5ApiRun: context.p5ApiRun, messageId: context.messageId,
           userId: context.userId,
           agentId: context.agentId ?? null,
           controlScopeAgentId: delegatedScopeAgentId,
@@ -13425,12 +14384,12 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
 
     tools.native_batshit_tool_use = tool({
       description:
-        'Execute one exact ref returned by native_batshit_tool_search. Refs look like mcp:tool, cli:toolId, artifact:use.artifact.slug, or fabric:sys.control.',
-      inputSchema: BATSHIT_TOOL_USE_INPUT_SCHEMA,
+        'Execute one exact ref returned by native_batshit_tool_search. Refs look like mcp:tool, cli:toolId, artifact:use.artifact.slug, fabric:sys.control, or batshit:sys.judge.ask.',
+      inputSchema: BATSHIT_TOOL_USE_API_INPUT_SCHEMA,
       // `options.toolCallId` is how a resumed run knows WHICH call the user approved: the
       // SDK hands `execute` the same call id the persisted card entry carries (measured,
       // Part 2.10 (c)). It is the only identifier that survives the round trip.
-      execute: async (input: BatshitToolUseInput, options?: { toolCallId?: string; abortSignal?: AbortSignal }) => {
+      execute: async (input: BatshitToolUseInput, options?: ToolExecutionOptions<unknown>) => {
         const toolCallId = typeof options?.toolCallId === 'string' ? options.toolCallId : null
         const denial = resolveApprovalDenial(toolCallId)
         if (denial) {
@@ -13456,8 +14415,16 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           } as any
         }
         const grant = resolveApprovalGrant(toolCallId)
+        const utilityTarget = (() => {
+          try { const ref = parseBatshitToolRef(input.ref); return ref.family === 'batshit' ? ref.target : '' } catch { return '' }
+        })()
+        const utilityInvocation = options && isApiUtilityControlId(utilityTarget) && input.ref === `batshit:${utilityTarget}`
+          ? captureApiUtilityInvocation(apiUtilityScope, utilityTarget, options) : undefined
         return await nativeBatshitToolUse({
           ...withoutBrokerPlumbing(input),
+          apiUtilityScope,
+          apiUtilityInvocation: utilityInvocation,
+          p5ApiRun: context.p5ApiRun,
           userId: context.userId,
           actorType: 'in-process',
           processOwner: context.processOwner,
@@ -13477,17 +14444,22 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           approvalGrant: grant,
           abortSignal: options?.abortSignal,
           executeControlUse: (controlInput, allowedControlIds) =>
-            executeBrokerScopedControlUse(controlInput, allowedControlIds, grant, options?.abortSignal, normalizeStringArray(input.selectedGateways))
+            executeBrokerScopedControlUse(controlInput, allowedControlIds, grant, options?.abortSignal, normalizeStringArray(input.selectedGateways), utilityInvocation)
         })
       },
-      toModelOutput: formatBatshitToolUseModelOutput(context)
+      toModelOutput: async options => await formatApiUtilityOutput(apiUtilityScope, options.output, options) ??
+        formatBatshitToolUseModelOutput(context)(options)
     })
   }
 
+  if (utilityBrokerOnly) {
+    tools.native_batshit_tool_search = markUtilityOnlyApiBroker(tools.native_batshit_tool_search, context)
+    tools.native_batshit_tool_use = markUtilityOnlyApiBroker(tools.native_batshit_tool_use, context)
+  }
   if (settings.webSearchEnabled) {
-    tools.native_web_search = tool({
+    tools.native_web_search = markApiUtilityCandidate(tool({
       description:
-        'Run web search using the provider configured in Batshit settings. Batshit resolves the provider from agent settings first, then admin defaults, then DuckDuckGo as fallback when needed.',
+        'Run web search using the provider configured in Batshit settings. Batshit uses the global default and falls back to DuckDuckGo when its provider key is unavailable.',
       inputSchema: z.object({
         query: z.string().min(1),
         maxResults: z.number().int().min(1).max(MAX_SEARCH_RESULTS).optional(),
@@ -13495,32 +14467,29 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         safeSearch: z.enum(['strict', 'moderate', 'off']).optional(),
       timeoutMs: z.number().int().min(1_000).max(MAX_WEB_SEARCH_TIMEOUT_MS).optional()
     }),
-      execute: async (input) =>
+      execute: async (input, options) =>
         nativeWebSearch({
           userId: context.userId,
           query: input.query,
-          agentDefaultProvider: settings.webSearchProvider,
-          agentDefaultExaSearchType: settings.webSearchExaSearchType,
-          agentDefaultPerplexityMaxTokensPerPage:
-            settings.webSearchPerplexityMaxTokensPerPage,
           maxResults: input.maxResults,
           region: input.region,
           safeSearch: input.safeSearch,
-          timeoutMs: input.timeoutMs
+          timeoutMs: input.timeoutMs,
+          abortSignal: options?.abortSignal ?? context.abortSignal
         })
-    })
+    }), 'webSearch', context)
   }
 
   // SA-111 P4 (DL-111-09): one BATCH tool, not N separate calls. A batch is what lets the
-  // 3-per-call cap live in one place, and it gives every lane the same parallelism no
-  // matter how the model schedules its tool calls.
+  // per-call cap (six since the delegation limits, 2026-10-24) live in one place, and it gives
+  // every lane the same parallelism no matter how the model schedules its tool calls.
   if (context.workers?.enabled === true) {
-    tools.native_spawn_workers = tool({
+    tools.native_spawn_workers = markApiUtilityCandidate(tool({
       description:
         `Spawn up to ${WORKERS_MAX_PER_CALL} throwaway workers that run in parallel and report back. ` +
         'A general worker uses your tools and model, without your skills or past context — use it to keep a large or ' +
         'parallel chunk of work out of your own context. Omit `base` for the built-in general worker, ' +
-        'or set it to an assigned API or CLI subagent slug to copy its prompt, model, tools, and skills. Workers cannot ' +
+        'or set it to an assigned subagent slug to copy its prompt, model, tools, and skills. Workers cannot ' +
         'be steered mid-run and cannot spawn more workers, so brief each one completely.',
       inputSchema: z.object({
         workers: z
@@ -13540,15 +14509,15 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
                 .string()
                 .optional()
                 .describe(
-                  'Slug of an assigned API or CLI subagent to copy. Omit for the built-in general worker.'
+                  'Slug of an assigned subagent to copy. Omit for the built-in general worker.'
                 )
             })
           )
           // Deliberately no `.max()`: DL-111-09 says a call over a cap returns an explicit
           // error RESULT, not a throw. A schema max would turn the one cap that can be
-          // expressed in a schema into an opaque invalid-input error, while the other two
-          // (3 concurrent, 9 per turn) still came back as readable refusals. One path, one
-          // vocabulary — the limit lives in the description and in `workerTurnBudget`.
+          // expressed in a schema into an opaque invalid-input error, while the other (six at
+          // a time) still came back as a readable refusal. One path, one vocabulary — the
+          // limit lives in the description and in `workerTurnBudget`.
           .min(1)
       }),
       execute: async (input) => {
@@ -13577,7 +14546,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           workers: (input as any)?.workers
         })
       }
-    })
+    }), 'workers', context)
   }
 
   if (settings.bashEnabled) {
@@ -13611,13 +14580,16 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
             const policy = evaluateBashPolicy(
               command,
               'agent',
-              settings.bashNeverAllowList
+              settings.bashNeverAllowList,
+              { commandsAfterPatchRun: true }
             )
             if (policy.blocked) return false
 
+            // SA-126 item 2: a patch with commands after it always asks, once, for both.
             return !isAgentModeAutoAllowedCommand(
               command,
-              settings.bashCommandAllowList
+              settings.bashCommandAllowList,
+              { commandsAfterPatchRun: true }
             )
           }
         : false
@@ -13628,14 +14600,19 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     }
 
     tools.native_bash_execute = tool({
-      // Agent Docs (2026-09-18): the model is told what a Stop and a timeout end (`commandEnd.ts`)
-      // and how to leave a program running; since BL-244 (2026-09-25) also how to send the managed
-      // apply_patch. Every API agent pays for these words on every turn.
+      // Agent Docs: how to send the managed apply_patch (BL-244), put the planned changes in one patch
+      // with each change precise (Josh, 2026-11-05) and write a long file (Josh, 2026-10-23: half the
+      // old length, Pi-style small diffs), and leave a program
+      // running. Every API agent pays for these words on every request.
       description:
-        'Execute bash commands using Agent Settings access mode (Plan, Agent, Dangerous) with policy guards and renderer mapping. ' +
-        NATIVE_BASH_APPLY_PATCH_GUIDANCE +
-        ' ' +
+        'Run a shell command in the project folder. The Work Mode in Agent Setup plus setup_changes decides what may run. ' +
         NATIVE_BASH_SHELL_GUIDANCE +
+        // SA-126 item 2: commands after a patch run in Dangerous mode, or in Agent mode where the
+        // one approval card can be raised; anywhere else such a call is refused.
+        (nativeBashCommandsAfterPatchRun(settings.bashAccessMode, bashApprovalRequestsEnabled)
+          ? NATIVE_BASH_APPLY_PATCH_GUIDANCE
+          : NATIVE_BASH_APPLY_PATCH_GUIDANCE_SEPARATE_CALL) +
+        ' ' +
         NATIVE_BASH_STOP_GUIDANCE,
       inputSchema: z.object({
         command: z.string().min(1),
@@ -13651,14 +14628,18 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         if (
           agentModePolicyOnly &&
           command &&
-          !isAgentModeAutoAllowedCommand(command, settings.bashCommandAllowList)
+          !isAgentModeAutoAllowedCommand(command, settings.bashCommandAllowList, { commandsAfterPatchRun: true })
         ) {
+          // SA-126 item 2: no allow pattern covers commands after a patch; they need a card.
+          const afterPatchNeedsCard = managedPatchAfterCommand(command) !== null
           return {
             success: false,
             blocked: true,
-            reason: groupMemberRun
-              ? GROUP_APPROVAL_UNAVAILABLE_REASON
-              : 'Blocked by Agent mode policy. Add this command to the allow list, switch Approval Policy to On Failure, or switch to Dangerous mode.',
+            reason: afterPatchNeedsCard
+              ? `Not run: a patch with commands after it needs the user's approval, and ${groupMemberRun ? 'approval cards are not available in group chats' : 'approval cards are off for this agent'}. Nothing was written. Send the patch alone (Agent mode allows a patch by itself), then the commands in their own call.`
+              : groupMemberRun
+                ? GROUP_APPROVAL_UNAVAILABLE_REASON
+                : agentModePolicyRefusal,
             command,
             policyMode: settings.bashPolicyMode,
             accessMode: settings.bashAccessMode
@@ -13666,6 +14647,13 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         }
 
         return nativeBashExecute({
+          // BL-1652: the API lane's zips store a proven multi-file read as one zip per file.
+          splitMultiFileReads: true,
+          // SA-137: with live file reads on, prove which file and form each read showed.
+          proveFileReadSource: context.liveFileReadsEnabled === true && !delegatedScopeAgentId,
+          toolCallId: typeof options?.toolCallId === 'string' ? options.toolCallId : undefined,
+          // SA-126 item 2: the commands after a managed patch run once the whole patch applied.
+          runCommandAfterPatch: true,
           userId: context.userId,
           processOwner: context.processOwner,
           agentId: context.agentId,
@@ -13682,20 +14670,12 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           commandAllowList: settings.bashCommandAllowList,
           neverAllowList: settings.bashNeverAllowList,
           maxOutputChars: input.maxOutputChars,
-          agentBrowserSettings: {
-            enabled: settings.agentBrowserEnabled,
-            liveViewEnabled: settings.agentBrowserLiveViewEnabled,
-            runtimeMode: settings.agentBrowserRuntimeMode,
-            cdpPort: settings.agentBrowserCdpPort,
-            provider: settings.agentBrowserProvider,
-            session: settings.agentBrowserSession,
-            profilePath: settings.agentBrowserProfilePath,
-            executablePath: settings.agentBrowserExecutablePath,
-            extraFlags: settings.agentBrowserExtraFlags,
-            timeoutMs: settings.agentBrowserTimeoutMs
-          },
+          agentBrowserSettings: { enabled: settings.agentBrowserEnabled },
           imageDelivery: context.imageDelivery ?? null,
-          abortSignal: options?.abortSignal
+          abortSignal: options?.abortSignal,
+          // BL-1978: an applied patch reaches the saved record even if the commands after it
+          // outlast BL-1959's Stop wait (the call is tracked under the run's own Stop signal).
+          onPatchApplied: (facts) => noteToolProgress(runAbortSignalOf(options), options?.toolCallId, facts)
         })
       },
       toModelOutput: async ({ output, toolCallId }) => {
@@ -13707,7 +14687,16 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
             ephemeralImages: context.ephemeralImages ?? null
           }
         )
-        if (screenshotOutput) return screenshotOutput
+        if (screenshotOutput) {
+          if (context.p5ApiRun && context.ephemeralImages && toolCallId && screenshotOutput.type === 'content') {
+            const images: EphemeralImageDelivery[] = screenshotOutput.value.flatMap(part => {
+              if (part.type !== 'file') return []
+              return [{ mediaType: part.mediaType, ...(part.data.type === 'data' ? { data: part.data.data } : { url: part.data.url.toString() }) }]
+            })
+            context.ephemeralImages.register(toolCallId, 'native_bash_execute', images, 'Agent Browser screenshot', 'tool_result')
+          }
+          return screenshotOutput
+        }
 
         if (typeof output === 'string') {
           return {
@@ -13732,7 +14721,74 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     })
   }
 
-  return { tools, toolApprovals, fetchZipAvailable }
+  // SA-136: `read_file`, `write_file` and `edit_file`, built in beside Bash under their own grant.
+  // They take the standalone managed patch's consent, which never asks, so they add no approval
+  // policy; Plan mode, the protected targets and Never Allow are checked in each call.
+  if (settings.bashEnabled && typedFileToolsEnabled) {
+    Object.assign(tools, buildTypedFileTools({
+      accessMode: settings.bashAccessMode,
+      refreshedFileReadsTurn: context.refreshedFileReadsTurn === true,
+      resolveEnvironment: async (options) => {
+        const workspace = await resolveBashWorkspaceRoot({
+          userId: context.userId,
+          projectPath: context.projectPath ?? null,
+          workspaceRoot: null
+        })
+        if ('blocked' in workspace) return { blocked: true, reason: workspace.reason }
+        const folder = await resolveBashWorkingDirectory({
+          requestedCwd: context.projectPath ?? null,
+          workspaceRoot: workspace.workspaceRoot
+        })
+        if ('blocked' in folder) return { blocked: true, reason: folder.reason }
+        const execution = options && typeof options === 'object' ? (options as Record<string, any>) : {}
+        return {
+          workspaceRoot: workspace.workspaceRoot,
+          cwd: folder.cwd,
+          commandBackend: settings.executionBackend,
+          admitDockerWorkspace: admitTypedDockerWorkspace,
+          accessMode: settings.bashAccessMode,
+          neverAllowList: settings.bashNeverAllowList,
+          protectedWriteReason: (targetPath: string) =>
+            getProtectedSystemSkillWriteViolationReason({ command: '', cwd: folder.cwd, touchedPaths: [targetPath], workspaceRoot: workspace.workspaceRoot }) ??
+            getProtectedBatshitRepoWriteViolationReason({ command: '', cwd: folder.cwd, touchedPaths: [targetPath], workspaceRoot: workspace.workspaceRoot }),
+          abortSignal: execution.abortSignal instanceof AbortSignal ? execution.abortSignal : null,
+          // BL-1978: the call's `committing` and `applied` reports reach a Stop's saved record.
+          onProgress: (facts) => noteToolProgress(runAbortSignalOf(options), execution.toolCallId, facts),
+          // SA-136 P2b: a Primary run's reads carry a sealed proof (SA-137's v1) for the zip
+          // adapter's `fileReadSource`; delegated runs make none (SA-137 leaves them static).
+          readProofOwner:
+            !delegatedRun &&
+            normalizeOptionalString(context.agentId) &&
+            normalizeOptionalString(context.sessionId) &&
+            normalizeOptionalString(context.messageId) &&
+            typeof execution.toolCallId === 'string' &&
+            execution.toolCallId
+              ? {
+                  userId: context.userId,
+                  agentId: normalizeOptionalString(context.agentId)!,
+                  sessionId: normalizeOptionalString(context.sessionId)!,
+                  messageId: normalizeOptionalString(context.messageId)!,
+                  toolCallId: execution.toolCallId
+                }
+              : null,
+          // SA-137: recorded in the read's proof; only a read made with live file reads on refreshes.
+          liveReadsOn: context.liveFileReadsEnabled === true
+        }
+      }
+    }))
+  }
+
+  return { tools, toolApprovals, fetchZipAvailable, utilityBrokerOnly,
+    bindApiUtilityScope(scope) {
+      if (utilityScopeBound) throw new Error('The API utility scope was already bound.')
+      utilityScopeBound = true
+      if (scope) assertApiUtilityScope(scope, context)
+      apiUtilityScope = scope
+      const entries = readApiUtilities(scope, context)
+      if (entries.length && !apiBrokerAllowedFamilies.includes('batshit')) apiBrokerAllowedFamilies.push('batshit')
+      for (const entry of entries) apiBrokerFabricAllowedControlIds.add(entry.controlId)
+    }
+  }
 }
 
 export const nativeToolService = {

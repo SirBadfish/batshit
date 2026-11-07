@@ -106,6 +106,12 @@ let tunnelStatus: Record<string, unknown> = QUIET_TUNNEL_STATUS
 let failGetsWith: number | null = null
 /** While set, a settings GET waits for it (a slow load). */
 let holdGets: Promise<void> | null = null
+let holdTunnelGet: Promise<void> | null = null
+let tunnelGetStatus = 200
+let holdTunnelPost: Promise<void> | null = null
+let tunnelPostStatus = 200
+let tunnelPostResponse: Record<string, unknown> | null = null
+let tunnelPosts: Array<{ body: Record<string, any> }> = []
 
 /** A record with Clip values and values the Clips panel does not own (which must never change). */
 async function seedStored() {
@@ -115,6 +121,21 @@ async function seedStored() {
     admin_settings: { dcm_tool_name_threshold: 33 },
     ...SAVED_CLIP
   })
+}
+
+async function seedUpload(overrides: Partial<typeof SAVED_UPLOAD>) {
+  await seedStored()
+  const upload = { ...SAVED_UPLOAD, ...overrides }
+  await redis.updateUserSettings(USER, {
+    ui_settings: { ...SAVED_UI, upload_settings: upload }, upload_settings: upload
+  })
+  return upload
+}
+
+function managedStatus(upload: typeof SAVED_UPLOAD) {
+  return { ...QUIET_TUNNEL_STATUS, autoStart: upload.cloudflared_auto_start, targetUrl: upload.cloudflared_target_url,
+    tunnel: { running: true, publicUrl: upload.tunnel_url, targetUrl: upload.cloudflared_target_url,
+      pid: 41000, startedAt: '2026-10-23T00:00:00.000Z', lastError: null } }
 }
 
 async function storedClip() {
@@ -145,6 +166,12 @@ function installRoutes() {
   holdGets = null
   tunnelReads = 0
   tunnelStatus = QUIET_TUNNEL_STATUS
+  holdTunnelGet = null
+  tunnelGetStatus = 200
+  holdTunnelPost = null
+  tunnelPostStatus = 200
+  tunnelPostResponse = null
+  tunnelPosts = []
   const installed = installUserSettingsRoutes({
     userId: USER,
     route,
@@ -152,10 +179,22 @@ function installRoutes() {
     holdGets: () => holdGets,
     // The status the panel asks for on open (and after a Retry that works). By default it
     // changes nothing the panel holds (auto-start off, no target, no public URL).
-    extra: (path, method) => {
+    extra: (path, method, init) => {
       if (path === TUNNEL_ROUTE && method === 'GET') {
         tunnelReads += 1
-        return jsonResponse(tunnelStatus)
+        const snapshot = structuredClone(tunnelStatus), gate = holdTunnelGet, status = tunnelGetStatus
+        return (async () => {
+          if (gate) await gate
+          return jsonResponse(status === 200 ? snapshot : { error: 'Tunnel observation unavailable' }, status)
+        })()
+      }
+      if (path === TUNNEL_ROUTE && method === 'POST') {
+        tunnelPosts.push({ body: JSON.parse(String(init.body)) })
+        const snapshot = structuredClone(tunnelPostResponse ?? tunnelStatus), gate = holdTunnelPost, status = tunnelPostStatus
+        return (async () => {
+          if (gate) await gate
+          return jsonResponse(status === 200 ? snapshot : { error: 'Tunnel action unavailable' }, status)
+        })()
       }
       return undefined
     }
@@ -176,6 +215,20 @@ const compressSwitch = () => switches()[0]
 const jpegSwitch = () => switches()[1]
 const tunnelUrlInput = () => document.getElementById('tunnel-url') as HTMLInputElement | null
 const loadingLine = () => screen.queryByText('Loading clip settings…')
+
+function deferred() {
+  let release!: () => void
+  const promise = new Promise<void>(resolve => { release = resolve })
+  return { promise, release }
+}
+
+async function chooseManualTunnel() {
+  const trigger = screen.getByText('Managed Cloudflare tunnel').closest('button')
+  if (!trigger) throw new Error('Managed tunnel selector is missing')
+  await fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+  await fireEvent.pointerUp(await screen.findByRole('option', { name: /Manual tunnel URL/ }), { pointerType: 'mouse' })
+  await waitFor(() => expect(tunnelUrlInput()).toBeTruthy())
+}
 
 /** The user tries to change a setting on the Clip cards: whatever the panel offers, click it. */
 async function tryToChangeAClipSetting() {
@@ -428,5 +481,240 @@ describe('Clip Settings never turns a failed load into a save (BL-962)', () => {
       tunnel_provider: 'none'
     })
     expect(stored.upload_provider).toBe('local')
+  }, 60_000)
+
+  it('BL-1620: an empty nested alias shows the authoritative legacy managed tunnel and an image edit preserves its choices', async () => {
+    const legacy = { ...SAVED_UPLOAD, tunnel_provider: 'cloudflared_managed',
+      tunnel_url: 'https://legacy-managed.trycloudflare.com', cloudflared_target_url: 'http://localhost:5610' }
+    await seedStored()
+    await redis.updateUserSettings(USER, {
+      ui_settings: { ...SAVED_UI, upload_settings: {} }, upload_settings: legacy
+    })
+    const before = await storedClip()
+    installRoutes()
+    // Matching observation: status/hydration are not user edits. The separate
+    // BL-978 differing-status autosave behavior is not repaired by this case.
+    tunnelStatus = { ...QUIET_TUNNEL_STATUS, autoStart: false, targetUrl: legacy.cloudflared_target_url,
+      tunnel: { running: true, publicUrl: legacy.tunnel_url, targetUrl: legacy.cloudflared_target_url,
+        pid: 41000, startedAt: '2026-10-17T00:00:00.000Z', lastError: null } }
+    renderPanel()
+    await waitForReadAndLoadingLineGone()
+    await waitFor(() => expect(tunnelReads).toBe(1))
+
+    expect(screen.queryByText('Managed Cloudflare tunnel')).toBeTruthy()
+    expect((document.getElementById('cloudflared-target-url') as HTMLInputElement | null)?.value).toBe(legacy.cloudflared_target_url)
+    expect(screen.queryByText(legacy.tunnel_url)).toBeTruthy()
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toEqual([])
+    expect(await storedClip()).toEqual(before)
+
+    await fireEvent.click(jpegSwitch())
+    await waitFor(() => expect(posts.length).toBe(1), { timeout: 5_000 })
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toHaveLength(1)
+    expect(await storedClip()).toEqual({
+      ui_settings: { ...SAVED_UI, force_jpeg: true, upload_settings: legacy },
+      upload_settings: legacy, upload_provider: 'local'
+    })
+    expect(await storedOthers()).toEqual(OTHERS)
+  }, 60_000)
+
+  it('BL-978(b): differing managed status is visible without changing saved tunnel intent or posting on mount', async () => {
+    const upload = await seedUpload({ tunnel_provider: 'cloudflared_managed', cloudflared_auto_start: true,
+      cloudflared_target_url: 'http://saved-target.example.com:5610', tunnel_url: 'https://saved.trycloudflare.com' })
+    installRoutes()
+    tunnelStatus = managedStatus({ ...upload, cloudflared_auto_start: false,
+      cloudflared_target_url: 'http://observed-target.example.com:9999', tunnel_url: 'https://observed.trycloudflare.com' })
+    renderPanel()
+    await waitForReadAndLoadingLineGone()
+    await waitFor(() => expect(tunnelReads).toBe(1))
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toEqual([])
+    expect(await storedClip()).toEqual({ ...SAVED_CLIP, ui_settings: { ...SAVED_UI, upload_settings: upload }, upload_settings: upload })
+    expect(screen.getByText('https://observed.trycloudflare.com')).toBeTruthy()
+    expect(screen.getByText('http://observed-target.example.com:9999')).toBeTruthy()
+    expect((document.getElementById('cloudflared-target-url') as HTMLInputElement).value).toBe(upload.cloudflared_target_url)
+  }, 60_000)
+
+  it('BL-978(b): a saved managed HTTPS false is not repaired by hydration or an unrelated image edit', async () => {
+    const upload = await seedUpload({ tunnel_provider: 'cloudflared_managed', use_https: false,
+      cloudflared_target_url: 'http://saved-target.example.com:5610', tunnel_url: 'https://saved.trycloudflare.com' })
+    installRoutes()
+    tunnelStatus = managedStatus(upload)
+    renderPanel()
+    await waitForReadAndLoadingLineGone()
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toEqual([])
+    await fireEvent.click(jpegSwitch())
+    await waitFor(() => expect(posts).toHaveLength(1))
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toHaveLength(1)
+    expect((await storedClip()).upload_settings).toEqual(upload)
+    expect(await storedOthers()).toEqual(OTHERS)
+  }, 60_000)
+
+  it.each([false, true])('BL-978(b): a saved manual HTTPS URL/flag=%s mounts without rewriting the flag', async use_https => {
+    const upload = await seedUpload({ use_https, tunnel_url: 'https://manual.example.com' })
+    installRoutes()
+    renderPanel()
+    await waitForReadAndLoadingLineGone()
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toEqual([])
+    expect((await storedClip()).upload_settings).toEqual(upload)
+    expect(document.getElementById('use-https')?.getAttribute('aria-checked')).toBe(String(use_https))
+  }, 60_000)
+
+  it('BL-978(b): successful Retry plus differing status posts nothing; a deliberate image edit preserves saved tunnel fields', async () => {
+    const upload = await seedUpload({ tunnel_provider: 'cloudflared_managed', cloudflared_auto_start: true,
+      cloudflared_target_url: 'http://saved-target.example.com:5610', tunnel_url: 'https://saved.trycloudflare.com' })
+    installRoutes()
+    failGetsWith = 503
+    tunnelStatus = managedStatus({ ...upload, cloudflared_auto_start: false,
+      cloudflared_target_url: 'http://observed-target.example.com:9999', tunnel_url: 'https://observed.trycloudflare.com' })
+    renderPanel()
+    await waitForReadAndLoadingLineGone()
+    const notice = await screen.findByTestId(NOTICE)
+    expect(posts).toEqual([])
+    failGetsWith = null
+    await fireEvent.click(within(notice).getByRole('button', { name: /Retry/ }))
+    await waitFor(() => expect(jpegSwitch()).toBeTruthy())
+    await waitFor(() => expect(tunnelReads).toBe(2))
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toEqual([])
+    await fireEvent.click(jpegSwitch())
+    await waitFor(() => expect(posts).toHaveLength(1))
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toHaveLength(1)
+    expect((await storedClip()).upload_settings).toEqual(upload)
+    expect(await storedOthers()).toEqual(OTHERS)
+  }, 60_000)
+
+  it.each([{}, { settings: [] }, { settings: 7 }])('Clip subset of BL-978(i): malformed settings envelope %j never opens saving', async payload => {
+    await seedStored()
+    installRoutes()
+    vi.spyOn(route, 'GET').mockResolvedValueOnce(jsonResponse(payload))
+    renderPanel()
+    await waitForReadAndLoadingLineGone()
+    await tryToChangeAClipSetting()
+    expect(posts).toEqual([])
+    expect(await storedClip()).toEqual(SAVED_CLIP)
+    expect(switches()).toEqual([])
+    expect(screen.getByTestId(NOTICE)).toBeTruthy()
+  }, 60_000)
+
+  it.each([200, 503])('BL-978(b): late status HTTP %s cannot overwrite a newer image intent or save observed tunnel fields', async status => {
+    const upload = await seedUpload({ tunnel_provider: 'cloudflared_managed', cloudflared_auto_start: true,
+      cloudflared_target_url: 'http://saved-target.example.com:5610', tunnel_url: 'https://saved.trycloudflare.com' })
+    installRoutes()
+    const gate = deferred()
+    holdTunnelGet = gate.promise
+    tunnelGetStatus = status
+    tunnelStatus = managedStatus({ ...upload, cloudflared_auto_start: false,
+      cloudflared_target_url: 'http://observed-target.example.com:9999', tunnel_url: 'https://observed.trycloudflare.com' })
+    renderPanel()
+    try {
+      await waitForReadAndLoadingLineGone()
+      await waitFor(() => expect(tunnelReads).toBe(1))
+      await fireEvent.click(jpegSwitch())
+      await waitFor(() => expect(posts).toHaveLength(1))
+      gate.release()
+      await pause(SAVE_DEBOUNCE_PAST)
+      expect(posts).toHaveLength(1)
+      expect((await storedClip()).upload_settings).toEqual(upload)
+      expect((await storedClip()).ui_settings.force_jpeg).toBe(true)
+      expect((document.getElementById('cloudflared-target-url') as HTMLInputElement).value).toBe(upload.cloudflared_target_url)
+      if (status === 200) expect(screen.getByText('https://observed.trycloudflare.com')).toBeTruthy()
+      else expect(screen.getByText('Tunnel observation unavailable')).toBeTruthy()
+    } finally { gate.release(); await pause(SAVE_DEBOUNCE_PAST) }
+  }, 60_000)
+
+  it('BL-978(b): deliberate manual URL input detects HTTPS, while an explicit flag change remains the user choice', async () => {
+    await seedUpload({ tunnel_url: 'manual.example.com', use_https: false })
+    installRoutes()
+    renderPanel()
+    await waitForReadAndLoadingLineGone()
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toEqual([])
+    await fireEvent.input(tunnelUrlInput()!, { target: { value: 'https://pasted.example.com' } })
+    await waitFor(() => expect(posts).toHaveLength(1))
+    expect((await storedClip()).upload_settings).toMatchObject({ tunnel_url: 'https://pasted.example.com', use_https: true })
+    await fireEvent.click(document.getElementById('use-https')!)
+    await waitFor(() => expect(posts).toHaveLength(2))
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toHaveLength(2)
+    expect((await storedClip()).upload_settings).toMatchObject({ tunnel_url: 'https://pasted.example.com', use_https: false })
+  }, 60_000)
+
+  it('BL-978(b): explicit Start, Stop and auto-start actions keep their request and settings behavior', async () => {
+    const upload = await seedUpload({ tunnel_provider: 'cloudflared_managed', tunnel_url: '',
+      cloudflared_target_url: 'http://saved-target.example.com:5610' })
+    installRoutes()
+    tunnelStatus = { ...managedStatus(upload), tunnel: { running: false, publicUrl: null, targetUrl: upload.cloudflared_target_url } }
+    renderPanel()
+    await waitForReadAndLoadingLineGone()
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toEqual([])
+
+    tunnelPostResponse = managedStatus({ ...upload, tunnel_url: 'https://started.trycloudflare.com' })
+    await fireEvent.click(screen.getByRole('button', { name: 'Start Tunnel', exact: true }))
+    await waitFor(() => expect(posts).toHaveLength(1))
+    expect(tunnelPosts[0]?.body).toEqual({ action: 'start', targetUrl: upload.cloudflared_target_url, autoStart: false })
+    expect((await storedClip()).upload_settings).toMatchObject({ tunnel_url: 'https://started.trycloudflare.com', use_https: true })
+
+    tunnelPostResponse = { ...managedStatus(upload), tunnel: { running: false, publicUrl: null, targetUrl: upload.cloudflared_target_url } }
+    await fireEvent.click(screen.getByRole('button', { name: 'Stop Tunnel', exact: true }))
+    await waitFor(() => expect(posts).toHaveLength(2))
+    expect(tunnelPosts[1]?.body).toEqual({ action: 'stop' })
+    expect((await storedClip()).upload_settings.tunnel_url).toBe('')
+
+    tunnelPostResponse = managedStatus({ ...upload, cloudflared_auto_start: true, tunnel_url: 'https://configured.trycloudflare.com' })
+    await fireEvent.click(switches()[2])
+    await waitFor(() => expect(posts).toHaveLength(3))
+    expect(tunnelPosts[2]?.body).toEqual({ action: 'set-auto-start', enabled: true, targetUrl: upload.cloudflared_target_url })
+    expect((await storedClip()).upload_settings).toMatchObject({ cloudflared_auto_start: true, tunnel_url: 'https://configured.trycloudflare.com' })
+  }, 60_000)
+
+  it.each([200, 503])('BL-978(b): late Start status HTTP %s cannot replace a newer manual panel intent', async status => {
+    const upload = await seedUpload({ tunnel_provider: 'cloudflared_managed',
+      cloudflared_target_url: 'http://saved-target.example.com:5610' })
+    installRoutes()
+    tunnelStatus = { ...managedStatus(upload), tunnel: { running: false, publicUrl: null, targetUrl: upload.cloudflared_target_url } }
+    const gate = deferred()
+    holdTunnelPost = gate.promise
+    tunnelPostStatus = status
+    tunnelPostResponse = managedStatus({ ...upload, tunnel_url: 'https://old-start.trycloudflare.com' })
+    renderPanel()
+    try {
+      await waitForReadAndLoadingLineGone()
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Start Tunnel', exact: true })).toBeTruthy())
+      await fireEvent.click(screen.getByRole('button', { name: 'Start Tunnel', exact: true }))
+      await waitFor(() => expect(tunnelPosts).toHaveLength(1))
+      await chooseManualTunnel()
+      await fireEvent.input(tunnelUrlInput()!, { target: { value: 'https://new-intent.example.com' } })
+      await waitFor(() => expect(posts).toHaveLength(1))
+      gate.release()
+      await pause(SAVE_DEBOUNCE_PAST)
+      expect(tunnelUrlInput()?.value).toBe('https://new-intent.example.com')
+      expect(posts).toHaveLength(1)
+      // Native action HTTP is route-shaped only; its physical persistence/concurrency is not claimed.
+      expect(posts[0].body.upload_settings.tunnel_provider).toBe('manual')
+    } finally { gate.release(); await pause(SAVE_DEBOUNCE_PAST) }
+  }, 60_000)
+
+  it('BL-978(b): Docker internal target and public status stay visible without becoming saved preferences', async () => {
+    const upload = await seedUpload({ tunnel_provider: 'cloudflared_managed',
+      cloudflared_target_url: 'http://saved-target.example.com:5610', tunnel_url: 'https://saved.trycloudflare.com' })
+    installRoutes()
+    tunnelStatus = { ...managedStatus({ ...upload, tunnel_url: 'https://sidecar.trycloudflare.com',
+      cloudflared_target_url: 'http://batshit-server:5600' }), supportLevel: 'docker-sidecar',
+      dockerSidecar: { status: 'running', publicUrl: 'https://sidecar.trycloudflare.com',
+        targetUrl: 'http://batshit-server:5600', lastSeenAt: '2026-10-23T00:00:00.000Z', stale: false } }
+    renderPanel()
+    await waitForReadAndLoadingLineGone()
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toEqual([])
+    expect((await storedClip()).upload_settings).toEqual(upload)
+    expect((screen.getByLabelText('Internal Target URL') as HTMLInputElement).value).toBe('http://batshit-server:5600')
+    expect(screen.getByText('https://sidecar.trycloudflare.com')).toBeTruthy()
   }, 60_000)
 })

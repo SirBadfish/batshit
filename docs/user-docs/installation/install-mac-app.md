@@ -8,12 +8,12 @@ Docker remains the cross-platform path. Manual source-checkout setup is advanced
 
 [Download Batshit for Mac](https://github.com/SirBadfish/batshit/releases/latest)
 
-The link opens the newest Batshit release on GitHub. Under **Assets**, download the file whose name ends in `-arm64.dmg`, such as `Batshit-0.1.0-alpha.2-arm64.dmg`. The name carries the version, and `arm64` means Apple Silicon Macs. Open the DMG, drag `Batshit.app` to Applications if prompted, then open `Batshit.app`.
+The link opens the newest Batshit release on GitHub. Under **Assets**, download the file whose name ends in `-arm64.dmg`, such as `Batshit-0.1.0-alpha.4-arm64.dmg`. The name carries the version, and `arm64` means Apple Silicon Macs. Open the DMG, drag `Batshit.app` to Applications if prompted, then open `Batshit.app`.
 
 To check that the download is intact, also save the `.sha256` file from the same release into the same folder, then run this in Terminal from that folder, using the name of the file you downloaded:
 
 ```bash
-shasum -a 256 -c Batshit-0.1.0-alpha.2-arm64.dmg.sha256
+shasum -a 256 -c Batshit-0.1.0-alpha.4-arm64.dmg.sha256
 ```
 
 It prints `OK` when the DMG matches.
@@ -105,7 +105,7 @@ Deleting `Batshit.app` does not delete your data. To fully reset a local alpha i
 
 ## n8n
 
-Start with an `API` Primary Agent. Connect n8n when you want workflow tools or n8n Workflow Subagents.
+Start with a Primary Agent. Connect n8n when you want workflow tools.
 
 For a local n8n instance, use:
 
@@ -113,22 +113,15 @@ For a local n8n instance, use:
 http://localhost:5678
 ```
 
-Current official n8n templates forward Batshit's short-lived per-message native-tool token, so normal Mac app n8n setup doesn't need a saved Batshit Header Auth credential.
+## Optional: Claude Code for your Claude plan
 
-## Optional CLI agent setup
+To use your own Claude plan as the model for an agent or a Subagent, Batshit needs Claude Code installed and signed in with that plan.
 
-`CLI` agents need the Codex CLI or Claude Code CLI installed, then signed in.
+**Easiest path — one-click managed install:** open Settings → API Keys → Claude Plan. If Claude Code is not installed yet, press **Install Claude Code CLI** in the card. Batshit downloads an official, checksum-verified copy and manages it for you.
 
-**Easiest path — one-click managed install:** when you set up a `CLI` agent in Settings, Batshit shows an install card for Codex CLI and Claude Code CLI in the model section. Click Install and Batshit downloads an official, checksum-verified copy and manages it for you.
+**Bring your own:** if you already installed Claude Code with its official installer, Batshit finds it. The Claude plan connection uses only the Claude Code version Batshit was tested with; if yours is different, the card says so and offers **Install Batshit-managed copy**.
 
-**Bring your own:** if you already installed the CLI yourself (for example `npm i -g @openai/codex`, or Claude Code's official installer), Batshit finds it automatically and keeps using it.
-
-Either way, sign in afterward:
-
-```sh
-codex login
-codex login status
-```
+Either way, sign in with your Claude plan afterward:
 
 ```sh
 claude auth login
@@ -136,9 +129,9 @@ claude auth login
 
 On Windows, Claude Code may print `Paste code here if prompted >` after the browser login. Paste the browser auth code at that prompt, then press Enter. The pasted code may not appear in the terminal, so do not wait for visible text. Do not save or share auth codes in docs or chat.
 
-If Batshit installed the CLI for you, Agent Settings shows the exact sign-in command with the full path — copy and run that one.
+If Batshit installed Claude Code for you, the Claude Plan card shows the exact sign-in command with the full path — copy and run that one, then press **Check Again**.
 
-Provider API keys saved in Batshit are not the same as CLI login. CLI agents need the CLI itself authenticated.
+Provider API keys saved in Batshit are not the same as a Claude Code sign-in. See [Claude plan](../providers/claude-plan.md).
 
 ## Agent command sandboxing
 
@@ -199,10 +192,6 @@ Batshit expects app `5620`, batshit-server `5600`, streamable MCP helper `5601`,
 ### API keys don't save or decrypt
 
 Check the generated `ENCRYPTION_KEY` in the Mac app runtime config. It must stay stable. If you change it after saving keys, re-enter the keys in Settings → API Keys.
-
-### An n8n Workflow Subagent does not return
-
-Check that the workflow is the current official Workflow Subagent template, that the Batshit Subagent Tools node sends `x-batshit-native-tool-token` from `batshit_native_tool_token`, and that the Batshit URL is reachable from the n8n process.
 
 ### Goon or media preview fails
 

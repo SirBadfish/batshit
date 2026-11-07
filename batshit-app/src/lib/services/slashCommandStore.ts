@@ -6,12 +6,14 @@ import type { SlashCommandRow } from '$lib/types/database'
 import { dispatchSlashCommandsUpdated } from '$lib/utils/liveSettingsEvents'
 
 export class SlashCommandStore extends RedisStoreBase {
-  async getSlashCommands(userId: string) {
+  async getSlashCommands(userId: string, options: { required?: boolean } = {}) {
     try {
       const response = await this.apiCall(`/slash-commands`)
+      if (options.required && !Array.isArray(response.slashCommands)) throw new Error('The saved command list is unreadable.')
       return response.slashCommands as SlashCommandRow[]
     } catch (error) {
       console.error('Failed to get slash commands:', error)
+      if (options.required) throw error
       return []
     }
   }

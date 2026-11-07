@@ -21,7 +21,7 @@
  */
 
 import { redis } from '$lib/server/redis'
-import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
+import { agentDmsOffHint, resolveAgentDmsEnabled } from '$lib/utils/dmControl'
 import {
   describeCadence,
   describeNextRun,
@@ -77,7 +77,7 @@ async function requireScheduleEnabledAgent(
   if (!resolveAgentDmsEnabled(agent)) {
     throw new ScheduleToolError(
       `Agent DMs are not turned on for "${agent.displayName ?? agent.name ?? normalized}", and a schedule works by sending one.`,
-      'Turn on Agent DMs for this agent in Agent Settings first.'
+      agentDmsOffHint(agent)
     )
   }
   return agent

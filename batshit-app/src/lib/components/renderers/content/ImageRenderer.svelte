@@ -7,6 +7,7 @@
   import { downloadBlob } from '$lib/utils/download'
   import { isOpenableFailedImageUrl, isUnsupportedImageScheme } from '$lib/utils/imageUrlSafety'
   import { classifyImageSource } from '$lib/utils/imageSource'
+  import { clipCompressionSettingsFromResponse } from '$lib/utils/clipCompressionSettings'
   import { allowImageLoad, isImageLoadAllowed, IMAGE_MESSAGE_ID_CONTEXT } from '$lib/stores/imageLoadConsent.svelte'
   import { getContext } from 'svelte'
   import type { ImageOriginDisplay } from '$lib/stores/imageAddressOrigins.svelte'
@@ -293,6 +294,17 @@
     const savingToast = toast.loading('Uploading image to Clip Vault...')
 
     try {
+      // BL-797: read the saved Clip compression settings now (as the Clips menu and Desktop
+      // Controls do), never the page-load snapshot, which stays old until a reload. A failed
+      // read fails the save; nothing is uploaded with guessed settings.
+      const settingsResponse = await fetch('/api/user/settings', { cache: 'no-store' })
+      const settingsPayload = await settingsResponse.json().catch(() => null)
+      const compressionSettings = clipCompressionSettingsFromResponse(
+        settingsResponse.ok,
+        settingsResponse.status,
+        settingsPayload
+      )
+
       const response = await fetch(actualSrc)
       const blob = await response.blob()
       const mimeType = blob.type || 'image/png'
@@ -307,14 +319,6 @@
         formData.append('sessionId', sessionId)
       }
       formData.append('userId', userId)
-
-      const uiSettings = pageData?.userSettings?.ui_settings || {}
-      const compressionSettings = {
-        compress_images: uiSettings.compress_images !== false,
-        compression_quality: uiSettings.compression_quality || 40,
-        max_image_size: uiSettings.max_image_size || '1024',
-        force_jpeg: uiSettings.force_jpeg !== false
-      }
 
       formData.append('compressionSettings', JSON.stringify(compressionSettings))
       formData.append('uploadSettings', JSON.stringify({

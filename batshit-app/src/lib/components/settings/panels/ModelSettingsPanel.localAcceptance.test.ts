@@ -273,6 +273,9 @@ describe('grouped Local AI preset acceptance', () => {
   it('flushes completed edits after close, publishes them, and reads fresh state before reopening', async () => {
     delayed = true
     const mounted = renderPanel(); await readyEditor()
+    const listGets = () => vi.mocked(fetch).mock.calls.filter(([input, init]) =>
+      String(input) === '/api/user/saved-models' && (init?.method ?? 'GET') === 'GET').length
+    const originalReads = listGets()
     const context = field('200,000')
     await fireEvent.focus(context)
     await fireEvent.input(context, { target: { value: '16384' } })
@@ -281,10 +284,14 @@ describe('grouped Local AI preset acceptance', () => {
     renderPanel()
     await waitFor(() => expect(posts).toHaveLength(1))
     expect(screen.queryByPlaceholderText('4,000')).toBeNull()
+    expect(listGets()).toBe(originalReads)
     posts[0].release()
     await readyEditor()
+    expect(listGets()).toBe(originalReads + 1)
     expect(field('200,000').value).toBe('16,384')
     expect(getSavedModels().find(model => model.id === 'first')?.contextWindow).toBe(16384)
+    await pause()
+    expect(posts).toHaveLength(1) // the fresh reopened read does not autosave
     await fireEvent.input(field('Claude 3 Sonnet'), { target: { value: 'After reopen' } })
     await waitFor(() => expect(posts).toHaveLength(2))
     expect(posts[1].body.contextWindow).toBe(16384)

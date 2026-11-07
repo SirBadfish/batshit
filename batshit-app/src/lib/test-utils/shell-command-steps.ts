@@ -3,10 +3,6 @@
  * search), in the shapes each lane really produces, and the step send-routed hands to
  * `adaptCoolToolsToZipSystem` for it.
  *
- * - Codex: the managed app-server lane's `command_execution` items, captured in the SA-120 P6
- *   live proof (2026-09-17, gpt-5.5, `_local/typesafe/p6-proof/p6-codex-2-silent-failure.raw.json`).
- *   `codexAppServerLane.ts` maps `exitCode` to `exit_code` only when it is a number, and maps a
- *   declined or cancelled command to `failed`, so a `failed` item can carry no exit code.
  * - Claude: what Claude Code reports for a Bash call. A non-zero exit is `is_error: true`, the
  *   block content is `Exit code N\n<output>`, and `tool_use_result` is the same text behind
  *   `Error: `; a success is `{ stdout, stderr, interrupted, isImage, noOutputExpected }`; a command
@@ -29,55 +25,6 @@ export const MISSING_FILE_ERROR = `cat: ${MISSING_FILE_PATH}: No such file or di
 export const PRESENT_FILE_PATH = '/tmp/batshit-example/notes.md'
 export const PRESENT_FILE_COMMAND = `cat ${PRESENT_FILE_PATH}`
 export const PRESENT_FILE_CONTENT = '# Notes\n\nFirst line.\nSecond line.\n'
-
-type CodexCommandOptions = {
-  id: string
-  /** The inner command; Codex wraps it in the login shell the way the live run did. */
-  command: string
-  output: string
-  /** Omitted when the app-server lane had no numeric exit code. */
-  exitCode?: number
-  status: 'completed' | 'failed'
-}
-
-/**
- * The login-shell line Codex reports for an inner command: single quotes, or double quotes when
- * the command has a single quote of its own (the F-P6-5 live capture:
- * `/bin/zsh -lc "sed -i.bak 's/a/b/' /definitely/…"`).
- */
-function codexShellLine(command: string): string {
-  return command.includes("'")
-    ? `/bin/zsh -lc "${command.replace(/(["\\$`])/g, '\\$1')}"`
-    : `/bin/zsh -lc '${command}'`
-}
-
-/** `item.started` and `item.completed` for one command, as the Codex event adapter receives them. */
-export function codexCommandEvents(options: CodexCommandOptions): any[] {
-  const command = codexShellLine(options.command)
-  return [
-    {
-      type: 'item.started',
-      item: {
-        id: options.id,
-        type: 'command_execution',
-        command,
-        aggregated_output: '',
-        status: 'in_progress'
-      }
-    },
-    {
-      type: 'item.completed',
-      item: {
-        id: options.id,
-        type: 'command_execution',
-        command,
-        aggregated_output: options.output,
-        ...(typeof options.exitCode === 'number' ? { exit_code: options.exitCode } : {}),
-        status: options.status
-      }
-    }
-  ]
-}
 
 type ClaudeBashOptions = {
   id: string
@@ -304,7 +251,7 @@ export function apiShellStep(options: ApiShellOptions, sessionId = 'session-shel
   }
 }
 
-/** The API lane's step for the same failed read as the Codex proof. */
+/** The API lane's step for the failed read of `MISSING_FILE_PATH` (the P6 proof's read). */
 export function apiFailedReadStep(): Record<string, any> {
   return apiShellStep({
     id: 'toolu_api_failed_read_1',
@@ -312,24 +259,4 @@ export function apiFailedReadStep(): Record<string, any> {
     stderr: `cat: can't open '${MISSING_FILE_PATH}': No such file or directory\n`,
     exitCode: 1
   })
-}
-
-type CodexFileChangeOptions = {
-  id: string
-  changes: Array<{ path: string; kind: 'add' | 'update' | 'delete' }>
-  status: 'completed' | 'failed'
-}
-
-/** `item.started` and `item.completed` for a Codex native patch (`file_change`). */
-export function codexFileChangeEvents(options: CodexFileChangeOptions): any[] {
-  return [
-    {
-      type: 'item.started',
-      item: { id: options.id, type: 'file_change', changes: options.changes, status: 'in_progress' }
-    },
-    {
-      type: 'item.completed',
-      item: { id: options.id, type: 'file_change', changes: options.changes, status: options.status }
-    }
-  ]
 }

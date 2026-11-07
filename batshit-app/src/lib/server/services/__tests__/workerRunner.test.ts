@@ -13,11 +13,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const workerMocks = vi.hoisted(() => ({
   processNativeMode: vi.fn(),
-  codexStreamNativeMode: vi.fn(),
-  prepareCodexProfile: vi.fn(),
+  prepareApiToolset: vi.fn(),
   redisGetUserSettings: vi.fn(),
   resolveManagedSubagentScope: vi.fn(),
-  buildManagedSubagentDynamicInfo: vi.fn(),
+  prepareManagedSubagentDynamicInfo: vi.fn(),
   redisStore: { current: null as any },
 }))
 
@@ -25,23 +24,10 @@ vi.mock('$env/dynamic/private', () => ({ env: {} }))
 
 vi.mock('$lib/server/services/vercelBrain', () => ({
   VercelAIBrain: vi.fn(function MockBrain(this: Record<string, unknown>) {
-    Object.assign(this, { processNativeMode: workerMocks.processNativeMode })
+    Object.assign(this, { processNativeMode: workerMocks.processNativeMode, prepareApiToolset: workerMocks.prepareApiToolset })
   }),
 }))
 
-vi.mock('$lib/server/services/codexBridge', () => ({ CodexBridge: vi.fn(function MockBridge(this: Record<string, unknown>) {
-  this.streamNativeMode = async (request: any, lease?: { abortBeforeSpawn: () => void }) => {
-    try { return await workerMocks.codexStreamNativeMode(request) } finally { lease?.abortBeforeSpawn() }
-  }
-}) }))
-vi.mock('$lib/server/services/claudeBridge', () => ({ ClaudeBridge: vi.fn() }))
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  buildAgentProfileId: vi.fn((value: string) => `batshit_agent_${value}`),
-  prepareManagedCodexSubagentProfile: workerMocks.prepareCodexProfile,
-}))
-vi.mock('$lib/server/services/claudeProfileManager', () => ({
-  prepareManagedClaudeSubagentProfile: vi.fn(),
-}))
 vi.mock('$lib/services/apiKey.server', () => ({
   apiKeyService: { retrieve: vi.fn().mockResolvedValue(null) },
 }))
@@ -60,9 +46,10 @@ vi.mock('$lib/server/redis', () => ({
 vi.mock('$lib/server/services/subagentRuntimeScope', () => ({
   resolveManagedSubagentScope: (...args: any[]) =>
     workerMocks.resolveManagedSubagentScope(...args),
-  buildManagedSubagentDynamicInfo: (...args: any[]) =>
-    workerMocks.buildManagedSubagentDynamicInfo(...args),
-  appendManagedSubagentDynamicInfo: (systemPrompt: string) => systemPrompt,
+  prepareManagedSubagentDynamicInfo: (...args: any[]) =>
+    workerMocks.prepareManagedSubagentDynamicInfo(...args),
+  appendManagedSubagentDynamicInfo: (systemPrompt: string, dynamicInfo: string) =>
+    dynamicInfo ? `${systemPrompt}\n\n${dynamicInfo}` : systemPrompt,
 }))
 
 vi.mock('$lib/server/services/slashCommandCapabilities', () => ({
@@ -74,7 +61,6 @@ import { createSubagentRedisMock } from '$lib/test-utils/subagent-redis-mock'
 import {
   WORKERS_MAX_CONCURRENT,
   WORKERS_MAX_PER_CALL,
-  WORKERS_MAX_RUNS_PER_TURN,
 } from '$lib/utils/delegationCapabilities'
 import { __resetWorkerTurnBudgetForTests } from '../workerTurnBudget'
 import { spawnWorkers, type WorkerParentContext } from '../workerRunner'
@@ -129,6 +115,11 @@ function systemPromptForCall(index: number): string {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  workerMocks.prepareApiToolset.mockImplementation(async request => {
+    const { captureApiUtilities } = await import('../apiUtilityRuntime')
+    return { fingerprint: 'empty-consumer-fixture', apiUtilityScope: captureApiUtilities({ identity: request, approvals: {} }).scope,
+      brokerAvailable: false, toolsRegistered: false }
+  })
   subagentRedis.clear()
   __resetWorkerTurnBudgetForTests()
   subagentRedis.seed('batshit:sub_system_prompt', '# Base SUBAGENT prompt')
@@ -142,7 +133,7 @@ beforeEach(() => {
   workerMocks.redisGetUserSettings.mockResolvedValue({
     global_custom_system_prompt: 'GLOBAL IDENTITY TEXT',
   })
-  workerMocks.buildManagedSubagentDynamicInfo.mockResolvedValue('')
+  workerMocks.prepareManagedSubagentDynamicInfo.mockResolvedValue(() => '')
   workerMocks.resolveManagedSubagentScope.mockImplementation(async () => ({
     subagentType: 'api',
     nativeToolSettings: {},
@@ -161,25 +152,60 @@ beforeEach(() => {
   })
 })
 
+const CLAUDE_CLI_MODEL_FIELDS = { primary_model_provider: 'anthropic-claude-cli', primary_model_name: 'claude-cli', claude_settings: { model: 'sonnet' } }
+
+/**
+ * SA-139 R5: a stored Claude Code CLI Subagent is a retired, delete-only record. A `base` Worker
+ * clone of one is refused by name before any Worker run is reserved (the CLI Worker lane and its
+ * profile slots went with the type).
+ */
+function cliBaseSubagent() {
+  return {
+    id: 'cli-helper',
+    user_id: 'USER-1',
+    displayName: 'CLI Helper',
+    subagentType: 'cli' as const,
+    system_prompt: 'CLI HELPER PROMPT',
+    ...CLAUDE_CLI_MODEL_FIELDS,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }
+}
+
 describe('spawnWorkers (DL-111-09)', () => {
-  it('projects a failed Codex Worker observation without losing a known sibling', async () => {
-    subagentRedis.seed('agent:primary-agent', { id: 'primary-agent', user_id: 'USER-1' })
-    workerMocks.prepareCodexProfile.mockResolvedValue({ profileId: 'batshit_agent_owned_worker_profile', resolvedGateways: [], gatewayToolMap: {} })
-    const observedUsage = { completeness: 'partial', parts: [{ source: 'codex-app-server-progress', counts: { outputTokens: 0, cacheCreationInputTokens: 3 } }] }
-    workerMocks.codexStreamNativeMode.mockImplementation(async (request: any) => {
-      const fails = request.messages.some((message: any) => message.role === 'user' && message.content === 'Fails')
-      if (fails) request.registerObservedUsageSource?.(() => observedUsage)
-      return { stream: { async *[Symbol.asyncIterator]() {
-        if (fails) throw new Error('owned Codex worker failure')
-        yield { type: 'finish', totalUsage: { inputTokens: 20, outputTokens: 2, totalTokens: 22 } }
-      } } }
+  it.each([
+    ['a stored Claude Code CLI Subagent', cliBaseSubagent()],
+    ['a typeless legacy record that names the Claude Code CLI', { ...cliBaseSubagent(), subagentType: undefined }],
+  ])('SA-139 R5: refuses a `base` clone of %s by name, before any Worker run is reserved', async (_label, record) => {
+    // Every Worker slot of this turn is held, so a refusal that came only after the reservation
+    // would read as the concurrency limit instead.
+    let releaseHeld: () => void = () => {}
+    const held = new Promise<void>((resolve) => { releaseHeld = resolve })
+    workerMocks.processNativeMode.mockImplementation(async () => {
+      await held
+      return { content: 'Held answer', intermediateSteps: [], usage: null }
     })
-    const result = await spawnWorkers({ parent: parent({ lane: 'cli', cliModelFields: { primary_model_provider: 'openai-codex', primary_model_name: 'codex-cli', codex_settings: { model: 'gpt-5.4' } } }), workers: [{ task: 'Fails' }, { task: 'Succeeds' }] })
-    expect(result, JSON.stringify(result)).toMatchObject({ success: true, requested: 2, completed: 1 })
-    expect((result as any).workers[0]).toMatchObject({ status: 'failed', usage: null, observedUsage })
-    expect((result as any).workers[1]).toMatchObject({ status: 'completed', usage: { inputTokens: 20, outputTokens: 2, totalTokens: 22 } })
-    expect(Object.keys(subagentRedis.snapshot()).some((key) => key.startsWith('subagent_sessions:') || key.startsWith('subagent_lock:'))).toBe(false)
+    const busy = spawnWorkers({
+      parent: parent(),
+      workers: Array.from({ length: WORKERS_MAX_CONCURRENT }, () => ({ task: 'Hold a slot' })),
+    })
+    await vi.waitFor(() => expect(workerMocks.processNativeMode).toHaveBeenCalledTimes(WORKERS_MAX_CONCURRENT))
+
+    const result = await spawnWorkers({
+      parent: parent({ assignedSubagents: [record] }),
+      workers: [{ task: 'Clone the CLI helper', base: 'cli-helper' }],
+    })
+
+    expect(result).toMatchObject({ kind: 'workers', success: false, error: 'unsupported_base' })
+    expect((result as any).message).toContain(
+      'CLI Helper ran on the Claude Code CLI lane, which Batshit no longer supports, so it can only be deleted.'
+    )
+    expect((result as any).message).toContain('Omit `base` to use the built-in worker.')
+    expect(workerMocks.processNativeMode).toHaveBeenCalledTimes(WORKERS_MAX_CONCURRENT)
+    releaseHeld()
+    await expect(busy).resolves.toMatchObject({ success: true, completed: WORKERS_MAX_CONCURRENT })
   })
+
   it('runs a batch in parallel and returns one record per worker', async () => {
     const result = await spawnWorkers({
       parent: parent(),
@@ -214,6 +240,42 @@ describe('spawnWorkers (DL-111-09)', () => {
     expect(keys.filter((key) => key.startsWith('subagent_sessions:'))).toEqual([])
     expect(keys.filter((key) => key.startsWith('subagent_thread:'))).toEqual([])
     expect(keys.filter((key) => key.startsWith('subagent_lock:'))).toEqual([])
+  })
+
+  // BL-2190: through the real batch path, a Worker whose base prompt cannot be read comes back as
+  // a readable failed record, and an absent prompt runs on the packaged default.
+  it('reports a Worker whose base prompt cannot be read as failed, and runs an absent one on the packaged default', async () => {
+    const original = subagentRedis.redis.execute
+    subagentRedis.redis.execute = async (operation: (client: any) => Promise<unknown>) =>
+      original((client: any) => operation({
+        ...client,
+        get: async (name: string) => {
+          if (name === 'batshit:worker_prompt') throw new Error('Connection is closed.')
+          return client.get(name)
+        },
+      }))
+    let failed: any
+    try {
+      failed = await spawnWorkers({ parent: parent(), workers: [{ task: 'Do a thing' }] })
+    } finally {
+      subagentRedis.redis.execute = original
+    }
+    expect(workerMocks.processNativeMode).not.toHaveBeenCalled()
+    expect(failed.workers[0]).toMatchObject({ status: 'failed' })
+    expect(failed.workers[0].output).toContain('SYSTEM_PROMPT_UNAVAILABLE: Batshit could not read batshit:worker_prompt, so this call did not run: Connection is closed.')
+
+    await subagentRedis.redis.del('batshit:worker_prompt')
+    await spawnWorkers({ parent: parent(), workers: [{ task: 'Do a thing' }] })
+    expect(systemPromptForCall(0).startsWith('==== BATSHIT WORKER SYSTEM PROMPT ====\n\n# Batshit Worker\n')).toBe(true)
+  })
+
+  // Decision 11: a Worker has no thread, so its DCM never gets a `thread:` line.
+  it('renders the worker DCM with no thread outcome', async () => {
+    const render = vi.fn((thread: string | null) => `<dynamic_info>\nTHREAD=${thread}\n</dynamic_info>`)
+    workerMocks.prepareManagedSubagentDynamicInfo.mockResolvedValue(render)
+    await spawnWorkers({ parent: parent(), workers: [{ task: 'Do a thing' }] })
+    expect(render.mock.calls).toEqual([[null]])
+    expect(systemPromptForCall(0)).toContain('THREAD=null')
   })
 
   it('gives the built-in worker the worker prompt, not the subagent prompt', async () => {
@@ -269,25 +331,37 @@ describe('spawnWorkers (DL-111-09)', () => {
     expect(workerMocks.processNativeMode).not.toHaveBeenCalled()
   })
 
-  it('refuses to clone an n8n Workflow Subagent', async () => {
+  // SA-139 R2: the n8n Workflow Subagent type is removed; a leftover record is refused by name.
+  const retiredIntake = () => ({
+    id: 'intake',
+    user_id: 'USER-1',
+    displayName: 'Intake',
+    subagentType: 'n8n-workflow',
+    webhookUrl: 'https://n8n.local/webhook/intake',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  })
+
+  it('refuses to clone a Subagent of a removed n8n type, by name', async () => {
     const result = await spawnWorkers({
-      parent: parent({
-        assignedSubagents: [
-          {
-            id: 'intake',
-            user_id: 'USER-1',
-            displayName: 'Intake',
-            subagentType: 'n8n-workflow',
-            webhookUrl: 'https://n8n.local/webhook/intake',
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          },
-        ],
-      }),
+      parent: parent({ assignedSubagents: [retiredIntake()] }),
       workers: [{ task: 'Run intake', base: 'intake' }],
     })
 
     expect(result).toMatchObject({ kind: 'workers', success: false, error: 'unsupported_base' })
+    expect((result as any).message).toContain('Intake uses an n8n Subagent type that Batshit removed, so it does not run.')
+    expect(workerMocks.processNativeMode).not.toHaveBeenCalled()
+  })
+
+  it('never offers a Subagent of a removed n8n type as an available base', async () => {
+    const result = await spawnWorkers({
+      parent: parent({ assignedSubagents: [baseSubagent(), retiredIntake()] }),
+      workers: [{ task: 'Dig', base: 'nobody' }],
+    })
+
+    expect(result).toMatchObject({ kind: 'workers', success: false, error: 'unknown_base' })
+    expect((result as any).message).toContain('Available: researcher.')
+    expect((result as any).message).not.toContain('intake')
     expect(workerMocks.processNativeMode).not.toHaveBeenCalled()
   })
 
@@ -303,18 +377,26 @@ describe('spawnWorkers (DL-111-09)', () => {
     expect(workerMocks.processNativeMode).not.toHaveBeenCalled()
   })
 
-  it('refuses once the parent turn has spent its worker budget', async () => {
-    const turns = WORKERS_MAX_RUNS_PER_TURN / WORKERS_MAX_PER_CALL
-    for (let call = 0; call < turns; call += 1) {
+  it('delegation limits: runs six workers in one batch, and has no per-turn total', async () => {
+    // Decision 6: six at a time and six per call; a turn may start batch after batch.
+    for (let call = 0; call < 3; call += 1) {
       const ok = await spawnWorkers({
         parent: parent(),
-        workers: Array.from({ length: WORKERS_MAX_PER_CALL }, () => ({ task: 'Work' })),
+        workers: Array.from({ length: 6 }, (_, index) => ({ task: `Work ${index + 1}` })),
       })
-      expect(ok.success).toBe(true)
+      expect(ok).toMatchObject({ success: true, requested: 6 })
     }
+    expect(workerMocks.processNativeMode).toHaveBeenCalledTimes(18)
+  })
 
-    const over = await spawnWorkers({ parent: parent(), workers: [{ task: 'One more' }] })
-    expect(over).toMatchObject({ kind: 'workers', success: false, error: 'worker_turn_limit' })
+  it('delegation limits: a seventh worker in one call is refused, readably', async () => {
+    const over = await spawnWorkers({
+      parent: parent(),
+      workers: Array.from({ length: 7 }, () => ({ task: 'Work' })),
+    })
+    expect(over).toMatchObject({ kind: 'workers', success: false, error: 'worker_batch_too_large' })
+    expect((over as any).message).toContain('at most 6 per call')
+    expect(workerMocks.processNativeMode).not.toHaveBeenCalled()
   })
 
   it('refuses when the parent turn cannot be identified, rather than skipping the cap', async () => {

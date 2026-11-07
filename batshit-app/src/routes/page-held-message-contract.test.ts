@@ -27,9 +27,24 @@ describe('the chat page and a message held for an approval card (BL-455)', () =>
     // BL-905: a send the chat's line kept at the same card can stand after the held words, so the
     // receipt goes under the held message itself, not under whatever is last.
     expect(chatArea).toContain(
-      '\n        {#if heldReceipt && heldReceipt.messageId === message.id}\n          <HeldMessageReceipt receipt={heldReceipt} onSendNow={onSendHeldMessage} />\n        {/if}\n      {/each}\n'
+      '\n        {#if heldReceipt && heldReceipt.messageId === message.id}\n          <HeldMessageReceipt receipt={heldReceipt} onSendNow={onSendHeldMessage} />\n        {:else if keptReceiptById[message.id]}\n          <HeldMessageReceipt receipt={keptReceiptById[message.id]} onSendNow={onSendKeptMessage} />\n        {/if}\n      {/each}\n'
     )
     expect(chatArea).not.toContain('\n      {#if heldReceipt}\n')
+  })
+
+  // BL-903 (a): a kept send's receipt is drawn from its record too, so it survives a reload and
+  // shows in every tab; the rule lives in `keptSendReceipt.ts`.
+  it('the chat draws a kept send\'s receipt from its record, once, and Send now sends it by id with its saved facts', () => {
+    expect(chatArea).toContain('for (const receipt of resolveKeptSendReceipts({ messages, busy: sessionBusy })) {')
+    expect(chatArea).toContain(
+      '\n      if (steerInbox.getSteer(receipt.messageId) || steerInbox.wasReceiptRetired(receipt.messageId)) continue\n'
+    )
+    expect(page).toContain('\n          onSendKeptMessage={sendKeptMessageNow}\n')
+    const sendStart = page.indexOf('function sendKeptMessageNow(messageId: string) {')
+    expect(sendStart).toBeGreaterThan(-1)
+    expect(page.slice(sendStart, sendStart + 700)).toContain(
+      '\n    void handleSendMessage(\n      kept.content,\n      { ...keptSendReplayMetadata(kept.metadata), composerSessionId: sessionId },\n      { fromDroppedReceipt: true, existingUserMessageId: messageId }\n    )'
+    )
   })
 
   it('the end-of-reply backstop arms only for what the server still has to place, never a send in the line', () => {

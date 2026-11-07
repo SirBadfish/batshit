@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes, randomUUID } from 'node:crypto'
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
 export type PlanTokens = {
@@ -40,28 +40,36 @@ function createPrivateFile(file: string): boolean {
 export class ChatgptPlanVault {
   private owner: DatabaseSync
   private db!: DatabaseSync
-  private key: Buffer
+  private key!: Buffer
+  private privateKeyFile: boolean
   private folder: string
   private closed = false
   private mutations = new Map<string, Set<Promise<void>>>()
 
-  constructor(folder: string, instanceKey: string) {
-    if (instanceKey.length < 32) throw new ChatgptPlanError('vault_key', 'The Mac instance encryption key is unavailable.')
-    this.key = Buffer.from(hkdfSync('sha256', instanceKey, '', 'batshit-chatgpt-plan-vault-v1', 32))
+  constructor(folder: string, instanceKey: string | { privateKeyFile: true }) {
+    this.privateKeyFile = typeof instanceKey !== 'string'
+    if (typeof instanceKey === 'string' && instanceKey.length < 32) throw new ChatgptPlanError('vault_key', 'The instance encryption key is unavailable.')
     this.folder = path.resolve(folder)
     mkdirSync(this.folder, { recursive: true, mode: 0o700 })
     // realpath checks every ancestor, not just the final entry.
     if (realpathSync(this.folder) !== this.folder) throw new ChatgptPlanError('vault_unsafe', 'ChatGPT credential storage must not use links.')
     privateEntry(this.folder, true)
     const ownerFile = path.join(this.folder, 'owner.sqlite')
-    createPrivateFile(ownerFile)
+    const freshOwner = createPrivateFile(ownerFile)
+    // Snapshot before BEGIN EXCLUSIVE can create its own owner journal.
+    const freshStore = freshOwner && readdirSync(this.folder).every(name => name === 'owner.sqlite')
     this.owner = new DatabaseSync(ownerFile, { timeout: 0 })
     try { this.owner.exec('PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;') } catch {
       this.owner.close()
       throw new ChatgptPlanError('vault_owner_busy', 'Another Batshit runtime owns this ChatGPT connection. Close it before continuing.')
     }
     try {
+      const material = typeof instanceKey === 'string' ? instanceKey : this.privateKeyMaterial(freshStore)
+      this.key = Buffer.from(hkdfSync('sha256', material, '', 'batshit-chatgpt-plan-vault-v1', 32))
       const file = path.join(this.folder, 'credentials.sqlite')
+      if (this.privateKeyFile && !freshStore && !existsSync(file)) {
+        throw new ChatgptPlanError('vault_corrupt', 'ChatGPT credential storage is incomplete. Keep the existing files for recovery.')
+      }
       const fresh = createPrivateFile(file)
       this.db = new DatabaseSync(file, { timeout: 0 })
       this.db.exec('PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA;')
@@ -74,6 +82,13 @@ export class ChatgptPlanVault {
         this.syncFolder()
       } else if ((this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version !== 1) {
         throw new ChatgptPlanError('vault_corrupt', 'ChatGPT credential storage is unreadable. Keep the existing files for recovery.')
+      }
+      if (this.privateKeyFile) {
+        const verifier = createHash('sha256').update(this.key).digest('hex')
+        if (fresh) this.db.prepare('INSERT INTO meta VALUES (?,?)').run('privateKeyVerifier', verifier)
+        else if (this.db.prepare('SELECT value FROM meta WHERE key=?').get('privateKeyVerifier')?.value !== verifier) {
+          throw new ChatgptPlanError('vault_key', 'The private ChatGPT key does not match this storage. Keep the existing files for recovery.')
+        }
       }
       this.checkFiles()
       // The owner OS lock is ours now; any committed refresh marker came from
@@ -89,15 +104,52 @@ export class ChatgptPlanVault {
         }
       })
     } catch (error) {
-      this.db?.close(); this.owner.exec('ROLLBACK'); this.owner.close(); this.key.fill(0)
+      try { this.db?.close() } finally {
+        try { this.owner.exec('ROLLBACK') } finally {
+          try { this.owner.close() } finally { this.key?.fill(0) }
+        }
+      }
       throw error instanceof ChatgptPlanError ? error : new ChatgptPlanError('vault_corrupt', 'ChatGPT credential storage is unreadable. Keep the existing files for recovery.')
     }
+  }
+
+  /** Docker only: a stable key never inherited by CLI/helper children. The
+   * existing SQLite owner is held before creating or opening this file. */
+  private privateKeyMaterial(freshStore: boolean): string {
+    const file = path.join(this.folder, 'vault.key')
+    if (!existsSync(file)) {
+      if (!freshStore || readdirSync(this.folder).some(name => !['owner.sqlite', 'owner.sqlite-journal'].includes(name))) {
+        throw new ChatgptPlanError('vault_key', 'The private ChatGPT key is missing. Keep the existing storage for recovery.')
+      }
+      if (existsSync(path.join(this.folder, 'owner.sqlite-journal'))) privateEntry(path.join(this.folder, 'owner.sqlite-journal'))
+      const temporary = path.join(this.folder, `.vault.key-${randomUUID()}`)
+      const fd = openSync(temporary, 'wx', 0o600)
+      try { writeFileSync(fd, randomBytes(32).toString('hex')); fsyncSync(fd) } finally { closeSync(fd) }
+      // link is exclusive, unlike rename. Never overwrite a raced-in key.
+      linkSync(temporary, file)
+      unlinkSync(temporary)
+      this.syncFolder()
+    }
+    privateEntry(file)
+    const before = lstatSync(file)
+    const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+    try {
+      const opened = fstatSync(fd)
+      if (!opened.isFile() || opened.nlink !== 1 || (opened.mode & 0o777) !== 0o600 ||
+          (process.getuid && opened.uid !== process.getuid()) || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== 64) {
+        throw new ChatgptPlanError('vault_key', 'The private ChatGPT key is unsafe. Keep the existing storage for recovery.')
+      }
+      const value = readFileSync(fd, 'utf8')
+      if (!/^[a-f0-9]{64}$/.test(value)) throw new ChatgptPlanError('vault_key', 'The private ChatGPT key is unreadable. Keep the existing storage for recovery.')
+      return value
+    } finally { closeSync(fd) }
   }
 
   private syncFolder() { const fd = openSync(this.folder, 'r'); try { fsyncSync(fd) } finally { closeSync(fd) } }
   private checkFiles() {
     if (this.closed) throw new ChatgptPlanError('vault_closed', 'ChatGPT connection is shutting down.')
     privateEntry(this.folder, true)
+    if (this.privateKeyFile) privateEntry(path.join(this.folder, 'vault.key'))
     for (const base of ['owner.sqlite', 'credentials.sqlite']) {
       privateEntry(path.join(this.folder, base))
       for (const suffix of ['-journal', '-wal', '-shm']) {
@@ -151,7 +203,7 @@ export class ChatgptPlanVault {
     this.checkFiles()
     const value = this.db.prepare('SELECT record FROM accounts WHERE id=?').get(id)
     const row: StoredRegistration | undefined = value ? JSON.parse(String(value.record)) : undefined
-    if (!row || row.userId !== userId) throw new ChatgptPlanError('account_missing', 'This ChatGPT account is not connected on this Mac. Reconnect it in API Keys.')
+    if (!row || row.userId !== userId) throw new ChatgptPlanError('account_missing', 'This ChatGPT account is not connected on this instance. Reconnect it in API Keys.')
     return row
   }
   binding(row: PlanRegistration): string {

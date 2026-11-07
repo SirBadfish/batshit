@@ -1,7 +1,6 @@
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { RedisService } from '$lib/server/redis'
-import { syncAgentCodexProfiles } from '$lib/server/services/codexProfileManager'
 
 export const GET: RequestHandler = async ({ locals }) => {
   if (!locals.user) {
@@ -40,11 +39,6 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       default_workspace_path:
         typeof defaultWorkspacePath === 'string' ? defaultWorkspacePath : null
     })
-    try {
-      await syncAgentCodexProfiles(locals.user.id)
-    } catch (error) {
-      console.warn('[ProjectPreferences] Failed to sync Codex profiles after preference save:', error)
-    }
 
     return json({ preferences })
   } catch (error) {

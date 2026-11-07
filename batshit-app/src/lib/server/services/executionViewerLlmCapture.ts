@@ -6,8 +6,6 @@ import type {
   ExecutionTokenUsage,
 } from '$lib/types/executionViewer'
 import { redactHeaders } from '$lib/server/services/executionViewerRedaction'
-import { asSchema } from 'ai'
-import type { Tool } from 'ai'
 import { resolveLocalPromptCacheReporting } from '$lib/data/localAiServers'
 import {
   hasUsageValues as hasNormalizedUsageValues,
@@ -97,16 +95,6 @@ export const buildTokenUsage = (
 
 const hasUsageValues = (usage: UsageLike): boolean =>
   hasNormalizedUsageValues(usage)
-
-/**
- * BL-503 / BL-1361: a managed CLI run's usage is `exact` only when its CLI reported it. A run that
- * failed, was stopped, or ended without the CLI's usage has none, so its counts are unknown
- * (`value: null` with the weaker label, the unknown an approval resume's merge already uses,
- * BL-525), never `exact` and never zero. A run whose CLI reported usage keeps `exact`.
- */
-export function reportedUsageConfidence(usage: UsageLike): ExecutionConfidenceLevel {
-  return hasUsageValues(usage) ? 'exact' : 'estimated'
-}
 
 const DATA_IMAGE_URL_REGEX =
   /data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\r\n]+)/gi
@@ -217,24 +205,6 @@ function sanitizePayloadForCapture<T>(value: T, keyHint?: string): T {
   }
 
   return visit(value, keyHint) as T
-}
-
-/**
- * SA-105 P3 — sanitize the managed CLI runtimes' RAW transport event trace
- * before it is persisted into the Execution Viewer snapshot.
- *
- * `__rawEvents` is the untouched Codex/Claude event stream, and it was being
- * stored verbatim. That was invisible until this packet, because nothing in a
- * CLI event carried image bytes — now an MCP tool result can, and the P3 live
- * probe found a delivered recall photo sitting in a real execution log even
- * though every other boundary had stripped it. Running the trace through the
- * same sanitizer the LLM captures use fixes that and, more usefully, closes the
- * whole class: data URLs, base64-keyed fields and provider thought signatures
- * in any future raw event are covered by one rule instead of a new patch each
- * time.
- */
-export function sanitizeRuntimeEventLogForCapture<T>(value: T): T {
-  return sanitizePayloadForCapture(value)
 }
 
 export function buildVercelLlmCapture(params: {
@@ -391,151 +361,6 @@ export function buildVercelLlmCapture(params: {
     totalUsage: buildTokenUsage(totalUsage, 'exact', 'provider'),
     breakdownConfidence:
       hasMissingStepUsage && hasTotalUsage ? 'near' : 'exact',
-  }
-
-  return { llmSummary, llmCalls }
-}
-
-export function buildCodexLlmCapture(params: {
-  prompt: string
-  developerInstructions?: string | null
-  images?: Array<{ url: string; alt?: string }>
-  tools?: Record<string, Tool> | null
-  toolMetadata?: Map<string, any> | null
-  totalUsage: UsageLike
-}): { llmSummary: ExecutionLlmSummary; llmCalls: ExecutionLlmCall[] } {
-  return buildCliModeLlmCapture({
-    runtime: 'codex',
-    prompt: params.prompt,
-    developerInstructions: params.developerInstructions,
-    images: params.images,
-    tools: params.tools,
-    toolMetadata: params.toolMetadata,
-    totalUsage: params.totalUsage,
-  })
-}
-
-export function buildClaudeLlmCapture(params: {
-  prompt: string
-  images?: Array<{ url: string; alt?: string }>
-  tools?: Record<string, Tool> | null
-  toolMetadata?: Map<string, any> | null
-  totalUsage: UsageLike
-}): { llmSummary: ExecutionLlmSummary; llmCalls: ExecutionLlmCall[] } {
-  return buildCliModeLlmCapture({
-    runtime: 'claude',
-    prompt: params.prompt,
-    images: params.images,
-    tools: params.tools,
-    toolMetadata: params.toolMetadata,
-    totalUsage: params.totalUsage,
-  })
-}
-
-function buildCliModeLlmCapture(params: {
-  runtime: 'codex' | 'claude'
-  prompt: string
-  developerInstructions?: string | null
-  images?: Array<{ url: string; alt?: string }>
-  tools?: Record<string, Tool> | null
-  toolMetadata?: Map<string, any> | null
-  totalUsage: UsageLike
-}): { llmSummary: ExecutionLlmSummary; llmCalls: ExecutionLlmCall[] } {
-  const serializedTools = (() => {
-    const output: Array<Record<string, any>> = []
-    const tools =
-      params.tools && typeof params.tools === 'object' ? params.tools : {}
-
-    for (const [toolName, tool] of Object.entries(tools)) {
-      const safe: Record<string, any> = {
-        name: toolName,
-        description: tool?.description ?? null,
-      }
-
-      try {
-        safe.inputSchema = asSchema((tool as any).inputSchema).jsonSchema
-      } catch {
-        safe.inputSchema = null
-      }
-
-      try {
-        safe.outputSchema = (tool as any).outputSchema
-          ? asSchema((tool as any).outputSchema).jsonSchema
-          : null
-      } catch {
-        safe.outputSchema = null
-      }
-
-      const meta = params.toolMetadata?.get?.(toolName)
-      if (meta && typeof meta === 'object') {
-        safe.gateway = meta
-      }
-
-      output.push(safe)
-    }
-
-    return output.sort((a, b) => String(a.name).localeCompare(String(b.name)))
-  })()
-
-  const requestPayload = sanitizePayloadForCapture({
-    ...(params.developerInstructions
-      ? { developerInstructions: params.developerInstructions }
-      : {}),
-    prompt: params.prompt,
-    ...(Array.isArray(params.images) && params.images.length > 0
-      ? { images: params.images }
-      : {}),
-    ...(serializedTools.length > 0 ? { tools: serializedTools } : {}),
-  })
-
-  const runtimeName =
-    params.runtime === 'codex' ? 'Codex CLI' : 'Claude Code CLI'
-  const usageSource = params.runtime === 'codex' ? 'codex' : 'claude'
-  const usageConfidence = reportedUsageConfidence(params.totalUsage)
-  const responseNote =
-    params.runtime === 'codex'
-      ? 'Codex CLI does not expose a raw provider response object. See Response Summary for the final output and Debug -> Raw Runtime Events for the runtime stream.'
-      : 'Claude Code CLI does not expose a raw provider response object. See Response Summary for the final output and Debug -> Raw Runtime Events for the runtime stream.'
-  const toolSerializationNote =
-    params.runtime === 'codex'
-      ? 'Codex tool definitions are provided via runtime/MCP configuration; the exact on-wire representation may differ from the direct API runtime payload.'
-      : 'Claude tool definitions are provided via runtime/MCP configuration; the exact on-wire representation may differ from the direct API runtime payload.'
-  const promptSerializationNote =
-    params.runtime === 'claude'
-      ? 'The compiled prompt captured here is exact, but Claude wraps it into stream-json text/image blocks before sending.'
-      : 'The developerInstructions and prompt captured here are the exact Batshit-to-Codex launch payload pieces. Codex still wraps them with native permissions, environment, tool, and built-in instruction context before the provider call.'
-
-  const llmCalls: ExecutionLlmCall[] = [
-    {
-      index: 1,
-      runtime: params.runtime,
-      usage: buildTokenUsage(params.totalUsage, usageConfidence, usageSource),
-      requestPayload,
-      requestConfidence: 'near',
-      responsePayload: {
-        note: responseNote,
-      },
-      responseConfidence: 'speculative',
-      finishReason: null,
-      toolCallsCount: undefined,
-      toolResultsCount: undefined,
-      notes: [
-        ...(serializedTools.length > 0
-          ? [
-              `Tool definitions shown here are derived from Batshit gateway discovery (MCP). ${runtimeName} may serialize them differently internally.`,
-            ]
-          : []),
-        ...(promptSerializationNote ? [promptSerializationNote] : []),
-        toolSerializationNote,
-        `${runtimeName} native built-in tools are runtime-owned and may not appear in this request payload list even when they were available during the run.`,
-      ],
-    },
-  ]
-
-  const llmSummary: ExecutionLlmSummary = {
-    callsCount: buildTokenStat(1, 'speculative', usageSource),
-    totalUsage: buildTokenUsage(params.totalUsage, usageConfidence, usageSource),
-    breakdownConfidence: 'speculative',
   }
 
   return { llmSummary, llmCalls }

@@ -70,9 +70,3 @@ export function determineModelCompatibility(provider?: string | null): ModelComp
     note
   }
 }
-
-export function isN8NSupported(provider?: string | null): boolean {
-  const normalized = provider?.toLowerCase().trim() || 'unknown'
-  if (normalized.startsWith('custom_')) return false
-  return N8N_SUPPORTED_PROVIDERS.has(normalized) || N8N_ONLY_PROVIDER_IDS.has(normalized)
-}

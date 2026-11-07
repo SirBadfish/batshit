@@ -15,30 +15,6 @@ export interface ZipData {
 
 export class UploadApiService {
   /**
-   * Create a new zip in Redis
-   */
-  async createZip(zipData: ZipData, fetcher?: typeof fetch) {
-    try {
-      return await httpClient.post('/api/zips', {
-        id: zipData.id,
-        content: zipData.content,
-        type: zipData.type,
-        tokens: zipData.tokens,
-        description: zipData.description || '',
-        sessionId: zipData.sessionId,
-        messageId: zipData.messageId,
-        metadata: {
-          source: 'ai',
-          ...(zipData.metadata || {})
-        }
-      }, fetcher)
-    } catch (error) {
-      console.error('[UploadAPI] Create zip error:', error)
-      throw error
-    }
-  }
-
-  /**
    * Get a zip by ID from Redis
    */
   async getZip(zipId: string, fetcher?: typeof fetch) {

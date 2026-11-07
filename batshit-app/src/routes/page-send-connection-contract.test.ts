@@ -37,7 +37,7 @@ describe('the page and the approval card send without holding a connection', () 
   })
 
   it('the approval card’s answer goes through postSendRouted too', () => {
-    const submit = chatMessage.indexOf('\n  async function submitToolApprovals(approvals: any[]) {')
+    const submit = chatMessage.indexOf('\n  async function submitToolApprovals(')
     const call = chatMessage.indexOf('\n        const response = await postSendRouted(\n          JSON.stringify({\n', submit)
     expect(submit).toBeGreaterThan(-1)
     expect(call).toBeGreaterThan(submit)

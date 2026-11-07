@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import { Badge } from '$lib/components/ui/badge'
   import { Button } from '$lib/components/ui/button'
   import { Input } from '$lib/components/ui/input'
@@ -28,12 +29,14 @@
       standingMediaCount?: number
       chain: { predecessors: Array<Record<string, any>>; successors: Array<Record<string, any>> }
     }
-    onChanged: () => void | Promise<void>
-    onDeleted: () => void | Promise<void>
+    onChanged: (agentId?: string, memoryId?: string) => void | Promise<void>
+    onDeleted: (agentId?: string, memoryId?: string) => void | Promise<void>
   }
 
   let { agentId, detail, onChanged, onDeleted }: Props = $props()
 
+  const mountedAgentId = untrack(() => agentId)
+  const mountedMemoryId = untrack(() => detail.record.id)
   const record = $derived(detail.record)
 
   // Draft fields hydrate from the loaded record; edits are explicit (Save Changes).
@@ -112,7 +115,7 @@
       if (!response.ok) throw new Error(payload?.error || `Replace failed (HTTP ${response.status}).`)
       toast.success('Memory image replaced.')
       hydratedId = null
-      await onChanged()
+      await onChanged(mountedAgentId, mountedMemoryId)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Memory image replacement failed.')
     } finally {
@@ -129,7 +132,7 @@
       toast.success('Memory image deleted.')
       mediaDeleteTarget = null
       hydratedId = null
-      await onChanged()
+      await onChanged(mountedAgentId, mountedMemoryId)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Memory image deletion failed.')
     } finally {
@@ -158,7 +161,7 @@
       const response = await fetch('/api/memory/manage/record', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agentId, memoryId: record.id, updates })
+        body: JSON.stringify({ agentId, memoryId: record.id, updates, moveLane: updates.lane !== undefined })
       })
       const payload = await response.json().catch(() => null)
       if (!response.ok) {
@@ -166,7 +169,7 @@
       }
       toast.success(successMessage)
       hydratedId = null
-      await onChanged()
+      await onChanged(mountedAgentId, mountedMemoryId)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Memory update failed.')
     } finally {
@@ -192,7 +195,7 @@
       {
         gist: draftGist.trim() ? draftGist.trim() : null,
         importance: draftImportance,
-        lane: draftLane,
+        ...(draftLane !== record.lane ? { lane: draftLane } : {}),
         trigger_terms: parseTermList(draftTriggerTerms),
         // Synonyms retired 2026-08-29: hydration folded them into terms; clear the field.
         trigger_synonyms: null,
@@ -228,9 +231,9 @@
       if (!response.ok) {
         throw new Error(payload?.error || `Delete failed (HTTP ${response.status}).`)
       }
-      toast.success('Memory deleted.')
+      toast.success('Memory moved to Deleted Memories.')
       showDeleteConfirm = false
-      await onDeleted()
+      await onDeleted(mountedAgentId, mountedMemoryId)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Memory delete failed.')
     } finally {
@@ -507,9 +510,8 @@
     <AlertDialogHeader>
       <AlertDialogTitle>Delete This Memory?</AlertDialogTitle>
       <AlertDialogDescription>
-        This permanently deletes the memory record. It cannot be undone. If a newer
-        memory replaced it, consider leaving it superseded instead — supersession keeps
-        the history visible.
+        This moves the memory and its photos to Deleted Memories. You can restore it
+        there, or permanently remove it by emptying that section.
       </AlertDialogDescription>
     </AlertDialogHeader>
     <AlertDialogFooter>

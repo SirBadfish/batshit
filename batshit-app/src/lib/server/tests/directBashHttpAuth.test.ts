@@ -1,8 +1,6 @@
 import { createServer } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
-import { redis } from '$lib/server/redis'
-import { mintRunCredential, revokeRunCredential } from '$lib/server/services/agentRunCredentials'
 
 const bash = vi.hoisted(() => vi.fn(async () => ({ success: true })))
 vi.mock('$lib/server/services/nativeTools', () => ({
@@ -11,19 +9,11 @@ vi.mock('$lib/server/services/nativeTools', () => ({
 
 useRedisTestServer()
 
-describe('direct Bash route over disposable HTTP with real run-credential authentication', () => {
+describe('direct Bash route over disposable HTTP with retired credential refusal', () => {
   beforeEach(() => bash.mockClear())
   afterEach(() => vi.unstubAllGlobals())
 
-  it('refuses a minted delegated or primary run token before a caller-controlled approval reaches Bash', async () => {
-    await redis.set('agent:primary_http', { user_id: 'user_http' })
-    const delegated = await mintRunCredential({
-      userId: 'user_http', agentId: 'subagent_cli_http', sessionId: 'session_http',
-      runtime: 'codex', delegated: true, scopeAgentId: 'worker_http', allowedControlIds: []
-    })
-    const primary = await mintRunCredential({
-      userId: 'user_http', agentId: 'primary_http', sessionId: 'session_http', runtime: 'codex'
-    })
+  it('refuses retired run tokens before a caller-controlled approval reaches Bash', async () => {
     const { POST } = await import('../../../routes/api/native-tools/bash/execute/+server')
     const server = createServer(async (incoming, outgoing) => {
       try {
@@ -57,19 +47,13 @@ describe('direct Bash route over disposable HTTP with real run-credential authen
     })
 
     try {
-      const delegatedReply = await call(delegated.token)
-      expect(delegatedReply.status).toBe(403)
-      expect((await delegatedReply.json()).code).toBe('CONTROL_NOT_ALLOWED')
-      const primaryReply = await call(primary.token)
-      expect(primaryReply.status).toBe(403)
-      expect((await primaryReply.json()).code).toBe('DIRECT_BASH_NOT_ALLOWED')
+      expect((await call('arc_retired_subagent.bsac_secret')).status).toBe(401)
+      expect((await call('arc_retired_primary.bsac_secret')).status).toBe(401)
       expect(bash).not.toHaveBeenCalled()
     } finally {
       await new Promise<void>((resolve, reject) =>
         server.close((error) => error ? reject(error) : resolve())
       )
-      await revokeRunCredential(delegated.credentialId)
-      await revokeRunCredential(primary.credentialId)
     }
   })
 })

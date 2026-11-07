@@ -118,7 +118,8 @@ Follow this order:
 2. If editing, call `sys.artifact.list`, then `sys.artifact.get`, and read `references/editing.md`.
 3. Load the references the build needs before coding. Each opens with a "Load when" line; read only what applies:
    - native artifact (static, Built-in AI, or a webhook UI): `references/brain-general.md` and `references/builder-kit-api.md`, plus `references/ai-capabilities.md` and `references/ai-models.md` for Built-in AI
-   - ComfyUI workflow: `references/brain-comfyui.md`, then `references/comfyui-build.md`
+   - an app installed in local Pinokio or a saved LAN computer: `references/runtime-pinokio.md`; save only the remote `pinokio_machine_id`, never its endpoint or revision. The Artifacts token does not grant `sys.pinokio.*` discovery/start or session-only machine routes. Use already supplied app/machine facts, or ask the user to use the in-app agent for those operations; never borrow browser cookies or claim the token approves a start.
+   - standalone ComfyUI workflow: `references/brain-comfyui.md`, then `references/comfyui-build.md`
    - n8n workflow: `references/brain-n8n.md`
    - HuggingFace path: `references/brain-huggingface.md`
    - standalone Gradio embed: `references/embed-gradio.md`
@@ -166,6 +167,7 @@ Read the build-path references named in the workflow before writing artifact HTM
 - `references/n8n-troubleshooting.md`
 - `references/runtime-api.md`
 - `references/runtime-location.md`
+- `references/runtime-pinokio.md`
 - `references/templates-gallery.md`
 - `references/zone-patterns.md`
 

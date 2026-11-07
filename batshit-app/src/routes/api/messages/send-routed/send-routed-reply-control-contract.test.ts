@@ -27,7 +27,7 @@ describe('send-routed: the reply-end control step (SA-129 DL-08)', () => {
     const cleaned = finalizeSource.indexOf('      endContent = replyControl.content')
     const merged = finalizeSource.indexOf('        Object.assign(endMetadataBase, replyControlMetadata)')
     const emitEnd = finalizeSource.indexOf('      await streamAdapter.emitEnd({')
-    const save = finalizeSource.indexOf('      await redis.saveMessage(finalMessage)')
+    const save = finalizeSource.indexOf('      await persistCanonicalReply(finalMessage, mcpOriginalPreparation, mcpApiPart)')
     expect(step).toBeGreaterThan(-1)
     expect(cleaned).toBeGreaterThan(step)
     expect(merged).toBeGreaterThan(cleaned)
@@ -72,7 +72,7 @@ describe('send-routed: the reply-end control step (SA-129 DL-08)', () => {
   })
 
   it('tells every tab when the step changed zip state, even when the save throws, once per reply (BL-537)', () => {
-    const save = finalizeSource.indexOf('\n      try {\n        await redis.saveMessage(finalMessage)\n')
+    const save = finalizeSource.indexOf('\n      try {\n        await persistCanonicalReply(finalMessage, mcpOriginalPreparation, mcpApiPart)\n')
     // BL-775: stored, so a later throw sends it through no second save.
     expect(finalizeSource.slice(save, finalizeSource.indexOf('} finally {', save))).toContain('finalMessagePersisted = true')
     const publish = finalizeSource.indexOf('\n        await announceReplyControlZipChange()\n', save)

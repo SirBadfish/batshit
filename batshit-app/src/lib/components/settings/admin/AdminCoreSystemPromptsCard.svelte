@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { AlertCircle, FileText, Loader2, RefreshCw } from '@lucide/svelte'
+  import { AlertCircle, Eye, FileText, Loader2, RefreshCw } from '@lucide/svelte'
   import { Badge } from '$lib/components/ui/badge'
   import { Button } from '$lib/components/ui/button'
   import SettingsAccordionCard from '$lib/components/settings/SettingsAccordionCard.svelte'
@@ -14,9 +14,14 @@
     onRetry: () => void
     onEdit: (id: string) => void
     onReset: (prompt: CoreSystemPromptSummary) => void
+    /** Opens the read-only text Batshit builds in code for this prompt (Josh, 2026-10-23). */
+    onViewBuiltIn: (id: string) => void
+    /** The prompt whose built-in text is loading. */
+    viewBusyId: string | null
   }
 
-  let { prompts, loading, error, busyId, onRetry, onEdit, onReset }: Props = $props()
+  let { prompts, loading, error, busyId, onRetry, onEdit, onReset, onViewBuiltIn, viewBusyId }: Props = $props()
+  const anyBusy = $derived(busyId !== null || viewBusyId !== null)
 </script>
 
 <SettingsAccordionCard
@@ -31,6 +36,11 @@
         These prompts are the default instructions Batshit gives its primary agents, subagents,
         Dynamic MCP, and tool/zip guidance. Edit only when you intentionally want to change core
         behavior.
+      </p>
+      <p class="mt-2">
+        Some text is built into Batshit instead of stored here: a placeholder such as
+        <code class="rounded">{'{{ $api_tool_zip_guidance }}'}</code> is filled when the prompt is sent, and
+        a Built In section has no stored prompt at all. Built-in Text shows that text, read-only.
       </p>
     </SettingsInfoMenu>
   {/snippet}
@@ -65,7 +75,9 @@
             <div class="min-w-0 space-y-2">
               <div class="flex flex-wrap items-center gap-2">
                 <span class="batshit-settings-child-label">{prompt.label}</span>
-                {#if prompt.matchesDefault}
+                {#if prompt.readOnly}
+                  <Badge variant="outline">Built in</Badge>
+                {:else if prompt.matchesDefault}
                   <Badge variant="outline" class="core-prompt-status-badge is-default">
                     Batshit default
                   </Badge>
@@ -79,38 +91,63 @@
                 {/if}
               </div>
               <p class="text-xs text-muted-foreground">{prompt.description}</p>
-              <div class="batshit-settings-caption">
-                {prompt.redisKey} / {prompt.defaultFile}
-                {#if prompt.lastUpdated}
-                  / Updated {formatBackupDate(prompt.lastUpdated)}
-                {/if}
-              </div>
+              {#if prompt.setupCompatibilityNotice}
+                <p class="batshit-settings-caption is-warning">{prompt.setupCompatibilityNotice}</p>
+              {/if}
+              {#if prompt.readOnly}
+                <div class="batshit-settings-caption">Built into Batshit (read-only)</div>
+              {:else}
+                <div class="batshit-settings-caption">
+                  {prompt.redisKey} / {prompt.defaultFile}
+                  {#if prompt.lastUpdated}
+                    / Updated {formatBackupDate(prompt.lastUpdated)}
+                  {/if}
+                </div>
+              {/if}
             </div>
             <div class="flex shrink-0 flex-wrap gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onclick={() => onEdit(prompt.id)}
-                disabled={busyId !== null}
-              >
-                {#if busyId === prompt.id}
-                  <Loader2 class="animate-spin" aria-hidden="true" />
-                {:else}
-                  <FileText aria-hidden="true" />
-                {/if}
-                Edit
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                onclick={() => onReset(prompt)}
-                disabled={prompt.matchesDefault || busyId !== null}
-              >
-                <RefreshCw aria-hidden="true" />
-                Reset
-              </Button>
+              {#if prompt.readOnly || prompt.hasBuiltInText}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onclick={() => onViewBuiltIn(prompt.id)}
+                  disabled={anyBusy}
+                >
+                  {#if viewBusyId === prompt.id}
+                    <Loader2 class="animate-spin" aria-hidden="true" />
+                  {:else}
+                    <Eye aria-hidden="true" />
+                  {/if}
+                  {prompt.readOnly ? 'View' : 'Built-in Text'}
+                </Button>
+              {/if}
+              {#if !prompt.readOnly}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onclick={() => onEdit(prompt.id)}
+                  disabled={anyBusy}
+                >
+                  {#if busyId === prompt.id}
+                    <Loader2 class="animate-spin" aria-hidden="true" />
+                  {:else}
+                    <FileText aria-hidden="true" />
+                  {/if}
+                  Edit
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onclick={() => onReset(prompt)}
+                  disabled={prompt.matchesDefault || anyBusy}
+                >
+                  <RefreshCw aria-hidden="true" />
+                  Reset
+                </Button>
+              {/if}
             </div>
           </div>
         </div>

@@ -30,7 +30,7 @@
     <IconRenderer
       {ref}
       label={disclosureLabel}
-      class="batshit-settings-tool-grid-identity-icon"
+      class={cn('batshit-settings-tool-grid-identity-icon', ref.kind === 'brand' && ref.slug.startsWith('gnubash-') && 'opacity-60')}
       {iconClass}
     />
   </DropdownMenu.Trigger>

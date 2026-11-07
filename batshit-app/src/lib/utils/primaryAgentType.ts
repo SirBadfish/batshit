@@ -1,6 +1,13 @@
-/** Live Primary Agent types. `n8n` is retained only as a stored retirement marker. */
-export type PrimaryAgentType = 'api' | 'cli'
-export type StoredPrimaryAgentType = PrimaryAgentType | 'n8n'
+import { namesRetiredCodexCliModel } from './cliRuntimeIdentity'
+
+/**
+ * The live Primary Agent type. SA-139 R4 (D14): `cli` (the Claude Code CLI lane, and the Codex
+ * CLI lane R1 removed) and `n8n` (SA-106) are kept only as stored retirement markers, so a stored
+ * record is recognised and refused, never run, and never silently read as `api`.
+ */
+export type PrimaryAgentType = 'api'
+export type RetiredPrimaryAgentType = 'cli' | 'n8n'
+export type StoredPrimaryAgentType = PrimaryAgentType | RetiredPrimaryAgentType
 
 type PrimaryModelConnectionLike =
   | {
@@ -35,14 +42,17 @@ function hasCliProviderHint(agent?: PrimaryAgentLike | null): boolean {
   const connectionId = normalizeString(agent?.primary_model_connection?.id)
   const connectionService = normalizeString(agent?.primary_model_connection?.service)
 
+  // SA-139 R1: a model id that merely contains "codex" (an OpenAI model on an API agent) is
+  // not a CLI hint; only the provider or connection names the retired Codex CLI lane, and such
+  // a record resolves to `cli` so the send path refuses it as retired Codex. SA-139 R3 (Faye
+  // S12): by the exact retired ids only, so a custom provider such as `codex-proxy` stays `api`.
+  // SA-139 R4: an untyped legacy record that names the Claude Code CLI lane still derives `cli`,
+  // the retired type, so it is refused and never runs on the API lane under a `claude-cli` id.
   return (
-    provider.includes('codex') ||
+    namesRetiredCodexCliModel(agent ?? {}) ||
     provider.includes('claude-cli') ||
-    model.includes('codex') ||
     model.includes('claude-cli') ||
-    connectionId.includes('codex') ||
     connectionId.includes('claude-cli') ||
-    connectionService.includes('codex') ||
     connectionService.includes('claude-cli')
   )
 }
@@ -100,10 +110,62 @@ export function isCliPrimaryAgentType(value: unknown): value is 'cli' {
   return normalizeString(value) === 'cli'
 }
 
-export function isManagedPrimaryAgentType(
-  value: unknown
-): value is 'api' | 'cli' {
-  return isApiPrimaryAgentType(value) || isCliPrimaryAgentType(value)
+export function isRetiredPrimaryAgentType(value: unknown): value is RetiredPrimaryAgentType {
+  return isCliPrimaryAgentType(value) || isN8nPrimaryAgentType(value)
+}
+
+/** SA-139 R4 (D14): the one code every refusal of a retired Primary type carries (HTTP 409). */
+export const PRIMARY_AGENT_TYPE_RETIRED_CODE = 'primary_agent_type_retired'
+
+export type RetiredPrimaryAgentRefusal = {
+  code: typeof PRIMARY_AGENT_TYPE_RETIRED_CODE
+  error: string
+  details: string
+}
+
+/** The readable sentence for a retired Primary type; a CLI record that names Codex gets the Codex one. */
+export function retiredPrimaryAgentTypeMessage(
+  type: RetiredPrimaryAgentType,
+  options: { codex?: boolean } = {}
+): { error: string; details: string } {
+  if (type === 'n8n') {
+    return {
+      error: 'The n8n Primary Agent type was removed from Batshit.',
+      details:
+        'This agent uses the retired n8n Primary Agent type, so it can only be deleted. Create a new agent instead. n8n is still fully supported as a tool platform: n8n tool workflows are unchanged.',
+    }
+  }
+  if (options.codex) {
+    return {
+      error: 'Codex CLI agents were removed from Batshit.',
+      details:
+        'This agent ran on Codex CLI, which Batshit no longer supports, so it can only be deleted. For ChatGPT models, create a new agent with the ChatGPT plan connection or an OpenAI API key.',
+    }
+  }
+  return {
+    error: 'The Claude Code CLI lane was removed from Batshit.',
+    details:
+      'This agent ran on the Claude Code CLI lane, which Batshit no longer supports, so it can only be deleted. To use your Claude plan, create a new agent and pick a Claude plan model.',
+  }
+}
+
+/**
+ * SA-139 R4 (D14 narrow refusal): null for a live Primary, else the readable refusal. Both the
+ * stored record and a requested type are checked, so a request cannot override its way past a
+ * retired record, and a request cannot ask for a retired type on a live one.
+ */
+export function retiredPrimaryAgentRefusal(
+  agent?: PrimaryAgentLike | null,
+  requestedType?: unknown
+): RetiredPrimaryAgentRefusal | null {
+  const stored = normalizePrimaryAgentType(agent)
+  const requested = requestedType === undefined ? stored : normalizePrimaryAgentType(agent, requestedType)
+  const type = isRetiredPrimaryAgentType(stored) ? stored : isRetiredPrimaryAgentType(requested) ? requested : null
+  if (!type) return null
+  return {
+    code: PRIMARY_AGENT_TYPE_RETIRED_CODE,
+    ...retiredPrimaryAgentTypeMessage(type, { codex: type === 'cli' && namesRetiredCodexCliModel(agent ?? {}) }),
+  }
 }
 
 export function primaryAgentAllowsNativeBash(value: unknown): boolean {
@@ -114,32 +176,17 @@ export function primaryAgentAllowsAgentBrowser(value: unknown): boolean {
   return isApiPrimaryAgentType(value)
 }
 
-export function getPrimaryAgentDisplayLabel(
-  value: unknown
-): 'n8n (retired)' | 'API' | 'CLI' {
-  if (isCliPrimaryAgentType(value)) return 'CLI'
-  // SA-106: only a record that actually names the retired type gets the retired label.
-  // Everything else — including malformed records — reads as API, matching what
-  // `normalizePrimaryAgentType` resolves it to.
-  if (isN8nPrimaryAgentType(value)) return 'n8n (retired)'
-  return 'API'
-}
-
 export function getPrimaryAgentSystemPromptRedisKey(type: PrimaryAgentType): string {
   switch (type) {
     case 'api':
       return 'batshit:batshit_mode3_system_prompt'
-    case 'cli':
-      return 'batshit:batshit_mode4_system_prompt'
   }
 }
 
 export function getPrimaryAgentSystemPromptLabel(type: PrimaryAgentType): string {
   switch (type) {
     case 'api':
-      return 'API PRIMARY SYSTEM PROMPT'
-    case 'cli':
-      return 'CLI PRIMARY SYSTEM PROMPT'
+      return 'PRIMARY AGENT SYSTEM PROMPT'
   }
 }
 

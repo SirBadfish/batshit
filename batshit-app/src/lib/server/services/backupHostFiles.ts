@@ -5,6 +5,7 @@ import path from 'node:path'
 
 import { getSkillCacheRoot } from '$lib/server/services/skillRegistry'
 import { getManagedVoiceProfileStorageRoot } from '$lib/server/services/voiceProfileRecords'
+import { assertMacCustodyPathAllowed } from './macCustodyPaths'
 
 /**
  * BL-373 / BL-369: host files in the backup archive.
@@ -239,6 +240,9 @@ async function walkFolder(ref: HostFolderRef, rootPath: string): Promise<FolderW
         continue
       }
       if (!stat.isFile()) return { ok: false, reason: 'not-a-regular-file' }
+      // A regular hardlink is not a symlink. Never carry a known credential
+      // through an otherwise exportable skill/voice folder.
+      try { assertMacCustodyPathAllowed(absolutePath) } catch { return { ok: false, reason: 'unreadable' } }
       const size = Number(stat.size)
       if (size > HOST_FILE_LIMITS.maxFileBytes) return { ok: false, reason: 'too-large' }
       totalBytes += size
@@ -330,6 +334,7 @@ function sameAsWalked(stat: import('node:fs').BigIntStats, file: HostFileExportA
  * `HostFileHandlesExhaustedError`, never a "changed" folder.
  */
 export async function openWalkedHostFile(file: HostFileExportAsset): Promise<FileHandle> {
+  assertMacCustodyPathAllowed(file.sourcePath)
   let handle: FileHandle
   try {
     handle = await fs.open(file.sourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)

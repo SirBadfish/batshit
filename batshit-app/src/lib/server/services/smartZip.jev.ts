@@ -212,6 +212,7 @@ export function selectSmartZipCandidates(items: ZipCompression[]): {
   const described: ZipCompression[] = []
   for (const item of items) {
     if (!item || item.zipType !== 'cool_tool' || item.groupUnshared || isFetchZipResult(item)) continue
+    if (item.operationKind === 'skill_read' || item.toolName === 'skill_read') continue
     if (namesNoTarget(item)) continue
     if (!item.zipId || seen.has(item.zipId)) continue
     if (!clip(item.description, SMART_ZIP_LIMITS.maxDescriptionChars)) continue
@@ -424,7 +425,7 @@ export function buildSmartZipDcmLines(decision: SmartZipDecision, options: { fet
   ]
   for (const hint of decision.opened) {
     lines.push(
-      `- Unzipped for you (inferred): ${describeHint(hint)} | its full content is in this prompt, and it zips again by itself after ${SMART_ZIP_OPEN_LIMITS.durationMessages} messages (zip control, when you have it, closes it sooner)`
+      `- Unzipped for you (inferred): ${describeHint(hint)} | its full content is in this prompt, and it zips again by itself after ${SMART_ZIP_OPEN_LIMITS.durationMessages} messages`
     )
   }
   for (const hint of decision.notOpened) {
@@ -437,7 +438,7 @@ export function buildSmartZipDcmLines(decision: SmartZipDecision, options: { fet
     lines.push(
       options.fetchZipEnabled
         ? '- To read one that is still zipped, fetch it by its zip ID (a peek; zip state stays as it is). Zip control, when you have it, keeps one open for later turns.'
-        : '- Fetch Zip is off for you, so you cannot open the zipped ones yourself. If one is needed, say so plainly or run the tool again; zip control, when you have it, opens one for the next turn.'
+        : '- Fetch Zip is off for you, so you cannot open the zipped ones yourself. If one is needed, say so plainly or run the tool again.'
     )
   }
   return lines
@@ -445,7 +446,7 @@ export function buildSmartZipDcmLines(decision: SmartZipDecision, options: { fet
 
 /** The heading of the notice that tells the agent what Batshit zipped after its last reply (DL-120-04). */
 export const JEV_JUICE_ZIPS_CLOSED_HEADING =
-  'jev_juice_zips_closed (after your last reply Batshit zipped these tool results because you seemed done with them; fetch or unzip one if that was wrong):'
+  'jev_juice_zips_closed (after your last reply Batshit zipped these tool results because you seemed done with them; fetch one if that was wrong):'
 
 /** One line per inferred rezip the agent has not been told about yet. Empty when there is none. */
 export function buildSmartZipClosedDcmLines(
@@ -591,6 +592,7 @@ function isJudgeableResult(item: {
   descriptionParts?: { target: string }
 }): boolean {
   if (item.zipType !== 'cool_tool') return false
+  if (item.operationKind === 'skill_read' || item.toolName === 'skill_read') return false
   if (item.operationKind === 'fetch_zip' || item.toolName === 'fetch_zip') return false
   if (TARGET_REQUIRED_KINDS.has(item.operationKind ?? '') && !item.descriptionParts?.target) return false
   return Boolean(clip(item.description, SMART_ZIP_LIMITS.maxDescriptionChars))

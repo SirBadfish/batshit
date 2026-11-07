@@ -569,7 +569,7 @@ describe('BL-889 deterministic old/new schedules (pure twin; real conformance se
           fake.json.set('mcp_gateways:josh', { gateways: [gateway(LIVE_GATEWAY)] })
           fake.sets.set(`user:josh:${prefix}s`, ['bob'])
           fake.json.set(`${prefix}:bob`, {
-            id: 'bob', codex_settings: { model: 'old' }, claude_settings: { model: 'old' },
+            id: 'bob', claude_settings: { model: 'old' },
             defaultMCPGateways: [DEAD_GATEWAY, LIVE_GATEWAY],
             defaultMCPToolSelections: ['read_file', 'shared'],
             dcmDisplaySettings: { groups: { [`${DEAD_GATEWAY}::dead`]: 'hidden', [`${LIVE_GATEWAY}::live`]: 'hidden' } }
@@ -579,7 +579,7 @@ describe('BL-889 deterministic old/new schedules (pure twin; real conformance se
         const edit = (fake: ReturnType<typeof seed>) => {
           const record = fake.json.get(`${prefix}:bob`)
           if (race === 'settings save') {
-            record.codex_settings.model = 'new'; record.claude_settings.model = 'new'
+            record.claude_settings.model = 'new'
             record.dcmDisplaySettings.groups[`${LIVE_GATEWAY}::live`] = 'group-only'
           } else if (race === 'selection edit') {
             record.defaultMCPGateways = [LIVE_GATEWAY, 'new-live', DEAD_GATEWAY]
@@ -611,7 +611,7 @@ describe('BL-889 deterministic old/new schedules (pure twin; real conformance se
         } else {
           expect(actual.defaultMCPGateways).toEqual(race === 'selection edit' ? [LIVE_GATEWAY, 'new-live'] : [LIVE_GATEWAY])
           if (race === 'settings save') {
-            expect(actual.codex_settings.model).toBe('new'); expect(actual.claude_settings.model).toBe('new')
+            expect(actual.claude_settings.model).toBe('new')
             expect(actual.dcmDisplaySettings.groups[`${LIVE_GATEWAY}::live`]).toBe('group-only')
           } else {
             expect(actual.defaultMCPToolSelections).toEqual(['new-tool', 'shared'])

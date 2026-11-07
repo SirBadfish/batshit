@@ -18,7 +18,7 @@ let savedKey: string | undefined
 function stubCatalog(items: unknown[]) {
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () => new Response(JSON.stringify({ data: items }), { status: 200 }))
+    vi.fn(async () => new Response(JSON.stringify({ data: items, pagination: { page: 1, page_size: items.length, total_pages: 1, has_more: false } }), { status: 200 }))
   )
 }
 

@@ -2,6 +2,7 @@ const TRUE_VALUES = new Set(['1', 'true', 'yes', 'on'])
 
 const PUBLIC_REGISTRY_PATHS = new Set([
   '/registry/catalog.json',
+  '/registry/voice-model-catalog.json',
   '/registry/compatibility-matrix.json'
 ])
 

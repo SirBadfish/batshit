@@ -1,6 +1,12 @@
+import { useOwnedRedisTestServer } from '$lib/test-utils/ownedRedisTestServer'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
+import { loadAgentRoute } from '$lib/test-utils/agentPutRoute'
+import { MODEL_SELECTION_REVISION_HEADER } from '$lib/appActions/settings/modelSelectionBaseline'
+import { MCP_SETTINGS_REVISION_HEADER, readMcpSettingsRevisions } from '$lib/utils/agentSettingsSectionSaves'
+import { PRIMARY_AGENT_TYPE_SOURCE_FIELDS } from '$lib/utils/primaryAgentType'
+import { withSettingsRecordReplacement } from '$lib/server/services/appActions/settings/lifecycle'
+import { buildDynamicOnlySelectionResetKey } from '$lib/server/services/mcpRuntimePolicy'
 
 /**
  * BL-770: the writers of an agent record that sat outside `updateAgent` write only what they change,
@@ -17,18 +23,13 @@ import { redis } from '$lib/server/redis'
  * The gap tests need the real client and run on the real lane only (`npm run test:redis`).
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
-}))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   syncAgentClaudeProfiles: vi.fn(async () => {}),
   deleteAgentClaudeConfig: vi.fn(async () => {}),
   agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
 }))
 
-useRedisTestServer()
+useOwnedRedisTestServer(redis)
 
 const REAL = process.env.VITEST_USE_REAL_REDIS === 'true'
 const USER = 'zawr_user'
@@ -58,13 +59,14 @@ async function stored() {
 
 afterEach(async () => {
   vi.restoreAllMocks()
-  for (const key of [KEY, `agent:${AGENT}:subagents`, `subagent:${SUBAGENT}`, `user:${USER}:agents`, `batshit:mcp_dynamic_only_reset:v1:${USER}`]) {
+  for (const key of [KEY, `agent:${AGENT}:subagents`, `subagent:${SUBAGENT}`, `user:${USER}:agents`, `batshit:mcp_dynamic_only_reset:v1:${USER}`,
+    'model:zawr_preset_a', 'model:zawr_preset_b', `user:${USER}:models`]) {
     await redis.del(key)
   }
 })
 
 /** The same probe as `agentUpdateByPath.test.ts`: another writer lands right after the first read. */
-function interleaveAnotherWriter() {
+function interleaveAnotherWriter(resetIssueOnly = false) {
   const execute = redis.execute.bind(redis)
   let wroteBetween = false
   const wholeRecordWrites: unknown[] = []
@@ -83,7 +85,7 @@ function interleaveAnotherWriter() {
           if (property === 'get') {
             return async (key: string, options?: unknown) => {
               const answer = await value.call(target, key, options)
-              if (key === KEY) await writeBetween()
+              if (key === KEY && !resetIssueOnly) await writeBetween()
               return answer
             }
           }
@@ -101,7 +103,7 @@ function interleaveAnotherWriter() {
           if (property === 'json') return json
           if (property === 'eval') {
             return async (script: string, options: { keys?: string[] }) => {
-              if (options?.keys?.[0] === KEY) await writeBetween()
+              if (options?.keys?.[0] === KEY && (!resetIssueOnly || script.includes('-- fixed-dynamic-only-mcp-reset-write'))) await writeBetween()
               return client.eval(script, options)
             }
           }
@@ -179,7 +181,7 @@ describe.skipIf(!REAL)('a change written while another agent writer runs survive
 
   it('the one-time dynamic-only MCP reset clears the two legacy lists and nothing else', async () => {
     await seed({ defaultMCPToolSelections: ['gw.tool'], default_mcp_tool_selections: ['gw.tool'] })
-    const probe = interleaveAnotherWriter()
+    const probe = interleaveAnotherWriter(true)
     const { __testUtils } = await import('$lib/server/services/mcpSelectionResolver')
 
     await __testUtils.runDynamicOnlySelectionReset(USER)
@@ -287,24 +289,35 @@ describe('a type change made after a route read the agent survives its save (rev
     expect(record.agentType).toBe('cli')
   })
 
-  it('PUT /api/agents/[id] with agentType still changes the type', async () => {
+  // SA-139 R4: `api` is the one live type, so a body can no longer change it to `cli` (400, nothing
+  // written); a body that names the type still hands it to updateAgent, normalized.
+  it('PUT /api/agents/[id] with agentType still passes the type it names; a cli type is refused', async () => {
     await seed()
     const { PUT } = await import('../../../routes/api/agents/[id]/+server')
-
-    const response = await PUT({
+    const put = (body: Record<string, unknown>) => PUT({
       params: { id: AGENT },
-      request: new Request('http://localhost', { method: 'PUT', body: JSON.stringify({ agentType: 'CLI' }) }),
+      request: new Request('http://localhost', { method: 'PUT', body: JSON.stringify(body) }),
       locals: { user: { id: USER } }
     } as any)
 
+    const before = await stored()
+    const refused = await put({ agentType: 'CLI', displayName: 'Must not save' })
+    expect(refused.status).toBe(400)
+    expect(await refused.json()).toMatchObject({ code: 'primary_agent_type_invalid' })
+    expect(await stored()).toEqual(before)
+
+    const probe = changeTypeBeforeTheSave({})
+    const response = await put({ agentType: 'API' })
     expect(response.status).toBe(200)
-    expect((await stored()).agentType).toBe('cli')
+    expect(probe.passed).toHaveLength(1)
+    expect(probe.passed[0].agentType).toBe('api')
+    expect((await stored()).agentType).toBe('api')
   })
 
   it('the legacy type clean-up of GET /api/agents/[id] keeps a canonical type written meanwhile', async () => {
     await seed({ agentType: undefined, batshitMode: 'direct', mode: 'vercel-native' })
+    const { GET } = await loadAgentRoute()
     changeTypeBeforeTheSave({ agentType: 'cli' })
-    const { GET } = await import('../../../routes/api/agents/[id]/+server')
 
     const response = await GET({ params: { id: AGENT }, locals: { user: { id: USER } } } as any)
 
@@ -467,6 +480,24 @@ describe('two copies of one agent saved from two places keep both changes (BL-84
         nativeTools: { bashAccessMode: 'agent', bashNeverAllowList: NEVER_ALLOW }
       }
     })
+    for (const model of [MODEL_FIELDS_A, MODEL_FIELDS_B]) {
+      await redis.json.set(`model:${model.primary_model_preset_id}`, '$', {
+        id: model.primary_model_preset_id, modelName: model.primary_model_name, modelId: model.primary_model_name,
+        provider: model.primary_model_provider, connection: { type: 'direct', id: `direct:${model.primary_model_provider}`, service: model.primary_model_provider },
+        settings: {}, createdAt: OLD_STAMP, updatedAt: OLD_STAMP
+      })
+      await redis.sAdd(`user:${USER}:models`, model.primary_model_preset_id)
+    }
+  }
+
+  /** BL-1703: capture the human fixture's body and original base in the same owned detail read. */
+  async function shownModelSelection() {
+    const { GET } = await loadAgentRoute()
+    const response = await GET({ params: { id: AGENT }, locals: { user: { id: USER } } } as any)
+    expect(response.status).toBe(200)
+    const revision = response.headers.get(MODEL_SELECTION_REVISION_HEADER)
+    expect(revision).toMatch(/^sha256:[a-f0-9]{64}$/)
+    return { record: await response.json(), revision: revision! }
   }
 
   /** The part of Agent Settings' basic payload these saves touch, built from a copy of the record. */
@@ -499,27 +530,28 @@ describe('two copies of one agent saved from two places keep both changes (BL-84
     expect(response.status).toBe(200)
   }
 
-  async function settingsSave(baseline: Record<string, unknown>, next: Record<string, unknown>) {
+  async function settingsSave(baseline: Record<string, unknown>, next: Record<string, unknown>, expectedModelSelection?: string) {
     const { buildAgentSettingsSavePatch } = await import('$lib/utils/agentSettingsSavePatch')
     const patch = buildAgentSettingsSavePatch(baseline, next)
-    await put(patch)
+    await put(expectedModelSelection === undefined ? patch : { ...patch, expectedModelSelection })
     return patch
   }
 
   it('a block that names only own keys leaves the stored model keys alone (BL-833)', async () => {
     await seedPresetA()
-    await put({ provider_specific_settings: { codex_permission_mode: 'agent' } })
+    await put({ provider_specific_settings: { claude_permission_mode: 'plan' } })
     expect((await stored()).provider_specific_settings).toEqual({
       temperature: 1.2,
       maxTokens: 4000,
       nativeTools: { bashAccessMode: 'agent', bashNeverAllowList: NEVER_ALLOW },
-      codex_permission_mode: 'agent'
+      claude_permission_mode: 'plan'
     })
   })
 
   it('a pick of a preset with no settings still clears the old model keys (an empty block)', async () => {
     await seedPresetA()
-    await put({ ...MODEL_FIELDS_B, provider_specific_settings: {} })
+    const shown = await shownModelSelection()
+    await put({ ...MODEL_FIELDS_B, provider_specific_settings: {}, expectedModelSelection: shown.revision })
     expect((await stored()).provider_specific_settings).toEqual({ nativeTools: { bashAccessMode: 'agent', bashNeverAllowList: NEVER_ALLOW } })
   })
 
@@ -541,10 +573,11 @@ describe('two copies of one agent saved from two places keep both changes (BL-84
 
   it("with Settings' copy stale, a model picked in the chat bar survives a never-allow edit from Settings (BL-833)", async () => {
     await seedPresetA()
-    const settingsCopy = settingsPayload(await stored())
+    const shown = await shownModelSelection()
+    const settingsCopy = settingsPayload(shown.record)
 
     // The chat-bar picker's save (ModelSelector): the preset's model fields and keys.
-    await put({ ...MODEL_FIELDS_B, provider_specific_settings: { temperature: 0.2 } })
+    await put({ ...MODEL_FIELDS_B, provider_specific_settings: { temperature: 0.2 }, expectedModelSelection: shown.revision })
     await settingsSave(settingsCopy, withNeverAllow(settingsCopy, NEVER_ALLOW_EDITED))
 
     const record = await stored()
@@ -644,10 +677,11 @@ describe('two copies of one agent saved from two places keep both changes (BL-84
 
   it.skipIf(!REAL)('a chat-bar Work-mode change inside a Settings model pick: both survive (BL-833, real Redis)', async () => {
     await seedPresetA()
-    const settingsCopy = settingsPayload(await stored())
+    const shown = await shownModelSelection()
+    const settingsCopy = settingsPayload(shown.record)
     const probe = runBeforeFirstScript(() => put(CHAT_BAR_PLAN))
 
-    await settingsSave(settingsCopy, withPresetB(settingsCopy))
+    await settingsSave(settingsCopy, withPresetB(settingsCopy), shown.revision)
 
     expect(probe.ran()).toBe(true)
     const record = await stored()
@@ -657,8 +691,9 @@ describe('two copies of one agent saved from two places keep both changes (BL-84
 
   it.skipIf(!REAL)('a Settings model pick inside a chat-bar Work-mode change: both survive (BL-833, real Redis)', async () => {
     await seedPresetA()
-    const settingsCopy = settingsPayload(await stored())
-    const probe = runBeforeFirstScript(() => settingsSave(settingsCopy, withPresetB(settingsCopy)))
+    const shown = await shownModelSelection()
+    const settingsCopy = settingsPayload(shown.record)
+    const probe = runBeforeFirstScript(() => settingsSave(settingsCopy, withPresetB(settingsCopy), shown.revision))
 
     await put(CHAT_BAR_PLAN)
 
@@ -670,18 +705,17 @@ describe('two copies of one agent saved from two places keep both changes (BL-84
 })
 
 /**
- * BL-848 and BL-855: `codex_settings`, `claude_settings` and `dcmDisplaySettings` are written field
- * by field, so the chat bar's Codex and Claude controls, the model selectors, the MCP menu and Agent
- * Settings, each holding a copy of the agent from a different time, keep each other's choices as
- * long as each save names only the keys it changed (`diffAgentBlock`, `agentBlockFieldSettings.ts`).
+ * BL-848 and BL-855: `claude_settings` and `dcmDisplaySettings` are written field by field, so the
+ * chat bar's Claude controls, the model selectors, the MCP menu and Agent Settings, each holding a
+ * copy of the agent from a different time, keep each other's choices as long as each save names
+ * only the keys it changed (`diffAgentBlock`, `agentBlockFieldSettings.ts`).
  */
 describe('two copies of one agent saved from two places keep both provider and Tool Grid choices (BL-848, BL-855)', () => {
-  const CODEX = { model: 'gpt-5', permissionMode: 'chat', sandbox: 'workspace-write', reasoningEffort: 'medium', addDirs: ['/a'], configOverrides: [] }
   const CLAUDE = { model: 'sonnet', permissionMode: 'default', alwaysThinkingEnabled: false, addDirs: [], configOverrides: [] }
   const DCM = { version: 1, groups: { gw_a: 'group-only' }, tools: { 'gw_a::read': 'name-only' }, groupDisplayPreferences: {}, toolDisplayPreferences: {} }
 
   async function seedBlocks() {
-    await seed({ codex_settings: CODEX, claude_settings: CLAUDE, dcmDisplaySettings: DCM, defaultMCPGateways: ['gw_a'], defaultTools: ['read_file'] })
+    await seed({ claude_settings: CLAUDE, dcmDisplaySettings: DCM, defaultMCPGateways: ['gw_a'], defaultTools: ['read_file'] })
   }
 
   async function putRaw(body: Record<string, unknown>) {
@@ -698,31 +732,34 @@ describe('two copies of one agent saved from two places keep both provider and T
     expect(response.status).toBe(200)
   }
 
-  // What the Codex model selector and Agent Settings send once each names only what it changed.
-  const CHAT_BAR_MODEL = { codex_settings: { model: 'gpt-6', reasoningEffort: 'high' } }
-  const SETTINGS_SANDBOX = { codex_settings: { sandbox: 'read-only' } }
-  const EXPECTED_CODEX = { ...CODEX, model: 'gpt-6', reasoningEffort: 'high', sandbox: 'read-only' }
+  // SA-139 R1 and R4: the removed CLI lanes' blocks (Codex, then Claude Code) are never stored
+  // from a save; an old record's leftover block is left exactly as it was (no migration, no
+  // rewrite), so a whole-record echo that carries it still saves.
+  it('drops a codex_settings block from a save; a leftover stored block stays as it was', async () => {
+    const LEFTOVER = { model: 'gpt-5', permissionMode: 'chat', sandbox: 'workspace-write' }
+    await seed({ codex_settings: LEFTOVER, claude_settings: CLAUDE, dcmDisplaySettings: DCM })
+    await put({ codex_settings: { model: 'gpt-6', sandbox: 'read-only' }, claude_settings: { model: 'opus' } })
+    let record = await stored()
+    expect(record.codex_settings).toEqual(LEFTOVER)
+    expect(record.claude_settings).toEqual(CLAUDE)
 
-  it("a chat-bar Codex model pick and Agent Settings' sandbox change each keep the other, in both orders (BL-848)", async () => {
-    for (const [first, second] of [[CHAT_BAR_MODEL, SETTINGS_SANDBOX], [SETTINGS_SANDBOX, CHAT_BAR_MODEL]]) {
-      await seedBlocks()
-      await put(first)
-      await put(second)
-      expect((await stored()).codex_settings).toEqual(EXPECTED_CODEX)
-    }
-  })
-
-  it("a chat-bar Claude mode change and Agent Settings' Claude model change each keep the other (BL-848)", async () => {
     await seedBlocks()
-    await put({ claude_settings: { permissionMode: 'plan' } })
-    await put({ claude_settings: { model: 'opus' } })
-    expect((await stored()).claude_settings).toEqual({ ...CLAUDE, permissionMode: 'plan', model: 'opus' })
+    await put({ displayName: 'Renamed', codex_settings: { model: 'gpt-6' } })
+    record = await stored()
+    expect(record.displayName).toBe('Renamed')
+    expect(record).not.toHaveProperty('codex_settings')
   })
 
   it("the chat bar's MCP menu and Agent Settings each save only the Tool Grid fields they changed (BL-855)", async () => {
     await seedBlocks()
+    const { GET } = await loadAgentRoute()
+    const detail = await GET({ params: { id: AGENT }, locals: { user: { id: USER } } } as any) as Response
+    expect(detail.status).toBe(200)
+    const shown = readMcpSettingsRevisions(detail.headers.get(MCP_SETTINGS_REVISION_HEADER))
+    if (!shown?.defaultMCPGateways) throw new Error('The Tool Grid fixture has no actual original gateway-list base.')
     // The MCP menu adds a gateway group and its list entry; Agent Settings, from an older copy, hides a tool.
-    await put({ dcmDisplaySettings: { groups: { gw_b: 'hidden' } }, defaultMCPGateways: ['gw_a', 'gw_b'] })
+    await put({ dcmDisplaySettings: { groups: { gw_b: 'hidden' } }, defaultMCPGateways: ['gw_a', 'gw_b'],
+      expectedMcpSettings: { defaultMCPGateways: shown.defaultMCPGateways } })
     await put({ dcmDisplaySettings: { tools: { 'gw_a::read': 'hidden' } } })
 
     const record = await stored()
@@ -731,45 +768,191 @@ describe('two copies of one agent saved from two places keep both provider and T
     expect(record.defaultTools).toEqual(['read_file'])
   })
 
-  it.skipIf(!REAL)('a chat-bar Codex model pick inside a Settings sandbox change: both survive, in both orders (BL-848, real Redis)', async () => {
-    for (const [inner, outer] of [[CHAT_BAR_MODEL, SETTINGS_SANDBOX], [SETTINGS_SANDBOX, CHAT_BAR_MODEL]]) {
-      await seedBlocks()
-      const probe = runBeforeFirstScript(() => put(inner))
-      await put(outer)
-      vi.restoreAllMocks()
-      expect(probe.ran()).toBe(true)
-      expect((await stored()).codex_settings).toEqual(EXPECTED_CODEX)
-    }
-  })
-
-  it('a partial block passes the config override check; a bad override is still refused when it is sent, and nothing is written', async () => {
-    await seedBlocks()
-    await put({ codex_settings: { model: 'gpt-6' } })
-    await put({ claude_settings: { permissionMode: 'plan' } })
-
-    const badCodex = await putRaw({ codex_settings: { model: 'gpt-7', configOverrides: [{ key: 'history.persistence', value: 'none' }] } })
-    expect(badCodex.status).toBe(400)
-    expect(((await badCodex.json()) as any).error).toContain("can't redefine Batshit-managed settings")
-    const badClaude = await putRaw({ claude_settings: { model: 'opus', configOverrides: [{ key: 'permissions', value: 'x' }] } })
-    expect(badClaude.status).toBe(400)
-    expect(((await badClaude.json()) as any).error).toContain("can't redefine Batshit-managed settings")
-
-    const record = await stored()
-    expect(record.codex_settings).toEqual({ ...CODEX, model: 'gpt-6' })
-    expect(record.claude_settings).toEqual({ ...CLAUDE, permissionMode: 'plan' })
-  })
-
+  // SA-139 R4: the Claude Code CLI Primary's chat-bar and Agent Settings `claude_settings` saves
+  // left with the lane (a body's block is dropped, above), so only the Tool Grid block is checked.
   it('a block that is not an object or null is a 400 from the route, and nothing is written', async () => {
     await seedBlocks()
-    for (const body of [{ codex_settings: 'gpt-6' }, { claude_settings: ['plan'] }, { dcmDisplaySettings: 5 }]) {
+    for (const body of [{ dcmDisplaySettings: 5 }]) {
       const response = await putRaw({ displayName: 'Half saved', ...body })
       expect(response.status).toBe(400)
       expect(((await response.json()) as any).error).toMatch(/must be an object or null/)
     }
     const record = await stored()
     expect(record.displayName).toBe('Probe')
-    expect(record.codex_settings).toEqual(CODEX)
     expect(record.claude_settings).toEqual(CLAUDE)
     expect(record.dcmDisplaySettings).toEqual(DCM)
+  })
+})
+
+// Last: issued-unknown cases deliberately retain only their exact private source custody.
+describe.skipIf(!REAL)('BL-2360 fixed private dynamic-only MCP reset on actual Redis', () => {
+  let fixtureNumber = 0
+  async function fixture() {
+    const suffix = ++fixtureNumber, user = `${USER}_reset_${suffix}`, id = `${AGENT}_reset_${suffix}`
+    const key = `agent:${id}`, marker = buildDynamicOnlySelectionResetKey(user), index = `user:${user}:agents`
+    const row = { id, user_id: user, created_at: '2026-10-27T01:00:00.000Z', updated_at: OLD_STAMP, agentType: 'api',
+      defaultMCPToolSelections: ['camel'], default_mcp_tool_selections: ['snake'], unrelated: { future: [0, false] } }
+    await redis.json.set(key, '$', row)
+    await redis.sAdd(index, id)
+    const { __testUtils } = await import('$lib/server/services/mcpSelectionResolver')
+    return { user, id, key, marker, index, row, run: () => __testUtils.runDynamicOnlySelectionReset(user) }
+  }
+  type Phase = 'read' | 'write' | 'marker'
+  async function watch(before?: (phase: Phase, options: any, count: number) => Promise<void>,
+    after?: (phase: Phase, answer: unknown, options: any, count: number) => unknown) {
+    const client = await redis.execute(value => value), actual = client.eval.bind(client)
+    const counts = { read: 0, write: 0, marker: 0 }
+    vi.spyOn(client, 'eval').mockImplementation((async (script: string, options: any) => {
+      const phase = (['read', 'write', 'marker'] as const).find(name => script.includes(`-- fixed-dynamic-only-mcp-reset-${name}`))
+      if (!phase) return actual(script, options)
+      const count = ++counts[phase]
+      await before?.(phase, options, count)
+      const answer = await actual(script, options)
+      return after ? after(phase, answer, options, count) : answer
+    }) as never)
+    return { client, counts }
+  }
+
+  it('shares competing invocations through one actual reset and one definitive marker', async () => {
+    const f = await fixture(), probe = await watch()
+    await Promise.all([f.run(), f.run(), f.run()])
+    expect(probe.counts).toEqual({ read: 1, write: 1, marker: 1 })
+    expect(await redis.json.get(f.key)).toEqual({ ...f.row, defaultMCPToolSelections: [], default_mcp_tool_selections: [], updated_at: expect.any(String) })
+    expect((await redis.json.get(f.key) as any).updated_at).not.toBe(OLD_STAMP)
+    expect(await probe.client.get(f.marker)).toMatch(/^\d{4}-\d\d-\d\dT/)
+  })
+  it('keeps the nonempty marker fast path and releases a transient pre-classification read failure', async () => {
+    const f = await fixture(), client = await redis.execute(value => value)
+    await client.set(f.marker, 'already-complete')
+    const read = vi.spyOn(client, 'get').mockRejectedValueOnce(new Error('Transient original marker read'))
+    await expect(f.run()).rejects.toThrow('Transient original marker read')
+    read.mockRestore()
+    const probe = await watch()
+    await expect(f.run()).resolves.toBeUndefined()
+    expect(probe.counts).toEqual({ read: 0, write: 0, marker: 0 })
+    expect(await redis.json.get(f.key)).toEqual(f.row)
+  })
+  it.each(['', ' \n '])('preserves the original empty/whitespace marker semantics: %j', async marker => {
+    const f = await fixture(), client = await redis.execute(value => value)
+    await client.set(f.marker, marker)
+    await f.run()
+    expect((await redis.json.get(f.key) as any).defaultMCPToolSelections).toEqual([])
+    expect(await client.get(f.marker)).toMatch(/^\d{4}-\d\d-\d\dT/)
+  })
+  it.each([undefined, null, [], 'unsupported', { future: true }].map(value => [value]))('does not expand the original nonempty-array classification: %j', async value => {
+    const f = await fixture(), row = { ...f.row, defaultMCPToolSelections: value, default_mcp_tool_selections: value }
+    await redis.json.set(f.key, '$', row)
+    const before = await redis.json.get(f.key), probe = await watch()
+    await f.run()
+    expect(probe.counts.write).toBe(0)
+    expect(await redis.json.get(f.key)).toEqual(before)
+    expect(await probe.client.get(f.marker)).toMatch(/^\d{4}-\d\d-\d\dT/)
+  })
+  it.each(['missing', 'foreign', 'wrong type'] as const)('preflights the complete original cohort before effects when a member is %s', async kind => {
+    const f = await fixture(), badId = `${f.id}_bad`, badKey = `agent:${badId}`
+    await redis.sAdd(f.index, badId)
+    if (kind === 'foreign') await redis.json.set(badKey, '$', { ...f.row, id: badId, user_id: 'different-owned-fixture-user' })
+    if (kind === 'wrong type') await redis.execute(client => client.set(badKey, 'not JSON'))
+    const probe = await watch()
+    await expect(f.run()).rejects.toMatchObject({ code: 'dynamic_mcp_reset_changed' })
+    expect(probe.counts.write).toBe(0); expect(probe.counts.marker).toBe(0)
+    expect(await redis.json.get(f.key)).toEqual(f.row)
+    expect(await probe.client.get(f.marker)).toBeNull()
+  })
+  it.each(['defaultMCPToolSelections', 'default_mcp_tool_selections', 'id', 'user_id', 'created_at', ...PRIMARY_AGENT_TYPE_SOURCE_FIELDS, 'deleted'])(
+    'never adopts an intervening original list/identity/type change: %s', async field => {
+      const f = await fixture()
+      let concurrent: unknown
+      const probe = await watch(async (phase, options) => {
+        if (phase !== 'write') return
+        if (field === 'deleted') await redis.del(f.key)
+        else await redis.json.set(f.key, `$.${field}`, field.startsWith('default') ? ['newer-choice'] : 'different-source')
+        concurrent = await redis.json.get(f.key)
+      })
+      const error = await f.run().catch(error => error)
+      expect(error).toMatchObject({ code: 'dynamic_mcp_reset_changed', status: 409 })
+      expect(await redis.json.get(f.key)).toEqual(concurrent)
+      await expect(f.run()).rejects.toBe(error)
+      expect(probe.counts.write).toBe(1); expect(probe.counts.marker).toBe(0)
+      expect(await probe.client.get(f.marker)).toBeNull()
+    })
+  it('retains the original lifecycle through an identical recreation after its raw cut', async () => {
+    const f = await fixture()
+    const probe = await watch(undefined, async (phase, answer) => {
+      if (phase === 'read') await withSettingsRecordReplacement(f.key, () => redis.json.set(f.key, '$', f.row))
+      return answer
+    })
+    const error = await f.run().catch(error => error)
+    expect(error).toMatchObject({ code: 'SETTINGS_LIFECYCLE_CHANGED' })
+    await expect(f.run()).rejects.toBe(error)
+    expect(probe.counts.write).toBe(0); expect(probe.counts.marker).toBe(0)
+    expect(await redis.json.get(f.key)).toEqual(f.row)
+  })
+  it('keeps known partial progress in original newest-first order without a marker or recapture', async () => {
+    const f = await fixture(), olderId = `${f.id}_older`, olderKey = `agent:${olderId}`
+    const older = { ...f.row, id: olderId, created_at: '2026-10-26T01:00:00.000Z' }
+    await redis.json.set(olderKey, '$', older); await redis.sAdd(f.index, olderId)
+    const probe = await watch(async (phase, options, count) => {
+      if (phase === 'write' && count === 2) {
+        expect(options.keys).toEqual([olderKey])
+        await redis.json.set(olderKey, '$.default_mcp_tool_selections', ['newer-choice'])
+      }
+    })
+    const error = await f.run().catch(error => error)
+    expect(error).toMatchObject({ code: 'dynamic_mcp_reset_changed' })
+    expect(await redis.json.get(f.key)).toEqual({ ...f.row, defaultMCPToolSelections: [], default_mcp_tool_selections: [], updated_at: expect.any(String) })
+    expect(await redis.json.get(olderKey)).toEqual({ ...older, default_mcp_tool_selections: ['newer-choice'] })
+    await expect(f.run()).rejects.toBe(error)
+    expect(probe.counts.write).toBe(2); expect(probe.counts.marker).toBe(0)
+    expect(await probe.client.get(f.marker)).toBeNull()
+  })
+  it('does not overwrite or bless a concurrently changed original marker', async () => {
+    const f = await fixture(), probe = await watch(async phase => { if (phase === 'marker') await redis.execute(client => client.set(f.marker, 'newer-marker')) })
+    const error = await f.run().catch(error => error)
+    expect(error).toMatchObject({ code: 'dynamic_mcp_reset_changed' })
+    expect(await probe.client.get(f.marker)).toBe('newer-marker')
+    await expect(f.run()).rejects.toBe(error)
+    expect(probe.counts.write).toBe(1); expect(probe.counts.marker).toBe(1)
+  })
+  it('keeps the original missing/empty creation-date fallback when ordering known progress', async () => {
+    const f = await fixture(), writes: string[] = []
+    const records = [[`${f.id}_missing`, undefined], [`${f.id}_empty`, ''], [`${f.id}_oldest`, '1960-01-01T00:00:00.000Z']] as const
+    for (const [id, created_at] of records) {
+      await redis.json.set(`agent:${id}`, '$', { ...f.row, id, created_at })
+      await redis.sAdd(f.index, id)
+    }
+    const probe = await watch(async (phase, options) => { if (phase === 'write') writes.push(options.keys[0]) })
+    await f.run()
+    expect(writes[0]).toBe(f.key)
+    expect(new Set(writes.slice(1, 3))).toEqual(new Set([`agent:${f.id}_missing`, `agent:${f.id}_empty`]))
+    expect(writes[3]).toBe(`agent:${f.id}_oldest`)
+    expect(probe.counts.write).toBe(4); expect(probe.counts.marker).toBe(1)
+  })
+  it.each(['lost', 'malformed'] as const)('retains %s actual reset reply as unknown, without a marker or replay', async failure => {
+    const f = await fixture(), probe = await watch(undefined, (phase, answer) => {
+      if (phase !== 'write') return answer
+      if (failure === 'lost') throw new Error('Owned fixture lost issued reset reply')
+      return [answer]
+    })
+    const error = await f.run().catch(error => error)
+    expect(error).toMatchObject({ code: 'dynamic_mcp_reset_unconfirmed', status: 503 })
+    expect((await redis.json.get(f.key) as any).defaultMCPToolSelections).toEqual([])
+    await expect(f.run()).rejects.toBe(error)
+    expect(probe.counts.write).toBe(1); expect(probe.counts.marker).toBe(0)
+    expect(await probe.client.get(f.marker)).toBeNull()
+    await expect(withSettingsRecordReplacement(f.key, async () => 'must not enter')).rejects.toThrow('unknown')
+  })
+  it.each(['lost', 'malformed'] as const)('never certifies a %s marker reply from its later readable value', async failure => {
+    const f = await fixture(), probe = await watch(undefined, (phase, answer) => {
+      if (phase !== 'marker') return answer
+      if (failure === 'lost') throw new Error('Owned fixture lost issued marker reply')
+      return [answer]
+    })
+    const error = await f.run().catch(error => error)
+    expect(error).toMatchObject({ code: 'dynamic_mcp_reset_unconfirmed', status: 503 })
+    expect(await probe.client.get(f.marker)).toMatch(/^\d{4}-\d\d-\d\dT/)
+    await expect(f.run()).rejects.toBe(error)
+    expect(probe.counts.write).toBe(1); expect(probe.counts.marker).toBe(1)
+    await expect(withSettingsRecordReplacement(f.marker, async () => 'must not enter')).rejects.toThrow('unknown')
   })
 })

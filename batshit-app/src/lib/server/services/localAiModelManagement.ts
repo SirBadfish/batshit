@@ -23,7 +23,7 @@
  * records current official API verification and the native capability gates.
  */
 
-import { createHmac, randomBytes } from 'node:crypto'
+import { localAiConnectionKey as connectionKey } from './localAiConnectionIdentity'
 import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
 import type { LocalAiServerId, LocalAiServerSummary } from '$lib/types/localAi'
 import { listLocalAiServers, resolveLocalAiRuntimeBaseUrl, saveKoboldManagedProfileReference } from './localAiServers'
@@ -147,15 +147,6 @@ type Ctx = {
   apiKey: string | null
 }
 
-// Browser freshness evidence must not offer an offline verifier for a saved
-// credential. This server-process secret is never persisted or sent. A restart
-// invalidates every prior model list and requires a fresh read before actions.
-const connectionIdentitySecret = randomBytes(32)
-
-function connectionKey(userId: string, programId: string, ctx: Ctx): string {
-  return createHmac('sha256', connectionIdentitySecret)
-    .update(JSON.stringify([userId, programId, ctx.baseUrl, ctx.apiKey])).digest('hex')
-}
 
 async function request(
   ctx: Ctx,
@@ -310,6 +301,25 @@ async function readLmStudio(ctx: Ctx, label: string): Promise<LocalAiManagementS
     reason: `${label}'s native v1 model list is unavailable. Model controls require a compatible native API (LM Studio 0.4 or newer).` }
   const models: any[] = Array.isArray(listed.json?.models) ? listed.json.models : []
 
+  // LM Link can repeat a model key in its combined local/linked inventory.
+  // Load still takes that native key; Unload takes an exact instance id.
+  // Merge the listings before deciding residency, so an empty duplicate never
+  // hides a loaded copy and distinct instances remain individually actionable.
+  const grouped = new Map<string, { model: any; instances: Map<string, any> }>()
+  for (const model of models) {
+    const key = typeof model?.key === 'string' ? model.key : ''
+    if (!key) continue
+    let group = grouped.get(key)
+    if (!group) {
+      group = { model, instances: new Map() }
+      grouped.set(key, group)
+    }
+    for (const instance of Array.isArray(model?.loaded_instances) ? model.loaded_instances : []) {
+      const id = String(instance?.id ?? instance?.instance_id ?? '')
+      if (id && !group.instances.has(id)) group.instances.set(id, instance)
+    }
+  }
+
   return {
     programId: 'lmstudio',
     label,
@@ -320,18 +330,17 @@ async function readLmStudio(ctx: Ctx, label: string): Promise<LocalAiManagementS
     // Native download exists in newer versions, but this manager owns load/unload only.
     canDownload: false,
     restartsOnSwitch: false,
-    models: models.flatMap((model) => {
-      const instances: any[] = Array.isArray(model?.loaded_instances) ? model.loaded_instances : []
+    models: [...grouped].flatMap<ManagedLocalModel>(([key, { model, instances }]) => {
       const row = {
         label: String(model?.display_name ?? model?.key ?? 'Unknown'),
         sizeBytes: typeof model?.size_bytes === 'number' ? model.size_bytes : null,
         format: typeof model?.format === 'string' ? model.format : null
       }
-      return instances.length ? instances.map((instance) => ({
-        ...row, id: String(instance.id ?? instance.instance_id ?? ''), loaded: true,
-        label: instances.length > 1 ? `${row.label} (${instance.id ?? instance.instance_id})` : row.label,
+      return instances.size ? [...instances].map(([id, instance]) => ({
+        ...row, id, loaded: true,
+        label: instances.size > 1 ? `${row.label} (${id})` : row.label,
         contextLength: instance.config?.context_length ?? null
-      })).filter((entry) => entry.id) : [{ ...row, id: String(model?.key ?? ''), loaded: false, contextLength: null }]
+      })) : [{ ...row, id: key, loaded: false, contextLength: null }]
     })
   }
 }

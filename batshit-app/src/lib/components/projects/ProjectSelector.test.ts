@@ -11,15 +11,17 @@ const mocks = vi.hoisted(() => ({
       root_path: '/Users/example/batshit'
     }
   ] as Array<{ id: string; name: string; root_path: string }>,
-  loadProjects: vi.fn()
+  loadProjects: vi.fn(),
+  setCurrentProject: vi.fn()
 }))
 
 vi.mock('$lib/stores/projects.svelte', () => ({
   getProjects: () => mocks.projects,
+  getSelectableProjects: () => mocks.projects,
   getCurrentProject: () => mocks.projects[0] ?? null,
   getCurrentProjectId: () => mocks.projects[0]?.id ?? null,
   setProjects: vi.fn(),
-  setCurrentProject: vi.fn()
+  setCurrentProject: mocks.setCurrentProject
 }))
 
 vi.mock('$lib/services/projects', () => ({
@@ -46,6 +48,16 @@ describe('ProjectSelector accessibility labels', () => {
     ]
     mocks.loadProjects.mockReset()
     mocks.loadProjects.mockImplementation(async () => mocks.projects)
+    mocks.setCurrentProject.mockReset()
+  })
+
+  // BL-2372: opening the sidebar must not choose the agent's project; the selection owner
+  // (`watchAgentProjectSelection`, mounted by ProjectsSidebar) does, open or closed.
+  it('mounting the selector loads the list but does not select a project', async () => {
+    render(ProjectSelector as any, { props: { data: { user: { id: 'josh' } } } })
+    await waitFor(() => expect(mocks.loadProjects).toHaveBeenCalledTimes(1))
+    await Promise.resolve()
+    expect(mocks.setCurrentProject).not.toHaveBeenCalled()
   })
 
   it('labels the trigger with the current project name', () => {

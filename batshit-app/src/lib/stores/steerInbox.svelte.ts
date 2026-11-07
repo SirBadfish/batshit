@@ -24,17 +24,23 @@ import {
   type SteerLane,
   type SteerSource
 } from '$lib/utils/steerControl'
-import { HELD_CARD_EXPIRED_SENTENCE, WAITS_FOR_APPROVAL_SENTENCE } from '$lib/utils/heldForApproval'
+import { WAITS_FOR_APPROVAL_SENTENCE } from '$lib/utils/heldForApproval'
+import {
+  droppedSendSentence,
+  toDroppedSendReason,
+  type DroppedSendReason
+} from '$lib/utils/keptSendReceipt'
 import { isConcreteClipId, replaceClipReferences } from '$lib/utils/zipReferenceSafety'
 
 /**
  * Where a steer is, from the browser's side.
  *
  * - `queued` — the server has it and the turn has not handed it to the model yet. On a
- *   managed CLI lane this is the NORMAL state for several seconds (Codex reads a steer at
- *   its next model call, Claude at its next tool boundary), so it is not a failure. A send
- *   waiting in the chat's line (BL-4; since BL-713 every busy send the steer route does not
- *   take: a Clip, an `@file`, a group chat, a lane that cannot take a steer) is `queued` too.
+ *   managed CLI lane this is the NORMAL state for several seconds (Claude reads a steer at
+ *   its next tool boundary; the removed Codex CLI read one at its next model call), so it is not
+ *   a failure. A send waiting in the chat's line (BL-4; since BL-713 every busy send the steer
+ *   route does not take: a Clip, an `@file`, a group chat, a lane that cannot take a steer) is
+ *   `queued` too.
  * - `delivered` — the model read it mid-reply. It now belongs inside the assistant record.
  * - `promoted` — the reply ended before it could land, so the server sent it as the user's
  *   next message (DL-114-07).
@@ -46,13 +52,13 @@ export type SteerBubbleState = 'queued' | 'delivered' | 'promoted' | 'dropped'
 /**
  * Why a steer was dropped (F-P3-4). `stopped` is the user's own Stop; `unanswered` is the
  * backstop — the chat went quiet with the steer still waiting, so the server never wrote
- * the promotion — and a send the server kept for another reason of its own (Batshit
- * stopping). Only the first may say "you stopped the reply". BL-713: a send the chat's line
+ * the promotion. Only the first may say "you stopped the reply". BL-713: a send the chat's line
  * kept at an approval card says why, in BL-455's words: `approval_wait` (nobody answered the
  * card in fifteen minutes) and `approval_expired` (the only answer was the page's own Deny of
- * the expired card).
+ * the expired card). BL-903 (c): a send the server kept for a reason of its own (Batshit
+ * stopping or a restore, the line's cap, a deleted agent) is `not_sent`, the plain "Not sent".
  */
-export type SteerDropReason = 'stopped' | 'unanswered' | 'approval_wait' | 'approval_expired'
+export type SteerDropReason = DroppedSendReason
 
 export interface SteerBubbleEntry {
   steerId: string
@@ -117,6 +123,21 @@ let steerBySteerId = $state<Record<string, SteerBubbleEntry>>({})
  * reused.
  */
 let clearedSteerIds = new Set<string>()
+
+/**
+ * BL-903 (a): receipts the user retired in this tab (Send now or Dismiss on the bubble,
+ * `clearDroppedSteer(id, { byUser: true })`). The chat also draws a kept send's receipt from its
+ * record (`keptSendReceipt.ts`); a receipt the user dismissed here must not come straight back
+ * from the record. Nothing else retires one: leaving the chat, the next send, or a tab that
+ * cannot send the bubble's words clearing it leaves the record's receipt to show.
+ */
+let retiredReceiptIds = $state<Record<string, true>>({})
+
+/** The user retired this bubble's receipt in this tab (Send now or Dismiss). */
+export function wasReceiptRetired(steerId?: string | null): boolean {
+  const id = normalize(steerId)
+  return id ? retiredReceiptIds[id] === true : false
+}
 
 function normalize(value?: string | null) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
@@ -287,10 +308,7 @@ export function applyQueuedSendHold(event: { sessionId?: string | null; heldForA
  * unanswered, at its end.
  */
 export function applySteerDropped(event: { steerIds?: string[]; reason?: string }) {
-  const reason: SteerDropReason =
-    event.reason === 'stopped' || event.reason === 'approval_wait' || event.reason === 'approval_expired'
-      ? event.reason
-      : 'unanswered'
+  const reason: SteerDropReason = toDroppedSendReason(event.reason)
   for (const id of Array.isArray(event.steerIds) ? event.steerIds : []) {
     markSteerDropped(id, reason)
   }
@@ -343,14 +361,8 @@ export function markSteerDropped(steerId: string, reason: SteerDropReason = 'sto
 export function steerBubbleStatusLabel(entry: SteerBubbleEntry): string {
   switch (entry.state) {
     case 'dropped':
-      if (entry.dropReason === 'unanswered') {
-        return 'Not sent — the reply ended before it could land. Send it again.'
-      }
-      if (entry.dropReason === 'approval_wait') {
-        return 'Not sent — the approval card is still waiting for your answer. Send it when you are ready.'
-      }
-      if (entry.dropReason === 'approval_expired') return HELD_CARD_EXPIRED_SENTENCE
-      return 'Not sent — you stopped the reply'
+      // BL-903 (a): one table for this receipt and the one drawn from a kept message's record.
+      return droppedSendSentence(entry.dropReason ?? 'stopped')
     default:
       // BL-713: the chat's line holds it for the user's answer to an approval card.
       if (entry.queuedSend && entry.heldForApprovalCard) return WAITS_FOR_APPROVAL_SENTENCE
@@ -445,7 +457,7 @@ export function forgetSteer(steerId: string) {
  * a `queued` promise about a reply that is over (AMD-118-08). Only a `dropped` bubble is
  * touched: a bubble that moved on between the draw and the click is not this button's.
  */
-export function clearDroppedSteer(steerId: string) {
+export function clearDroppedSteer(steerId: string, options: { byUser?: boolean } = {}) {
   const id = normalize(steerId)
   if (!id) return
   const existing = steerBySteerId[id]
@@ -454,6 +466,7 @@ export function clearDroppedSteer(steerId: string) {
   delete next[id]
   clearedSteerIds.add(id)
   steerBySteerId = next
+  if (options.byUser) retiredReceiptIds = { ...retiredReceiptIds, [id]: true }
 }
 
 /**
@@ -493,4 +506,5 @@ export function clearSteerInboxForTest() {
   if (typeof process !== 'undefined' && process.env.VITEST !== 'true') return
   steerBySteerId = {}
   clearedSteerIds = new Set()
+  retiredReceiptIds = {}
 }

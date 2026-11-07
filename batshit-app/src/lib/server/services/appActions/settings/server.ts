@@ -17,7 +17,7 @@ export const inspectSettings = createSettingsInspector({
   async readAgent(subjectAgentId, userId) {
     const value = await redis.json.get(`agent:${subjectAgentId}`)
     if (!value || value.id !== subjectAgentId || value.user_id !== userId) refuseSettings('agent_not_owned')
-    if (value.agentType !== 'api' && value.agentType !== 'cli') refuseSettings('unsupported_primary_agent')
+    if (value.agentType !== 'api') refuseSettings('unsupported_primary_agent')
     if (typeof value.displayName !== 'string') refuseSettings('display_name_unavailable')
     return { displayName: value.displayName, agentType: value.agentType }
   },

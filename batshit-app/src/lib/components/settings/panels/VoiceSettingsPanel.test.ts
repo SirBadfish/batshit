@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import VoiceSettingsPanel from './VoiceSettingsPanel.svelte'
 import { FISH_STT_CAPABILITIES } from '$lib/data/voiceCapabilityRegistry'
 import { dispatchVoiceEnginesUpdated } from '$lib/utils/voiceEngineEvents'
+import { BUNDLED_VOICE_PROVIDER_SUMMARIES } from '$lib/data/builtinVoiceProviderBaseline'
 
 const originalCreateObjectURL = URL.createObjectURL
 const originalRevokeObjectURL = URL.revokeObjectURL
@@ -277,6 +278,369 @@ describe('VoiceSettingsPanel external engine refresh', () => {
         value: originalRevokeObjectURL
       })
     }
+  })
+
+  function installEngineDraftFixture(userId: string) {
+    let stored = { ...byoEngine, localRuntime: { canStopOnShutdown: true, shutdownStopPolicy: 'per-engine',
+      startup: { autoStartOnLaunch: false, stopOnShutdown: false } } }
+    const puts: Array<Record<string, any>> = []
+    let hold: Promise<void> | null = null
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+      if (url.includes('/api/user/settings')) return jsonResponse({ settings: { voice_settings: baseVoiceSettings } })
+      if (url.includes('/api/voice/byo/engines')) {
+        if (init?.method === 'PUT') {
+          const body = JSON.parse(String(init.body))
+          puts.push(body)
+          stored = { ...stored, ...body.engines[0] }
+          const reply = structuredClone(stored)
+          const gate = hold
+          hold = null
+          if (gate) await gate
+          return jsonResponse({ engines: [reply] })
+        }
+        return jsonResponse({ engines: [structuredClone(stored)] })
+      }
+      if (url.includes('/api/voice/runtime/livekit')) return jsonResponse({ runtime: null })
+      if (url.includes('/api/voice/providers')) return jsonResponse({ providers: [browserProvider, byoProvider] })
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [] })
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+    // @ts-expect-error test override
+    global.fetch = fetchMock
+    const panel = render(VoiceSettingsPanel, { props: { data: { user: { id: userId }, userSettings: { voice_settings: baseVoiceSettings } } } })
+    return { panel, puts, setHold: (value: Promise<void>) => { hold = value }, stored: () => stored }
+  }
+
+  async function openInstalledControls() {
+    await openVoiceTab('Voice Engines')
+    const installed = await openVoiceEngineSection('Installed Engine Controls')
+    await fireEvent.click(await installed.findByRole('button', { name: /Chatterbox Turbo/i }))
+    return installed
+  }
+
+  it('shows model-specific transport badges in the actual TTS dropdown without saving on load', async () => {
+    vi.useFakeTimers()
+    let saved = { ...baseVoiceSettings, tts: { providerId: 'inworld', modelId: 'inworld-tts-2', voiceId: 'Zoe', profileId: '' } }
+    const writes: unknown[] = []
+    const inworld = BUNDLED_VOICE_PROVIDER_SUMMARIES.find(provider => provider.id === 'inworld')!
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+      if (url.includes('/api/user/settings')) { if (init?.method === 'POST') writes.push(JSON.parse(String(init.body))); return jsonResponse({ settings: { voice_settings: saved } }) }
+      if (url.includes('/api/voice/providers')) return jsonResponse({ providers: [browserProvider, { ...inworld, ready: true, ttsModels: ['inworld-tts-2', 'inworld-tts-2-flash'] }] })
+      if (url.includes('/api/voice/byo/engines')) return jsonResponse({ engines: [] })
+      if (url.includes('/api/voice/runtime/livekit')) return jsonResponse({ runtime: null })
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [{ id: 'flash-profile', user_id: 'inworld-flash-test', name: 'Flash', provider: 'inworld', model: 'inworld-tts-2-flash', voiceId: 'Zoe', created_at: '2026-10-28T00:00:00.000Z', updated_at: '2026-10-28T00:00:00.000Z' }] })
+      if (url.includes('/api/voice/voices')) return jsonResponse({ voices: [{ id: 'Zoe', name: 'Zoe' }] })
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+    const panel = render(VoiceSettingsPanel, { props: { data: { user: { id: 'inworld-test' }, userSettings: { voice_settings: saved } } } })
+    const label = await screen.findByText('Model', { selector: 'label' })
+    const row = label.closest('.batshit-settings-form-row')!
+    const trigger = row.querySelector('button[aria-haspopup="listbox"]')!
+    expect(trigger).toHaveTextContent('inworld-tts-2')
+    expect(trigger).toHaveTextContent('Realtime TTS')
+    await fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+    expect(await screen.findByRole('option', { name: /inworld-tts-2-flash.*Batch TTS/ })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: /^inworld-tts-2\s+Realtime TTS/ })).toBeInTheDocument()
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(writes).toEqual([])
+    expect(saved.tts).toEqual({ providerId: 'inworld', modelId: 'inworld-tts-2', voiceId: 'Zoe', profileId: '' })
+    panel.unmount()
+    saved = { ...saved, tts: { ...saved.tts, modelId: '', profileId: 'flash-profile' } }
+    const flashPanel = render(VoiceSettingsPanel, { props: { data: { user: { id: 'inworld-flash-test' }, userSettings: { voice_settings: saved } } } })
+    await screen.findByText('Flash supports batch synthesis; Direct streaming is not available yet. Delivery mode and spoken steering instructions do not apply. Saved settings remain available for other models; non-verbal tags still work.')
+    const flashLabel = await screen.findByText('Model', { selector: 'label' })
+    const flashTrigger = flashLabel.closest('.batshit-settings-form-row')!.querySelector('button[aria-haspopup="listbox"]')!
+    expect(flashTrigger).toHaveTextContent('inworld-tts-2-flash')
+    expect(flashTrigger).toHaveTextContent('Batch TTS')
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(writes).toEqual([])
+    expect(saved.tts).toEqual({ providerId: 'inworld', modelId: '', voiceId: 'Zoe', profileId: 'flash-profile' })
+    flashPanel.unmount()
+  })
+
+  it('shows MiMo design applicability from a saved profile while preserving its preset field and hydration', async () => {
+    vi.useFakeTimers()
+    const saved = { ...baseVoiceSettings, tts: { providerId: 'mimo', profileId: 'mimo-configured-design', voiceId: 'Chloe' } }, writes: unknown[] = []
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+      if (url.includes('/api/user/settings')) { if (init?.method === 'POST') writes.push(JSON.parse(String(init.body))); return jsonResponse({ settings: { voice_settings: saved } }) }
+      if (url.includes('/api/voice/providers')) return jsonResponse({ providers: [browserProvider, { ...BUNDLED_VOICE_PROVIDER_SUMMARIES.find(provider => provider.id === 'mimo'), ready: true }] })
+      if (url.includes('/api/voice/byo/engines')) return jsonResponse({ engines: [] })
+      if (url.includes('/api/voice/runtime/livekit')) return jsonResponse({ runtime: null })
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [{ id: 'mimo-configured-design', user_id: 'mimo-applicability', name: 'Configured design', provider: 'mimo', voiceId: 'Chloe',
+        model: 'mimo-v2.5-tts-voicedesign', created_at: '2026-10-28T00:00:00.000Z', updated_at: '2026-10-28T00:00:00.000Z' }] })
+      if (url.includes('/api/voice/voices')) return jsonResponse({ voices: [{ id: 'Chloe', name: 'Chloe' }] })
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+    const panel = render(VoiceSettingsPanel, { props: { data: { user: { id: 'mimo-applicability' }, userSettings: { voice_settings: saved } } } })
+    await screen.findByText('Voice Design requires a voice description in Voice Engines → Instructions. The saved Voice value is kept and is not sent.')
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(writes).toEqual([])
+    expect(saved.tts).toEqual({ providerId: 'mimo', profileId: 'mimo-configured-design', voiceId: 'Chloe' })
+    panel.unmount()
+  })
+
+  it('uses a selected Qwen profile model and region for the visible voice choices', async () => {
+    vi.useFakeTimers()
+    const endpoint = 'https://workspace-123.ap-southeast-1.maas.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer'
+    const saved = { ...baseVoiceSettings, tts: { providerId: 'alibaba', profileId: 'qwen-profile', voiceId: 'longanhuan_v3.1' }, ttsEngineSettings: { alibaba: { common: { endpoint } } } }, writes: unknown[] = []
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+      if (url.includes('/api/user/settings')) { if (init?.method === 'POST') writes.push(JSON.parse(String(init.body))); return jsonResponse({ settings: { voice_settings: saved } }) }
+      if (url.includes('/api/voice/providers')) return jsonResponse({ providers: [browserProvider, { ...BUNDLED_VOICE_PROVIDER_SUMMARIES.find(provider => provider.id === 'alibaba'), ready: true }] })
+      if (url.includes('/api/voice/byo/engines')) return jsonResponse({ engines: [] })
+      if (url.includes('/api/voice/runtime/livekit')) return jsonResponse({ runtime: null })
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [{ id: 'qwen-profile', user_id: 'qwen-test', name: 'Qwen', provider: 'alibaba', voiceId: 'longanhuan_v3.1', model: 'qwen-audio-3.1-tts-flash', created_at: '2026-10-28T00:00:00.000Z', updated_at: '2026-10-28T00:00:00.000Z' }] })
+      if (url.includes('/api/voice/voices')) return jsonResponse({ voices: [{ id: 'Cherry', name: 'Cherry', provider: 'alibaba' }] })
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+    const panel = render(VoiceSettingsPanel, { props: { data: { user: { id: 'qwen-test' }, userSettings: { voice_settings: saved } } } })
+    await screen.findByText('Qwen Audio requires the workspace endpoint for your key’s region and a voice supported by the chosen model. Language hints vary by model and voice.')
+    const label = screen.getByText('Voice', { selector: 'label' })
+    const row = label.closest('.batshit-settings-form-row')!
+    const trigger = row.querySelector('button')!
+    await fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+    expect(await screen.findByRole('option', { name: 'longanhuan_v3.1', exact: true })).toBeTruthy()
+    expect(screen.queryByRole('option', { name: 'Cherry', exact: true })).toBeNull()
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(writes).toEqual([])
+    panel.unmount()
+  })
+
+  it('refreshes catalog metadata on focus without replacing a pending custom model or saving hydration', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+    let phase: 'initial' | 'updated' | 'malformed' = 'initial', providerReads = 0
+    let saved = { ...baseVoiceSettings, tts: { providerId: 'openai', modelId: 'gpt-4o-mini-tts', voiceId: 'alloy' } }
+    const writes: any[] = []
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+      if (url.includes('/api/user/settings')) {
+        if (init?.method === 'POST') { const body = JSON.parse(String(init.body)); writes.push(body); saved = { ...saved, ...body.voice_settings } }
+        return jsonResponse({ settings: { voice_settings: saved } })
+      }
+      if (url.includes('/api/voice/providers')) {
+        providerReads += 1
+        if (phase === 'malformed') return jsonResponse({ providers: {} })
+        const modelCatalog = { source: 'remote', sourceStatus: 'verified', lastVerifiedAt: new Date().toISOString(), lastAttemptAt: new Date().toISOString(), stale: false,
+          discoveryCoverage: 'complete', qualificationCoverage: 'pending', unavailableCount: phase === 'updated' ? 2 : 0 }
+        return jsonResponse({ providers: [browserProvider, { ...openaiProvider, modelCatalog }] })
+      }
+      if (url.includes('/api/voice/byo/engines')) return jsonResponse({ engines: [] })
+      if (url.includes('/api/voice/runtime/livekit')) return jsonResponse({ runtime: null })
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [] })
+      if (url.includes('/api/voice/voices')) return jsonResponse({ voices: [] })
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+    global.fetch = fetchMock
+    const panel = render(VoiceSettingsPanel, { props: { data: { user: { id: 'catalog-focus' }, userSettings: { voice_settings: saved } } } })
+    await screen.findByText('Text-to-Speech (TTS)')
+    await waitFor(() => expect(providerReads).toBe(1))
+    expect(writes).toEqual([])
+    const ttsSection = screen.getByText('Text-to-Speech (TTS)').closest('details') as HTMLElement
+    const modelRow = within(ttsSection).getByText('Model', { selector: 'label' }).closest('.batshit-settings-form-row') as HTMLElement
+    await fireEvent.click(within(modelRow).getByRole('button', { name: 'Enter manually' }))
+    const input = await screen.findByPlaceholderText('gpt-4o-mini-tts') as HTMLInputElement
+    await fireEvent.input(input, { target: { value: 'custom-unsent-model' } })
+    phase = 'updated'
+    await fireEvent(window, new Event('focus'))
+    await screen.findByText('2 model updates await compatibility checks.')
+    expect(input.value).toBe('custom-unsent-model')
+    expect(writes).toEqual([])
+    await vi.advanceTimersByTimeAsync(700)
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0].voice_settings.tts.modelId).toBe('custom-unsent-model')
+    phase = 'malformed'
+    await fireEvent(window, new Event('focus'))
+    await screen.findByText('The voice provider list could not be read. Previous choices are kept.')
+    expect(input.value).toBe('custom-unsent-model')
+    await vi.advanceTimersByTimeAsync(700)
+    expect(writes).toHaveLength(1)
+    panel.unmount()
+    const reads = providerReads
+    await fireEvent(window, new Event('focus'))
+    expect(providerReads).toBe(reads)
+  })
+
+  it('does not offer cloud-ready fallback after an unreadable first provider response or save the preserved custom ID', async () => {
+    vi.useFakeTimers()
+    const writes: unknown[] = [], saved = { ...baseVoiceSettings, tts: { providerId: 'openai', modelId: 'saved-custom-model', voiceId: 'alloy' } }
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+      if (url.includes('/api/user/settings')) { if (init?.method === 'POST') writes.push(JSON.parse(String(init.body))); return jsonResponse({ settings: { voice_settings: saved } }) }
+      if (url.includes('/api/voice/providers')) return jsonResponse({ providers: {} })
+      if (url.includes('/api/voice/byo/engines')) return jsonResponse({ engines: [] })
+      if (url.includes('/api/voice/runtime/livekit')) return jsonResponse({ runtime: null })
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [] })
+      if (url.includes('/api/voice/voices')) return jsonResponse({ voices: [] })
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+    const panel = render(VoiceSettingsPanel, { props: { data: { user: { id: 'catalog-first-unreadable' }, userSettings: { voice_settings: saved } } } })
+    await screen.findByText('The voice provider list could not be read. Previous choices are kept.')
+    const section = screen.getByText('Text-to-Speech (TTS)').closest('details') as HTMLElement
+    const modelRow = within(section).getByText('Model', { selector: 'label' }).closest('.batshit-settings-form-row') as HTMLElement
+    const model = within(modelRow).getByPlaceholderText('gpt-4o-mini-tts') as HTMLInputElement
+    expect(model.value).toBe('saved-custom-model')
+    expect(within(modelRow).queryByRole('button', { name: /saved-custom-model/ })).toBeNull()
+    expect(within(section).getByText('Voice model compatibility could not be read. Saved choices are kept.')).toBeTruthy()
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(writes).toEqual([])
+    panel.unmount()
+  })
+
+  it('keeps a deliberate choice available when catalog narrowing leaves one different healthy model', async () => {
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+    let narrowed = false, saved = { ...baseVoiceSettings, tts: { providerId: 'openai', modelId: 'gpt-4o-mini-tts', voiceId: 'alloy' } }
+    const writes: any[] = []
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+      if (url.includes('/api/user/settings')) { if (init?.method === 'POST') { const body = JSON.parse(String(init.body)); writes.push(body); saved = { ...saved, ...body.voice_settings } }; return jsonResponse({ settings: { voice_settings: saved } }) }
+      if (url.includes('/api/voice/providers')) return jsonResponse({ providers: [browserProvider, { ...openaiProvider, ttsModels: narrowed ? ['tts-1'] : openaiProvider.ttsModels,
+        modelCatalog: { source: 'retained', sourceStatus: 'verified', lastVerifiedAt: new Date().toISOString(), lastAttemptAt: new Date().toISOString(), stale: false,
+          discoveryCoverage: 'complete', qualificationCoverage: narrowed ? 'blocked' : 'pending', unavailableCount: narrowed ? 1 : 0 } }] })
+      if (url.includes('/api/voice/byo/engines')) return jsonResponse({ engines: [] })
+      if (url.includes('/api/voice/runtime/livekit')) return jsonResponse({ runtime: null })
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [] })
+      if (url.includes('/api/voice/voices')) return jsonResponse({ voices: [] })
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+    const panel = render(VoiceSettingsPanel, { props: { data: { user: { id: 'catalog-one-healthy' }, userSettings: { voice_settings: saved } } } })
+    await screen.findByText('Text-to-Speech (TTS)')
+    const section = screen.getByText('Text-to-Speech (TTS)').closest('details') as HTMLElement
+    const modelRow = within(section).getByText('Model', { selector: 'label' }).closest('.batshit-settings-form-row') as HTMLElement
+    await waitFor(() => expect(within(modelRow).getByRole('button', { name: /gpt-4o-mini-tts/ }).textContent).toContain('gpt-4o-mini-tts'))
+    narrowed = true
+    await fireEvent(window, new Event('focus'))
+    await screen.findByText('1 model update awaits compatibility checks.')
+    const trigger = within(modelRow).getByRole('button', { name: /gpt-4o-mini-tts/ })
+    expect(trigger.textContent).toContain('gpt-4o-mini-tts')
+    expect(trigger).not.toHaveAttribute('disabled')
+    expect(writes).toEqual([])
+    await fireEvent.click(within(modelRow).getByRole('button', { name: 'Enter manually' }))
+    const manual = within(modelRow).getByPlaceholderText('gpt-4o-mini-tts')
+    await fireEvent.input(manual, { target: { value: 'tts-1' } })
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0].voice_settings.tts.modelId).toBe('tts-1')
+    panel.unmount()
+  })
+
+  it('BL-978(k): a held Engine Manager acknowledgement preserves a later startup draft', async () => {
+    const fixture = installEngineDraftFixture('voice978-engine-ack')
+    const installed = await openInstalledControls()
+    const enabled = within((await installed.findByText('Enabled')).closest('.batshit-settings-pill') as HTMLElement).getByRole('switch')
+    const startup = within((await installed.findByText('Start with Batshit')).closest('.batshit-settings-pill') as HTMLElement).getByRole('switch')
+    let release = () => {}
+    fixture.setHold(new Promise<void>(resolve => { release = resolve }))
+    try {
+      await fireEvent.click(enabled)
+      await waitFor(() => expect(fixture.puts).toHaveLength(1))
+      await fireEvent.click(startup)
+      release()
+      await waitFor(() => expect(startup).toHaveAttribute('aria-checked', 'true'))
+      await waitFor(() => expect(fixture.puts).toHaveLength(2))
+    } finally { release() }
+    await new Promise(resolve => setTimeout(resolve, 700))
+    expect(fixture.puts).toHaveLength(2)
+    expect(fixture.stored().localRuntime.startup).toEqual({ autoStartOnLaunch: true, stopOnShutdown: false })
+    expect(fixture.puts.every(body => !('ttsDefaults' in body.engines[0]) && !('sttDefaults' in body.engines[0]))).toBe(true)
+  })
+
+  it('BL-978(k): unmount revokes the queued Engine Manager timer', async () => {
+    const fixture = installEngineDraftFixture('voice978-engine-unmount')
+    const installed = await openInstalledControls()
+    const enabled = within((await installed.findByText('Enabled')).closest('.batshit-settings-pill') as HTMLElement).getByRole('switch')
+    await fireEvent.click(enabled)
+    fixture.panel.unmount()
+    await new Promise(resolve => setTimeout(resolve, 800))
+    expect(fixture.puts).toEqual([])
+    expect(fixture.stored().enabled).toBe(true)
+  })
+
+  it('BL-978(k): a malformed Engine Manager reply is an error, never a confirmed empty list or save', async () => {
+    const writes: string[] = []
+    let readable = false
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+      if (init?.method === 'POST' || init?.method === 'PUT') writes.push(url)
+      if (url.includes('/api/user/settings')) return jsonResponse({ settings: { voice_settings: baseVoiceSettings } })
+      if (url.includes('/api/voice/byo/engines')) return jsonResponse(readable ? { engines: [] } : {})
+      if (url.includes('/api/voice/runtime/livekit')) return jsonResponse({ runtime: null })
+      if (url.includes('/api/voice/providers')) return jsonResponse({ providers: [browserProvider] })
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [] })
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+    // @ts-expect-error test override
+    global.fetch = fetchMock
+    render(VoiceSettingsPanel, { props: { data: { user: { id: 'voice978-malformed-engines' }, userSettings: null } } })
+    await openVoiceTab('Voice Engines')
+    const installed = await openVoiceEngineSection('Installed Engine Controls')
+    const notice = await installed.findByTestId('voice-engines-load-error')
+    expect(installed.getByRole('button', { name: 'Connect Existing' })).toBeDisabled()
+    expect(installed.queryByText('No BYO engines registered yet.')).toBeNull()
+    readable = true
+    await fireEvent.click(within(notice).getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(installed.queryByTestId('voice-engines-load-error')).toBeNull())
+    expect(installed.getByRole('button', { name: 'Connect Existing' })).not.toBeDisabled()
+    expect(installed.getByText('No BYO engines registered yet.')).toBeTruthy()
+    await new Promise(resolve => setTimeout(resolve, 700))
+    expect(writes).toEqual([])
+  })
+
+  it('BL-978(e): an older Engine Manager window omits registry defaults on an unrelated edit', async () => {
+    const oldEngine = {
+      ...byoEngine,
+      iconRef: { kind: 'brand', slug: 'openai-mono' },
+      ttsDefaults: { modelId: 'old-tts-model', voiceId: 'old-voice' },
+      sttDefaults: { modelId: 'old-stt-model', language: 'en' },
+      localRuntime: {
+        canStopOnShutdown: true, shutdownStopPolicy: 'per-engine',
+        startup: { autoStartOnLaunch: false, stopOnShutdown: false }
+      }
+    }
+    let storedEngine = structuredClone(oldEngine)
+    const puts: Array<Record<string, any>> = []
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+      if (url.includes('/api/user/settings')) return jsonResponse({ settings: { voice_settings: baseVoiceSettings } })
+      if (url.includes('/api/voice/byo/engines')) {
+        if (init?.method === 'PUT') {
+          const body = JSON.parse(String(init.body))
+          puts.push(body)
+          storedEngine = { ...storedEngine, ...body.engines[0] }
+        }
+        return jsonResponse({ engines: [structuredClone(storedEngine)] })
+      }
+      if (url.includes('/api/voice/runtime/livekit')) return jsonResponse({ runtime: null })
+      if (url.includes('/api/voice/providers')) return jsonResponse({ providers: [browserProvider, byoProvider] })
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [] })
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+    // @ts-expect-error test override
+    global.fetch = fetchMock
+    render(VoiceSettingsPanel, { props: { data: { user: { id: 'josh' }, userSettings: { voice_settings: baseVoiceSettings } } } })
+    await openVoiceTab('Voice Engines')
+    const installedSection = await openVoiceEngineSection('Installed Engine Controls')
+    await fireEvent.click(await installedSection.findByRole('button', { name: /Chatterbox Turbo/i }))
+    const enabledRow = (await installedSection.findByText('Enabled')).closest('.batshit-settings-pill') as HTMLElement
+    await new Promise(resolve => setTimeout(resolve, 700))
+    expect(puts).toEqual([])
+
+    // A separate writer changes registry defaults after this panel read the old summary.
+    const currentTts = { modelId: 'current-tts-model', voiceId: 'current-voice' }
+    const currentStt = { modelId: 'current-stt-model', language: 'fr' }
+    storedEngine = { ...storedEngine, ttsDefaults: currentTts, sttDefaults: currentStt }
+    await fireEvent.click(within(enabledRow).getByRole('switch'))
+    await waitFor(() => expect(puts).toHaveLength(1))
+    expect(puts[0]).toEqual({ engines: [{
+      id: oldEngine.id, enabled: false, iconRef: oldEngine.iconRef,
+      localRuntime: { startup: { autoStartOnLaunch: false, stopOnShutdown: false } }
+    }] })
+    expect(storedEngine.ttsDefaults).toEqual(currentTts)
+    expect(storedEngine.sttDefaults).toEqual(currentStt)
+    await new Promise(resolve => setTimeout(resolve, 700))
+    expect(puts).toHaveLength(1)
   })
 
   it('no longer shows the old auto-mute zipped content toggle', async () => {

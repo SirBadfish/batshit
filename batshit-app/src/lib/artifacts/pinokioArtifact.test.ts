@@ -132,6 +132,39 @@ describe('Pinokio app artifact save rules (SA-072 P2, DL-09)', () => {
     expect(readPinokioArtifactBinding({ metadata: { ...comfyMetadata(), source_type: 'built_in' } })).toBeNull()
     expect(readPinokioArtifactBinding({ metadata: { source_type: 'comfyui', pinokio_app_id: 'comfy.git' } })).toBeNull()
   })
+
+  it('admits stable remote metadata without saving transient target authority', () => {
+    const machineId = 'd86fbc94-7364-4bbc-bb21-f21627736492'
+    const metadata = comfyMetadata({ pinokio_machine_id: machineId })
+    const before = JSON.stringify(metadata)
+    expect(published(metadata)).toEqual([])
+    expect(readPinokioArtifactBinding({ metadata })).toMatchObject({ appId: 'comfy.git', machineId })
+    expect(JSON.stringify(metadata)).toBe(before)
+    expect(metadata).not.toHaveProperty('pinokio_machine_revision')
+    for (const transient of [{ pinokio_machine_revision: 3 }, { pinokio_launch_fingerprint: 'old' }, { pinokio_machine_address: '192.168.1.90' }]) {
+      expect(published({ ...metadata, ...transient }).length).toBeGreaterThan(0)
+    }
+  })
+
+  it('preserves omitted local metadata and refuses invalid or preparatory revision pairs', () => {
+    const original = comfyMetadata()
+    const before = JSON.stringify(original)
+    expect(readPinokioArtifactBinding({ metadata: original })).toMatchObject({ appId: 'comfy.git' })
+    expect(JSON.stringify(original)).toBe(before)
+    expect(published(comfyMetadata({ pinokio_machine_id: 'local' }))).toEqual([])
+    expect(readPinokioArtifactBinding({ metadata: comfyMetadata({ pinokio_machine_id: 'd86fbc94-7364-4bbc-bb21-f21627736492' }) })).toMatchObject({ machineId: 'd86fbc94-7364-4bbc-bb21-f21627736492' })
+    for (const binding of [
+      { pinokio_machine_id: 'local', pinokio_machine_revision: 0 },
+      { pinokio_machine_id: null },
+      { pinokio_machine_id: 'missing' },
+      { pinokio_machine_revision: 1 },
+      { pinokio_machine_id: 'local', pinokio_machine_revision: 1 },
+      { pinokio_machine_id: 'd86fbc94-7364-4bbc-bb21-f21627736492', pinokio_machine_revision: 1 }
+    ]) {
+      expect(published(comfyMetadata(binding)).length).toBeGreaterThan(0)
+      expect(readPinokioArtifactBinding({ metadata: comfyMetadata(binding) })).toBeNull()
+    }
+  })
 })
 
 describe('Pinokio App power source, badge, and agent use (SA-072 P2)', () => {

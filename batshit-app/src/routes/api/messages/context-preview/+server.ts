@@ -5,6 +5,7 @@ import {
   resolveContextPreviewMessages
 } from '$lib/server/services/contextTokenPreview'
 import { requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
+import { retiredPrimaryAgentRefusal } from '$lib/utils/primaryAgentType'
 
 export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch }) => {
   const user = requireUser(locals)
@@ -26,6 +27,9 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
     if (!agent || agent.user_id !== user.value.id) {
       return json({ error: 'Agent not found' }, { status: 404 })
     }
+    // SA-139 R4 (D14): a retired Primary type compiles nothing, so it has no preview.
+    const retired = retiredPrimaryAgentRefusal(agent, typeof body?.agentType === 'string' ? body.agentType : undefined)
+    if (retired) return json(retired, { status: 409 })
 
     const messages = await resolveContextPreviewMessages({
       sessionId,
@@ -37,7 +41,6 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
       messages,
       agent,
       userId: user.value.id,
-      agentTypeHint: typeof body?.agentType === 'string' ? body.agentType : undefined,
       trimmedMessageIds: Array.isArray(body?.trimmedMessageIds) ? body.trimmedMessageIds : [],
       eventFetch
     })
@@ -45,7 +48,6 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
     return json({
       tokens: estimate.tokens,
       budget: estimate.budget,
-      wrapperOverheadTokens: estimate.wrapperOverheadTokens,
       trimmedMessageCount: estimate.trimmedMessageCount
     })
   } catch (error) {

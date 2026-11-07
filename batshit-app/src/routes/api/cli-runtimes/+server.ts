@@ -9,14 +9,13 @@ import {
   uninstallManagedCli,
   type ManagedCliRuntimeId
 } from '$lib/server/services/managedCliInstaller'
-import {
-  resolveCodexCliExecutableDetailed,
-  type CliExecutableResolution
-} from '$lib/server/services/codexCliStatus'
+import type { CliExecutableResolution } from '$lib/server/services/cliExecutableResolution'
 import { resolveClaudeCliExecutableDetailed } from '$lib/server/services/claudeCliStatus'
+import { noteClaudeCodeChanged } from '$lib/server/services/claudeCodeChanges'
 import { requireAdmin, requireUser } from '$lib/server/services/routeSecurity'
 import { isCliVersionOlder, probeCliVersion } from '$lib/server/services/cliVersion'
 import { redis } from '$lib/server/redis'
+import { CODEX_CLI_RETIRED_CODE, CODEX_CLI_RETIRED_ERROR } from '$lib/utils/cliRuntimeIdentity'
 
 const MAX_MUTATION_BODY_BYTES = 1024
 const MUTATION_RATE_LIMIT = 6
@@ -90,20 +89,14 @@ type CliRuntimeSummary = {
   }
 }
 
-function resolveRuntimeExecutable(runtime: ManagedCliRuntimeId): CliExecutableResolution {
-  return runtime === 'codex'
-    ? resolveCodexCliExecutableDetailed()
-    : resolveClaudeCliExecutableDetailed()
-}
-
 async function buildRuntimeSummary(runtime: ManagedCliRuntimeId): Promise<CliRuntimeSummary> {
   const [managed, resolution] = await Promise.all([
     getManagedCliInstallStatus(runtime),
-    Promise.resolve(resolveRuntimeExecutable(runtime))
+    Promise.resolve(resolveClaudeCliExecutableDetailed())
   ])
   const found = resolution.source !== 'not-found'
-  // BL-268: a CLI older than the pinned one may refuse newer models on Batshit's list
-  // ("requires a newer version of Codex"), so Agent Settings says so beside the install button.
+  // BL-268: a CLI older than the pinned one may refuse newer models on Batshit's list,
+  // so Agent Settings says so beside the install button.
   const version =
     resolution.source === 'managed' && resolution.managedVersion
       ? resolution.managedVersion
@@ -121,6 +114,9 @@ async function buildRuntimeSummary(runtime: ManagedCliRuntimeId): Promise<CliRun
   }
 }
 
+// SA-139 R4: the runtime summary only. The Primary's CLI reasoning check (`?reasoningRuntime=`)
+// went with the Claude Code CLI Primary; install, reinstall and uninstall stay (the Claude plan
+// connection and Claude Code CLI Subagents run this CLI).
 export const GET: RequestHandler = async ({ locals }) => {
   const user = requireUser(locals)
   if (!user.ok) return user.response
@@ -129,7 +125,8 @@ export const GET: RequestHandler = async ({ locals }) => {
     const entries = await Promise.all(
       MANAGED_CLI_RUNTIME_IDS.map(async (runtime) => [runtime, await buildRuntimeSummary(runtime)] as const)
     )
-    return json({ runtimes: Object.fromEntries(entries), canManage: Boolean(user.value.is_admin) })
+    const runtimes = Object.fromEntries(entries)
+    return json({ runtimes, canManage: Boolean(user.value.is_admin) })
   } catch (error) {
     console.error('[cli-runtimes] Failed to inspect CLI runtimes:', error)
     return json(
@@ -156,8 +153,11 @@ export const POST: RequestHandler = async ({ locals, request }) => {
     return json({ error: 'Invalid JSON body.' }, { status: 400 })
   }
 
+  if (runtime === 'codex') {
+    return json({ error: CODEX_CLI_RETIRED_ERROR, code: CODEX_CLI_RETIRED_CODE }, { status: 409 })
+  }
   if (!isManagedCliRuntimeId(runtime)) {
-    return json({ error: 'Unknown CLI runtime. Expected "codex" or "claude".' }, { status: 400 })
+    return json({ error: 'Unknown CLI runtime. Expected "claude".' }, { status: 400 })
   }
   if (operation !== 'install' && operation !== 'reinstall' && operation !== 'uninstall') {
     return json({ error: 'Unsupported operation. Expected "install", "reinstall", or "uninstall".' }, { status: 400 })
@@ -167,10 +167,15 @@ export const POST: RequestHandler = async ({ locals, request }) => {
     const limited = await enforceMutationRateLimit(admin.value.id)
     if (limited) return limited
 
-    if (operation === 'install' || operation === 'reinstall') {
-      await installManagedCli(runtime, { force: operation === 'reinstall' })
-    } else {
-      await uninstallManagedCli(runtime)
+    try {
+      if (operation === 'install' || operation === 'reinstall') {
+        await installManagedCli(runtime, { force: operation === 'reinstall' })
+      } else {
+        await uninstallManagedCli(runtime)
+      }
+    } finally {
+      // SA-139: the Claude plan's shared status read looks again after any attempt (a failed one may still change files).
+      if (runtime === 'claude') noteClaudeCodeChanged()
     }
 
     const summary = await buildRuntimeSummary(runtime)

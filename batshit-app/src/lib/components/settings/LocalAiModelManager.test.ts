@@ -95,6 +95,28 @@ afterEach(() => {
 })
 
 describe('BL-134 the Local AI model card announces a model switch', () => {
+  it('keeps a native LM Studio instance id distinct from another downloadable model key', async () => {
+    defaultState = {
+      ...STATE, programId: 'lmstudio', label: 'LM Studio', canRestoreStartup: false,
+      models: [
+        { id: 'shared-native-value', label: 'Loaded instance', loaded: true, format: 'gguf' },
+        { id: 'shared-native-value', label: 'Available model', loaded: false, format: 'gguf' }
+      ]
+    }
+    render(LocalAiModelManager, { props: { programId: 'lmstudio' } })
+    await screen.findByText('Loaded instance')
+    await screen.findByText('Available model')
+    await fireEvent.click(await screen.findByTitle('Unload'))
+    await waitFor(() => expect(events).toHaveLength(1))
+    await fireEvent.click(await screen.findByRole('button', { name: 'Load', exact: true }))
+    await waitFor(() => expect(events).toHaveLength(2))
+    expect(posts.map(({ program, action, modelId }) => ({ program, action, modelId }))).toEqual([
+      { program: 'lmstudio', action: 'unload', modelId: 'shared-native-value' },
+      { program: 'lmstudio', action: 'load', modelId: 'shared-native-value' }
+    ])
+    expect(posts.every(({ expectedConnectionKey }) => expectedConnectionKey === STATE.connectionKey)).toBe(true)
+  })
+
   it('sends the model-connection change after a successful Load', async () => {
     render(LocalAiModelManager, { props: { programId: 'koboldcpp' } })
     await fireEvent.click(await screen.findByRole('button', { name: /Load/ }))

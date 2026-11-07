@@ -1,0 +1,52 @@
+{
+  "version": { "pinokiod": "8.2.0", "pinokio": "8.2.0", "script": "8.0.0" },
+  "status": {
+    "app_id": "comfy.git",
+    "title": "ComfyUI",
+    "path": "C:\\Pinokio\\api\\comfy.git",
+    "install_script": "install.js",
+    "start_script": "start.js",
+    "default_target": "C:\\Pinokio\\api\\comfy.git\\start.js",
+    "default_script": "start.js",
+    "running": false,
+    "ready": false,
+    "ready_url": null,
+    "external_ready_urls": [],
+    "state": "offline",
+    "running_scripts": [],
+    "ready_script": null,
+    "probe": null,
+    "last_error": null,
+    "source": { "host": "192.168.1.20", "local": true },
+    "ref": "pinokio://192.168.1.20:42000/api/comfy.git"
+  },
+  "candidates": {
+    "ok": true,
+    "app": {
+      "id": "comfy.git",
+      "title": "ComfyUI",
+      "workspace_path": "C:\\Pinokio\\api\\comfy.git",
+      "launcher_path": "C:\\Pinokio\\api\\comfy.git",
+      "launcher_root": "",
+      "env_path": "C:\\Pinokio\\api\\comfy.git\\ENVIRONMENT",
+      "autolaunch": "start.js",
+      "autolaunch_depends": [],
+      "autolaunch_enabled": false
+    },
+    "dependency_apps": [],
+    "launcher_root": "",
+    "menu": [
+      { "script": "start.js", "label": "Start", "group": "", "icon": "", "source": "menu", "menu_default": true, "has_params": false }
+    ],
+    "other": [],
+    "current": "start.js"
+  },
+  "logs": {
+    "app_id": "comfy.git",
+    "script": "start.js",
+    "line_count": 2,
+    "lines": ["first", "\u001b[32msecond\u001b[0m"],
+    "source": "api",
+    "ref": "pinokio://192.168.1.20:42000/api/comfy.git"
+  }
+}

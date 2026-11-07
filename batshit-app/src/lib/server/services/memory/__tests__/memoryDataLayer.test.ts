@@ -34,6 +34,7 @@ import {
   type CreateMemoryInput
 } from '../memoryStore'
 import { memoryKey } from '../memoryKeys'
+import { redis } from '$lib/server/redis'
 
 /**
  * SA-104 memory data-layer suite. Runs ONLY under the dedicated memory-search lane
@@ -109,6 +110,7 @@ function memoryInput(overrides: Partial<CreateMemoryInput> = {}): CreateMemoryIn
 describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 db0)', () => {
   beforeEach(async () => {
     await configureTestEmbedding()
+    for (const id of ['agent_test', 'agent_other']) await redis.json.set(`agent:${id}`, '$', { id, user_id: 'user_test', memory_enabled: true } as never)
     await ensureMemoryIndexes()
   })
 
@@ -130,15 +132,18 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
       const embedDocuments = vi.fn(fakeEmbedder.embedDocuments)
       const embedder = { ...fakeEmbedder, embedDocuments }
 
-      for (const id of [original.id, 'mem_bl825_refused']) {
+      const refusedIds = ['mem_bl825_refused_1', 'mem_bl825_refused_2']
+      for (const id of refusedIds) {
         await expect(createMemory(memoryInput({ id, [field]: value }), { embedder }))
           .rejects.toThrow(error)
       }
+      await expect(createMemory(memoryInput({ id: original.id, [field]: value }), { embedder }))
+        .rejects.toThrow('A memory with this id already exists.')
 
       expect(embedDocuments).not.toHaveBeenCalled()
       expect(await harness.adminClient().sendCommand(['JSON.GET', key])).toBe(rawBefore)
       expect((await harness.adminClient().keys('memory:agent_test:*')).sort()).toEqual(keysBefore)
-      expect(await getMemory('agent_test', 'mem_bl825_refused')).toBeNull()
+      for (const id of refusedIds) expect(await getMemory('agent_test', id)).toBeNull()
     })
 
     it('embeds accepted explicit dates once and preserves the complete saved record', async () => {
@@ -190,7 +195,9 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     }
 
     it('create stores both expiry fields through the second final hour and keeps Awareness eligible', async () => {
-      await inSantiago(async () => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date('2026-04-05T03:30:00.000Z'))
+      try { await inSantiago(async () => {
         const created = await createMemory(memoryInput({
           lane: 'awareness',
           expires_at: '2026-04-04',
@@ -209,7 +216,7 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
           .toEqual([stored])
         expect(selectAwarenessState([stored], budgets, Date.parse('2026-04-05T04:00:00.000Z')).entries)
           .toEqual([])
-      })
+      }) } finally { vi.useRealTimers() }
     })
 
     it('update stores a newly chosen bare expiry without changing the other record fields', async () => {
@@ -296,7 +303,7 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     expect(updated.updated_at).toBeDefined()
 
     expect(await deleteMemory('agent_test', created.id)).toBe(true)
-    expect(await getMemory('agent_test', created.id)).toBeNull()
+    expect(await getMemory('agent_test', created.id)).toMatchObject({ deleted_ts: expect.any(Number), content: updated.content })
   })
 
   it('refuses always-on media outside the Awareness lane at the storage boundary', async () => {
@@ -325,9 +332,9 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
   })
 
   it('refuses a fifth active standing image at the storage boundary', async () => {
-    const media = (id: string) => ({
+    const media = (memoryId: string, id: string) => ({
       id,
-      filename: `agent_test/mem_cap/${id}.png`,
+      filename: `agent_test/${memoryId}/${id}.png`,
       display_name: `${id}.png`,
       mime_type: 'image/png' as const,
       bytes: 3,
@@ -338,20 +345,22 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     })
     await createMemory(
       memoryInput({
+        id: 'mem_cap_four',
         lane: 'awareness',
         content: 'Four standing images',
         media_mode: 'always',
-        media: ['one', 'two', 'three', 'four'].map(media)
+        media: ['one', 'two', 'three', 'four'].map(id => media('mem_cap_four', id))
       }),
       { embedder: fakeEmbedder }
     )
     await expect(
       createMemory(
         memoryInput({
+          id: 'mem_cap_fifth',
           lane: 'awareness',
           content: 'Fifth standing image',
           media_mode: 'always',
-          media: [media('five')]
+          media: [media('mem_cap_fifth', 'five')]
         }),
         { embedder: fakeEmbedder }
       )
@@ -362,9 +371,9 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
   // fill the slots; restoring it with no check left the agent over the cap, and every send then
   // failed at the compile until the user fixed it in the panel.
   it('unsupersede refuses to restore always-on images past the 4-image cap, before any write (BL-438)', async () => {
-    const media = (id: string) => ({
+    const media = (memoryId: string, id: string) => ({
       id,
-      filename: `agent_test/mem_bl438/${id}.png`,
+      filename: `agent_test/${memoryId}/${id}.png`,
       display_name: `${id}.png`,
       mime_type: 'image/png' as const,
       bytes: 3,
@@ -375,10 +384,11 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     })
     const pair = await createMemory(
       memoryInput({
+        id: 'mem_bl438_pair',
         lane: 'awareness',
         content: 'Standing pair of photos',
         media_mode: 'always',
-        media: ['p1', 'p2'].map(media)
+        media: ['p1', 'p2'].map(id => media('mem_bl438_pair', id))
       }),
       { embedder: fakeEmbedder }
     )
@@ -390,10 +400,11 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     // The superseded pair no longer counts, so three more standing images fit.
     const trio = await createMemory(
       memoryInput({
+        id: 'mem_bl438_trio',
         lane: 'awareness',
         content: 'Standing trio of photos',
         media_mode: 'always',
-        media: ['t1', 't2', 't3'].map(media)
+        media: ['t1', 't2', 't3'].map(id => media('mem_bl438_trio', id))
       }),
       { embedder: fakeEmbedder }
     )
@@ -411,10 +422,11 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     // every slot taken. (Created while a slot is free: a save counts its own images.)
     const expired = await createMemory(
       memoryInput({
+        id: 'mem_bl438_expired',
         lane: 'awareness',
         content: 'Expired standing photo',
         media_mode: 'always',
-        media: [media('e1')],
+        media: [media('mem_bl438_expired', 'e1')],
         expires_at: '2020-01-01T00:00:00.000Z'
       }),
       { embedder: fakeEmbedder }
@@ -422,10 +434,11 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     await supersedeMemory('agent_test', winner.id, [expired.id])
     const single = await createMemory(
       memoryInput({
+        id: 'mem_bl438_single',
         lane: 'awareness',
         content: 'Standing single photo',
         media_mode: 'always',
-        media: [media('s1')]
+        media: [media('mem_bl438_single', 's1')]
       }),
       { embedder: fakeEmbedder }
     )
@@ -546,11 +559,12 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     )
     const demoted = await markExpiredDemotion('agent_test', expiring.id, 'ltm')
     expect(demoted.lane).toBe('ltm')
-    expect(demoted.expired_demoted_to).toBe('ltm')
+    expect(demoted.expiry_processed_at).toEqual(expect.any(String))
+    expect(demoted.expired_demoted_to).toBeUndefined()
     expect(demoted.content).toContain('trailer')
 
     const noExpiry = await createMemory(memoryInput(), { embedder: fakeEmbedder })
-    await expect(markExpiredDemotion('agent_test', noExpiry.id, 'ltm')).rejects.toThrow(/no expiry/)
+    await expect(markExpiredDemotion('agent_test', noExpiry.id, 'ltm')).rejects.toThrow(/Only an expired/)
   })
 
   it('answers KNN with agent scoping and filters', async () => {

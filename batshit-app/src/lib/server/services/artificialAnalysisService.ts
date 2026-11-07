@@ -4,8 +4,8 @@ import { redis } from '$lib/server/redis'
 import type { ModelCapabilities, ModelEnrichmentSnapshot } from '$lib/types/savedModels'
 import { sanitizeCatalogMaxOutputTokens } from '$lib/utils/modelOutputTokens'
 import { readArtificialAnalysisPrice } from '$lib/utils/catalogPricing'
+import { fetchArtificialAnalysisCatalog } from './artificialAnalysisCatalog'
 
-const DEFAULT_API_URL = 'https://artificialanalysis.ai/api/v2/data/llms/models'
 const CATALOG_CACHE_KEY = 'aa_cache:catalog'
 const MODEL_CACHE_PREFIX = 'aa_cache:model:'
 const CACHE_TTL_SECONDS = 60 * 60 * 24 * 7 // 7 days
@@ -84,29 +84,10 @@ async function loadCatalog(forceRefresh = false): Promise<CatalogCache> {
     throw new Error('ARTIFICIAL_ANALYSIS_API_KEY is not set')
   }
 
-  const apiUrl = env.ARTIFICIAL_ANALYSIS_API_URL || DEFAULT_API_URL
-  const response = await fetch(apiUrl, {
-    headers: {
-      'x-api-key': apiKey,
-      Accept: 'application/json'
-    }
+  const models = await fetchArtificialAnalysisCatalog<ArtificialAnalysisRawModel>({
+    apiKey,
+    apiUrl: env.ARTIFICIAL_ANALYSIS_API_URL || undefined
   })
-
-  if (!response.ok) {
-    throw new Error(`Artificial Analysis API request failed (${response.status})`)
-  }
-
-  const payload = await response.json()
-  const models: ArtificialAnalysisRawModel[] =
-    payload?.models ||
-    payload?.data?.models ||
-    payload?.data ||
-    payload?.items ||
-    []
-
-  if (!Array.isArray(models) || models.length === 0) {
-    throw new Error('Artificial Analysis API returned an empty model list')
-  }
 
   const catalog: CatalogCache = {
     items: models,

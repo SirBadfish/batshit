@@ -8,10 +8,10 @@ Use it when you want a coding agent to help write the skill or prompt outside Ba
 
 - Batshit running locally.
 - A Portable Skill Token with the `Skills` scope.
-- The downloaded `skill-creator` Portable Skill bundle.
+- The `skill-creator` skill from the current complete Batshit plugin.
 - An idea for the Skill or Prompt you want.
 
-Download links are listed in [Portable Skill downloads](../reference/portable-skills.md).
+Download the current package from **Settings → Plugins & shit → Plugins → Batshit → Download Plugin**; see [outside-agent setup](portable-skills.md).
 
 ## Skill or Prompt
 
@@ -65,6 +65,6 @@ A good completion report includes:
 - dependencies or required tools;
 - enablement notes;
 - save or import result;
-- any action still needed in Settings -> Skills & Prompts.
+- any action still needed in Settings → Plugins & shit.
 
 If Batshit rejects the save because the target is a protected system skill, that is expected. System skills are product-owned and cannot be changed through this user-facing portable path.

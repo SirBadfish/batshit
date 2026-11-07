@@ -1,0 +1,119 @@
+# Choose how to install Batshit
+
+Choose the setup that fits your computer and how you want to run Batshit:
+
+- **Mac app** — for Mac users who want to open `Batshit.app` and let it supervise the local Batshit runtime.
+- **Docker** — for users who prefer Docker, use Linux, or want the core stack in Docker Compose.
+- **Pinokio** — for Apple-silicon Mac users and Windows x64 users with WSL2 already enabled who want to install and launch Batshit from Pinokio.
+
+Manual source-checkout setup is advanced repair/development material now, not the normal public install path while the Mac app is available.
+
+## Quick choice
+
+| Choose | Good fit when | Tradeoff |
+| --- | --- | --- |
+| Mac app | You're on a supported Mac and want the most Mac-like setup: open the app, let Runtime Doctor check the Mac app runtime, then use Batshit. | Local alpha/dev builds without curated managed runtime assets may still need repair fallbacks; release packages are intended to own Node, Redis, and ffmpeg. |
+| Docker | You want the Batshit app, batshit-server, and Redis in a repeatable Compose stack, or you're not on macOS. | Cleaner core-stack boundaries, but local engines, sidecars, and host services need caller-aware URLs and sometimes a host operator. |
+| Pinokio | You already use Pinokio and want to install and launch Batshit there, on Apple-silicon Mac or Windows with ready WSL2. | Windows services and files stay separate from Batshit’s Linux environment. Check the guide’s voice and optional-runtime limits. |
+
+For Windows, choose Docker or the [Pinokio path](install-pinokio.md) with WSL2 already enabled. For Linux, use Docker for now. The Mac app is macOS-only.
+
+## What runs where
+
+### Mac app
+
+`Batshit.app` runs Runtime Doctor at startup. When checks pass, it opens Batshit automatically; when something needs attention, Runtime Doctor stays visible. The doctor can start, stop, restart, and check the services the Mac app owns:
+
+- Batshit app on `http://127.0.0.1:5620`
+- batshit-server on `http://localhost:5600`
+- streamable MCP helper on `http://localhost:5601/mcp`
+- Mac-app-owned Redis 8 on `localhost:5639`
+
+Runtime Doctor refuses to attach to an unrelated Redis process on the Mac app Redis port. If something else is already listening there, Batshit reports the conflict instead of quietly using the wrong data store.
+
+After `Batshit.app` starts the runtime, you can also open `http://127.0.0.1:5620` in a normal browser — a second window into the same Mac app instance and data.
+
+Inside the Mac app, Settings → Admin → Runtimes shows **Mac App Required Runtime** for viewing Runtime Doctor checks later. Docker installs do not show Mac-only Apple Container/runtime requirement cards.
+
+The Mac app stores durable state under `~/Library/Application Support/Batshit`, logs under `~/Library/Logs/Batshit`, and cache/scratch under `~/Library/Caches/Batshit`.
+When you save settings, agents, chats, Goons, scenes, or other app data, Batshit writes that change to the Mac-app-owned Redis process immediately. The Mac app also runs Redis with append-only persistence so recent saves are written to disk quickly and survive app restarts or Mac reboots.
+
+n8n is connect-existing for the Mac app. Run your own n8n instance when you want workflow tools.
+
+Apple Container is the Mac app's default sandbox backend for agent command execution on supported Macs. It is not the whole app runtime; it is the isolated command backend used when agents run sandboxed commands. Docker Sandbox remains selectable for Mac users and remains the cross-platform sandbox path.
+
+### Docker
+
+Docker Batshit runs the core stack in Compose:
+
+- `app` container, published to `http://localhost:5620`
+- `batshit-server` container, published to `http://localhost:5600`
+- internal-only Redis 8
+- optional `n8n` profile, published to `http://localhost:5678`
+
+Docker Batshit also writes every save to its Redis immediately, and that Redis runs with append-only persistence: each change reaches disk within about a second, so recent saves survive a container restart, a Docker Desktop crash, or a restart of your computer.
+
+Inside Docker, services use Docker names: the app calls batshit-server at `http://batshit-server:5600`, batshit-server and n8n call the app at `http://app:3000`, the app calls the optional Docker n8n at `http://n8n:5678`, and the app reaches host services through `host.docker.internal`.
+
+Docker is not just the Mac app launcher inside a container. The core app container doesn't get raw host Docker access by default — Docker Sandbox and approved sidecar start/stop actions use a first-party host operator prepared by `./start-docker.sh`.
+
+### Pinokio
+
+Pinokio installs Batshit’s pinned release and runs its app, file server and Redis on a separate local lane. Open Batshit at `http://127.0.0.1:5650`. On Windows, these services run in a dedicated WSL2 Linux environment; Docker is not required.
+
+Use Pinokio’s **Update** button for updates. Your data lives outside the downloaded app folder and survives Update and Reset. See [Install with Pinokio](install-pinokio.md) for prerequisites, data locations, existing voice engines and current support limits.
+
+## Security and trust
+
+A useful mental model:
+
+- The Mac app is powerful because it runs local services directly on your Mac.
+- Docker is more contained for the core app stack, but add-ons and host services still cross boundaries intentionally.
+- Sandboxed Agent Mode is the safer normal mode for command execution.
+- Full-permission or host-power paths are trusted-user power tools.
+- Untrusted Skills, MCP gateways, n8n workflows, Artifacts, and CLI tools can be risky in either path.
+
+Don't expose a local alpha Batshit instance to the public internet unless you know exactly what you're doing with auth, HTTPS, tunnels, reverse proxies, and provider secrets.
+
+## Mac app and Docker feature comparison
+
+| Feature area | Mac app | Docker |
+| --- | --- | --- |
+| Basic chat with `API` agents | Good | Good |
+| n8n workflow tools | Good with an existing local n8n | Good with the optional Docker n8n profile or existing n8n |
+| Claude plan | Claude Code plan sign-in | Not yet qualified for this connection |
+| Local AI | Direct `localhost` URLs usually work | Use `host.docker.internal` for host runtimes or service names for sidecars |
+| Voice cloud providers | Good with saved keys | Good with saved keys |
+| Local voice engines | Connect-existing or approved managed host runtime records | Connect-existing or saved host-runtime launch; not arbitrary installs inside the app container |
+| Agent Browser | Host runtime path | Optional `agent-browser` sidecar |
+| Command sandboxing | Apple Container by default on supported Macs; Docker Sandbox selectable as a backup | Docker Sandbox through Batshit's host operator |
+| Backups | Batshit data export plus your own external runtime backups | Same, plus Docker volumes if you want exact full-instance rollback |
+
+## Which one is for you?
+
+Pick the **Mac app** if:
+
+- You use macOS and want the simplest local Batshit launch.
+- You expect to run local AI, local voice engines, Blender, or other host tools.
+- You're comfortable with a local alpha app that may still show honest repair guidance if a managed runtime asset is missing from that build.
+- You understand local agents may have more access to your machine.
+
+Pick **Docker** if:
+
+- You want a repeatable core app stack.
+- You want Batshit, batshit-server, and Redis packaged together.
+- You want to isolate core app data in Docker volumes.
+- You're comfortable with Docker Desktop, Compose profiles, and caller-specific URLs.
+
+Pick **Pinokio** if:
+
+- You use an Apple-silicon Mac or Windows x64 with WSL2 already enabled.
+- You want to install, launch and update Batshit from Pinokio.
+- The [Pinokio guide’s current limits](install-pinokio.md) fit the voice engines and optional runtimes you need.
+
+## What to read next
+
+- Mac path: [Install Mac app](install-mac-app.md)
+- Docker path: [Install Docker](install-docker.md)
+- Pinokio path: [Install with Pinokio](install-pinokio.md)
+- After installation: [First run](first-run.md)

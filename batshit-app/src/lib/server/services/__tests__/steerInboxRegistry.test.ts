@@ -1,23 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  attachSteerTransport,
   clearSteerInbox,
   clearSteerRun,
-  confirmSteerDelivery,
   countPendingSteers,
   drainDeliveredSteers,
   enqueueSteer,
-  flushPendingSteersToTransport,
   getSteerRun,
-  listInFlightSteers,
   listPendingSteers,
   refileUndeliveredSteers,
   registerSteerRun,
-  returnSteersToPending,
   takeMissedDmSteers,
   takeMissedUserSteers,
   takePendingSteersForDelivery,
-  takePendingSteersForTransport,
   takeUndeliveredSteers,
   __resetSteerInboxRegistryForTests
 } from '$lib/server/services/steerInboxRegistry'
@@ -162,10 +156,11 @@ describe('steer inbox', () => {
     takePendingSteersForDelivery(SESSION, MESSAGE, { step: 1, lane: 'api' })
     drainDeliveredSteers(SESSION, MESSAGE)
     enqueueSteer(SESSION, entry('b'))
-    takePendingSteersForTransport(SESSION, MESSAGE)
-    confirmSteerDelivery(SESSION, MESSAGE, { steerIds: ['b'], step: 0, lane: 'codex' })
-    drainDeliveredSteers(SESSION, MESSAGE)
-    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'codex' })
+    refileUndeliveredSteers(SESSION, MESSAGE, 'msg_assistant_2')
+    takeMissedUserSteers(SESSION, { keepMessageId: MESSAGE })
+    enqueueSteer(SESSION, entry('dm', { source: 'dm' }))
+    takeMissedDmSteers(SESSION)
+    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'api' })
     clearSteerRun(SESSION, MESSAGE)
     enqueueSteer(SESSION, entry('c'))
     takeUndeliveredSteers(SESSION, MESSAGE)
@@ -248,109 +243,6 @@ describe('steer inbox', () => {
     expect(code).not.toContain('active_clips')
     expect(code).not.toContain('registerSessionTurn')
   })
-})
-
-/**
- * SA-114 P2 — the managed CLI half.
- *
- * A CLI steer has a third state the API lane does not: written to the transport's wire and
- * not yet echoed back. "Written" is not "read", and the whole packet turns on that
- * difference — an unechoed steer must be promoted, never marked delivered.
- */
-describe('the in-flight lane (P2)', () => {
-  it('moves a steer to in flight when a transport takes it', () => {
-    enqueueSteer(SESSION, entry('a'))
-    expect(takePendingSteersForTransport(SESSION, MESSAGE).map((row) => row.steerId)).toEqual(['a'])
-    expect(listPendingSteers(SESSION)).toEqual([])
-    expect(listInFlightSteers(SESSION).map((row) => row.steerId)).toEqual(['a'])
-  })
-
-  it('counts an in-flight steer against the waiting cap', () => {
-    for (let i = 0; i < MAX_PENDING_STEERS; i += 1) enqueueSteer(SESSION, entry(`s${i}`))
-    takePendingSteersForTransport(SESSION, MESSAGE)
-    expect(listPendingSteers(SESSION)).toEqual([])
-
-    // The CLI holds them; the model has read none of them. The user is still waiting on
-    // five messages, so the sixth is refused exactly as it was before they were written.
-    const refused = enqueueSteer(SESSION, entry('overflow'))
-    expect(refused.ok).toBe(false)
-    if (refused.ok) throw new Error('expected a refusal')
-    expect(refused.reason).toContain('Wait for the reply')
-    expect(countPendingSteers(SESSION, MESSAGE)).toBe(MAX_PENDING_STEERS)
-  })
-
-  it('marks delivered only the ids the transport actually echoed', () => {
-    enqueueSteer(SESSION, entry('a'))
-    enqueueSteer(SESSION, entry('b'))
-    takePendingSteersForTransport(SESSION, MESSAGE)
-
-    const delivered = confirmSteerDelivery(SESSION, MESSAGE, {
-      steerIds: ['a'],
-      step: 0,
-      lane: 'claude'
-    })
-    expect(delivered.map((row) => [row.steerId, row.lane, row.step])).toEqual([['a', 'claude', 0]])
-    expect(listInFlightSteers(SESSION).map((row) => row.steerId)).toEqual(['b'])
-    expect(drainDeliveredSteers(SESSION, MESSAGE).map((row) => row.steerId)).toEqual(['a'])
-  })
-
-  it('confirms nothing for an id belonging to another turn', () => {
-    enqueueSteer(SESSION, entry('a', { messageId: 'msg_other' }))
-    takePendingSteersForTransport(SESSION, 'msg_other')
-    expect(
-      confirmSteerDelivery(SESSION, MESSAGE, { steerIds: ['a'], step: 0, lane: 'codex' })
-    ).toEqual([])
-  })
-
-  /**
-   * AMD-114-01: every unechoed steer is promoted. On Claude it is the exact line that
-   * would otherwise start a second turn in the same process, which is why the bridge kills
-   * the child instead of letting it run — and why the words have to come back here.
-   */
-  it('promotes an unechoed in-flight steer when the turn ends', () => {
-    enqueueSteer(SESSION, entry('echoed'))
-    enqueueSteer(SESSION, entry('written'))
-    takePendingSteersForTransport(SESSION, MESSAGE)
-    confirmSteerDelivery(SESSION, MESSAGE, { steerIds: ['echoed'], step: 0, lane: 'claude' })
-    enqueueSteer(SESSION, entry('never-sent', { at: '2026-09-10T12:00:01.000Z' }))
-
-    // Acceptance order, whichever list an entry sat in.
-    expect(takeUndeliveredSteers(SESSION, MESSAGE).map((row) => row.steerId)).toEqual([
-      'written',
-      'never-sent'
-    ])
-    expect(listInFlightSteers(SESSION)).toEqual([])
-    expect(listPendingSteers(SESSION)).toEqual([])
-  })
-
-  it('returns a refused write to the front of the waiting list', () => {
-    enqueueSteer(SESSION, entry('first'))
-    const taken = takePendingSteersForTransport(SESSION, MESSAGE)
-    enqueueSteer(SESSION, entry('second'))
-
-    returnSteersToPending(SESSION, taken)
-    expect(listInFlightSteers(SESSION)).toEqual([])
-    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['first', 'second'])
-  })
-
-  it('PR #106 F-9: returns only what is still in flight, and never re-creates a cleared inbox', () => {
-    enqueueSteer(SESSION, entry('first'))
-    const taken = takePendingSteersForTransport(SESSION, MESSAGE)
-    // The transport echoed it: the model has it, it is delivered.
-    confirmSteerDelivery(SESSION, MESSAGE, { steerIds: ['first'], step: 1, lane: 'codex' })
-    returnSteersToPending(SESSION, taken)
-    // A late rejection must not put a delivered steer back to be promoted a second time.
-    expect(listPendingSteers(SESSION)).toEqual([])
-
-    enqueueSteer(SESSION, entry('second'))
-    const takenAgain = takePendingSteersForTransport(SESSION, MESSAGE)
-    clearSteerInbox(SESSION)
-    returnSteersToPending(SESSION, takenAgain)
-    // The turn is over; a rejection arriving after `clearSteerInbox` must not leave a ghost
-    // that eats a slot for every later turn.
-    expect(countPendingSteers(SESSION)).toBe(0)
-    expect(listPendingSteers(SESSION)).toEqual([])
-  })
 
   it('PR #106 F-10: the cap counts the messages waiting for THIS reply, not the whole chat', () => {
     for (let index = 0; index < MAX_PENDING_STEERS; index += 1) {
@@ -361,38 +253,24 @@ describe('the in-flight lane (P2)', () => {
     const live = enqueueSteer(SESSION, entry('live', { messageId: 'msg_live' }))
     expect(live.ok).toBe(true)
   })
-
-  it('keeps a live turn’s in-flight steers when a finished request clears the inbox', () => {
-    enqueueSteer(SESSION, entry('stopped', { messageId: 'msg_stopped' }))
-    takePendingSteersForTransport(SESSION, 'msg_stopped')
-    enqueueSteer(SESSION, entry('live', { messageId: 'msg_live' }))
-    takePendingSteersForTransport(SESSION, 'msg_live')
-
-    clearSteerInbox(SESSION, { keepMessageId: 'msg_live' })
-    expect(listInFlightSteers(SESSION).map((row) => row.steerId)).toEqual(['live'])
-  })
 })
 
+/**
+ * SA-139 R4: the run PULLS at its next step (`prepareStep`); the managed CLI Primary, the one
+ * run the route pushed to, is gone, so a registration carries the verdict and nothing else.
+ */
 describe('the steer run registration (P2, DL-114-09)', () => {
   const run = (overrides: Record<string, unknown> = {}) => ({
     messageId: MESSAGE,
     steerable: true,
     reason: null,
-    lane: 'codex' as const,
+    lane: 'api' as const,
     ...overrides
   })
 
-  it('records the verdict and starts with no transport', () => {
+  it('records the verdict', () => {
     registerSteerRun(SESSION, run())
-    expect(getSteerRun(SESSION)).toEqual({ ...run(), send: null })
-  })
-
-  it('attaches a transport only to the run that is still live', () => {
-    registerSteerRun(SESSION, run())
-    expect(attachSteerTransport(SESSION, 'msg_other', 'codex', async () => true)).toBe(false)
-    expect(getSteerRun(SESSION)?.send).toBeNull()
-    expect(attachSteerTransport(SESSION, MESSAGE, 'codex', async () => true)).toBe(true)
-    expect(typeof getSteerRun(SESSION)?.send).toBe('function')
+    expect(getSteerRun(SESSION)).toEqual(run())
   })
 
   it('clears only its own registration', () => {
@@ -401,137 +279,6 @@ describe('the steer run registration (P2, DL-114-09)', () => {
     expect(getSteerRun(SESSION)).not.toBeNull()
     clearSteerRun(SESSION, MESSAGE)
     expect(getSteerRun(SESSION)).toBeNull()
-  })
-})
-
-describe('flushing to a managed CLI transport (P2)', () => {
-  it('leaves an API steer alone: its hook pulls instead', async () => {
-    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'api' })
-    enqueueSteer(SESSION, entry('a'))
-
-    expect(await flushPendingSteersToTransport(SESSION, MESSAGE)).toEqual({
-      flushed: 0,
-      reason: 'no_transport'
-    })
-    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['a'])
-  })
-
-  it('sends every waiting steer as one joined delivery', async () => {
-    const sent: Array<{ steerIds: string[]; text: string }> = []
-    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'codex' })
-    attachSteerTransport(SESSION, MESSAGE, 'codex', async (payload) => {
-      sent.push(payload)
-      return true
-    })
-    enqueueSteer(SESSION, entry('a'))
-    enqueueSteer(SESSION, entry('b'))
-
-    expect(await flushPendingSteersToTransport(SESSION, MESSAGE)).toEqual({
-      flushed: 2,
-      reason: 'sent'
-    })
-    expect(sent).toHaveLength(1)
-    expect(sent[0].steerIds).toEqual(['a', 'b'])
-    expect(sent[0].text).toContain('steer a')
-    expect(sent[0].text).toContain('steer b')
-    expect(listInFlightSteers(SESSION).map((row) => row.steerId)).toEqual(['a', 'b'])
-  })
-
-  /**
-   * F-P2-1 (Faye's review): a steer accepted BEFORE the CLI child existed sat in `pending`
-   * with nothing to push it — the route's flush had found no transport, and nothing ran a
-   * second flush once one was attached — so it was promoted at the end of the turn instead
-   * of landing at the first boundary. Attaching the transport now pushes what is waiting.
-   */
-  it('pushes a steer that was accepted before the transport was attached', async () => {
-    const sent: Array<{ steerIds: string[]; text: string }> = []
-    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'codex' })
-    enqueueSteer(SESSION, entry('early'))
-    expect(await flushPendingSteersToTransport(SESSION, MESSAGE)).toEqual({
-      flushed: 0,
-      reason: 'no_transport'
-    })
-
-    attachSteerTransport(SESSION, MESSAGE, 'codex', async (payload) => {
-      sent.push(payload)
-      return true
-    })
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
-    expect(sent.map((row) => row.steerIds)).toEqual([['early']])
-    expect(listPendingSteers(SESSION)).toEqual([])
-    expect(listInFlightSteers(SESSION).map((row) => row.steerId)).toEqual(['early'])
-  })
-
-  it('returns the words to the inbox when the transport refuses', async () => {
-    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'codex' })
-    attachSteerTransport(SESSION, MESSAGE, 'codex', async () => false)
-    enqueueSteer(SESSION, entry('a'))
-
-    expect(await flushPendingSteersToTransport(SESSION, MESSAGE)).toEqual({
-      flushed: 0,
-      reason: 'refused'
-    })
-    expect(listInFlightSteers(SESSION)).toEqual([])
-    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['a'])
-  })
-
-  it('returns the words to the inbox when the transport throws', async () => {
-    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'claude' })
-    attachSteerTransport(SESSION, MESSAGE, 'claude', async () => {
-      throw new Error('no active turn to steer')
-    })
-    enqueueSteer(SESSION, entry('a'))
-
-    const result = await flushPendingSteersToTransport(SESSION, MESSAGE)
-    expect(result.reason).toBe('refused')
-    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['a'])
-  })
-
-  it('will not push a steer into a turn that has moved on', async () => {
-    const sent: unknown[] = []
-    registerSteerRun(SESSION, {
-      messageId: 'msg_newer',
-      steerable: true,
-      reason: null,
-      lane: 'codex'
-    })
-    attachSteerTransport(SESSION, 'msg_newer', 'codex', async (payload) => {
-      sent.push(payload)
-      return true
-    })
-    enqueueSteer(SESSION, entry('a'))
-
-    expect(await flushPendingSteersToTransport(SESSION, MESSAGE)).toEqual({
-      flushed: 0,
-      reason: 'stale_transport'
-    })
-    expect(sent).toEqual([])
-  })
-
-  it('sends nothing twice when two flushes race', async () => {
-    let resolveSend: (() => void) | null = null
-    const sent: Array<{ steerIds: string[] }> = []
-    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'codex' })
-    attachSteerTransport(SESSION, MESSAGE, 'codex', async (payload) => {
-      sent.push(payload)
-      await new Promise<void>((resolve) => {
-        resolveSend = resolve
-      })
-      return true
-    })
-    enqueueSteer(SESSION, entry('a'))
-
-    const first = flushPendingSteersToTransport(SESSION, MESSAGE)
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    // The second flush finds nothing waiting: the first took the entry BEFORE its write.
-    expect(await flushPendingSteersToTransport(SESSION, MESSAGE)).toEqual({
-      flushed: 0,
-      reason: 'nothing_pending'
-    })
-    resolveSend?.()
-    await first
-    expect(sent.map((row) => row.steerIds)).toEqual([['a']])
   })
 })
 
@@ -612,15 +359,6 @@ describe('DM-sourced steers (DL-114-13)', () => {
     ])
   })
 
-  it('takes an in-flight DM steer too — written is not read', () => {
-    enqueueSteer(SESSION, dmEntry('dm_written'))
-    takePendingSteersForTransport(SESSION, MESSAGE)
-    expect(listInFlightSteers(SESSION).map((row) => row.steerId)).toEqual(['dm_written'])
-
-    expect(takeMissedDmSteers(SESSION).map((row) => row.steerId)).toEqual(['dm_written'])
-    expect(listInFlightSteers(SESSION)).toEqual([])
-  })
-
   it('never takes a user steer, whatever the clear is about to do', () => {
     enqueueSteer(SESSION, entry('user_1'))
     expect(takeMissedDmSteers(SESSION)).toEqual([])
@@ -659,52 +397,13 @@ describe('a queued steer (deliver: end) — DL-119-05', () => {
     expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['q1'])
   })
 
-  it('is never taken by a CLI lane’s transport flush (DL-119-05)', () => {
+  it('is not handed over when it is the only message waiting', () => {
     enqueueSteer(SESSION, queued('q1'))
-    enqueueSteer(SESSION, entry('now1'))
 
-    expect(takePendingSteersForTransport(SESSION, MESSAGE).map((row) => row.steerId)).toEqual([
-      'now1'
-    ])
-    expect(listInFlightSteers(SESSION).map((row) => row.steerId)).toEqual(['now1'])
+    // Nothing is handed over, so nothing can reach the model mid-reply.
+    expect(takePendingSteersForDelivery(SESSION, MESSAGE, { step: 1, lane: 'api' })).toEqual([])
+    expect(drainDeliveredSteers(SESSION, MESSAGE)).toEqual([])
     expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['q1'])
-  })
-
-  it('is not enough on its own to make a flush claim it sent something', async () => {
-    const sent: Array<{ steerIds: string[]; text: string }> = []
-    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'claude' })
-    attachSteerTransport(SESSION, MESSAGE, 'claude', async (payload) => {
-      sent.push(payload)
-      return true
-    })
-    enqueueSteer(SESSION, queued('q1'))
-
-    expect(await flushPendingSteersToTransport(SESSION, MESSAGE)).toEqual({
-      flushed: 0,
-      reason: 'nothing_pending'
-    })
-    // Nothing reached the wire, so nothing can reach the model mid-reply.
-    expect(sent).toEqual([])
-    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['q1'])
-  })
-
-  it('flushes only the mid-reply steers when both kinds are waiting', async () => {
-    const sent: Array<{ steerIds: string[]; text: string }> = []
-    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'codex' })
-    attachSteerTransport(SESSION, MESSAGE, 'codex', async (payload) => {
-      sent.push(payload)
-      return true
-    })
-    enqueueSteer(SESSION, queued('q1'))
-    enqueueSteer(SESSION, entry('now1'))
-
-    expect(await flushPendingSteersToTransport(SESSION, MESSAGE)).toEqual({
-      flushed: 1,
-      reason: 'sent'
-    })
-    expect(sent).toHaveLength(1)
-    expect(sent[0].steerIds).toEqual(['now1'])
-    expect(sent[0].text).not.toContain('steer q1')
   })
 
   it('counts against the cap like any other waiting message (DL-119-05)', () => {
@@ -733,14 +432,16 @@ describe('a queued steer (deliver: end) — DL-119-05', () => {
     expect(listPendingSteers(SESSION)).toEqual([])
   })
 
-  it('is promoted after an in-flight steer that was accepted first', () => {
+  it('is promoted alone after a boundary delivered the steer accepted before it', () => {
     enqueueSteer(SESSION, entry('now1', { at: '2026-09-13T10:00:00.000Z' }))
-    takePendingSteersForTransport(SESSION, MESSAGE)
+    takePendingSteersForDelivery(SESSION, MESSAGE, { step: 1, lane: 'api' })
     enqueueSteer(SESSION, queued('q1', { at: '2026-09-13T10:00:01.000Z' }))
 
+    // The delivered steer is part of this reply, never a second time the next message.
     expect(
       takeUndeliveredSteers(SESSION, MESSAGE, { source: 'user' }).map((row) => row.steerId)
-    ).toEqual(['now1', 'q1'])
+    ).toEqual(['q1'])
+    expect(drainDeliveredSteers(SESSION, MESSAGE).map((row) => row.steerId)).toEqual(['now1'])
   })
 
   /**
@@ -755,7 +456,6 @@ describe('a queued steer (deliver: end) — DL-119-05', () => {
 
     clearSteerInbox(SESSION)
     expect(listPendingSteers(SESSION)).toEqual([])
-    expect(listInFlightSteers(SESSION)).toEqual([])
   })
 
   it('is kept by a scoped clear when the live turn is still its own', () => {
@@ -769,7 +469,7 @@ describe('a queued steer (deliver: end) — DL-119-05', () => {
   it('never reaches a different turn, including the promoted follow-up', () => {
     enqueueSteer(SESSION, queued('q1'))
     expect(takePendingSteersForDelivery(SESSION, 'msg_assistant_2', { step: 1, lane: 'api' })).toEqual([])
-    expect(takePendingSteersForTransport(SESSION, 'msg_assistant_2')).toEqual([])
+    expect(takeUndeliveredSteers(SESSION, 'msg_assistant_2')).toEqual([])
     expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['q1'])
   })
 })
@@ -794,13 +494,9 @@ describe('steers carried into a context-exhaustion continuation (BL-137)', () =>
     enqueueSteer(SESSION, entry('c', { messageId: RUN_ONE, at: '2026-09-25T10:00:03.000Z' }))
     enqueueSteer(SESSION, entry('dm', { messageId: RUN_ONE, at: '2026-09-25T10:00:04.000Z', source: 'dm' }))
     enqueueSteer(SESSION, entry('other', { messageId: 'msg_someone_else', at: '2026-09-25T10:00:00.500Z' }))
-    // `a` was written to a CLI's wire and never echoed back: written is not read.
-    expect(takePendingSteersForTransport(SESSION, RUN_ONE).map((row) => row.steerId)).toEqual(['a', 'c', 'dm'])
-    returnSteersToPending(SESSION, [entry('c', { messageId: RUN_ONE }), entry('dm', { messageId: RUN_ONE })])
 
     expect(refileUndeliveredSteers(SESSION, RUN_ONE, RUN_TWO)).toBe(4)
 
-    expect(listInFlightSteers(SESSION)).toEqual([])
     expect(
       listPendingSteers(SESSION)
         .filter((row) => row.messageId === RUN_TWO)
@@ -839,15 +535,12 @@ describe('steers carried into a context-exhaustion continuation (BL-137)', () =>
 
 
 it('takes only undelivered user ids at cleanup, preserving another live run, DMs and delivered entries (BL-1291)', () => {
-  enqueueSteer(SESSION, entry('pending'))
-  enqueueSteer(SESSION, entry('inflight'))
+  enqueueSteer(SESSION, entry('delivered'))
+  takePendingSteersForDelivery(SESSION, MESSAGE, { step: 1, lane: 'api' })
+  enqueueSteer(SESSION, entry('undelivered'))
   enqueueSteer(SESSION, entry('dm', { source: 'dm' }))
   enqueueSteer(SESSION, entry('new-live', { messageId: 'new-reply' }))
-  const taken = takePendingSteersForTransport(SESSION, MESSAGE)
-  expect(taken.map(item => item.steerId)).toContain('inflight')
-  confirmSteerDelivery(SESSION, MESSAGE, { steerIds: ['pending'], step: 1, lane: 'codex' })
-  expect(takeMissedUserSteers(SESSION, { keepMessageId: 'new-reply' }).map(item => item.steerId)).toEqual(['inflight'])
-  expect(listPendingSteers(SESSION).map(item => item.steerId)).toEqual(['new-live'])
-  expect(listInFlightSteers(SESSION).map(item => item.steerId)).toEqual(['dm'])
-  expect(drainDeliveredSteers(SESSION, MESSAGE).map(item => item.steerId)).toEqual(['pending'])
+  expect(takeMissedUserSteers(SESSION, { keepMessageId: 'new-reply' }).map(item => item.steerId)).toEqual(['undelivered'])
+  expect(listPendingSteers(SESSION).map(item => item.steerId)).toEqual(['dm', 'new-live'])
+  expect(drainDeliveredSteers(SESSION, MESSAGE).map(item => item.steerId)).toEqual(['delivered'])
 })

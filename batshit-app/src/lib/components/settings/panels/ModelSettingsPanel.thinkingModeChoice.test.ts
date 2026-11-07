@@ -23,6 +23,7 @@ import ModelSettingsPanel from './ModelSettingsPanel.svelte'
 import TooltipProviderWrapper from '$lib/test-utils/TooltipProviderWrapper.svelte'
 import type { SavedModel } from '$lib/types/savedModels'
 import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
+import { waitForModelPresetSaves } from '../models/modelPresetAutosave'
 
 const originalFetch = globalThis.fetch
 const originalResizeObserver = globalThis.ResizeObserver
@@ -193,6 +194,44 @@ describe('BL-866 the Models panel shows the Thinking mode a Sonnet 5.5 send will
     vi.restoreAllMocks()
   })
 
+  it.each([true, false])('BL-1521 hides ignored controls and preserves saved values or absence on unrelated save (saved=%s)', async hasSaved => {
+    const preset = presetWithThinkingMode(SONNET_4_5, 'disabled')
+    preset.settings = { thinkingMode: 'disabled', maxTokens: 64_000,
+      ...(hasSaved ? { presencePenalty: 0, frequencyPenalty: 0.35, seed: 0 } : {}) }
+    const before = structuredClone(preset)
+    const saved = structuredClone(preset)
+    const baseFetch = mockFetch(saved)
+    fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith('/api/user/saved-models') && init?.method === 'POST') {
+        Object.assign(saved, JSON.parse(init.body as string))
+        return new Response(JSON.stringify({ model: saved }), { status: 200 })
+      }
+      return baseFetch(input, init)
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const { container } = renderPanel()
+    const name = await screen.findByDisplayValue(preset.modelName, {}, { timeout: 10_000 })
+    await fireEvent.click(await screen.findByRole('button', { name: 'Expand Common' }))
+    await screen.findByText('Temperature', { exact: true })
+    const labels = () => Array.from(container.querySelectorAll('.batshit-settings-form-label')).map(node => node.textContent?.trim())
+    for (const label of ['Presence penalty', 'Frequency penalty', 'Seed']) expect(labels()).not.toContain(label)
+    await expectNothingWritten()
+    await fireEvent.input(name, { target: { value: 'Renamed unchanged settings' } })
+    await waitFor(() => expect(writesMade()).toHaveLength(1), { timeout: 10_000 })
+    const body = JSON.parse((writesMade()[0][1] as RequestInit).body as string)
+    expect(body.settings).toMatchObject({ thinkingMode: 'disabled', maxTokens: 64_000 })
+    for (const key of ['presencePenalty', 'frequencyPenalty', 'seed'] as const) {
+      if (hasSaved) expect(body.settings[key]).toBe(preset.settings?.[key])
+      else expect(body.settings).not.toHaveProperty(key)
+    }
+    await waitForModelPresetSaves()
+    for (const key of ['presencePenalty', 'frequencyPenalty', 'seed'] as const) {
+      if (hasSaved) expect(saved.settings?.[key]).toBe(preset.settings?.[key])
+      else expect(saved.settings).not.toHaveProperty(key)
+    }
+    expect(preset).toEqual(before)
+  }, 30_000)
+
   it('shows a saved Disabled on Sonnet 5.5 as Between tools (lowest), and saves nothing', async () => {
     fetchMock = mockFetch(presetWithThinkingMode(SONNET_5_5, 'disabled'))
     globalThis.fetch = fetchMock as unknown as typeof fetch
@@ -217,8 +256,9 @@ describe('BL-866 the Models panel shows the Thinking mode a Sonnet 5.5 send will
     // The note lives in an amber info menu; open it as a user does.
     const info = within(row).getByRole('button', { name: 'Thinking mode not available' })
     await fireEvent.pointerDown(info, { button: 0, pointerType: 'mouse' })
+    // 62e66e758 gave Sonnet 5.5 its reviewed values ['adaptive', 'between_tools'].
     const note = await screen.findByText(
-      'Thinking mode "enabled" is not available on claude-sonnet-5-5. Choose Between tools (lowest), or clear it.',
+      'Thinking mode "enabled" is not available on claude-sonnet-5-5. Choose Adaptive or Between tools (lowest), or clear it.',
       { exact: true },
       { timeout: 10_000 }
     )

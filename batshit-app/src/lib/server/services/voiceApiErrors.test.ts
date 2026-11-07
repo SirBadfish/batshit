@@ -1,7 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import { classifyVoiceApiError } from './voiceApiErrors'
+import { VoiceCatalogCompatibilityError } from './builtinVoiceCatalogErrors'
+import { MimoVoiceInputError } from './mimoVoiceInput'
 
 describe('classifyVoiceApiError', () => {
+  it('uses the owning MiMo input error for known400 even when plural wording misses generic patterns', () => {
+    expect(classifyVoiceApiError(new MimoVoiceInputError('MiMo design Instructions are required.'), 'tts')).toMatchObject({ status: 400, logLevel: 'warn', setupHint: expect.stringContaining('different inputs') })
+  })
+  it('recognizes only the owning catalog refusal as a known412 with refresh guidance', () => {
+    const error = new VoiceCatalogCompatibilityError('Saved voice model compatibility is unavailable. Your selection is kept.')
+    expect(error.code).toBe('voice_model_compatibility_unavailable')
+    expect(classifyVoiceApiError(error, 'tts')).toMatchObject({ status: 412, logLevel: 'warn', setupHint: expect.stringContaining('Refresh the model list') })
+    expect(classifyVoiceApiError(Object.assign(new Error('Unknown failure'), { status: 412 }), 'tts').status).toBe(500)
+  })
   it('marks missing API keys as setup errors with actionable hints', () => {
     const result = classifyVoiceApiError(new Error('OpenAI API key not configured'), 'tts')
 

@@ -7,6 +7,10 @@
 import { describe, expect, it } from 'vitest'
 import type { CatalogModel } from '$lib/types/modelCatalog'
 import { _mergeCatalogs } from './+server'
+import { buildCatalogFromSnapshot } from '$lib/server/services/modelCatalogSync'
+import { resolveCatalogIds } from '$lib/utils/modelIdResolver'
+import { resolveCatalogConnectionPricing } from '$lib/utils/catalogConnectionLimits'
+import mistralCollision from '$lib/server/services/__fixtures__/mistral-catalog-collision.json'
 
 function row(canonicalId: string, connectionId: string, extra: Partial<CatalogModel> = {}): CatalogModel {
   const [provider, name] = canonicalId.split('/')
@@ -27,6 +31,28 @@ function row(canonicalId: string, connectionId: string, extra: Partial<CatalogMo
 }
 
 describe('BL-241 /api/models row identity', () => {
+  it('keeps both Mistral selector rows and exact saved-preset targets after replay and actual models merging', () => {
+    const models = _mergeCatalogs(buildCatalogFromSnapshot(mistralCollision).payload.models, [])
+    expect(models).toHaveLength(mistralCollision.models.length)
+    for (const original of mistralCollision.models) {
+      const model = models.find(row => row.canonicalId === original.canonicalId)!
+      expect(resolveCatalogIds({ connectionId: 'direct:mistral', developerId: model.provider, modelId: model.name, idVariants: model.idVariants })?.effectiveModelId)
+        .toBe(original.idVariants['direct:mistral'].effectiveId)
+      expect(resolveCatalogConnectionPricing(model, 'direct:mistral').pricing).toEqual(original.pricing)
+    }
+  })
+
+  it('keeps same-identity reasoning facts while a supplemental row updates other fields', () => {
+    const evidence: any = { lastGood: { version: 1, scope: 'public', support: 'supported', connection: 'direct:openai', effectiveModelId: 'exact-model',
+      endpoint: 'responses', controls: [{ id: 'effort', kind: 'effort', values: ['low'] }],
+      evidence: [{ url: 'https://developers.openai.com/api/docs/models/exact-model', checkedAt: '2026-10-14' }], lastVerified: '2026-10-14' },
+      lastAttempt: { at: '2026-10-14T12:00:00Z', outcome: 'verified' } }
+    const original = row('openai/exact-model', 'direct:openai')
+    original.idVariants!['direct:openai'].reasoningEvidence = evidence
+    const models = _mergeCatalogs([original], [row('openai/exact-model', 'direct:openai')])
+    expect(models[0].idVariants!['direct:openai'].reasoningEvidence).toEqual(evidence)
+    expect(models[0].features).toEqual(original.features)
+  })
   it('keeps two rows that share a bare id, each once, with unique catalog ids', () => {
     const models = _mergeCatalogs(
       [row('moonshot/kimi-k3', 'direct:moonshot'), row('system/kimi-k3', 'direct:qwencloud')],

@@ -1,4 +1,27 @@
+<script module lang="ts">
+  // Browser-realm custody only: a hard reload/restart does not prove an old request completed.
+  type DeletePhase = 'idle' | 'issued' | 'refresh' | 'unknown'
+  type VoiceBrowserOwner = {
+    view: symbol | null
+    views: Set<symbol>
+    requests: Map<symbol, number>
+    listeners: Set<() => void>
+    deletion: { phase: DeletePhase; revision: number; automatic: boolean; notice: string | null }
+  }
+  const voiceBrowserOwners = new Map<string, VoiceBrowserOwner>()
+  function notifyVoiceOwner(owner: VoiceBrowserOwner) {
+    for (const listener of owner.listeners) listener()
+  }
+</script>
+
 <script lang="ts">
+  import { mimoVoiceModelNotice } from '$lib/data/mimoVoiceProfiles'
+  import { voiceModelApplicabilityNotice, voiceTranscriptionModelNotice } from '$lib/data/voiceModelApplicability'
+  import { getQwenAudioTtsVoices, isQwenAudioTtsModel, parseQwenAudioEndpoint } from '$lib/data/qwenAudioTts'
+  import { resolveVoiceTtsDisplayEndpoint, resolveVoiceTtsDisplaySelection, voiceTtsModelStreams } from '$lib/utils/voiceTtsDisplay'
+  import { BUNDLED_VOICE_PROVIDER_SUMMARIES } from '$lib/data/builtinVoiceProviderBaseline'
+  import { readVoiceProviderEnvelope } from '$lib/utils/voiceProviderEnvelope'
+  import { projectVoiceProviderSummaries, voiceModelCatalogNotice, voiceProviderModelProfile, voiceSttCapabilitiesForModel } from '$lib/utils/builtinVoiceCatalogProjection'
   import { onMount, untrack } from 'svelte'
   import { debounce } from '$lib/utils/debounce'
   import * as Label from '$lib/components/ui/label'
@@ -41,6 +64,7 @@
   import { readConfirmedVoiceSaveAnswer, readVoiceSettingsReadAnswer } from '$lib/services/voiceSettingsPersistence'
   import * as agentStore from '$lib/stores/agents.svelte'
   import type { UserSettingsRow } from '$lib/types/database'
+  import { VOICE_ENGINE_DELETE_OUTCOME_CONTRACT } from '$lib/types/voice'
   import type {
     GoonLipSyncMode,
     GoonLipSyncPremiumAnalyzerId,
@@ -54,6 +78,7 @@
     VoiceSummary,
     VoiceProfileRecord,
     VoiceEngineClientSummary,
+    VoiceEngineDeleteOutcomeReceipt,
     VoiceEngineModelCatalogEntry,
     VoiceEngineUiField,
     VoiceEngineUiSchema
@@ -150,6 +175,7 @@
     volume?: string
     language?: string
     instructions?: string
+    endpoint?: string
   }
 
   type VoiceTtsEngineSettingsForm = {
@@ -278,10 +304,45 @@
   let persistedSignature = $state(makeSignature(normaliseSettings(null)))
   let persistedVoicePayload: VoiceSettings | null = null
   let voiceSaveQueueGeneration = 0
-  let voiceSavesInFlight = 0
-  let pendingVoiceSaveGeneration: number | null = null
+  let voiceSavesInFlight = $state(0)
+  let pendingVoiceSaveGeneration = $state<number | null>(null)
   let voiceSaveDispatchSequence = 0
   let latestVoiceSaveSettlement = 0
+  let voiceRawBaseline = $state<string | null>(null)
+  let observedVoiceRaw = JSON.stringify(normaliseSettings(null))
+  let voiceEditEpoch = 0
+  let voiceReadToken = 0
+  let voiceReadActive = false
+  let voiceReadRequested = false
+  let engineRawBaseline = $state<string | null>(null)
+  let observedEngineRaw = JSON.stringify([])
+  let engineEditEpoch = 0
+  let engineReadToken = 0
+  let engineReadActive = false
+  let engineReadRequested = false
+  let engineReadBusy = $state(false)
+  let engineQueueGeneration = 0
+  let pendingEngineGeneration = $state<number | null>(null)
+  let engineSavesInFlight = $state(0)
+  let engineDispatchSequence = 0
+  let engineSettlementSequence = 0
+  let auxiliaryActions = $state(0)
+  let engineActionEpoch = 0
+  let mounted = $state(false)
+  const viewToken = Symbol('Voice Settings view')
+  let browserOwner: VoiceBrowserOwner | null = null
+  let browserOwnerTick = $state(0)
+  let recoveryRunning = false
+  const statusTimers = new Set<ReturnType<typeof setTimeout>>()
+  const deletePhase = $derived.by(() => {
+    browserOwnerTick
+    return browserOwner?.deletion.phase ?? 'idle'
+  })
+  const deletionNotice = $derived.by(() => {
+    browserOwnerTick
+    return browserOwner?.deletion.notice ?? null
+  })
+
   let byoEngines = $state<VoiceEngineClientSummary[]>([])
   let persistedEngineSignature = $state(makeEngineSignature([]))
   let isLoading = $state(true)
@@ -303,6 +364,9 @@
   const settingsStatusError = $derived(settingsSaveError ?? settingsLoadError)
   let engineSaveState = $state<'idle' | 'saving' | 'saved' | 'error'>('idle')
   let engineSaveError = $state<string | null>(null)
+  let engineLoadError = $state<string | null>(null)
+  const engineStatusState = $derived(engineSaveError || engineLoadError ? 'error' : engineSaveState)
+  const engineStatusError = $derived(engineSaveError ?? engineLoadError)
   // Saved engine records the server cannot read (a newer Batshit wrote them, say). It keeps them
   // unchanged and names them beside the engines it lists (`scope: 'list'`: the whole list).
   type UnreadableEngineNotice = { scope: 'list' | 'record'; id: string | null; reason: string }
@@ -462,7 +526,7 @@
     })
   }
 
-  function buildProviderModelOptions(models: string[], defaultModel?: string | null): ProviderModelOption[] {
+  function buildProviderModelOptions(models: string[], defaultModel?: string | null, includeUnlistedDefault = true): ProviderModelOption[] {
     const merged = new Map<string, ProviderModelOption>()
     const trimmedDefault = defaultModel?.trim()
 
@@ -475,7 +539,7 @@
       })
     }
 
-    if (trimmedDefault && !merged.has(trimmedDefault)) {
+    if (includeUnlistedDefault && trimmedDefault && !merged.has(trimmedDefault)) {
       merged.set(trimmedDefault, {
         value: trimmedDefault,
         isDefault: true
@@ -762,14 +826,14 @@
     return `${provider.label} is not available for Voice Mode STT.`
   }
 
-  function getTtsLaneLabel(provider: VoiceProviderSummary | null) {
+  function getTtsLaneLabel(provider: VoiceProviderSummary | null, model?: string | null) {
     if (!provider) return 'Not configured'
-    return provider.supports.streaming ? 'Realtime TTS' : 'Batch TTS'
+    return voiceTtsModelStreams(provider, model) ? 'Realtime TTS' : 'Batch TTS'
   }
 
-  function getTtsBadgeClass(provider: VoiceProviderSummary | null) {
+  function getTtsBadgeClass(provider: VoiceProviderSummary | null, model?: string | null) {
     if (!provider) return 'batshit-settings-pill'
-    return provider.supports.streaming ? 'batshit-settings-pill is-success' : 'batshit-settings-pill'
+    return voiceTtsModelStreams(provider, model) ? 'batshit-settings-pill is-success' : 'batshit-settings-pill'
   }
 
   let openEngineAccordionId = $state<string | null>(null)
@@ -788,197 +852,9 @@
   let liveKitRuntimeError = $state<string | null>(null)
   let externalVoiceEngineRefreshTimer: ReturnType<typeof setTimeout> | null = null
 
-  const fallbackProviders: VoiceProviderSummary[] = [
-    {
-      id: 'browser',
-      label: 'Browser (Web Speech API)',
-      type: 'browser',
-      supports: {
-        tts: true,
-        stt: true,
-        listVoices: false,
-        clone: false,
-        streaming: false,
-        styles: false,
-        emotions: false
-      },
-      sttCapabilities: BROWSER_STT_CAPABILITIES,
-      sttModels: [],
-      ttsModels: []
-    },
-    {
-      id: 'google',
-      label: 'Google Gemini',
-      type: 'cloud',
-      requiresKey: true,
-      supports: {
-        tts: true,
-        stt: true,
-        listVoices: true,
-        clone: false,
-        streaming: false,
-        styles: false,
-        emotions: false
-      },
-      defaultTtsModel: 'gemini-3.1-flash-tts-preview',
-      defaultSttModel: 'gemini-3.5-transcribe',
-      defaultModel: 'gemini-3.1-flash-tts-preview',
-      defaultVoice: 'Kore',
-      ttsModels: [
-        'gemini-3.1-flash-tts-preview',
-        'gemini-2.5-flash-preview-tts',
-        'gemini-2.5-pro-preview-tts'
-      ],
-      sttModels: ['gemini-3.5-transcribe'],
-      sttCapabilities: GOOGLE_STT_CAPABILITIES
-    },
-    {
-      id: 'openai',
-      label: 'OpenAI',
-      type: 'cloud',
-      requiresKey: true,
-      supports: {
-        tts: true,
-        stt: true,
-        listVoices: true,
-        clone: false,
-        streaming: false,
-        styles: true,
-        emotions: false
-      },
-      defaultTtsModel: 'gpt-4o-mini-tts',
-      defaultSttModel: 'gpt-4o-mini-transcribe',
-      defaultRealtimeSttModel: 'gpt-realtime-whisper',
-      defaultModel: 'gpt-4o-mini-tts',
-      sttModels: [
-        'gpt-4o-mini-transcribe',
-        'gpt-4o-transcribe',
-        'gpt-4o-transcribe-diarize',
-        'whisper-1'
-      ],
-      realtimeSttModels: ['gpt-realtime-whisper'],
-      sttCapabilities: OPENAI_STT_CAPABILITIES,
-      ttsModels: ['gpt-4o-mini-tts', 'tts-1', 'tts-1-hd']
-    },
-    {
-      id: 'elevenlabs',
-      label: 'ElevenLabs',
-      type: 'cloud',
-      requiresKey: true,
-      supports: {
-        tts: true,
-        stt: true,
-        listVoices: true,
-        clone: true,
-        streaming: false,
-        styles: true,
-        emotions: true
-      },
-      defaultSttModel: 'scribe_v2',
-      defaultTtsModel: 'eleven_multilingual_v2',
-      defaultModel: 'eleven_multilingual_v2',
-      sttModels: ['scribe_v2'],
-      defaultRealtimeSttModel: 'scribe_v2_realtime',
-      realtimeSttModels: ['scribe_v2_realtime'],
-      sttCapabilities: ELEVENLABS_STT_CAPABILITIES,
-      ttsModels: [
-        'eleven_v3',
-        'eleven_multilingual_v2',
-        'eleven_flash_v2_5',
-        'eleven_flash_v2'
-      ]
-    },
-    {
-      id: 'deepgram',
-      label: 'Deepgram',
-      type: 'cloud',
-      requiresKey: true,
-      supports: {
-        tts: true,
-        stt: true,
-        listVoices: true,
-        clone: false,
-        streaming: false,
-        styles: false,
-        emotions: false
-      },
-      sttModels: [
-        'nova-3',
-        'nova-3-general',
-        'nova-3-medical',
-        'nova-2',
-        'nova-2-general',
-        'nova-2-meeting',
-        'nova-2-phonecall',
-        'nova-2-finance',
-        'nova-2-conversationalai',
-        'nova-2-voicemail',
-        'nova-2-video',
-        'nova-2-medical',
-        'nova-2-drivethru',
-        'nova-2-automotive',
-        'nova-2-atc',
-        'whisper',
-        'whisper-tiny',
-        'whisper-base',
-        'whisper-small',
-        'whisper-medium',
-        'whisper-large'
-      ],
-      realtimeSttModels: ['flux-general-en', 'flux-general-multi'],
-      defaultTtsModel: 'aura-2-asteria-en',
-      defaultSttModel: 'nova-3',
-      defaultRealtimeSttModel: 'flux-general-en',
-      defaultModel: 'aura-2-asteria-en',
-      defaultVoice: 'aura-2-asteria-en',
-      ttsModels: ['aura-2-asteria-en', 'flux-hannah-en'],
-      sttCapabilities: DEEPGRAM_STT_CAPABILITIES
-    },
-    {
-      id: 'fish',
-      label: 'Fish Audio',
-      type: 'cloud',
-      requiresKey: true,
-      supports: {
-        tts: true,
-        stt: true,
-        listVoices: true,
-        clone: false,
-        streaming: true,
-        styles: false,
-        emotions: false
-      },
-      defaultSttModel: 'transcribe-1',
-      defaultTtsModel: 's2-pro',
-      defaultModel: 's2-pro',
-      sttModels: ['transcribe-1'],
-      ttsModels: ['s2-pro', 's1'],
-      sttCapabilities: FISH_STT_CAPABILITIES
-    },
-    {
-      id: 'mistral',
-      label: 'Mistral Voxtral',
-      type: 'cloud',
-      requiresKey: true,
-      supports: {
-        tts: true,
-        stt: true,
-        listVoices: true,
-        clone: true,
-        streaming: false,
-        styles: false,
-        emotions: false
-      },
-      defaultTtsModel: 'voxtral-mini-tts-2603',
-      defaultSttModel: 'voxtral-mini-latest',
-      defaultRealtimeSttModel: 'voxtral-mini-transcribe-realtime-2602',
-      defaultModel: 'voxtral-mini-tts-2603',
-      ttsModels: ['voxtral-mini-tts-2603'],
-      sttModels: ['voxtral-mini-latest', 'voxtral-mini-2602'],
-      realtimeSttModels: ['voxtral-mini-transcribe-realtime-2602'],
-      sttCapabilities: MISTRAL_STT_CAPABILITIES
-    },
-  ]
+  // Only the server can confirm absent cache vs an unreadable cache hiding newer blocks.
+  const fallbackProviders = projectVoiceProviderSummaries(BUNDLED_VOICE_PROVIDER_SUMMARIES,
+    { snapshot: null, source: 'unavailable', checkedAt: null }, Date.now())
 
   const providerOptions = $derived(
     providerSummaries.length > 0 ? providerSummaries : fallbackProviders
@@ -1021,7 +897,13 @@
   const selectedTtsDefaultModel = $derived(
     selectedTtsProvider?.defaultTtsModel ?? selectedTtsProvider?.defaultModel ?? null
   )
-  const selectedSttCapabilities = $derived(selectedSttProvider?.sttCapabilities ?? null)
+  const selectedTtsModelNotice = $derived.by(() => {
+    const selected = resolveVoiceTtsDisplaySelection({}, { tts: { providerId: settings.ttsProvider, modelId: settings.ttsModel,
+      voiceId: settings.ttsVoiceId, profileId: settings.ttsProfileId } }, profiles, providerOptions)
+    const provider = providerOptions.find(provider => provider.id === selected.providerId)
+    return mimoVoiceModelNotice(selected.providerId, selected.modelId, voiceProviderModelProfile(provider, 'tts-batch', selected.modelId)) ?? voiceModelApplicabilityNotice(selected.providerId, selected.modelId)
+  })
+  const selectedSttCapabilities = $derived(voiceSttCapabilitiesForModel(selectedSttProvider, settings.sttModel))
   const selectedRealtimeSttCapabilities = $derived(selectedRealtimeSttProvider?.sttCapabilities ?? null)
   const selectedVoiceRuntimeLabel = $derived(
     getVoiceRuntimeLabel(settings.voiceSessionRuntime ?? 'direct')
@@ -1040,8 +922,6 @@
     getVoiceModeSttBadgeClass(selectedRealtimeSttProvider)
   )
   const selectedVoiceModeSttNotice = $derived(getVoiceModeSttNotice(selectedRealtimeSttProvider))
-  const selectedTtsLaneLabel = $derived(getTtsLaneLabel(selectedTtsProvider))
-  const selectedTtsBadgeClass = $derived(getTtsBadgeClass(selectedTtsProvider))
   const currentAgent = $derived(agentStore.getCurrentAgent())
   const currentAgentVoiceProfile = $derived(normalizeAgentVoiceProfile(currentAgent?.voice_profile))
   const currentAgentVoiceOverrideParts = $derived.by(() => {
@@ -1078,13 +958,13 @@
   const realtimeSttModelOptions = $derived(getSttModelsForLane(selectedRealtimeSttProvider, 'realtime'))
   const ttsModelOptions = $derived(selectedTtsProvider?.ttsModels ?? [])
   const sttProviderModelOptions = $derived.by(() =>
-    buildProviderModelOptions(sttModelOptions, selectedSttDefaultModel)
+    buildProviderModelOptions(sttModelOptions, selectedSttDefaultModel, !selectedSttProvider?.modelCatalog)
   )
   const realtimeSttProviderModelOptions = $derived.by(() =>
-    buildProviderModelOptions(realtimeSttModelOptions, selectedRealtimeSttDefaultModel)
+    buildProviderModelOptions(realtimeSttModelOptions, selectedRealtimeSttDefaultModel, !selectedRealtimeSttProvider?.modelCatalog)
   )
   const ttsProviderModelOptions = $derived.by(() =>
-    buildProviderModelOptions(ttsModelOptions, selectedTtsDefaultModel)
+    buildProviderModelOptions(ttsModelOptions, selectedTtsDefaultModel, !selectedTtsProvider?.modelCatalog)
   )
   const selectedSttNeedsModel = $derived(
     Boolean(settings.sttModel?.trim()) ||
@@ -1092,9 +972,9 @@
       selectedSttProvider?.type === 'byo' ||
       selectedSttProvider?.type === 'local'
   )
-  const sttHasSingleModelOption = $derived(sttProviderModelOptions.length === 1)
-  const realtimeSttHasSingleModelOption = $derived(realtimeSttProviderModelOptions.length === 1)
-  const ttsHasSingleModelOption = $derived(ttsProviderModelOptions.length === 1)
+  const sttHasSingleModelOption = $derived(sttProviderModelOptions.length === 1 && resolveDisplayedModel(settings.sttModel, sttProviderModelOptions, selectedSttDefaultModel) === sttProviderModelOptions[0]?.value)
+  const realtimeSttHasSingleModelOption = $derived(realtimeSttProviderModelOptions.length === 1 && resolveDisplayedModel(settings.realtimeSttModel, realtimeSttProviderModelOptions, selectedRealtimeSttDefaultModel) === realtimeSttProviderModelOptions[0]?.value)
+  const ttsHasSingleModelOption = $derived(ttsProviderModelOptions.length === 1 && resolveDisplayedModel(settings.ttsModel, ttsProviderModelOptions, selectedTtsDefaultModel) === ttsProviderModelOptions[0]?.value)
   const sttDisplayedModel = $derived.by(() =>
     resolveDisplayedModel(settings.sttModel, sttProviderModelOptions, selectedSttDefaultModel)
   )
@@ -1105,9 +985,13 @@
       selectedRealtimeSttDefaultModel
     )
   )
-  const ttsDisplayedModel = $derived.by(() =>
-    resolveDisplayedModel(settings.ttsModel, ttsProviderModelOptions, selectedTtsDefaultModel)
-  )
+  const ttsDisplayedModel = $derived.by(() => {
+    const selected = resolveVoiceTtsDisplaySelection({}, { tts: { providerId: settings.ttsProvider, modelId: settings.ttsModel,
+      voiceId: settings.ttsVoiceId, profileId: settings.ttsProfileId } }, profiles, providerOptions)
+    return selected.modelId ?? resolveDisplayedModel(settings.ttsModel, ttsProviderModelOptions, selectedTtsDefaultModel)
+  })
+  const selectedTtsLaneLabel = $derived(getTtsLaneLabel(selectedTtsProvider, ttsDisplayedModel))
+  const selectedTtsBadgeClass = $derived(getTtsBadgeClass(selectedTtsProvider, ttsDisplayedModel))
   const selectedRealtimeSttNeedsModel = $derived(
     Boolean(settings.realtimeSttModel?.trim()) || realtimeSttProviderModelOptions.length > 0
   )
@@ -1145,11 +1029,21 @@
       provider: selectedRealtimeSttProvider
     })
   )
-  const ttsVoiceOptions = $derived.by(() => {
-    const provider = settings.ttsProvider ?? 'browser'
+  const ttsVoiceOptions = $derived.by<VoiceSummary[]>(() => {
+    const global = { ...persistedVoicePayload, tts: { ...persistedVoicePayload?.tts, providerId: settings.ttsProvider, modelId: settings.ttsModel,
+      voiceId: settings.ttsVoiceId, profileId: settings.ttsProfileId }, ttsEngineSettings: settings.ttsEngineSettings }
+    const selected = resolveVoiceTtsDisplaySelection({}, global, profiles, providerOptions)
+    const provider = (selected.providerId ?? settings.ttsProvider ?? 'browser') as VoiceProviderId
     const merged = new Map<string, VoiceSummary>()
+    if (provider === 'alibaba' && isQwenAudioTtsModel(selected.modelId ?? '')) {
+      try {
+        const { region } = parseQwenAudioEndpoint(resolveVoiceTtsDisplayEndpoint(selected, global, profiles))
+        return getQwenAudioTtsVoices(selected.modelId ?? '', region).map(id => ({ id, name: id, provider }))
+      } catch { return [] }
+    }
+    const step3 = provider === 'stepfun' && selected.modelId === 'stepaudio-3-tts'
     const defaultVoiceId = selectedTtsProvider?.defaultVoice?.trim()
-    if (defaultVoiceId) {
+    if (defaultVoiceId && !step3) {
       merged.set(defaultVoiceId, {
         id: defaultVoiceId,
         name: defaultVoiceId,
@@ -1157,7 +1051,7 @@
         isDefault: true
       })
     }
-    selectedTtsProvider?.voiceSurface?.voices?.forEach((voiceId) => {
+    ;(step3 ? ['zixinnansheng'] : selectedTtsProvider?.voiceSurface?.voices ?? []).forEach((voiceId) => {
       const trimmed = voiceId.trim()
       if (!trimmed || merged.has(trimmed)) return
       merged.set(trimmed, {
@@ -1168,6 +1062,7 @@
       })
     })
     voices.forEach((voice) => {
+      if (step3 && voice.id !== 'zixinnansheng') return
       const existing = merged.get(voice.id)
       merged.set(voice.id, {
         ...voice,
@@ -1201,6 +1096,9 @@
       ? profiles.find((profile) => profile.id === selectedProfileId && profile.provider === provider)
       : null
     if (selectedProfile?.voiceId) return selectedProfile.voiceId
+    const effective = resolveVoiceTtsDisplaySelection({}, { tts: { providerId: settings.ttsProvider, modelId: settings.ttsModel,
+      voiceId: settings.ttsVoiceId, profileId: settings.ttsProfileId } }, profiles, providerOptions)
+    if (effective.providerId === 'alibaba' && isQwenAudioTtsModel(effective.modelId ?? '') || effective.providerId === 'stepfun' && effective.modelId === 'stepaudio-3-tts') return ''
     return selectedTtsProvider?.defaultVoice?.trim() ?? ''
   })
   const displayedTtsVoiceName = $derived.by(() => {
@@ -1275,7 +1173,154 @@
     }
   })
 
+  function ownsView() {
+    browserOwnerTick
+    return mounted && browserOwner?.view === viewToken
+  }
+
+  function hasForeignRequest() {
+    browserOwnerTick
+    return Boolean(browserOwner && [...browserOwner.requests].some(([view, count]) => view !== viewToken && count > 0))
+  }
+
+  function beginOwnedRequest() {
+    const owner = browserOwner!
+    owner.requests.set(viewToken, (owner.requests.get(viewToken) ?? 0) + 1)
+    notifyVoiceOwner(owner)
+    return () => {
+      const remaining = (owner.requests.get(viewToken) ?? 1) - 1
+      if (remaining > 0) owner.requests.set(viewToken, remaining)
+      else owner.requests.delete(viewToken)
+      notifyVoiceOwner(owner)
+      if (!owner.view && !owner.requests.size && owner.deletion.phase === 'idle' && !owner.deletion.notice) {
+        for (const [userId, value] of voiceBrowserOwners) if (value === owner) voiceBrowserOwners.delete(userId)
+      }
+    }
+  }
+
+  function writesAvailable() {
+    return ownsView() && browserOwner?.deletion.phase === 'idle' && !hasForeignRequest()
+  }
+
+  function voiceClean() {
+    return voiceRawBaseline !== null && JSON.stringify(settings) === voiceRawBaseline
+  }
+
+  function enginesClean() {
+    return engineRawBaseline !== null && makeEngineSignature(byoEngines) === engineRawBaseline
+  }
+
+  function voiceReadAvailable(recovery?: number) {
+    const phase = browserOwner?.deletion
+    const admitted = phase?.phase === 'idle' || phase?.phase === 'refresh' && phase.revision === recovery
+    return ownsView() && admitted && !hasForeignRequest() && !voiceSavesInFlight && pendingVoiceSaveGeneration === null &&
+      (!settingsLoaded || voiceClean())
+  }
+
+  function engineReadAvailable(recovery?: number) {
+    const phase = browserOwner?.deletion
+    const admitted = phase?.phase === 'idle' || phase?.phase === 'refresh' && phase.revision === recovery
+    return ownsView() && admitted && !hasForeignRequest() && !auxiliaryActions && !engineSavesInFlight && pendingEngineGeneration === null &&
+      (engineRawBaseline === null || enginesClean())
+  }
+
+  function cancelQueuedVoice() {
+    voiceSaveQueueGeneration += 1
+    pendingVoiceSaveGeneration = null
+  }
+
+  function cancelQueuedEngines() {
+    engineQueueGeneration += 1
+    pendingEngineGeneration = null
+  }
+
+  function scheduleStatusReset(lane: 'voice' | 'engine') {
+    if (!ownsView()) return
+    const timer = setTimeout(() => {
+      statusTimers.delete(timer)
+      if (!ownsView()) return
+      if (lane === 'voice' && settingsSaveState === 'saved') settingsSaveState = 'idle'
+      if (lane === 'engine' && engineSaveState === 'saved') engineSaveState = 'idle'
+    }, 2000)
+    statusTimers.add(timer)
+  }
+
+  function readEngineAnswer(result: any): VoiceEngineClientSummary[] {
+    if (!result || result.success === false || !Array.isArray(result.engines) ||
+      result.engines.some((engine: any) => !engine || typeof engine !== 'object' || Array.isArray(engine) || typeof engine.id !== 'string')) {
+      throw new Error('Engine Manager response did not include a valid engine list.')
+    }
+    return result.engines
+  }
+
+  function wakeOwnedReads() {
+    if (!ownsView()) return
+    untrack(() => {
+      if (browserOwner?.deletion.phase === 'refresh') {
+        if (browserOwner.deletion.automatic) void recoverDeletedSettings()
+        return
+      }
+      if (browserOwner?.deletion.phase !== 'idle') return
+      if (voiceReadRequested && !voiceReadActive && voiceReadAvailable()) void loadSettings(false)
+      if (engineReadRequested && !engineReadActive && engineReadAvailable()) void loadByoEngines(false)
+    })
+  }
+
+  function engineActionAvailable() {
+    return writesAvailable() && engineRawBaseline !== null && enginesClean() && !engineReadBusy &&
+      !engineSavesInFlight && pendingEngineGeneration === null && !auxiliaryActions
+  }
+
+  function deleteAtRest() {
+    browserOwnerTick
+    return writesAvailable() && settingsLoaded && voiceClean() && enginesClean() &&
+      !settingsLoadBusy && !engineReadBusy && !browserOwner?.requests.size && !voiceSavesInFlight && !engineSavesInFlight &&
+      pendingVoiceSaveGeneration === null && pendingEngineGeneration === null && !auxiliaryActions &&
+      !settingsSaveError && !engineSaveError
+  }
+
+  async function recoverDeletedSettings() {
+    const owner = browserOwner
+    if (!ownsView() || !owner || owner.deletion.phase !== 'refresh' || recoveryRunning || hasForeignRequest()) return
+    recoveryRunning = true
+    const revision = owner.deletion.revision
+    owner.deletion.automatic = false
+    try {
+      const [voiceReady, enginesReady] = await Promise.all([loadSettings(true, revision), loadByoEngines(true, revision)])
+      if (ownsView() && owner.deletion.phase === 'refresh' && owner.deletion.revision === revision && voiceReady && enginesReady) {
+        owner.deletion.phase = 'idle'
+        notifyVoiceOwner(owner)
+      }
+    } finally {
+      recoveryRunning = false
+      if (ownsView() && owner.deletion.phase === 'refresh' && owner.deletion.revision === revision &&
+        (voiceReadRequested || engineReadRequested)) {
+        owner.deletion.automatic = true
+        wakeOwnedReads()
+      }
+    }
+  }
+
+  function retrySettingsRead() {
+    if (browserOwner?.deletion.phase === 'refresh') return recoverDeletedSettings()
+    if (browserOwner?.deletion.phase === 'unknown' || browserOwner?.deletion.phase === 'issued') return
+    return loadSettings()
+  }
+
   onMount(() => {
+    mounted = true
+    const userId = data?.user?.id ?? ''
+    browserOwner = voiceBrowserOwners.get(userId) ?? {
+      view: null, views: new Set(), requests: new Map(), listeners: new Set(),
+      deletion: { phase: 'idle', revision: 0, automatic: false, notice: null }
+    }
+    voiceBrowserOwners.set(userId, browserOwner)
+    browserOwner.views.add(viewToken)
+    browserOwner.view ??= viewToken
+    const owner = browserOwner
+    const wake = () => { browserOwnerTick += 1; wakeOwnedReads() }
+    owner.listeners.add(wake)
+    notifyVoiceOwner(owner)
     const handleVoiceEnginesUpdated = () => {
       if (externalVoiceEngineRefreshTimer) {
         clearTimeout(externalVoiceEngineRefreshTimer)
@@ -1290,6 +1335,9 @@
     }
 
     window.addEventListener(VOICE_ENGINES_UPDATED_EVENT, handleVoiceEnginesUpdated as EventListener)
+    const refreshVisibleCatalog = () => { if (mounted && document.visibilityState === 'visible') void loadProviders() }
+    window.addEventListener('focus', refreshVisibleCatalog)
+    const catalogRefreshTimer = setInterval(refreshVisibleCatalog, 60 * 60_000)
 
     void (async () => {
       const tasks: Array<Promise<unknown>> = [
@@ -1302,9 +1350,26 @@
       ]
 
       await Promise.all(tasks)
+      wakeOwnedReads()
     })()
 
     return () => {
+      mounted = false
+      window.removeEventListener('focus', refreshVisibleCatalog)
+      clearInterval(catalogRefreshTimer)
+      cancelQueuedVoice()
+      cancelQueuedEngines()
+      voiceReadToken += 1
+      engineReadToken += 1
+      voiceReadRequested = false
+      engineReadRequested = false
+      for (const timer of statusTimers) clearTimeout(timer)
+      statusTimers.clear()
+      owner.listeners.delete(wake)
+      owner.views.delete(viewToken)
+      if (owner.view === viewToken) owner.view = owner.views.values().next().value ?? null
+      notifyVoiceOwner(owner)
+      if (!owner.view && !owner.requests.size && owner.deletion.phase === 'idle' && !owner.deletion.notice) voiceBrowserOwners.delete(userId)
       window.removeEventListener(VOICE_ENGINES_UPDATED_EVENT, handleVoiceEnginesUpdated as EventListener)
       if (externalVoiceEngineRefreshTimer) {
         clearTimeout(externalVoiceEngineRefreshTimer)
@@ -1314,168 +1379,156 @@
     }
   })
 
-  const debouncedSave = debounce(async (payload: VoiceSettings, patch: VoiceSettingsPatch, queueGeneration: number) => {
-    // A queued timer is revocable. A request that already started keeps its ownership.
-    if (queueGeneration !== voiceSaveQueueGeneration) return
+  const debouncedSave = debounce(async (payload: VoiceSettings, patch: VoiceSettingsPatch, queueGeneration: number, raw: VoiceSettingsForm) => {
+    if (!writesAvailable() || queueGeneration !== voiceSaveQueueGeneration || !settingsLoaded || !persistedVoicePayload) return
     pendingVoiceSaveGeneration = null
     voiceSavesInFlight += 1
     const saveSequence = ++voiceSaveDispatchSequence
+    const finish = beginOwnedRequest()
     try {
-      if (!settingsLoaded || !persistedVoicePayload) throw new Error('Voice settings have not loaded.')
       const { goonLipSync: _lipSync, ...voiceSettings } = payload
       const response = await fetch('/api/user/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          voice_settings: voiceSettings,
-          ...(patch.goonLipSync ? { voice_settings_patch: patch } : {})
-        })
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ voice_settings: voiceSettings, ...(patch.goonLipSync ? { voice_settings_patch: patch } : {}) })
       })
-
-      if (!response.ok) {
-        const message = await extractError(response, 'Failed to save voice settings')
-        throw new Error(message)
-      }
-
-      const result = await response.json()
-      const updated = readConfirmedVoiceSaveAnswer(result)
-      // An old answer cannot replace a newer settled save's baseline/store or cancel its
-      // queued follow-up. Failed newer saves also keep their draft/error instead of retrying.
-      if (saveSequence < latestVoiceSaveSettlement) return
+      if (!response.ok) throw new Error(await extractError(response, 'Failed to save voice settings'))
+      const updated = readConfirmedVoiceSaveAnswer(await response.json())
+      if (!ownsView() || saveSequence < latestVoiceSaveSettlement) return
       latestVoiceSaveSettlement = saveSequence
       const confirmedLip = normalizeVoiceSettings(updated.voice_settings).goonLipSync
-
       untrack(() => {
-        // Follow the real saved answer only where no later local lip choice replaced this one.
-        // The pair is one choice; the blend slider is independent. Other drafts stay untouched.
+        const observedBeforeAnswer = JSON.stringify(settings) === observedVoiceRaw
         const submitted = payload.goonLipSync
-        const pairUntouched = settings.goonLipSyncMode === submitted?.mode &&
-          settings.goonLipSyncAnalyzerId === submitted?.analyzerId
+        const pairUntouched = settings.goonLipSyncMode === submitted?.mode && settings.goonLipSyncAnalyzerId === submitted?.analyzerId
         const blendUntouched = settings.goonLipSyncBlendMs === submitted?.visemeBlendMs
-        settings = {
-          ...settings,
-          ...(pairUntouched ? {
-            goonLipSyncMode: confirmedLip?.mode,
-            goonLipSyncAnalyzerId: confirmedLip?.analyzerId
-          } : {}),
-          ...(blendUntouched ? { goonLipSyncBlendMs: confirmedLip?.visemeBlendMs } : {})
-        }
+        settings = { ...settings,
+          ...(pairUntouched ? { goonLipSyncMode: confirmedLip?.mode, goonLipSyncAnalyzerId: confirmedLip?.analyzerId } : {}),
+          ...(blendUntouched ? { goonLipSyncBlendMs: confirmedLip?.visemeBlendMs } : {}) }
         persistedVoicePayload = { ...payload, goonLipSync: confirmedLip }
         persistedSignature = makeSignature(persistedVoicePayload)
+        voiceRawBaseline = JSON.stringify({ ...raw, goonLipSyncMode: confirmedLip?.mode,
+          goonLipSyncAnalyzerId: confirmedLip?.analyzerId, goonLipSyncBlendMs: confirmedLip?.visemeBlendMs })
+        if (observedBeforeAnswer) observedVoiceRaw = JSON.stringify(settings)
+        if (voiceSavesInFlight === 1 && makeSignature(settings) === persistedSignature) cancelQueuedVoice()
         settingsSaveState = voiceSavesInFlight > 1 || pendingVoiceSaveGeneration !== null ? 'saving' : 'saved'
         settingsSaveError = null
-        // A save that landed shows the store answers, so it also ends the standing failure of an
-        // earlier refresh (the copy the form holds is still the loaded one). A failed refresh
-        // stays on the status chip until a save lands or a read succeeds.
         settingsLoadError = null
       })
-
-      if (updated || result?.settings === null) {
-        setUserSettings(updated)
-      }
+      setUserSettings(updated)
     } catch (error) {
-      latestVoiceSaveSettlement = Math.max(latestVoiceSaveSettlement, saveSequence)
-      console.error('Voice settings save failed:', error)
-      untrack(() => {
-        settingsSaveState = 'error'
-        settingsSaveError = error instanceof Error ? error.message : 'Failed to save voice settings'
-      })
+      if (!ownsView() || saveSequence < latestVoiceSaveSettlement) return
+      latestVoiceSaveSettlement = saveSequence
+      settingsSaveState = 'error'
+      settingsSaveError = error instanceof Error ? error.message : 'Failed to save voice settings'
     } finally {
       voiceSavesInFlight -= 1
-      untrack(() => {
-        if (voiceSavesInFlight === 0 && pendingVoiceSaveGeneration === null && settingsSaveState === 'saving') {
-          settingsSaveState = 'saved'
-        }
-      })
-      setTimeout(() => {
-        untrack(() => {
-          if (settingsSaveState === 'saved') {
-            settingsSaveState = 'idle'
-          }
-        })
-      }, 2000)
+      if (ownsView()) {
+        if (!voiceSavesInFlight && pendingVoiceSaveGeneration === null && settingsSaveState === 'saving') settingsSaveState = 'saved'
+        scheduleStatusReset('voice')
+      }
+      finish()
+      wakeOwnedReads()
     }
   }, SAVE_DEBOUNCE_MS)
 
-  const debouncedEngineSave = debounce(async (engines: VoiceEngineClientSummary[]) => {
+  const debouncedEngineSave = debounce(async (payload: ReturnType<typeof buildEnginePublicPayload>, queueGeneration: number) => {
+    if (!writesAvailable() || queueGeneration !== engineQueueGeneration || engineRawBaseline === null) return
+    pendingEngineGeneration = null
+    engineSavesInFlight += 1
+    const sequence = ++engineDispatchSequence
+    const finish = beginOwnedRequest()
     try {
       const response = await fetch('/api/voice/byo/engines', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ engines: buildEnginePublicPayload(engines) })
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ engines: payload })
       })
-
-      if (!response.ok) {
-        const message = await extractError(response, 'Failed to save Engine Manager changes')
-        throw new Error(message)
-      }
-
+      if (!response.ok) throw new Error(await extractError(response, 'Failed to save Engine Manager changes'))
       const result = await response.json()
-      const updated = Array.isArray(result?.engines) ? result.engines : []
-
+      const updated = readEngineAnswer(result)
+      if (!ownsView() || sequence < engineSettlementSequence) return
+      engineSettlementSequence = sequence
       untrack(() => {
-        byoEngines = updated
+        // Fresh metadata can follow; a public choice made after issue keeps its own draft.
+        const observedBeforeAnswer = makeEngineSignature(byoEngines) === observedEngineRaw
+        const submitted = new Map(payload.map(engine => [engine.id, engine]))
+        const live = new Map(byoEngines.map(engine => [engine.id, engine]))
+        byoEngines = updated.map(engine => {
+          const current = live.get(engine.id)
+          const original = submitted.get(engine.id)
+          if (!current || !original) return engine
+          const now = buildEnginePublicPayload([current])[0]
+          return { ...engine,
+            ...(JSON.stringify(now.enabled) !== JSON.stringify(original.enabled) ? { enabled: current.enabled } : {}),
+            ...(JSON.stringify(now.iconRef) !== JSON.stringify(original.iconRef) ? { iconRef: current.iconRef } : {}),
+            ...(JSON.stringify(now.localRuntime) !== JSON.stringify(original.localRuntime)
+              ? { localRuntime: { ...engine.localRuntime, startup: current.localRuntime?.startup } } : {}) }
+        })
         byoUnreadableEngines = readUnreadableEngines(result)
         persistedEngineSignature = makeEngineSignature(updated)
-        engineSaveState = 'saved'
+        engineRawBaseline = persistedEngineSignature
+        if (observedBeforeAnswer) observedEngineRaw = makeEngineSignature(byoEngines)
+        if (engineSavesInFlight === 1 && makeEngineSignature(byoEngines) === engineRawBaseline) cancelQueuedEngines()
+        engineSaveState = engineSavesInFlight > 1 || pendingEngineGeneration !== null ? 'saving' : 'saved'
         engineSaveError = null
+        engineLoadError = null
       })
-
-      await loadProviders()
+      if (ownsView()) await loadProviders()
     } catch (error) {
-      console.error('Voice engine registry save failed:', error)
-      untrack(() => {
-        engineSaveState = 'error'
-        engineSaveError = error instanceof Error ? error.message : 'Failed to save Engine Manager changes'
-      })
+      if (!ownsView() || sequence < engineSettlementSequence) return
+      engineSettlementSequence = sequence
+      engineSaveState = 'error'
+      engineSaveError = error instanceof Error ? error.message : 'Failed to save Engine Manager changes'
     } finally {
-      setTimeout(() => {
-        untrack(() => {
-          if (engineSaveState === 'saved') {
-            engineSaveState = 'idle'
-          }
-        })
-      }, 2000)
+      engineSavesInFlight -= 1
+      if (ownsView()) {
+        if (!engineSavesInFlight && pendingEngineGeneration === null && engineSaveState === 'saving') engineSaveState = 'saved'
+        scheduleStatusReset('engine')
+      }
+      finish()
+      wakeOwnedReads()
     }
   }, SAVE_DEBOUNCE_MS)
 
   $effect(() => {
-    // BL-962: never a write built while no read of the saved voice settings succeeded. The
-    // controls are not offered then either; this line keeps the whole block from being sent if
-    // one ever is.
-    if (isLoading || !settingsLoaded) return
-
+    // Read the raw draft first. Ownership metadata is deliberately not edit intent.
+    const raw = JSON.stringify(settings)
     const payload = buildVoiceSettingsPayload(settings)
-    const signature = makeSignature(payload)
-    if (signature === persistedSignature) {
-      voiceSaveQueueGeneration += 1
-      pendingVoiceSaveGeneration = null
-      untrack(() => {
-        if (voiceSavesInFlight === 0 && settingsSaveState === 'saving') settingsSaveState = 'idle'
-      })
-      return
-    }
-
-    settingsSaveState = 'saving'
-    settingsSaveError = null
-    // Capture intent against the baseline this form actually read, before any later answer
-    // rebases an untouched lip choice. A delayed payload cannot infer new intent from it.
-    const patch = untrack(() => buildVoiceLipSyncPatch(payload, persistedVoicePayload!))
-    pendingVoiceSaveGeneration = ++voiceSaveQueueGeneration
-    debouncedSave(payload, patch, pendingVoiceSaveGeneration)
+    untrack(() => {
+      if (raw === observedVoiceRaw) return
+      observedVoiceRaw = raw
+      voiceEditEpoch += 1
+      if (!writesAvailable() || isLoading || !settingsLoaded || !persistedVoicePayload) return
+      if (makeSignature(payload) === persistedSignature && !voiceSavesInFlight) {
+        cancelQueuedVoice()
+        if (!voiceSavesInFlight && settingsSaveState === 'saving') settingsSaveState = 'idle'
+        wakeOwnedReads()
+        return
+      }
+      settingsSaveState = 'saving'
+      settingsSaveError = null
+      const patch = buildVoiceLipSyncPatch(payload, persistedVoicePayload)
+      pendingVoiceSaveGeneration = ++voiceSaveQueueGeneration
+      debouncedSave(JSON.parse(JSON.stringify(payload)), patch, pendingVoiceSaveGeneration, JSON.parse(raw))
+    })
   })
 
   $effect(() => {
-    if (isLoading) return
-
-    const signature = makeEngineSignature(byoEngines)
-    if (signature === persistedEngineSignature) {
-      return
-    }
-
-    engineSaveState = 'saving'
-    engineSaveError = null
-    debouncedEngineSave(byoEngines)
+    const raw = makeEngineSignature(byoEngines)
+    untrack(() => {
+      if (raw === observedEngineRaw) return
+      observedEngineRaw = raw
+      engineEditEpoch += 1
+      if (!writesAvailable() || isLoading || engineRawBaseline === null) return
+      if (raw === persistedEngineSignature && !engineSavesInFlight) {
+        cancelQueuedEngines()
+        if (!engineSavesInFlight && engineSaveState === 'saving') engineSaveState = 'idle'
+        wakeOwnedReads()
+        return
+      }
+      engineSaveState = 'saving'
+      engineSaveError = null
+      pendingEngineGeneration = ++engineQueueGeneration
+      debouncedEngineSave(JSON.parse(raw), pendingEngineGeneration)
+    })
   })
 
   $effect(() => {
@@ -1560,7 +1613,8 @@
         speed: config.common?.speed != null ? String(config.common.speed) : '',
         volume: config.common?.volume != null ? String(config.common.volume) : '',
         language: config.common?.language ?? '',
-        instructions: config.common?.instructions ?? ''
+        instructions: config.common?.instructions ?? '',
+        endpoint: config.common?.endpoint ?? ''
       }
       const providerOptions = toFormProviderOptionBlock(config.providerOptions)
       const hasCommon = Object.values(common).some((value) => value.trim() !== '')
@@ -1609,8 +1663,10 @@
 
     const language = normaliseString(common.language)
     const instructions = normaliseString(common.instructions)
+    const endpoint = normaliseString(common.endpoint)
     if (language) output.language = language
     if (instructions) output.instructions = instructions
+    if (endpoint) output.endpoint = endpoint
 
     return Object.keys(output).length > 0
       ? (output as NonNullable<VoiceSettings['tts']>['common'])
@@ -1642,7 +1698,7 @@
   function getCommonKeyForCapabilityField(field: VoiceCapabilityField): keyof VoiceCommonForm | null {
     if (!field.path.startsWith('common.')) return null
     const key = field.path.replace('common.', '')
-    return ['speed', 'volume', 'language', 'instructions'].includes(key)
+    return ['speed', 'volume', 'language', 'instructions', 'endpoint'].includes(key)
       ? (key as keyof VoiceCommonForm)
       : null
   }
@@ -1935,8 +1991,7 @@
       id: engine.id,
       enabled: engine.enabled !== false,
       iconRef: engine.iconRef ?? null,
-      ttsDefaults: engine.ttsDefaults,
-      sttDefaults: engine.sttDefaults,
+      // Registry defaults are display hints; unrelated controls never own their replacement.
       localRuntime:
         engine.localRuntime?.startup
           ? {
@@ -2047,6 +2102,10 @@
   }
 
   async function handleConnectExistingEngine() {
+    if (!engineActionAvailable()) {
+      if (ownsView()) toast.error('Wait for Engine Manager changes to finish, then try again.')
+      return
+    }
     const engineId = makeEngineIdFromName(existingEngineForm.engineId)
     if (!engineId) {
       existingEngineError = 'Add an engine ID.'
@@ -2063,6 +2122,9 @@
 
     existingEngineSaving = true
     existingEngineError = null
+    auxiliaryActions += 1
+    engineActionEpoch += 1
+    const finish = beginOwnedRequest()
     try {
       const response = await fetch('/api/voice/byo/engines', {
         method: 'POST',
@@ -2092,92 +2154,121 @@
       }
 
       const result = await response.json()
-      const updated = Array.isArray(result?.engines) ? result.engines : []
+      if (result?.success !== true || result?.engine?.id !== engineId || !Array.isArray(result?.engines)) {
+        throw new Error('Connecting the engine did not return a matching saved record.')
+      }
+      if (!ownsView()) return
+      await loadByoEngines()
+      if (!ownsView()) return
       untrack(() => {
-        byoEngines = updated
-        byoUnreadableEngines = readUnreadableEngines(result)
-        persistedEngineSignature = makeEngineSignature(updated)
         existingEngineFormOpen = false
         resetExistingEngineForm()
       })
       await loadProviders()
+      if (!ownsView()) return
       await checkByoEngineHealth(engineId)
-      toast.success('Existing voice engine connected')
+      if (ownsView()) toast.success('Existing voice engine connected')
     } catch (error) {
+      if (!ownsView()) return
       const message = error instanceof Error ? error.message : 'Failed to connect existing engine'
       existingEngineError = message
       toast.error(message)
     } finally {
-      existingEngineSaving = false
+      auxiliaryActions -= 1
+      if (ownsView()) existingEngineSaving = false
+      finish()
+      wakeOwnedReads()
     }
   }
 
-  async function loadSettings() {
+  async function loadSettings(requested = true, recovery?: number): Promise<boolean> {
+    if (requested) voiceReadRequested = true
+    if (voiceReadActive || !voiceReadRequested || !voiceReadAvailable(recovery)) return false
+    voiceReadRequested = false
+    voiceReadActive = true
     settingsLoadBusy = true
+    const token = ++voiceReadToken
+    const epoch = voiceEditEpoch
+    const baseline = voiceRawBaseline
+    const settled = latestVoiceSaveSettlement
     try {
       const response = await fetch('/api/user/settings')
-      if (!response.ok) {
-        const message = await extractError(response, 'Failed to load voice settings')
-        throw new Error(message)
-      }
-
+      if (!response.ok) throw new Error(await extractError(response, 'Failed to load voice settings'))
       const result = await response.json()
       const remoteSettings = readVoiceSettingsReadAnswer(result)
       const next = normaliseSettings(remoteSettings?.voice_settings)
-
+      if (!ownsView() || token !== voiceReadToken) return false
+      if (voiceReadRequested || !voiceReadAvailable(recovery) || epoch !== voiceEditEpoch || baseline !== voiceRawBaseline || settled !== latestVoiceSaveSettlement) {
+        voiceReadRequested = true
+        return false
+      }
       untrack(() => {
         settings = { ...next }
         persistedVoicePayload = buildVoiceSettingsPayload(next)
         persistedSignature = makeSignature(next)
-        // A successful (re)load clears the failure at once, in the same block that resets the
-        // signature: the autosave effect returns at its signature guard and would never reach
-        // code that clears it (BL-487's follow-up).
+        voiceRawBaseline = JSON.stringify(next)
+        observedVoiceRaw = voiceRawBaseline
         settingsLoaded = true
         settingsLoadError = null
         isLoading = false
       })
-
-      if (remoteSettings || result?.settings === null) {
-        setUserSettings(remoteSettings)
-      }
+      setUserSettings(remoteSettings)
+      return true
     } catch (error) {
-      console.error('Failed to load voice settings:', error)
-      // BL-962: a failed read changes nothing but the failure. `settings` and its baseline stay
-      // what they were (the page's copy or the defaults before a first good read, the loaded copy
-      // after one); they are never replaced by the page's copy.
-      untrack(() => {
+      if (ownsView() && token === voiceReadToken) untrack(() => {
         settingsLoadError = error instanceof Error ? error.message : 'Failed to load voice settings'
         isLoading = false
       })
+      return false
     } finally {
-      untrack(() => {
-        settingsLoadBusy = false
-      })
+      if (token === voiceReadToken) {
+        voiceReadActive = false
+        if (ownsView()) settingsLoadBusy = false
+        wakeOwnedReads()
+      }
     }
   }
 
-  async function loadByoEngines() {
+  async function loadByoEngines(requested = true, recovery?: number): Promise<boolean> {
+    if (requested) engineReadRequested = true
+    if (engineReadActive || !engineReadRequested || !engineReadAvailable(recovery)) return false
+    engineReadRequested = false
+    engineReadActive = true
+    engineReadBusy = true
+    const token = ++engineReadToken
+    const epoch = engineEditEpoch
+    const baseline = engineRawBaseline
+    const settled = engineSettlementSequence
     try {
       const response = await fetch('/api/voice/byo/engines')
-      if (!response.ok) {
-        const message = await extractError(response, 'Failed to load Engine Manager')
-        throw new Error(message)
-      }
-
+      if (!response.ok) throw new Error(await extractError(response, 'Failed to load Engine Manager'))
       const result = await response.json()
-      const engines = Array.isArray(result?.engines) ? result.engines : []
-
+      const engines = readEngineAnswer(result)
+      if (!ownsView() || token !== engineReadToken) return false
+      if (engineReadRequested || !engineReadAvailable(recovery) || epoch !== engineEditEpoch || baseline !== engineRawBaseline || settled !== engineSettlementSequence) {
+        engineReadRequested = true
+        return false
+      }
       untrack(() => {
         byoEngines = engines
         byoUnreadableEngines = readUnreadableEngines(result)
         persistedEngineSignature = makeEngineSignature(engines)
+        engineRawBaseline = persistedEngineSignature
+        observedEngineRaw = persistedEngineSignature
+        engineLoadError = null
       })
+      return true
     } catch (error) {
-      console.error('Failed to load Engine Manager:', error)
-      untrack(() => {
-        engineSaveState = 'error'
-        engineSaveError = error instanceof Error ? error.message : 'Failed to load Engine Manager'
+      if (ownsView() && token === engineReadToken) untrack(() => {
+        engineLoadError = error instanceof Error ? error.message : 'Failed to load Engine Manager'
       })
+      return false
+    } finally {
+      if (token === engineReadToken) {
+        engineReadActive = false
+        if (ownsView()) engineReadBusy = false
+        wakeOwnedReads()
+      }
     }
   }
 
@@ -2263,22 +2354,23 @@
   }
 
   async function loadProviders() {
+    if (providersLoading || !mounted) return
     providersLoading = true
     providersError = null
 
     try {
-      const response = await fetch('/api/voice/providers')
+      const response = await fetch('/api/voice/providers?catalog=refresh')
       if (!response.ok) {
         const message = await extractError(response, 'Failed to load voice providers')
         throw new Error(message)
       }
 
       const result = await response.json()
-      const items = Array.isArray(result?.providers) ? result.providers : []
-      providerSummaries = items
+      const items = readVoiceProviderEnvelope(result)
+      if (mounted) providerSummaries = items
     } catch (error) {
       console.error('Failed to load voice providers:', error)
-      providersError = error instanceof Error ? error.message : 'Failed to load voice providers'
+      if (mounted) providersError = error instanceof Error ? error.message : 'Failed to load voice providers'
     } finally {
       providersLoading = false
     }
@@ -2348,6 +2440,7 @@
   }
 
   function handleSettingsChange(next: Partial<VoiceSettingsForm>) {
+    if (!writesAvailable() || !settingsLoaded) return
     settings = { ...settings, ...next }
   }
 
@@ -2515,6 +2608,7 @@
   }
 
   function setTtsEngineCommonFieldValue(providerId: string, key: keyof VoiceCommonForm, rawValue: string) {
+    if (!writesAvailable() || !settingsLoaded) return
     const nextMap = { ...(settings.ttsEngineSettings ?? {}) }
     const nextConfig = { ...(nextMap[providerId] ?? {}) }
     const nextCommon = { ...(nextConfig.common ?? {}) }
@@ -2537,6 +2631,7 @@
     key: string,
     rawValue: string | boolean
   ) {
+    if (!writesAvailable() || !settingsLoaded) return
     const nextMap = { ...(settings.ttsEngineSettings ?? {}) }
     const nextConfig = { ...(nextMap[providerId] ?? {}) }
     const nextProviderOptions = { ...(nextConfig.providerOptions ?? {}) }
@@ -2557,6 +2652,7 @@
   }
 
   function setSttEngineLanguageValue(providerId: string, rawValue: string) {
+    if (!writesAvailable() || !settingsLoaded) return
     const nextMap = { ...(settings.sttEngineSettings ?? {}) }
     const nextConfig = { ...(nextMap[providerId] ?? {}) }
     if (rawValue.trim()) nextConfig.language = rawValue
@@ -2574,6 +2670,7 @@
     key: string,
     rawValue: string | boolean
   ) {
+    if (!writesAvailable() || !settingsLoaded) return
     const nextMap = { ...(settings.sttEngineSettings ?? {}) }
     const nextConfig = { ...(nextMap[providerId] ?? {}) }
     const nextProviderOptions = { ...(nextConfig.providerOptions ?? {}) }
@@ -2636,6 +2733,10 @@
     providerId: string,
     updater: (provider: VoiceEngineClientSummary) => VoiceEngineClientSummary
   ) {
+    if (!writesAvailable() || engineRawBaseline === null || auxiliaryActions) {
+      if (ownsView()) toast.error('Engine Manager is busy. Wait for the current change to finish.')
+      return
+    }
     const providers = [...byoEngines]
     const index = providers.findIndex((provider) => provider.id === providerId)
     if (index < 0) return
@@ -2698,6 +2799,7 @@
   }
 
   function setTtsEnginePrompt(providerId: string, value: string) {
+    if (!writesAvailable() || !settingsLoaded) return
     const prompt = normalizeTtsEnginePromptText(value)
     const nextPrompts = { ...(settings.ttsEnginePrompts ?? {}) }
 
@@ -2814,6 +2916,13 @@
     model: VoiceEngineModelCatalogEntry,
     action: 'download' | 'use' | 'delete'
   ) {
+    if (!engineActionAvailable()) {
+      if (ownsView()) toast.error('Wait for Engine Manager changes to finish, then try again.')
+      return null
+    }
+    auxiliaryActions += 1
+    engineActionEpoch += 1
+    const finish = beginOwnedRequest()
     setEngineModelJob(provider.id, model.id, action)
     try {
       const response = await fetch(`/api/voice/byo/engines/${encodeURIComponent(provider.id)}/models`, {
@@ -2831,12 +2940,12 @@
         throw new Error(result?.error ?? 'Failed to update STT model')
       }
 
+      if (!ownsView()) return result
       if (result?.engine) {
-        updateByoProvider(provider.id, () => result.engine as VoiceEngineClientSummary)
-        persistedEngineSignature = makeEngineSignature(
-          byoEngines.map((engine) => (engine.id === provider.id ? result.engine : engine))
-        )
+        await loadByoEngines()
+        if (!ownsView()) return result
         await loadProviders()
+        if (!ownsView()) return result
       }
 
       if (action === 'download') {
@@ -2852,10 +2961,13 @@
       }
       return result
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to update STT model')
+      if (ownsView()) toast.error(error instanceof Error ? error.message : 'Failed to update STT model')
       return null
     } finally {
-      setEngineModelJob(provider.id, model.id, null)
+      auxiliaryActions -= 1
+      if (ownsView()) setEngineModelJob(provider.id, model.id, null)
+      finish()
+      wakeOwnedReads()
     }
   }
 
@@ -3095,7 +3207,46 @@
     }
   }
 
+  function readDeleteOutcomeReceipt(value: unknown, engineId: string): VoiceEngineDeleteOutcomeReceipt | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    const receipt = value as Partial<VoiceEngineDeleteOutcomeReceipt>
+    if (receipt.contract !== VOICE_ENGINE_DELETE_OUTCOME_CONTRACT || receipt.engineId !== engineId ||
+      !['known_no_change', 'known_settled_partial', 'unknown'].includes(receipt.configurationOutcome ?? '')) return null
+    return receipt as VoiceEngineDeleteOutcomeReceipt
+  }
+
+  function applyDeleteOutcome(owner: VoiceBrowserOwner, revision: number, engineId: string, result: any, error?: unknown, terminalFailure = false) {
+    if (owner.deletion.revision !== revision || owner.deletion.phase !== 'issued') return false
+    const strings = (value: unknown) => Array.isArray(value) && value.every(id => typeof id === 'string' && id.length > 0)
+    const files = result?.localFiles
+    const canonical = !error && result?.success === true && result.deletedEngineId === engineId &&
+      result.deletedProviderId === `byo:${engineId}` && strings(result.deletedProviderIds) &&
+      result.deletedProviderIds.includes(`byo:${engineId}`) && typeof result.clearedUserDefaults === 'boolean' &&
+      strings(result.clearedAgentIds) && strings(result.deletedVoiceProfileIds) && files &&
+      typeof files === 'object' && !Array.isArray(files) && typeof files.requested === 'boolean' &&
+      typeof files.deleted === 'boolean' && strings(files.deletedInstallRoots) && strings(files.deletedStateRoots) &&
+      Array.isArray(files.skipped) && files.skipped.every((entry: any) => typeof entry?.engineId === 'string' && typeof entry?.reason === 'string') &&
+      Array.isArray(files.errors) && files.errors.every((entry: any) => typeof entry?.engineId === 'string' && typeof entry?.message === 'string')
+    const receipt = terminalFailure ? readDeleteOutcomeReceipt(result?.deleteOutcome, engineId) : null
+    const configurationSettled = receipt?.configurationOutcome === 'known_no_change' || receipt?.configurationOutcome === 'known_settled_partial'
+    owner.deletion.phase = canonical || configurationSettled ? 'refresh' : 'unknown'
+    owner.deletion.automatic = Boolean(canonical)
+    if (!canonical) {
+      const details = error instanceof Error ? error.message : 'The reply did not confirm this engine removal.'
+      const notice = configurationSettled
+        ? `Engine removal was incomplete. Retry reads current configuration before editing; it does not confirm complete cleanup. Do not repeat Delete. Details: ${details}`
+        : `Engine removal could not be confirmed. Saved Voice controls remain unavailable. Do not repeat Delete. Reopening or reloading does not confirm that removal finished. Details: ${details}`
+      owner.deletion.notice = [owner.deletion.notice, notice].filter(Boolean).join(' ')
+    }
+    notifyVoiceOwner(owner)
+    return Boolean(canonical)
+  }
+
   async function handleDeleteByoEngine(provider: VoiceEngineClientSummary) {
+    if (!deleteAtRest()) {
+      toast.error('Finish saving Voice and engine changes before deleting an engine.')
+      return
+    }
     const deleteLocalFiles =
       isBatshitManagedLocalEngine(provider) && getDeleteLocalFilesForEngine(provider.id)
     const description = [
@@ -3109,6 +3260,9 @@
       )
     }
 
+    const targetBeforeConfirmation = JSON.stringify(byoEngines.find(engine => engine.id === provider.id))
+    const readBeforeConfirmation = engineReadToken
+    const actionBeforeConfirmation = engineActionEpoch
     const confirmed = await confirmDialog({
       title: `Delete "${provider.name}" from Engine Manager?`,
       description,
@@ -3116,7 +3270,22 @@
       tone: 'destructive'
     })
     if (!confirmed) return
-
+    if (!deleteAtRest() || readBeforeConfirmation !== engineReadToken || actionBeforeConfirmation !== engineActionEpoch ||
+      targetBeforeConfirmation !== JSON.stringify(byoEngines.find(engine => engine.id === provider.id))) {
+      if (ownsView()) toast.error('Voice or engine settings changed. Finish saving, then choose Delete again.')
+      return
+    }
+    const owner = browserOwner!
+    owner.deletion = { phase: 'issued', revision: owner.deletion.revision + 1, automatic: false, notice: owner.deletion.notice }
+    cancelQueuedVoice()
+    cancelQueuedEngines()
+    voiceReadToken += 1
+    engineReadToken += 1
+    notifyVoiceOwner(owner)
+    const revision = owner.deletion.revision
+    const outcomeEngineId = provider.id.trim().toLowerCase()
+    let canonicalAcknowledged = false
+    const finish = beginOwnedRequest()
     try {
       const response = await fetch(`/api/voice/byo/engines/${encodeURIComponent(provider.id)}`, {
         method: 'DELETE',
@@ -3127,23 +3296,29 @@
           deleteLocalFiles
         })
       })
+      const result = await response.json().catch(() => null)
       if (!response.ok) {
-        const message = await extractError(response, 'Failed to delete BYO engine')
-        throw new Error(message)
+        const error = new Error(typeof result?.error === 'string' ? result.error : 'Failed to delete BYO engine')
+        applyDeleteOutcome(owner, revision, outcomeEngineId, result, error, true)
+        if (ownsView()) toast.error(error.message)
+        return
       }
-
-      const result = await response.json()
-      await refreshVoiceEngineState()
-      await loadProfiles()
+      if (!applyDeleteOutcome(owner, revision, outcomeEngineId, result)) return
+      canonicalAcknowledged = true
+      if (!ownsView()) return
+      await recoverDeletedSettings()
+      if (!ownsView()) return
+      await Promise.all([loadProviders(), loadLiveKitRuntime(), loadProfiles()])
+      if (!ownsView()) return
       setDeleteLocalFilesForEngine(provider.id, false)
       if (Array.isArray(result?.clearedAgentIds) && result.clearedAgentIds.length > 0) {
         await Promise.all(
           result.clearedAgentIds.map(async (agentId: unknown) => {
-            if (typeof agentId !== 'string' || !agentId.trim()) return
+            if (!ownsView() || typeof agentId !== 'string' || !agentId.trim()) return
             const agentResponse = await fetch(`/api/agents/${encodeURIComponent(agentId)}`)
             if (!agentResponse.ok) return
             const agent = await agentResponse.json().catch(() => null)
-            if (agent?.id) {
+            if (ownsView() && agent?.id) {
               agentStore.updateAgent(agent.id, agent)
             }
           })
@@ -3189,8 +3364,14 @@
         )
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to delete BYO engine')
-    }
+      if (!canonicalAcknowledged) applyDeleteOutcome(owner, revision, outcomeEngineId, null, error)
+      else if (owner.deletion.revision === revision) {
+        const message = error instanceof Error ? error.message : 'Follow-up view refresh failed.'
+        owner.deletion.notice = [owner.deletion.notice, `Engine removal was confirmed, but a follow-up view refresh failed. Details: ${message}`].filter(Boolean).join(' ')
+        notifyVoiceOwner(owner)
+      }
+      if (ownsView()) toast.error(error instanceof Error ? error.message : 'Failed to delete BYO engine')
+    } finally { finish() }
   }
 
   async function handlePreview(options?: { clone?: VoiceProfileRecord | null }) {
@@ -3206,7 +3387,8 @@
     const volume = engineTtsSettings?.common?.volume ? Number(engineTtsSettings.common.volume) : undefined
     const common: Record<string, any> = {
       language: normaliseString(engineTtsSettings?.common?.language),
-      instructions: normaliseString(engineTtsSettings?.common?.instructions)
+      instructions: normaliseString(engineTtsSettings?.common?.instructions),
+      endpoint: normaliseString(engineTtsSettings?.common?.endpoint)
     }
     if (typeof speed === 'number' && Number.isFinite(speed)) common.speed = speed
     if (typeof volume === 'number' && Number.isFinite(volume)) common.volume = volume
@@ -3411,7 +3593,7 @@
 
 {#snippet voiceSettingsLoadGate(hidden: string)}
   <!-- BL-962: the controls that hold voice values wait for a real read of the saved settings. -->
-  {#if isLoading}
+  {#if deletePhase !== 'unknown' && (isLoading || settingsLoadBusy || engineReadBusy || deletePhase === 'issued')}
     <div class="batshit-settings-group batshit-settings-caption flex items-center gap-2">
       <Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
       <span>Loading Voice settings...</span>
@@ -3423,7 +3605,7 @@
           Voice settings could not load, so {hidden} are hidden. Press Retry to load them.
           {#if settingsLoadError}Details: {settingsLoadError}{/if}
         </span>
-        <Button variant="outline" size="sm" onclick={loadSettings} disabled={settingsLoadBusy}>
+        <Button variant="outline" size="sm" onclick={retrySettingsRead} disabled={settingsLoadBusy || engineReadBusy || deletePhase === 'unknown' || !ownsView()}>
           <RefreshCw class={settingsLoadBusy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
           Retry
         </Button>
@@ -3433,6 +3615,16 @@
 {/snippet}
 
 <div class="space-y-6">
+      {#if mounted && !ownsView()}
+        <div class="batshit-settings-inline-alert is-info" data-testid="voice-settings-other-view">
+          Saved Voice settings are active in another view. Close that view to edit here.
+        </div>
+      {/if}
+      {#if deletionNotice}
+        <div class="batshit-settings-inline-alert is-danger" data-testid="voice-engine-delete-notice">
+          <span>{deletionNotice}</span>
+        </div>
+      {/if}
       <Tabs.Root bind:value={activeTab} class="w-full">
         <Tabs.List class="flex w-full flex-wrap gap-2">
           <Tabs.Trigger value="global" class="min-w-[180px] flex-1 gap-2 sm:flex-none">
@@ -3471,7 +3663,7 @@
             />
           </div>
 
-          {#if !settingsLoaded}
+          {#if !settingsLoaded || !ownsView() || deletePhase !== 'idle' || hasForeignRequest()}
             {@render voiceSettingsLoadGate('the Global Voice Settings controls')}
           {:else}
           {#if currentAgentVoiceOverrideParts.length > 0}
@@ -3839,6 +4031,12 @@
                             {selectedSttProviderSetupHint}
                           </p>
                         {/if}
+                        {#if voiceModelCatalogNotice(selectedSttProvider, 'stt-recorded', settings.sttModel)}
+                          <p class="batshit-settings-form-meta is-warning">{voiceModelCatalogNotice(selectedSttProvider, 'stt-recorded', settings.sttModel)}</p>
+                        {/if}
+                        {#if voiceTranscriptionModelNotice(settings.sttProvider, settings.sttModel)}
+                          <p class="batshit-settings-form-meta is-warning">{voiceTranscriptionModelNotice(settings.sttProvider, settings.sttModel)}</p>
+                        {/if}
                         {#if selectedSttCapabilities}
                           <div class="flex flex-wrap items-center gap-1.5 pt-1">
                             {#if selectedSttCapabilities.recorded}
@@ -4150,6 +4348,9 @@
                           <p class="batshit-settings-inline-alert is-warning">
                             {selectedRealtimeSttProviderSetupHint}
                           </p>
+                        {/if}
+                        {#if voiceModelCatalogNotice(selectedRealtimeSttProvider, selectedRealtimeSttProvider && providerHasRealtimeVoiceMode(selectedRealtimeSttProvider) ? 'stt-direct-realtime' : 'stt-recorded', settings.realtimeSttModel)}
+                          <p class="batshit-settings-form-meta is-warning">{voiceModelCatalogNotice(selectedRealtimeSttProvider, selectedRealtimeSttProvider && providerHasRealtimeVoiceMode(selectedRealtimeSttProvider) ? 'stt-direct-realtime' : 'stt-recorded', settings.realtimeSttModel)}</p>
                         {/if}
                         {#if !voiceModeUsesSttInput}
                           <p class="batshit-settings-inline-alert is-info">
@@ -4578,6 +4779,12 @@
                             {selectedTtsProviderSetupHint}
                           </p>
                         {/if}
+                        {#if selectedTtsModelNotice}
+                          <p class="batshit-settings-form-meta is-warning">{selectedTtsModelNotice}</p>
+                        {/if}
+                        {#if voiceModelCatalogNotice(selectedTtsProvider, ['tts-batch', 'tts-direct-stream'], settings.ttsModel)}
+                          <p class="batshit-settings-form-meta is-warning">{voiceModelCatalogNotice(selectedTtsProvider, ['tts-batch', 'tts-direct-stream'], settings.ttsModel)}</p>
+                        {/if}
                       </div>
                     </div>
 
@@ -4616,8 +4823,8 @@
                                       <div class="flex items-center justify-between gap-2">
                                         <span>{model.value}</span>
                                         <div class="flex shrink-0 items-center gap-1.5">
-                                          <Badge variant="outline" class={getTtsBadgeClass(selectedTtsProvider)}>
-                                            {getTtsLaneLabel(selectedTtsProvider)}
+                                          <Badge variant="outline" class={getTtsBadgeClass(selectedTtsProvider, model.value)}>
+                                            {getTtsLaneLabel(selectedTtsProvider, model.value)}
                                           </Badge>
                                           {#if model.isDefault}
                                             <Badge variant="outline" class="batshit-settings-child-label">Default</Badge>
@@ -4931,15 +5138,15 @@
                 savedLabel="Settings saved"
               />
               <SettingsSaveStatus
-                state={engineSaveState}
-                error={engineSaveError}
+                state={engineStatusState}
+                error={engineStatusError}
                 sticky={false}
                 savedLabel="Engines saved"
               />
             </div>
           </div>
 
-          {#if !settingsLoaded}
+          {#if !settingsLoaded || !ownsView() || deletePhase !== 'idle' || hasForeignRequest()}
             {@render voiceSettingsLoadGate(
               'the Voice Runtimes, Text-to-Speech Engines, and Speech-to-Text Engines cards'
             )}
@@ -5746,7 +5953,9 @@
               <Button
                 size="sm"
                 variant="outline"
+                disabled={engineRawBaseline === null || !writesAvailable() || auxiliaryActions > 0}
                 onclick={() => {
+                  if (engineRawBaseline === null || !writesAvailable() || auxiliaryActions) return
                   existingEngineFormOpen = !existingEngineFormOpen
                   if (!existingEngineFormOpen) resetExistingEngineForm()
                 }}
@@ -5755,6 +5964,16 @@
                 Connect Existing
               </Button>
             {/snippet}
+              {#if engineRawBaseline === null}
+                {#if engineReadBusy}
+                  <div class="batshit-settings-caption flex items-center gap-2"><Loader2 class="h-4 w-4 animate-spin" />Loading Engine Manager...</div>
+                {:else}
+                  <div class="batshit-settings-inline-alert is-danger" data-testid="voice-engines-load-error">
+                    <span>Engine Manager could not load. Press Retry before connecting or changing engines. {engineLoadError}</span>
+                    <Button variant="outline" size="sm" onclick={() => loadByoEngines()} disabled={!writesAvailable()}><RefreshCw />Retry</Button>
+                  </div>
+                {/if}
+              {/if}
               {#if byoUnreadableNotice}
                 <p class="batshit-settings-inline-alert is-warning">{byoUnreadableNotice}</p>
               {/if}
@@ -5980,7 +6199,7 @@
                     <Button
                       size="sm"
                       onclick={handleConnectExistingEngine}
-                      disabled={existingEngineSaving}
+                      disabled={existingEngineSaving || !engineActionAvailable()}
                     >
                       {#if existingEngineSaving}
                         <Loader2 class="animate-spin" />
@@ -6002,7 +6221,7 @@
                   </div>
                 </div>
               {/if}
-              {#if byoEngineProviders.length === 0}
+              {#if engineRawBaseline !== null && byoEngineProviders.length === 0}
                 <div class="batshit-settings-muted-panel batshit-settings-caption">
                   No BYO engines registered yet.
                 </div>
@@ -6064,7 +6283,7 @@
                           </div>
                         </div>
                       </button>
-                      <Collapsible.Content class="space-y-4 pt-2">
+                      <Collapsible.Content class="space-y-4 pt-2" inert={!ownsView() || deletePhase !== 'idle' || hasForeignRequest()}>
                         <div class="flex flex-wrap items-center justify-between gap-3 batshit-settings-muted-panel">
                           <div class="flex items-center gap-1.5">
                             <p class="batshit-settings-form-label">Engine Controls</p>
@@ -6080,6 +6299,7 @@
                             <IconPicker
                               value={getByoEngineIconRef(provider)}
                               triggerLabel="Choose Icon"
+                              disabled={!writesAvailable() || auxiliaryActions > 0}
                               onSelect={(iconRef) => setByoEngineIconRef(provider.id, iconRef)}
                             />
                             <Button
@@ -6101,6 +6321,7 @@
                               variant="outline"
                               class="is-danger"
                               onclick={() => handleDeleteByoEngine(provider)}
+                              disabled={!deleteAtRest()}
                             >
                               <Trash2  />
                               Delete
@@ -6134,6 +6355,7 @@
                               <span class="batshit-settings-form-label">Enabled</span>
                               <Switch.Root
                                 checked={provider.enabled !== false}
+                                disabled={!writesAvailable() || auxiliaryActions > 0}
                                 onCheckedChange={(value) =>
                                   updateByoProvider(provider.id, (current) => ({
                                     ...current,
@@ -6169,6 +6391,7 @@
                               </SettingsInfoMenu>
                               <Switch.Root
                                 checked={provider.localRuntime?.startup?.autoStartOnLaunch === true}
+                                disabled={!writesAvailable() || auxiliaryActions > 0}
                                 onCheckedChange={(value) =>
                                   updateByoProvider(provider.id, (current) => ({
                                     ...current,
@@ -6219,7 +6442,7 @@
                                 </SettingsInfoMenu>
                                 <Switch.Root
                                   checked={mustStopEngineWithBatshit(provider) || isStopWithBatshitOn(provider)}
-                                  disabled={mustStopEngineWithBatshit(provider)}
+                                  disabled={mustStopEngineWithBatshit(provider) || !writesAvailable() || auxiliaryActions > 0}
                                   onCheckedChange={(value) =>
                                     !mustStopEngineWithBatshit(provider) && updateByoProvider(provider.id, (current) => ({
                                       ...current,

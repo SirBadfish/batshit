@@ -1,4 +1,7 @@
+import { inspectStoredRecipeArchive, uploadConstructedRecipePackage } from './goonRecipePackageUpload.server'
+import { requiresFirstPartyRecipePreparation } from '$lib/goons/recipe/recipeAuthorUpdatePolicy'
 import type { GoonRecord } from '$lib/types/goons'
+import { MAX_COMPATIBILITY_BASIS_BYTES } from '$lib/goons/goonCompatibilityBasis'
 import { parseHairState, validateHairStateBinding } from '$lib/goons/hairAssets'
 import { parseAppearanceDialsManifest } from '$lib/goons/appearanceDials.schema'
 import { createFacialArtworkRecipeSiblingVerifier } from '$lib/goons/recipe/facialArtworkRecipeMigration'
@@ -43,6 +46,7 @@ import {
   recipeRevisionRedisKey,
   recipeMigrationReportSha256,
   sha256Hex,
+  parseGoonRecipeJob,
   parseGoonRecipeV2,
   verifyGoonLiveBuildReceipt,
   verifyLiveGoonBakeArtifacts,
@@ -308,7 +312,7 @@ export async function buildExternalRecipeSiblingInputs(input: {
         })
       } catch (targetError) {
         if (asset.sourceClass !== 'builtin') throw targetError
-        const migration = await (input.migrateBuiltinState ?? migrateSavedHairBuiltinState)(state)
+        const migration = await (input.migrateBuiltinState ?? migrateSavedHairBuiltinState)(state, input.target.identities)
         if (migration.status !== 'migrated' || !migration.targetAsset) {
           throw new Error(
             `built-in revision ${asset.assetId}@${asset.revisionId} is stale for the target head but has no exact current successor.`
@@ -456,6 +460,8 @@ export type RecipeAssetReader = (asset: RecipeStoredAssetRef) => Promise<Uint8Ar
 
 async function resolveBakeDependencies(input: {
   userId: string
+  goonId?: string
+  replayControl?: RecipeReplayControl
   state: RecipeStateSnapshot
   source: RecipeSource
   readAsset: RecipeAssetReader
@@ -467,7 +473,7 @@ async function resolveBakeDependencies(input: {
 
 /** Freshly resolved ownership/metadata and every actual external construction byte.
  * A stored asset revision label alone cannot authorize reuse. */
-async function bakeDependenciesSha256(input: Awaited<ReturnType<typeof resolveBakeDependencies>>) {
+export async function bakeDependenciesSha256(input: Awaited<ReturnType<typeof resolveBakeDependencies>>) {
   const bytesHash = (bytes: Uint8Array | undefined) => bytes ? sha256Hex(bytes) : null
   const hair = input.hair
   return canonicalRecipeSha256({
@@ -494,6 +500,8 @@ export type RecipeLifecycleDependencies = {
   leaseMs?: number
   resolveHairAsset?: typeof resolveHairAssetRevision
   migrateBuiltinHairState?: typeof migrateSavedHairBuiltinState
+  uploadConstructedPackage?: typeof uploadConstructedRecipePackage
+  inspectSourceArchive?: typeof inspectStoredRecipeArchive
 }
 
 export type AnalyzeRecipePackageUpdateInput = {
@@ -541,6 +549,8 @@ export type StageRecipeCandidateInput = {
   live: RecipeAssetSet
   signal?: AbortSignal
 }
+
+export type BuildAndStageRecipeCandidateInput = Omit<StageRecipeCandidateInput, 'live' | 'liveBuildReceipt'>
 
 type LoadedArchive = {
   receipt: RecipeArchiveContainmentReceipt
@@ -688,6 +698,7 @@ async function verifyStoredLiveArtifacts(
 
 async function constructDeterministicLiveBake(input: {
   userId: string
+  goonId: string
   archive: LoadedArchive
   revisionId: string
   revision: number
@@ -695,13 +706,14 @@ async function constructDeterministicLiveBake(input: {
   readAsset: RecipeAssetReader
   resolveHairAsset: typeof resolveHairAssetRevision
   replayControl?: RecipeReplayControl
+  enforceControl?: boolean
 }) {
   let expected: Awaited<ReturnType<typeof bakeLiveGoon>>
   let dependenciesSha256: string
   try {
-    const replayControl = input.replayControl
+    const replayControl = input.replayControl ?? (input.enforceControl ? readOnlyRecipeReplayControl() : undefined)
     await replayControl?.checkpoint()
-    const { hair } = await resolveBakeDependencies({ ...input, source: input.archive.source })
+    const { hair } = await resolveBakeDependencies({ ...input, source: input.archive.source, replayControl: input.replayControl ?? replayControl })
     dependenciesSha256 = await bakeDependenciesSha256({ hair })
     await replayControl?.checkpoint()
     expected = await bakeLiveGoon({
@@ -718,7 +730,8 @@ async function constructDeterministicLiveBake(input: {
     }, () => replayControl?.checkCancelled())
     await replayControl?.checkpoint()
   } catch (error) {
-    if (error instanceof GoonRecipeLifecycleError || error instanceof RecipeRepositoryError) throw error
+    if (error instanceof GoonRecipeLifecycleError || error instanceof RecipeRepositoryError ||
+        (error as { code?: unknown } | null)?.code === 'CLEANUP_UNCONFIRMED') throw error
     const message = error instanceof Error ? error.message : 'unknown deterministic bake failure'
     throw new GoonRecipeLifecycleError(
       'CANDIDATE_MISMATCH',
@@ -786,8 +799,7 @@ async function loadArchive(
     )
   }
   if (Object.hasOwn(manifest, 'sphericalEyelidEvaluatedBuild')) {
-    throw new GoonRecipeLifecycleError('INVALID_STATE',
-      'This Goon file uses a construction format that this version does not support.', 400)
+    throw new GoonRecipeLifecycleError('INVALID_STATE', 'This Goon file uses a construction format that this version does not support.', 400)
   }
   const metadata = await verifyRecipePackageMetadata(manifest, model.sha256)
   return {
@@ -809,6 +821,76 @@ async function loadArchive(
   }
 }
 
+/** The browser's re-upload receipt is not proof that it describes this Goon's
+ * current Source. Ask the file owner to inspect the saved archive, then bind
+ * both the submitted files and the saved extracted files to that measurement. */
+async function assertBootstrapMatchesCurrentSource(
+  goon: GoonRecord,
+  archive: LoadedArchive,
+  readAsset: RecipeAssetReader,
+  inspect: typeof inspectStoredRecipeArchive
+) {
+  const roles = ['package', 'model', 'manifest'] as const
+  const files = goon.customAvatar
+  const current = {} as Record<(typeof roles)[number], { ref: string; filename: string; size?: number }>
+  for (const role of roles) {
+    const file = files?.[role]
+    const namespace = role === 'package' ? 'goon_custom_packages' :
+      role === 'model' ? 'goon_custom_models' : 'goon_custom_manifests'
+    if (!file || typeof file.filename !== 'string' ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(file.filename) || file.filename.includes('..') ||
+        file.url !== `/uploads/${namespace}/${file.filename}`) {
+      throw new GoonRecipeLifecycleError('ASSET_MISMATCH', `The current Recipe ${role} reference is invalid.`, 409)
+    }
+    current[role] = { ref: file.url, filename: file.filename, size: file.size }
+  }
+  let inspection: Awaited<ReturnType<typeof inspectStoredRecipeArchive>>
+  try {
+    inspection = await inspect(current.package.filename)
+  } catch (error) {
+    throw new GoonRecipeLifecycleError('ASSET_UNAVAILABLE',
+      `The current Recipe package could not be verified: ${error instanceof Error ? error.message : String(error)}`, 409)
+  }
+  const model = inspection.members.find((member) => member.role === 'model')
+  const manifest = inspection.members.find((member) => member.role === 'manifest')
+  if (!model || !manifest) {
+    throw new GoonRecipeLifecycleError('ASSET_MISMATCH', 'The current Recipe package inspection is incomplete.', 409)
+  }
+  const expected = { package: inspection.archive, model, manifest }
+  const submitted = { package: archive.receipt.archive,
+    model: archiveMember(archive.receipt, 'model').extracted,
+    manifest: archiveMember(archive.receipt, 'manifest').extracted }
+  for (const role of roles) {
+    const measured = expected[role]
+    const offered = submitted[role]
+    if (measured.sha256 !== offered.sha256 || measured.bytes !== offered.bytes ||
+        (current[role].size !== undefined && current[role].size !== measured.bytes)) {
+      throw new GoonRecipeLifecycleError('ASSET_MISMATCH',
+        `The current Recipe ${role} does not match the inspected package.`, 409)
+    }
+    // loadArchive has already read and hashed this exact ref. A different
+    // saved ref can still name the same bytes, but must be read independently.
+    if (current[role].ref !== offered.ref) {
+      await readVerifiedAsset({ ref: current[role].ref, sha256: measured.sha256, bytes: measured.bytes }, readAsset)
+    }
+  }
+}
+
+function assertBootstrapReceiptNamespaces(receipt: RecipeArchiveContainmentReceipt) {
+  const assets = [
+    ['package', 'goon_custom_packages', receipt.archive],
+    ['model', 'goon_custom_models', archiveMember(receipt, 'model').extracted],
+    ['manifest', 'goon_custom_manifests', archiveMember(receipt, 'manifest').extracted]
+  ] as const
+  for (const [role, namespace, asset] of assets) {
+    const prefix = `/uploads/${namespace}/`
+    const name = asset.ref.startsWith(prefix) ? asset.ref.slice(prefix.length) : ''
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.includes('..')) {
+      throw new GoonRecipeLifecycleError('ASSET_MISMATCH', `The submitted Recipe ${role} reference is invalid.`, 409)
+    }
+  }
+}
+
 export async function bootstrapRecipeV2(
   input: {
     userId: string
@@ -819,6 +901,7 @@ export async function bootstrapRecipeV2(
   },
   dependencies: RecipeLifecycleDependencies = {}
 ) {
+  const verificationEpoch = activeVerificationEpoch()
   const readAsset = dependencies.readAsset ?? defaultReadAsset
   const goon = await getOwnedGoonForRecipeBootstrap(input.userId, input.goonId)
   if (goon.kind !== 'custom' || goon.sourceProfile !== 'expert-custom-glb') {
@@ -836,7 +919,18 @@ export async function bootstrapRecipeV2(
     )
   }
   const expectedManagedState = createRecipeBootstrapManagedSnapshot(goon)
-  const archive = await loadArchive(input.receipt, readAsset)
+  const submittedReceipt = await verifyRecipeArchiveContainmentReceipt(input.receipt)
+  assertBootstrapReceiptNamespaces(submittedReceipt)
+  const archive = await loadArchive(submittedReceipt, readAsset)
+  await assertBootstrapMatchesCurrentSource(goon, archive, readAsset,
+    dependencies.inspectSourceArchive ?? inspectStoredRecipeArchive)
+  const summary = goon.customAvatar?.manifestSummary
+  if (requiresFirstPartyRecipePreparation(summary) &&
+      (archive.source.identities.baseId !== summary?.baseId ||
+       archive.source.identities.fitFamily !== summary?.baseId)) {
+    throw new GoonRecipeLifecycleError('ASSET_MISMATCH',
+      'The current Recipe Source does not match its preparation identity.', 409)
+  }
   const submittedState = await verifyRecipeStateSnapshot(input.state)
   await validateSkinSurfaceSiblingOwnership(goon, submittedState)
   await validateHairSiblingOwnership({
@@ -845,6 +939,7 @@ export async function bootstrapRecipeV2(
     source: archive.source,
     resolveAsset: dependencies.resolveHairAsset ?? resolveHairAssetRevision
   })
+
   const stateWithoutAnatomyFit = await withoutAnatomyFitRecipeSibling(submittedState)
   let state: RecipeStateSnapshot
   try {
@@ -918,6 +1013,7 @@ export async function bootstrapRecipeV2(
     goonId: input.goonId,
     expectedManagedState,
     nextGoon,
+    verificationEpoch,
     records: [
       {
         key: recipeDocumentRedisKey(input.userId, input.goonId, containmentDocument.sha256),
@@ -1907,6 +2003,7 @@ export async function reviewRecipePackageState(
     source: target.source,
     resolveAsset: dependencies.resolveHairAsset ?? resolveHairAssetRevision
   })
+
   const reviewHash = await canonicalRecipeSha256({
     analysisId: pending.analysisId,
     planSha256: plan.planSha256,
@@ -2207,6 +2304,7 @@ export async function startRecipeBake(
     source: source.source,
     resolveAsset: dependencies.resolveHairAsset ?? resolveHairAssetRevision
   })
+
   const operation = owner.activeRevision ? ('rebake' as const) : ('first-bake' as const)
   // Bootstrap captures the initial source, but Save Goon may include edits made
   // before any Live revision exists. Capture that draft in the same versioned
@@ -2442,6 +2540,7 @@ function assertLeaseCurrent(job: GoonRecipeJob, now: Date) {
 }
 
 type RecipeReplayControl = {
+  signal?: AbortSignal
   checkpoint: () => Promise<void>
   checkCancelled: () => void
   wasUsed: () => boolean
@@ -2463,6 +2562,7 @@ export function readOnlyRecipeReplayControl(
     }
   }
   return {
+    signal,
     checkCancelled,
     checkpoint: async () => {
       used = true
@@ -2545,7 +2645,7 @@ export function recipeReplayControl(input: {
       throw error
     }
   }
-  return { checkpoint, checkCancelled, wasUsed: () => used, expectedLease: () => latestLease }
+  return { signal: input.signal, checkpoint, checkCancelled, wasUsed: () => used, expectedLease: () => latestLease }
 }
 
 function uniqueSortedAssets(assets: RecipeStoredAssetRef[]) {
@@ -2578,8 +2678,8 @@ function edgeForPlan(plan: RecipeMigrationPlan, archive: LoadedArchive) {
   return matches[0]!
 }
 
-function assertLiveReceiptBindings(
-  job: GoonRecipeJob,
+export function assertLiveReceiptBindings(
+  job: Pick<GoonRecipeJob, 'targetRevisionId' | 'targetRecipeRevision' | 'stagedSource'>,
   state: RecipeStateSnapshot,
   receipt: GoonLiveBuildReceipt,
   live: RecipeAssetSet
@@ -2737,10 +2837,79 @@ export async function stageRecipeUpdateCandidate(
   input: StageRecipeCandidateInput,
   dependencies: RecipeLifecycleDependencies = {}
 ) {
-  return stageRecipeCandidate(input, dependencies)
+  return stageRecipeCandidate({ kind: 'uploaded', input }, dependencies)
 }
 
-async function stageRecipeCandidate(input: StageRecipeCandidateInput, dependencies: RecipeLifecycleDependencies) {
+/** A disconnected browser cannot race Fail against ingestion. Once admitted,
+ * this request owns settlement and records failure only at its exact versions. */
+export async function buildAndStageRecipeCandidate(
+  input: BuildAndStageRecipeCandidateInput,
+  dependencies: RecipeLifecycleDependencies = {}
+) {
+  const settlement: { admitted: { writeVersion: number; stateVersion: number } | null } = { admitted: null }
+  const abort = new AbortController()
+  const cancel = () => abort.abort(input.signal?.reason)
+  if (input.signal?.aborted) cancel()
+  else input.signal?.addEventListener('abort', cancel, { once: true })
+  const deadline = setTimeout(() => abort.abort(new Error('Building the Goon took too long. Try again.')),
+    EVALUATED_REPLAY_DEADLINE_MS)
+  try {
+    return await stageRecipeCandidate({
+      kind: 'server', input: { ...input, signal: abort.signal },
+      onAdmitted: (owner, job) => { settlement.admitted = { writeVersion: owner.writeVersion, stateVersion: job.stateVersion } },
+      onSuperseded: () => { settlement.admitted = null }
+    }, dependencies)
+  } catch (error) {
+    if (settlement.admitted) {
+      try {
+        await failRecipeJob({ ...input,
+          expectedWriteVersion: settlement.admitted.writeVersion,
+          expectedJobStateVersion: settlement.admitted.stateVersion,
+          stage: 'verifying',
+          reason: (error instanceof Error ? error.message : String(error)).slice(0, 2000)
+        }, dependencies)
+      } catch (failure) {
+        // Never reload new versions and mark somebody else's newer work failed.
+        throw new AggregateError([error, failure],
+          'The server build failed and its durable failure state could not be confirmed. Recover the Goon update before retrying.')
+      }
+    }
+    throw error
+  } finally {
+    clearTimeout(deadline)
+    input.signal?.removeEventListener('abort', cancel)
+  }
+}
+
+/** Upload cancellation is observed after registration. Continue renewing only
+ * this admitted lease while a finite internal upload settles, then join the
+ * renewal before registration advances versions. */
+async function uploadWithRecipeLease(
+  upload: () => ReturnType<typeof uploadConstructedRecipePackage>,
+  control: RecipeReplayControl
+) {
+  let renewal: Promise<void> | null = null
+  let failure: unknown = null
+  const timer = setInterval(() => {
+    if (renewal || failure) return
+    renewal = control.checkpoint().catch((error) => { failure = error }).finally(() => { renewal = null })
+  }, 60_000)
+  try {
+    return { upload: await upload(), renewalFailure: () => failure }
+  } finally {
+    clearInterval(timer)
+    if (renewal) await renewal
+  }
+}
+
+type CandidateStageMode =
+  | { kind: 'uploaded'; input: StageRecipeCandidateInput }
+  | { kind: 'server'; input: BuildAndStageRecipeCandidateInput;
+      onAdmitted: (owner: GoonRecipeV2, job: GoonRecipeJob) => void;
+      onSuperseded: () => void }
+
+async function stageRecipeCandidate(mode: CandidateStageMode, dependencies: RecipeLifecycleDependencies) {
+  const input = mode.input
   const verificationEpoch = activeVerificationEpoch()
   const readAsset = dependencies.readAsset ?? defaultReadAsset
   const now = (dependencies.now ?? (() => new Date()))()
@@ -2765,9 +2934,16 @@ async function stageRecipeCandidate(input: StageRecipeCandidateInput, dependenci
     )
   }
   const state = reviewedState.state
-  if (
+  if (mode.kind === 'server') {
+    if (goon.sourceProfile !== 'expert-custom-glb' ||
+      !['first-bake', 'rebake'].includes(job.operation) || job.candidateRevision) {
+      throw new GoonRecipeLifecycleError('INVALID_JOB_STATE',
+        'Server construction requires an ordinary first-bake or rebake without a ready candidate.', 409)
+    }
+    mode.onAdmitted(owner, job)
+  } else if (
     !job.stagedLive ||
-    canonicalRecipeString(job.stagedLive) !== canonicalRecipeString(input.live)
+    canonicalRecipeString(job.stagedLive) !== canonicalRecipeString(mode.input.live)
   ) {
     throw new GoonRecipeLifecycleError(
       'CANDIDATE_NOT_REGISTERED',
@@ -2844,16 +3020,79 @@ async function stageRecipeCandidate(input: StageRecipeCandidateInput, dependenci
   let liveBuildReceipt: GoonLiveBuildReceipt
   let reproduced: { manifest: Record<string, unknown>; dependenciesSha256: string }
   const constructionInput = () => ({
-    userId: input.userId, archive: target,
+    userId: input.userId, goonId: input.goonId, archive: target,
     revisionId: job.targetRevisionId, revision: job.targetRecipeRevision, state, readAsset,
     resolveHairAsset: dependencies.resolveHairAsset ?? resolveHairAssetRevision,
     replayControl
   })
-  live = input.live
-  liveBuildReceipt = await verifyGoonLiveBuildReceipt(input.liveBuildReceipt)
-  assertLiveReceiptBindings(job, state, liveBuildReceipt, live)
-  await replayControl.checkpoint()
-  reproduced = await verifyDeterministicLiveBake({ ...constructionInput(), receipt: liveBuildReceipt })
+  if (mode.kind === 'uploaded') {
+    live = mode.input.live
+    liveBuildReceipt = await verifyGoonLiveBuildReceipt(mode.input.liveBuildReceipt)
+    assertLiveReceiptBindings(job, state, liveBuildReceipt, live)
+    await replayControl.checkpoint()
+    reproduced = await verifyDeterministicLiveBake({ ...constructionInput(), receipt: liveBuildReceipt })
+  } else {
+    await replayControl.checkpoint()
+    // Package bytes have no consumer after ingestion. Keep their lifetime out
+    // of fresh Source/dependency/stored-output readback below.
+    const generated = await (async () => {
+      const built = await constructDeterministicLiveBake({ ...constructionInput(), enforceControl: true })
+      await replayControl.checkpoint()
+      let candidate = job.stagedLive
+      if (!candidate) {
+        // No user cancellation signal on this renewal: settle ingestion and
+        // attach its valid receipt to the job before honoring cancellation.
+        const uploadControl = recipeReplayControl({ userId: input.userId, goonId: input.goonId,
+          job, expectedWriteVersion: owner.writeVersion, dependencies })
+        const settled = await uploadWithRecipeLease(() =>
+          (dependencies.uploadConstructedPackage ?? uploadConstructedRecipePackage)(
+            built.packageBytes, `${input.goonId}-live-r${job.targetRecipeRevision}.bgoon`), uploadControl)
+        candidate = settled.upload.live
+        const registered = await registerRecipeCandidateAssets({
+          ...input, expectedWriteVersion: owner.writeVersion,
+          expectedJobStateVersion: job.stateVersion, live: candidate
+        }, dependencies)
+        if (registered.replayed) {
+          // Another request registered this same candidate while we uploaded.
+          // Its newer job version is not ours to stage or fail.
+          mode.onSuperseded()
+          throw new GoonRecipeLifecycleError('WRITE_CONFLICT',
+            'Another server build registered this Recipe candidate first.', 409)
+        }
+        goon = registered.goon
+        owner = registered.owner
+        job = registered.job
+        mode.onAdmitted(owner, job)
+        const renewalFailure = settled.renewalFailure()
+        if (renewalFailure) throw renewalFailure
+      }
+      // Registered retry must reproduce exactly; never silently substitute a
+      // different result into an already owned candidate.
+      const receipt = await verifyGoonLiveBuildReceipt(built.receipt)
+      assertLiveReceiptBindings(job, state, receipt, candidate)
+      return { live: candidate, receipt, manifest: built.manifest,
+        dependenciesSha256: built.dependenciesSha256 }
+    })()
+    live = generated.live
+    liveBuildReceipt = generated.receipt
+    reproduced = generated
+    replayControl = makeReplayControl()
+    await replayControl.checkpoint()
+    const constructedSource = canonicalRecipeString(target.source)
+    target = await loadArchiveFromDocument(input.userId, input.goonId,
+      job.stagedSource.containmentReceipt, readAsset, true)
+    if (canonicalRecipeString(target.source) !== constructedSource) {
+      throw new GoonRecipeLifecycleError('ASSET_MISMATCH', 'Recipe Source changed during server construction.', 409)
+    }
+    const freshDependencies = await bakeDependenciesSha256(await resolveBakeDependencies({
+      userId: input.userId, goonId: input.goonId, state, source: target.source, readAsset, replayControl,
+      resolveHairAsset: dependencies.resolveHairAsset ?? resolveHairAssetRevision,
+    }))
+    if (freshDependencies !== reproduced.dependenciesSha256) {
+      throw new GoonRecipeLifecycleError('ASSET_MISMATCH',
+        'Recipe attachment ownership or bytes changed during server construction.', 409)
+    }
+  }
   await replayControl.checkpoint()
   await verifyStoredLiveArtifacts(live, liveBuildReceipt, readAsset)
   const buildDocument = await createGoonRecipeDocument({
@@ -3038,6 +3277,7 @@ async function verifyRecipeRevision(
   )
   const replayInput = {
     userId,
+    goonId,
     archive: source,
     revisionId: envelope.revision.revisionId,
     revision: envelope.revision.recipeRevision,
@@ -3325,6 +3565,85 @@ async function recoverExpiredJobFromCorruptAuthoringState(input: {
     candidate,
     recovered: true
   }
+}
+
+const READ_READY_RECIPE_JOB = `
+if redis.call('EXISTS', KEYS[3]) ~= 0 then return {'RESTORING'} end
+local owner = redis.call('JSON.GET', KEYS[1])
+local job = redis.call('JSON.GET', KEYS[2])
+if not owner or not job then return {'MISSING'} end
+return {'OK', owner, job}
+`
+
+/** A staged preview may read a ready candidate, but must never run the ordinary
+ * job GET's expired-lease recovery. No result from this read is a Commit permit. */
+export async function readReadyRecipeJob(input: {
+  userId: string
+  goonId: string
+  jobId: string
+}) {
+  const unavailable = (): never => {
+    throw new GoonRecipeLifecycleError('READY_JOB_UNAVAILABLE',
+      'The ready Recipe candidate could not be verified. Reload and try again.', 409)
+  }
+  const epoch = captureRecipeVerificationEpoch()
+  if (!isRecipeVerificationEpochCurrent(epoch)) return unavailable()
+  const jobKey = recipeJobRedisKey(input.userId, input.goonId, input.jobId)
+  const readSnapshot = async (): Promise<[string, string]> => {
+    const result = await redis.execute(client => client.eval(READ_READY_RECIPE_JOB, {
+      keys: [`goon:${input.goonId}`, jobKey, 'goon_asset_restore'], arguments: []
+    }))
+    if (!Array.isArray(result) || result.length !== 3 || result[0] !== 'OK' ||
+        typeof result[1] !== 'string' || typeof result[2] !== 'string' ||
+        Buffer.byteLength(result[1], 'utf8') > MAX_COMPATIBILITY_BASIS_BYTES ||
+        Buffer.byteLength(result[2], 'utf8') > MAX_COMPATIBILITY_BASIS_BYTES ||
+        !isRecipeVerificationEpochCurrent(epoch)) return unavailable()
+    return [result[1], result[2]]
+  }
+
+  const [ownerRaw, jobRaw] = await readSnapshot()
+  const parsed: unknown = JSON.parse(ownerRaw)
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return unavailable()
+  const goon = parsed as GoonRecord
+  if (goon.id !== input.goonId || goon.user_id !== input.userId) return unavailable()
+  const job = parseGoonRecipeJob(JSON.parse(jobRaw))
+  if (job.userId !== input.userId || job.goonId !== input.goonId || job.jobId !== input.jobId ||
+      job.status !== 'ready' || !job.candidateRevision || !job.stagedLive) return unavailable()
+  const owner = await verifyGoonRecipeV2(goon.recipe)
+  if (owner.writeVersion !== job.targetWriteVersion ||
+      canonicalRecipeString(owner.pendingJob) !== canonicalRecipeString(pendingJob(job))) return unavailable()
+
+  const [reviewedState, candidate, containmentDocument] = await Promise.all([
+    loadReviewedState(input.userId, input.goonId, job.reviewedState),
+    loadEnvelopeByRef(input.userId, input.goonId, job.candidateRevision),
+    loadDocumentByRef(input.userId, input.goonId, job.stagedSource.containmentReceipt)
+  ])
+  const containment = await verifyRecipeArchiveContainmentReceipt(containmentDocument.content)
+  const source = job.stagedSource.source
+  const model = containment.members.find(member => member.role === 'model')
+  const manifest = containment.members.find(member => member.role === 'manifest')
+  if (!model || !manifest || reviewedState.operation !== job.operation ||
+      reviewedState.containmentReceiptSha256 !== containment.receiptSha256 ||
+      source.package.ref !== containment.archive.ref || source.package.sha256 !== containment.archive.sha256 ||
+      source.model.ref !== model.extracted.ref || source.model.sha256 !== model.sha256 ||
+      source.manifest.ref !== manifest.extracted.ref || source.manifest.sha256 !== manifest.sha256 ||
+      candidate.revision.revisionId !== job.targetRevisionId ||
+      candidate.revision.recipeRevision !== job.targetRecipeRevision ||
+      canonicalRecipeString(candidate.sourceContainmentReceipt) !== canonicalRecipeString(job.stagedSource.containmentReceipt) ||
+      canonicalRecipeString(candidate.revision.source) !== canonicalRecipeString(source) ||
+      canonicalRecipeString(candidate.revision.state) !== canonicalRecipeString(reviewedState.state) ||
+      canonicalRecipeString(candidate.revision.updateReport) !== canonicalRecipeString(job.migrationReport) ||
+      canonicalRecipeString(candidate.live) !== canonicalRecipeString(job.stagedLive)) return unavailable()
+  const buildDocument = await loadDocumentByRef(input.userId, input.goonId, candidate.revision.liveBuildReceipt)
+  if (buildDocument.documentContract !== GOON_LIVE_BUILD_CONTRACT) return unavailable()
+  const buildReceipt = await verifyGoonLiveBuildReceipt(buildDocument.content)
+  assertLiveReceiptBindings(job, reviewedState.state, buildReceipt, candidate.live)
+  const result = { goon, job, reviewedState, candidate, recovered: false as const }
+  if (Buffer.byteLength(JSON.stringify(result), 'utf8') > 8 * 1024 * 1024) return unavailable()
+  const [freshOwnerRaw, freshJobRaw] = await readSnapshot()
+  if (freshOwnerRaw !== ownerRaw || freshJobRaw !== jobRaw ||
+      !isRecipeVerificationEpochCurrent(epoch)) return unavailable()
+  return result
 }
 
 export async function recoverInterruptedRecipeJob(

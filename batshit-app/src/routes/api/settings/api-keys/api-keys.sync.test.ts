@@ -8,8 +8,6 @@ const apiKeyService = {
   storedKeyName: (service: string, userId: string) => `api_keys:${userId}:${service}`
 }
 
-const syncAgentCodexProfiles = vi.fn()
-const syncAgentClaudeProfiles = vi.fn()
 const dynamicPrivateEnv = vi.hoisted(() => ({
   env: {} as Record<string, string | undefined>
 }))
@@ -20,14 +18,8 @@ vi.mock('$lib/services/apiKey.server', () => ({
 
 vi.mock('$env/dynamic/private', () => dynamicPrivateEnv)
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles
-}))
-
-vi.mock('$lib/server/services/claudeProfileManager', () => ({
-  syncAgentClaudeProfiles
-}))
-
+// SA-139 R4 removed the Primary profile sync that followed an n8n Instance MCP token save or
+// delete; these cases keep the save and the guarded delete themselves.
 describe('/api/settings/api-keys managed profile sync hooks', () => {
   let routeModule: typeof import('./+server')
 
@@ -41,7 +33,7 @@ describe('/api/settings/api-keys managed profile sync hooks', () => {
     routeModule = await import('./+server')
   })
 
-  it('POST syncs both Codex and Claude profiles for n8n instance MCP token updates', async () => {
+  it('POST stores an n8n instance MCP token update', async () => {
     const request = new Request('http://localhost/api/settings/api-keys', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -58,11 +50,9 @@ describe('/api/settings/api-keys managed profile sync hooks', () => {
 
     expect(response.status).toBe(200)
     expect(apiKeyService.store).toHaveBeenCalledWith('n8n_instance_mcp_token', 'secret-token', 'josh')
-    expect(syncAgentCodexProfiles).toHaveBeenCalledWith('josh')
-    expect(syncAgentClaudeProfiles).toHaveBeenCalledWith('josh')
   })
 
-  it('DELETE syncs both Codex and Claude profiles for n8n instance MCP token removal', async () => {
+  it('DELETE removes the n8n instance MCP token in one guarded step', async () => {
     const request = new Request('http://localhost/api/settings/api-keys', {
       method: 'DELETE',
       headers: { 'content-type': 'application/json' },
@@ -87,8 +77,6 @@ describe('/api/settings/api-keys managed profile sync hooks', () => {
       []
     )
     expect(apiKeyService.delete).not.toHaveBeenCalled()
-    expect(syncAgentCodexProfiles).toHaveBeenCalledWith('josh')
-    expect(syncAgentClaudeProfiles).toHaveBeenCalledWith('josh')
   })
 
   it('GET reports Batshit internal token as Docker runtime-managed when containerized', async () => {

@@ -45,6 +45,7 @@ import {
 } from './local-style-overrides.mjs';
 import {
   resolveMainWindowSizePolicy,
+  resolveMainWindowTitleBarPolicy,
   restoreMainWindowBounds
 } from './main-window-policy.mjs';
 import {
@@ -57,6 +58,7 @@ import { settleShutdownPreparations } from './shutdown-lifecycle.mjs';
 import {
   SUPERVISOR_COMMANDS,
   collectAllowedOrigins,
+  createNavigationDiagnostic,
   isAllowedAppUrl,
   isAllowedElectronMediaPermission,
   isAllowedMainWindowUrl,
@@ -69,6 +71,7 @@ import {
   resolveDesktopGoonUrl,
   resolveCustomCssPath,
   resolveDevToolsEnabled,
+  resolveNavigationDiagnosticsEnabled,
   resolveMacShellIdentity,
   resolveShellAssetPath,
   validateElectronIpcSender,
@@ -87,6 +90,7 @@ const moduleDir = dirname(fileURLToPath(import.meta.url));
 const shellIdentity = resolveMacShellIdentity({ packaged: app.isPackaged, packagedName: app.getName() });
 Object.assign(process.env, macShellFolderEnv(shellIdentity, process.env, homedir()));
 const allowedOrigins = collectAllowedOrigins();
+const navigationDiagnosticsEnabled = resolveNavigationDiagnosticsEnabled();
 const devToolsEnabled = resolveDevToolsEnabled({ homePath: homedir(), fileExists: existsSync });
 const customCssPath = resolveCustomCssPath(process.env, homedir());
 const desktopGoonUrl = resolveDesktopGoonUrl();
@@ -501,11 +505,33 @@ function configureRoleNavigation(contents, role) {
           desktopGoonUrl,
           desktopControlsUrl
         );
-  const enforce = (event, navigationUrl) => {
-    if (!isAllowed(navigationUrl)) event.preventDefault();
+  const diagnostic = (phase, event, legacyUrl, extra = {}) => {
+    if (!navigationDiagnosticsEnabled) return;
+    try {
+      console.info('[Batshit navigation]', JSON.stringify(createNavigationDiagnostic({
+        phase, role, legacyUrl, eventUrl: event?.url, allowedOrigins,
+        isMainFrame: event?.isMainFrame,
+        isSameDocument: event?.isSameDocument,
+        defaultPrevented: event?.defaultPrevented,
+        ...extra
+      })));
+    } catch { /* Diagnostics must never change navigation or shutdown. */ }
   };
-  contents.on('will-navigate', enforce);
-  contents.on('will-redirect', enforce);
+  const enforce = (phase, event, navigationUrl) => {
+    const allowed = isAllowed(navigationUrl);
+    if (!allowed) event.preventDefault();
+    diagnostic(phase, event, navigationUrl, { allowed });
+  };
+  contents.on('will-navigate', (event, url) => enforce('will-navigate', event, url));
+  contents.on('will-redirect', (event, url) => enforce('will-redirect', event, url));
+  if (navigationDiagnosticsEnabled) {
+    contents.on('did-finish-load', () => {
+      try { diagnostic('did-finish-load', null, contents.getURL()); } catch { /* Window ended. */ }
+    });
+    contents.on('did-fail-load', (event, errorCode, _description, url, isMainFrame) => {
+      diagnostic('did-fail-load', event, url, { errorCode, isMainFrame });
+    });
+  }
 }
 
 function intentionalShutdownInProgress() {
@@ -554,14 +580,17 @@ async function persistMainWindowState(window) {
 
 function createWindow(savedState = null) {
   const restoredBounds = restoreSavedMainWindowBounds(savedState);
+  const titleBar = resolveMainWindowTitleBarPolicy(process.platform);
   const window = new BrowserWindow({
     ...resolveMainWindowSizePolicy(),
     ...(restoredBounds ?? {}),
+    ...titleBar.options,
     show: false,
     backgroundColor: '#080810',
     title: shellIdentity.appName,
     webPreferences: {
       preload: join(moduleDir, 'preload.cjs'),
+      additionalArguments: [...titleBar.preloadArguments],
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,

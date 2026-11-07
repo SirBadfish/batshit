@@ -16,7 +16,7 @@ const source = readFileSync('src/routes/api/messages/send-routed/+server.ts', 'u
  */
 describe('send-routed: an approval is answered once', () => {
   const register = source.indexOf('\n    const sessionTurnRegistration = registerSessionTurn(\n')
-  const analyze = source.indexOf('const approvalState = analyzeApprovalState(approvalHistoryMessages)')
+  const analyze = source.indexOf('const approvalState = await sweepApprovalState({')
   const lateWarning = source.indexOf("'[Send-Routed] Late approval converted to deny due to timeout'")
   const answer = source.indexOf('approvalAnswer = await answerApprovalsOnce({')
   const streamMetadata = source.indexOf('const metadataForStream =', answer)

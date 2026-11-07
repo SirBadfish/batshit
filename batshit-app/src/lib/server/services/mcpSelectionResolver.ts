@@ -1,6 +1,6 @@
 import { redis } from '$lib/server/redis'
 import type { AgentRow, MCPToolSelections } from '$lib/types/database'
-import { isManagedPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { isApiPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 import { mcpGatewayService } from './mcpGatewayService'
 import { mcpGatewayDiscovery } from './mcpGatewayDiscovery'
 import type { ToolMetadataMap } from './mcpGatewayTypes'
@@ -9,6 +9,10 @@ import {
   buildDynamicOnlySelectionResetKey
 } from './mcpRuntimePolicy'
 import { runGatewayOrphanReferenceCleanup } from './mcpGatewayReferenceCleanup'
+import { restrictP5ApiPreparedTools, type P5OriginalPreparation } from './appActions/mcp/originalTask'
+import { PRIMARY_AGENT_TYPE_SOURCE_FIELDS } from '$lib/utils/primaryAgentType'
+import { captureSettingsLifecycle, assertSettingsLifecycle, acquireSettingsMutation,
+  type SettingsLifecycleSnapshot } from './appActions/settings/lifecycle'
 
 interface MCPSelectionResolverOptions {
   userId: string
@@ -20,9 +24,9 @@ interface MCPSelectionResolverOptions {
   /** Untrusted discovery/execution filter, not an authority to add gateways. */
   selectedGateways?: string[] | null
   toolSelections?: MCPToolSelections | null
+  /** Genuine in-process API preparation; never a body field or posted scope. */
+  mcpOriginalPreparation?: P5OriginalPreparation
   includeGatewayToolMap?: boolean
-  /** SA-009: When true, this is a Codex/Mode 4 agent - inject artifact/Dynamic MCP tools but NOT file ops */
-  isCodexMode?: boolean
 }
 
 export interface MCPSelectionResolution {
@@ -54,8 +58,7 @@ export async function resolveMCPSelections(
     agentMetadata,
     selectedGateways,
     toolSelections,
-    includeGatewayToolMap,
-    isCodexMode
+    includeGatewayToolMap
   } = options
 
   if (!userId) {
@@ -93,6 +96,9 @@ export async function resolveMCPSelections(
 
   if (agent && !isBatshitAgent(agent)) {
     resolvedToolSelections = filterBlockedTools(resolvedToolSelections)
+  }
+  if (options.mcpOriginalPreparation !== undefined) {
+    resolvedToolSelections = restrictP5ApiPreparedTools(options.mcpOriginalPreparation, resolvedToolSelections, { userId, agentId })
   }
 
   const gatewayToolMap =
@@ -207,7 +213,7 @@ export async function resolveDynamicMcpGatewayScope(
 
 function isBatshitAgent(agent: AgentRow | null) {
   if (!agent) return false
-  return isManagedPrimaryAgentType(normalizePrimaryAgentType(agent))
+  return isApiPrimaryAgentType(normalizePrimaryAgentType(agent))
 }
 
 function filterBlockedTools(selections: MCPToolSelections | undefined) {
@@ -314,38 +320,148 @@ export function mergeToolSelections(
   return undefined
 }
 
+const RESET_SOURCE_PATHS = [...new Set(['id', 'user_id', 'created_at', ...PRIMARY_AGENT_TYPE_SOURCE_FIELDS,
+  ...LEGACY_AGENT_MCP_SELECTION_FIELDS])].map(field => `$.${field}`)
+const READ_RESET_SOURCE = `-- fixed-dynamic-only-mcp-reset-read
+if redis.call('EXISTS', KEYS[1]) == 0 then return {'MISSING'} end
+local shape = redis.pcall('JSON.TYPE', KEYS[1], '$')
+if type(shape) ~= 'table' or shape.err or shape[1] ~= 'object' then return {'INVALID'} end
+local out = {'SOURCE'}
+for _, path in ipairs(cjson.decode(ARGV[1])) do out[#out + 1] = redis.call('JSON.GET', KEYS[1], path) or '' end
+return out
+`
+const WRITE_RESET_SOURCE = `-- fixed-dynamic-only-mcp-reset-write
+local paths = cjson.decode(ARGV[1])
+local original = cjson.decode(ARGV[2])
+local stamp = cjson.decode(ARGV[3])
+if #paths ~= #original or type(stamp) ~= 'string' then return 'INVALID' end
+for _, raw in ipairs(original) do if type(raw) ~= 'string' then return 'INVALID' end end
+if redis.call('EXISTS', KEYS[1]) == 0 then return 'MISSING' end
+local shape = redis.pcall('JSON.TYPE', KEYS[1], '$')
+if type(shape) ~= 'table' or shape.err or shape[1] ~= 'object' then return 'INVALID' end
+for index, path in ipairs(paths) do
+  if (redis.call('JSON.GET', KEYS[1], path) or '') ~= original[index] then return 'CHANGED' end
+end
+for _, write in ipairs({{'$.defaultMCPToolSelections', '[]'}, {'$.default_mcp_tool_selections', '[]'}, {'$.updated_at', ARGV[3]}}) do
+  local answer = redis.call('JSON.SET', KEYS[1], write[1], write[2])
+  if type(answer) ~= 'table' or answer.ok ~= 'OK' then return 'UNCONFIRMED' end
+end
+return 'OK'
+`
+const WRITE_RESET_MARKER = `-- fixed-dynamic-only-mcp-reset-marker
+local original = redis.call('GET', KEYS[1])
+if ARGV[1] == 'absent' then
+  if original then return 'CHANGED' end
+elseif ARGV[1] ~= 'present' or original ~= ARGV[2] then return 'CHANGED' end
+local answer = redis.call('SET', KEYS[1], ARGV[3])
+if type(answer) ~= 'table' or answer.ok ~= 'OK' then return 'UNCONFIRMED' end
+return 'OK'
+`
+class DynamicMcpResetChangedError extends Error {
+  readonly code = 'dynamic_mcp_reset_changed'
+  readonly status = 409
+  constructor() { super('The legacy MCP reset stopped because its original source changed. Earlier confirmed resets remain saved.') }
+}
+class DynamicMcpResetUnconfirmedError extends Error {
+  readonly code = 'dynamic_mcp_reset_unconfirmed'
+  readonly status = 503
+  constructor(cause?: unknown) { super('The legacy MCP reset was issued but its outcome is unconfirmed. It will not be repeated automatically.', cause === undefined ? undefined : { cause }) }
+}
+type ResetAttempt = { promise: Promise<void>; classified: boolean }
+const resetAttempts = new Map<string, ResetAttempt>()
+function resetValue(raw: unknown): unknown {
+  if (typeof raw !== 'string') throw new DynamicMcpResetChangedError()
+  const values: unknown = JSON.parse(raw || '[]')
+  if (!Array.isArray(values) || values.length > 1) throw new DynamicMcpResetChangedError()
+  return values[0]
+}
+
+/** Fixed private maintenance owner, not a way to mint human Settings consent. Original
+ * source classification precedes every effect; only the two retired lists and stamp change. */
 async function runDynamicOnlySelectionReset(userId: string): Promise<void> {
-  const markerKey = buildDynamicOnlySelectionResetKey(userId)
-
-  const alreadyReset = await redis.execute(async (client) => {
-    const marker = await client.get(markerKey)
-    return typeof marker === 'string' && marker.trim().length > 0
+  const prior = resetAttempts.get(userId)
+  if (prior) return prior.promise
+  const attempt = { classified: false } as ResetAttempt
+  attempt.promise = performDynamicOnlySelectionReset(userId, attempt).then(() => {
+    resetAttempts.delete(userId) // Only a known complete marker permits the ordinary fast path.
+  }, error => {
+    // Before classification there is no original save to retain. After it, a later call
+    // cannot recapture newer choices, replay partial progress or certify a lost marker reply.
+    if (!attempt.classified) resetAttempts.delete(userId)
+    throw error
   })
-  if (alreadyReset) return
+  resetAttempts.set(userId, attempt)
+  return attempt.promise
+}
 
-  const agents = await redis.getAgents(userId)
-
-  for (const agent of agents) {
-    if (!agent?.id) continue
-    const hasCamelSelections =
-      Array.isArray((agent as any)[LEGACY_AGENT_MCP_SELECTION_FIELDS[0]]) &&
-      (agent as any)[LEGACY_AGENT_MCP_SELECTION_FIELDS[0]].length > 0
-    const hasSnakeSelections =
-      Array.isArray((agent as any)[LEGACY_AGENT_MCP_SELECTION_FIELDS[1]]) &&
-      (agent as any)[LEGACY_AGENT_MCP_SELECTION_FIELDS[1]].length > 0
-
-    if (!hasCamelSelections && !hasSnakeSelections) continue
-
-    // BL-770: clear the two legacy lists by path. It wrote back the whole record `getAgents`
-    // answered (with its browser upload URLs), taking back any save made meanwhile.
-    await redis.updateAgent(agent.id, {
-      [LEGACY_AGENT_MCP_SELECTION_FIELDS[0]]: [],
-      [LEGACY_AGENT_MCP_SELECTION_FIELDS[1]]: []
-    } as any)
-  }
-
-  await redis.execute(async (client) => {
-    await client.set(markerKey, new Date().toISOString())
+async function performDynamicOnlySelectionReset(userId: string, attempt: ResetAttempt): Promise<void> {
+  if (typeof userId !== 'string' || !userId.trim()) throw new DynamicMcpResetChangedError()
+  const markerKey = buildDynamicOnlySelectionResetKey(userId), indexKey = `user:${userId}:agents`
+  const originalLifecycle = captureSettingsLifecycle([markerKey, indexKey])
+  await redis.execute(async client => {
+    const marker = await client.get(markerKey)
+    assertSettingsLifecycle(originalLifecycle)
+    if (typeof marker === 'string' && marker.trim().length) return
+    if (marker !== null && typeof marker !== 'string') throw new DynamicMcpResetChangedError()
+    const ids = await client.sMembers(indexKey)
+    assertSettingsLifecycle(originalLifecycle)
+    if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string' || !id)) throw new DynamicMcpResetChangedError()
+    const sourcePaths = JSON.stringify(RESET_SOURCE_PATHS)
+    const sources: Array<{ key: string; arguments: string[]; lifecycle: SettingsLifecycleSnapshot; createdAt: unknown; candidate: boolean }> = []
+    for (const id of ids) {
+      const key = `agent:${id}`, lifecycle = captureSettingsLifecycle([key])
+      const answer = await client.eval(READ_RESET_SOURCE, { keys: [key], arguments: [JSON.stringify(RESET_SOURCE_PATHS)] })
+      if (!Array.isArray(answer) || answer[0] !== 'SOURCE' || answer.length !== RESET_SOURCE_PATHS.length + 1) throw new DynamicMcpResetChangedError()
+      const raw = answer.slice(1) as string[], values = raw.map(resetValue)
+      const value = (field: string) => values[RESET_SOURCE_PATHS.indexOf(`$.${field}`)]
+      if (value('id') !== id || value('user_id') !== userId) throw new DynamicMcpResetChangedError()
+      attempt.classified = true
+      assertSettingsLifecycle(lifecycle)
+      const candidate = LEGACY_AGENT_MCP_SELECTION_FIELDS.some(field => Array.isArray(value(field)) && (value(field) as unknown[]).length > 0)
+      sources.push({ key, arguments: [sourcePaths, JSON.stringify(raw), JSON.stringify(new Date().toISOString())],
+        lifecycle, createdAt: value('created_at'), candidate })
+    }
+    // getAgents historically reset newest first. Keep that order, without its mutating
+    // legacy-type normalization or its catch-and-skip partial population reads.
+    sources.sort((a, b) => new Date((b.createdAt || 0) as string).getTime() - new Date((a.createdAt || 0) as string).getTime())
+    for (const source of sources) assertSettingsLifecycle(source.lifecycle)
+    assertSettingsLifecycle(originalLifecycle)
+    const markerArguments = [marker === null ? 'absent' : 'present', marker ?? '', new Date().toISOString()]
+    attempt.classified = true
+    for (const source of sources.filter(source => source.candidate)) {
+      const lease = acquireSettingsMutation(source.lifecycle)
+      let issued = false, settled = false
+      try {
+        lease.check(); issued = true
+        const answer = await client.eval(WRITE_RESET_SOURCE, {
+          keys: [source.key], arguments: source.arguments
+        })
+        if (!['OK', 'CHANGED', 'MISSING', 'INVALID'].includes(answer as string)) throw new DynamicMcpResetUnconfirmedError()
+        lease.settle(); settled = true
+        if (answer !== 'OK') throw new DynamicMcpResetChangedError()
+      } catch (error) {
+        if (issued && !settled && !(error instanceof DynamicMcpResetUnconfirmedError)) throw new DynamicMcpResetUnconfirmedError(error)
+        throw error
+      } finally {
+        if (!settled) { if (issued) lease.unknown(); else lease.settle() }
+      }
+    }
+    const lease = acquireSettingsMutation(originalLifecycle)
+    let issued = false, settled = false
+    try {
+      lease.check(); issued = true
+      const answer = await client.eval(WRITE_RESET_MARKER, {
+        keys: [markerKey], arguments: markerArguments
+      })
+      if (answer !== 'OK' && answer !== 'CHANGED') throw new DynamicMcpResetUnconfirmedError()
+      lease.settle(); settled = true
+      if (answer !== 'OK') throw new DynamicMcpResetChangedError()
+    } catch (error) {
+      if (issued && !settled && !(error instanceof DynamicMcpResetUnconfirmedError)) throw new DynamicMcpResetUnconfirmedError(error)
+      throw error
+    } finally {
+      if (!settled) { if (issued) lease.unknown(); else lease.settle() }
+    }
   })
 }
 

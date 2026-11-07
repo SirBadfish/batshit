@@ -47,6 +47,7 @@ import {
   buildSkillToolHintRequest,
   computeSkillToolHints,
   decideSkillToolHints,
+  toolCandidatesFromDiscoverable,
   type SkillToolHintRequest
 } from '../skillToolHints.jev'
 import { checkJudgeRequestFit, profileJudgeLimits } from '$lib/utils/judgeProviders'
@@ -272,14 +273,10 @@ describe('buildCapabilityGapCatalog', () => {
     expect(gaps.find((gap) => gap.id === 'gateway:gw_github')?.what).toBe('tools such as create_issue, list_prs')
   })
 
-  // BL-878 (Josh, 2026-09-28): a Codex or Claude agent has its own Bash, so a saved Bash value of
-  // `false` (an agent changed from API to CLI keeps it; nothing on screen can clear it) must not
-  // become "Off for this agent: Bash", which tells the agent to say so plainly instead of using
-  // its own shell. An API agent's real off switch still does.
+  // BL-878 (Josh, 2026-09-28): an API agent's real Bash off switch is a missing capability.
+  // SA-139 R4: the CLI Primary rows (its own Bash) left with the lane; a CLI Primary record is
+  // refused before any turn reaches Judge Juice, so the catalog is built for API agents only.
   it.each([
-    ['a CLI agent', { agentType: 'cli' }, false],
-    ['a Codex agent known only by its provider (a legacy record)', { primary_model_provider: 'codex-cli' }, false],
-    ['a Claude agent known only by its provider (a legacy record)', { primary_model_provider: 'claude-cli' }, false],
     ['an API agent', { agentType: 'api' }, true]
   ])('BL-878: %s and a Bash value of false', async (_name, agentFields, offered) => {
     registries.listAllSlashCapabilities.mockResolvedValue([])
@@ -340,6 +337,24 @@ describe('computeSkillToolHints', () => {
 
   const skills = [{ id: 'vroid', name: 'vroid', displayName: 'VRoid', type: 'skill' as const, invocation: '/vroid-dressup', isSystem: false, skillId: 'vroid_dressup', description: 'Dress a Goon' }]
   const discoverable = [{ ref: 'mcp:hf_search', family: 'mcp' as const, name: 'hf_search', group: 'HF', description: 'Search models', hint: 'required: query:string', enabled: false }]
+
+  it('does not suggest an already open or user-closed skill while still suggesting available tools', async () => {
+    const fetchImpl = vi.fn<TypesafeFetch>().mockResolvedValue(jsonResponse({
+      model: 'jev-1.13.0', answers: {
+        needs_action: { type: 'noul', noul: 1 },
+        tool: { type: 'choice', choice: 'mcp:hf_search', probabilities: { 'mcp:hf_search': 1, none: 0 }, confidence: 1 }
+      }, usage: { input_tokens: 10, output_tokens: 0 }
+    }))
+    const outcome = await computeSkillToolHints({
+      userId: 'josh', agent: { id: 'agent_1', displayName: 'Faye' }, message: 'look up the needed model',
+      skills, discoverable, resolvedGatewayIds: null, excludedSkillIds: ['vroid_dressup'],
+      client: createTypesafeClient({ fetch: fetchImpl, dispatcher: null })
+    })
+    const sent = JSON.parse(String(fetchImpl.mock.calls[0][1].body))
+    expect(sent.questions.skill).toBeUndefined()
+    expect(outcome.lines.some((line) => line.includes('Likely skill:'))).toBe(false)
+    expect(outcome.lines.some((line) => line.includes('Likely tool: mcp:hf_search'))).toBe(true)
+  })
 
   it('makes one call under the compile-lane deadline and returns lines, a record with the decision, and a gap', async () => {
     const fetchImpl = vi.fn<TypesafeFetch>().mockResolvedValue(
@@ -450,5 +465,12 @@ describe('computeSkillToolHints', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
     expect(outcome.record).toMatchObject({ status: 'unavailable', reason: 'master_off' })
     expect(outcome.note?.reason).toBe('master_off')
+  })
+})
+
+
+describe('utility discovery candidates', () => {
+  it('retains neutral utility hints when no description is present', () => {
+    expect(toolCandidatesFromDiscoverable([{ ref: 'batshit:sys.judge.ask', name: 'sys.judge.ask', family: 'batshit', group: 'Fabric & Utilities', description: null, hint: 'Ask Judge Juice — state, questions', enabled: false }])[0]).toMatchObject({ family: 'batshit', description: 'Ask Judge Juice — state, questions' })
   })
 })

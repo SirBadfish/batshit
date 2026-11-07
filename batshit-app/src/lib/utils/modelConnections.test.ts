@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { autoSelectConnectionForModel, isModelAllowedForConnection, isDirectDeveloperCompatible } from './modelConnections'
 import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
+import { resolveCatalogIds } from './modelIdResolver'
 import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
 
 const baseModel = (overrides: Partial<CatalogModel> = {}): CatalogModel => ({
@@ -23,6 +24,44 @@ const baseConnection = (overrides: Partial<CatalogConnectionOption> = {}): Catal
 })
 
 describe('modelConnections utilities', () => {
+  it('does not apply a shared chat model through unsupported Replicate text, but keeps its working gateway and media routes', () => {
+    const replicate = baseConnection({ id: 'direct:replicate', service: 'replicate', transport: 'direct', providers: ['replicate'] })
+    const model = baseModel({ id: 'anthropic/claude-opus-5.5', name: 'claude-opus-5.5', purpose: 'chat',
+      availableConnections: ['vercel-gateway', 'direct:replicate'], idVariants: {
+        'direct:replicate': { developerId: 'anthropic', modelId: 'claude-opus-5.5', effectiveId: 'anthropic/claude-opus-5.5', source: 'direct' }
+      } })
+    const before = structuredClone(model)
+    expect(isModelAllowedForConnection(model, replicate)).toBe(false)
+    expect(isModelAllowedForConnection(model, baseConnection())).toBe(true)
+    expect(autoSelectConnectionForModel([replicate, baseConnection()], model)?.id).toBe('vercel-gateway')
+    expect(isModelAllowedForConnection({ ...model, purpose: 'visual' }, replicate)).toBe(true)
+    expect(model).toEqual(before)
+  })
+
+  it('does not offer retired MiMo plan chat IDs while keeping current plan models and the PAYG route separate', () => {
+    const plan = baseConnection({ id: 'direct:mimo_token_plan', service: 'mimo_token_plan', transport: 'direct' })
+    const old = baseModel({ provider: 'xiaomi', name: 'mimo-v2.5-pro', purpose: 'chat', connectionId: plan.id })
+    expect(isModelAllowedForConnection(old, plan)).toBe(false)
+    expect(isModelAllowedForConnection({ ...old, name: 'mimo-v2.6-pro' }, plan)).toBe(true)
+    expect(isModelAllowedForConnection({ ...old, connectionId: 'direct:mimo' },
+      baseConnection({ id: 'direct:mimo', service: 'mimo', transport: 'direct' }))).toBe(true)
+  })
+
+  it.each([['mimo', 'xiaomi'], ['zai_coding', 'zai'], ['stepfun', 'stepai']] as const)(
+    'admits the reviewed %s maker without accepting unrelated developers or plan variants',
+    (service, developerId) => {
+      const connection = baseConnection({ id: `direct:${service}`, transport: 'direct', service, providers: [service] })
+      const variant = { developerId, modelId: 'Exact-Model', effectiveId: 'Exact-Model', source: 'direct' as const }
+      const model = baseModel({ provider: developerId, availableConnections: [connection.id], idVariants: { [connection.id]: variant } })
+      expect(isDirectDeveloperCompatible(developerId, connection)).toBe(true)
+      expect(isModelAllowedForConnection(model, connection)).toBe(true)
+      expect(isModelAllowedForConnection({ ...model, idVariants: { [connection.id]: { ...variant, developerId: 'openai' } } }, connection)).toBe(false)
+      expect(isModelAllowedForConnection({ ...model, availableConnections: ['vercel-gateway'], idVariants: {
+        'vercel-gateway': { ...variant, effectiveId: `${developerId}/Exact-Model` },
+        [`direct:${service}_token_plan`]: variant
+      } }, connection)).toBe(false)
+    }
+  )
   it.each(LOCAL_AI_SERVER_DEFINITIONS)(
     'allows a different model maker on the $id connection',
     ({ id }) => {
@@ -272,6 +311,39 @@ describe('modelConnections utilities', () => {
       id: 'openrouter',
       label: 'OpenRouter',
       transport: 'openrouter'
+    })
+
+    it.each(['vercel-gateway', 'openrouter'] as const)('refuses an unadvertised %s transport hint before readiness selection', transport => {
+      const mimo = baseConnection({ id: 'direct:mimo', transport: 'direct', service: 'mimo', providers: ['mimo'], status: 'locked' })
+      const router = transport === 'openrouter' ? openrouter : gateway
+      const model = baseModel({ provider: 'xiaomi', name: 'mimo-v2.6-pro', transport, connectionId: mimo.id,
+        availableConnections: [mimo.id], idVariants: {
+          [mimo.id]: { developerId: 'xiaomi', modelId: 'mimo-v2.6-pro', effectiveId: 'mimo-v2.6-pro', source: 'direct' }
+        } })
+      const selected = autoSelectConnectionForModel([router, mimo], model)
+      expect(selected).toBe(mimo)
+      expect(selected?.status).toBe('locked')
+      expect(resolveCatalogIds({ connection: selected, developerId: model.provider, modelId: model.name, idVariants: model.idVariants })).toMatchObject({ effectiveModelId: 'mimo-v2.6-pro' })
+      expect(autoSelectConnectionForModel([router], model)).toBeNull()
+    })
+
+    it('preserves transport fallback for a legacy row with no declared connection identities', () => {
+      const model = baseModel({ connectionId: undefined, availableConnections: undefined, idVariants: undefined })
+      expect(autoSelectConnectionForModel([gateway], model)).toBe(gateway)
+    })
+
+    it('selects an advertised ready maker route instead of the first unrelated ready provider', () => {
+      const mimo = baseConnection({ id: 'direct:mimo', transport: 'direct', service: 'mimo', providers: ['mimo'] })
+      const model = baseModel({ provider: 'xiaomi', availableConnections: ['vercel-gateway', 'direct:mimo'], idVariants: {
+        'vercel-gateway': { developerId: 'xiaomi', modelId: 'mimo-v2.6-pro', effectiveId: 'xiaomi/mimo-v2.6-pro', source: 'vercel' },
+        'direct:mimo': { developerId: 'xiaomi', modelId: 'mimo-v2.6-pro', effectiveId: 'mimo-v2.6-pro', source: 'direct' }
+      } })
+      expect(autoSelectConnectionForModel([anthropicDirect, mimo, { ...gateway, status: 'locked' }], model)?.id).toBe('direct:mimo')
+      expect(autoSelectConnectionForModel([anthropicDirect], model)).toBeNull()
+      expect(autoSelectConnectionForModel([{ ...mimo, status: 'locked' }, anthropicDirect], model)?.id).toBe('direct:mimo')
+      expect(autoSelectConnectionForModel([mimo], { ...model, availableConnections: ['vercel-gateway'], idVariants: {
+        'vercel-gateway': model.idVariants!['vercel-gateway']
+      } })).toBeNull()
     })
 
     it('prefers ready direct connections for matching provider', () => {

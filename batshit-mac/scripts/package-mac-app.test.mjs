@@ -304,10 +304,17 @@ test('Electron Packager options: the real app exactly as before, a test package 
   assert.deepEqual({ ...lane, appBundleId: 'ai.batshit.mac' }, realApp);
 });
 
-test('the package is built with the Electron installed here', () => {
+test('the Mac manifest, lock, packager and DMG signing agree on the security-maintenance pins', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(scriptsRoot, '..', 'package.json'), 'utf8'));
+  const lock = JSON.parse(fs.readFileSync(path.join(scriptsRoot, '..', 'package-lock.json'), 'utf8'));
+  assert.equal(electronVersion, '43.8.3');
   assert.equal(electronVersion, manifest.devDependencies.electron);
+  assert.equal(lock.packages[''].devDependencies.electron, electronVersion);
+  assert.equal(lock.packages['node_modules/electron'].version, electronVersion);
   assert.equal(packagerOptionsFor('').electronVersion, electronVersion);
+  const dmgScript = fs.readFileSync(path.join(scriptsRoot, 'package-release-dmg.mjs'), 'utf8');
+  assert.ok(dmgScript.includes(`version: '${electronVersion}',`));
+  assert.equal(lock.packages['node_modules/undici'].version, '7.30.1');
 });
 
 test('the staged shell names the app Electron runs as (its Keychain entry and one-instance lock follow it)', () => {

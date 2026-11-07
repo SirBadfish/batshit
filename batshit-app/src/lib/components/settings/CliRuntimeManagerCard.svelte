@@ -5,7 +5,7 @@
   import { dispatchModelConnectionsUpdated } from '$lib/utils/liveSettingsEvents'
   import { onDestroy } from 'svelte'
 
-  type CliRuntimeId = 'codex' | 'claude'
+  type CliRuntimeId = 'claude'
 
   type CliRuntimeSummary = {
     managed: {
@@ -42,8 +42,8 @@
 
   let { runtime, onChanged }: Props = $props()
 
-  const displayName = $derived(runtime === 'codex' ? 'Codex CLI' : 'Claude Code CLI')
-  const approxDownload = $derived(runtime === 'codex' ? 'about 90 MB' : 'about 120 MB')
+  const displayName = 'Claude Code CLI'
+  const approxDownload = 'about 120 MB'
 
   let summary = $state<CliRuntimeSummary | null>(null)
   let loading = $state(true)

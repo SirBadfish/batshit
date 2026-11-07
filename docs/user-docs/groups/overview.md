@@ -17,7 +17,7 @@ If you just want one assistant that delegates to helpers behind the scenes, that
 
 ## Which agents can join
 
-Group Chat uses `API` and `CLI` Primary Agents—the two live Primary Agent types.
+Group Chat uses your current Primary Agents. A leftover agent from a removed CLI or n8n type cannot join. If an older Group still lists one, its turn is refused with an explanation; create a new agent on a saved model instead.
 
 Each agent in a Group keeps its own model, system prompt, personality, voice, and tool access. That's the point — a Group is a room full of *different* agents, not one agent wearing hats.
 
@@ -57,7 +57,7 @@ The Goon changes when the active speaker changes; Batshit does not render the wh
 
 ## Setting up a Group
 
-1. Create the `API` or `CLI` Primary Agents you want in the room, and confirm each one works on its own first.
+1. Create the Primary Agents you want in the room, and confirm each one works on its own first.
 2. Create a Group and add those agents.
 3. Set speak policies if you want some agents to hold back until addressed.
 4. Set tool sharing the way you want the group to collaborate.
@@ -77,7 +77,7 @@ Settings → Groups → the Group → delete. This removes the Group and its ava
 
 | Symptom | Likely cause | What to check |
 | --- | --- | --- |
-| An agent can't be added to a Group | The saved record is missing or uses a retired type. | Delete the retired record and create an `API` or `CLI` agent. |
+| An agent cannot be added to a Group | The saved record is missing or is a leftover of a removed type. | Delete the leftover and create a new agent. |
 | The group feels stuck | Turns are sequential, so one agent's slow or stuck tool call holds the line. | Check that agent's model/provider and tools on their own. |
 | The wrong agent keeps answering | Speak policies, or you didn't name a specific agent. | Address an agent by name, adjust speak policies, or put the agents on **Judge Juice: Smart** so a judgment model picks. |
 | Agents ignore each other | Tool results aren't shared, so they're missing each other's context. | Turn on tool sharing for the results the group should see. |

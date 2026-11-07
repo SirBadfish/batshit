@@ -248,6 +248,7 @@ export class SkinAppearanceEngineRuntime {
     if (this.disposed) fail('cannot apply state after disposal')
     const generation = ++this.generation
     await this.artworkProjection?.initialize()
+    if (this.disposed || generation !== this.generation) return false
     if (!value && !legacyMaterialArtwork && !this.artworkProjection) {
       this.restoreOriginal()
       return true
@@ -328,6 +329,7 @@ export class SkinAppearanceEngineRuntime {
     let nipplePigmentCanvas: HTMLCanvasElement | null = null
     let nippleMaskCanvas: HTMLCanvasElement | null = null
     let preparedProjection: SkinArtworkPreparedProjection | null = null
+    let material: THREE.MeshStandardMaterial | null = null
     try {
       if (state.surface.baseColor.mode === 'custom') {
         uploadedBaseColor = await this.loadCustomMap(
@@ -360,7 +362,7 @@ export class SkinAppearanceEngineRuntime {
           : null
       if (customMetallic) ownedTextures.push(customMetallic)
 
-      const material = this.originalMaterial.clone()
+      material = this.originalMaterial.clone()
       material.name = `${this.definition.runtimeBinding.material}__skin_appearance_runtime_v2`
       material.color.setRGB(1, 1, 1)
 
@@ -581,6 +583,7 @@ export class SkinAppearanceEngineRuntime {
       material.needsUpdate = true
       return { material, ownedTextures, projection: preparedProjection }
     } catch (error) {
+      material?.dispose()
       this.artworkProjection?.disposePrepared(preparedProjection)
       for (const texture of ownedTextures) texture.dispose()
       throw error

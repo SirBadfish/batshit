@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { basename, dirname, join, relative, resolve, sep } from 'node:path'
+import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 import { unzipSync } from 'fflate'
 
@@ -47,6 +47,8 @@ import {
   sha256Hex
 } from '../src/lib/goons/recipe/recipeCanonical'
 import { verifyRecipeSourceProjectionHashes } from '../src/lib/goons/recipe/sourcePackageProjections'
+import { verifyHairFollowerDefinitionBytes } from '../src/lib/goons/hairFollowers'
+import { verifyHairSecondaryMotionDefinitionBytes } from '../src/lib/goons/secondaryMotion'
 import {
   buildHairImportRecipeContext,
   proposeHairImportAuthoringInput
@@ -172,9 +174,55 @@ function arg(name: string): string {
   return value
 }
 
-function under(parent: string, child: string): boolean {
+export function isPathWithin(parent: string, child: string): boolean {
   const rel = relative(resolve(parent), resolve(child))
-  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !resolve(rel).startsWith(sep))
+  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
+}
+
+async function prospectiveRealPath(value: string): Promise<string> {
+  let existing = resolve(value)
+  const suffix: string[] = []
+  for (;;) {
+    try {
+      return resolve(await realpath(existing), ...suffix)
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error
+      try {
+        await lstat(existing)
+      } catch (entryError) {
+        if (!(entryError instanceof Error) || !('code' in entryError) || entryError.code !== 'ENOENT') throw entryError
+        const parent = dirname(existing)
+        if (parent === existing) throw error
+        suffix.unshift(basename(existing))
+        existing = parent
+        continue
+      }
+      fail(`output contains an unresolved existing entry: ${existing}`)
+    }
+  }
+}
+
+export async function assertNewBuiltinHairOutput(outputRoot: string): Promise<void> {
+  try {
+    await lstat(outputRoot)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return
+    throw error
+  }
+  fail(`output already exists; immutable staging never overwrites ${outputRoot}`)
+}
+
+/** Reject both lexical and existing-symlink aliases of the protected tree. */
+export async function assertSafeBuiltinHairOutput(outputRoot: string, protectedRoot: string): Promise<void> {
+  const output = resolve(outputRoot)
+  const protectedPath = resolve(protectedRoot)
+  const [actualOutput, actualProtected] = await Promise.all([
+    prospectiveRealPath(output), realpath(protectedPath)
+  ])
+  if (isPathWithin(protectedPath, output) || isPathWithin(output, protectedPath) ||
+      isPathWithin(actualProtected, actualOutput) || isPathWithin(actualOutput, actualProtected)) {
+    fail('output may not overlap the immutable static hair/v1 tree')
+  }
 }
 
 function parseJson(bytes: Uint8Array, context: string): JsonRecord {
@@ -322,6 +370,7 @@ function replaceV1Ref(
 export async function buildR2Asset(input: {
   sourceAsset: HairAssetV1
   targetDirectory: string
+  targetRevision?: number
   recipeSource: RecipeSourceIdentity
   authoredRootMatrix: number[]
   result: HairImportAuthoringResult
@@ -338,7 +387,33 @@ export async function buildR2Asset(input: {
   if (source.sourceClass !== 'builtin' || source.revision !== 1) {
     fail(`${source.assetId} source must be the immutable built-in r1 revision`)
   }
-  const revisionId = `${source.assetId}-r2`
+  const revision = input.targetRevision ?? 2
+  if (!Number.isSafeInteger(revision) || revision <= source.revision ||
+      !/^[a-z0-9][a-z0-9._-]*$/.test(input.targetDirectory)) {
+    fail('target Hair revision and directory must be a new stable identity')
+  }
+  const revisionId = `${source.assetId}-r${revision}`
+  const evidence = input.result.evidence
+  if (evidence.recipeSourceSha256 !== input.recipeSource.modelSha256 ||
+      evidence.appearanceDefinitionSha256 !== input.recipeSource.definitionSha256 ||
+      evidence.outputGeometrySha256 !== sha256(input.result.geometryGlb) ||
+      evidence.meshCount !== input.topology.meshCount || evidence.vertexCount !== input.topology.vertexCount) {
+    fail(`${source.assetId} authoring evidence does not match the target Source and output`)
+  }
+  const acceptedReceipt = source.receiptRefs.find((entry) => entry.ref.endsWith('/accepted-source-receipt.json'))
+  if (!acceptedReceipt || !source.material.neutralValueTexture || !source.material.highlightMask) {
+    fail(`${source.assetId} source is missing its accepted artwork authority`)
+  }
+  for (const [ref, bytes] of [
+    [source.display.previewImage, input.copied.preview],
+    [source.material.neutralValueTexture, input.copied.neutralValue],
+    [source.material.highlightMask, input.copied.highlightMask],
+    [acceptedReceipt, input.copied.acceptedSourceReceipt]
+  ] as const) {
+    if (ref.bytes !== bytes.byteLength || ref.sha256 !== sha256(bytes)) {
+      fail(`${source.assetId} accepted artwork or source receipt bytes do not match their authority`)
+    }
+  }
   const geometry = localRef(input.targetDirectory, 'geometry.glb', input.result.geometryGlb, 'model/gltf-binary')
   const followerBytes = jsonBytes(input.result.followerDefinition)
   const physicsBytes = jsonBytes(input.result.secondaryMotionDefinition)
@@ -396,7 +471,7 @@ export async function buildR2Asset(input: {
     schemaVersion: HAIR_ASSET_CONTRACT,
     assetId: source.assetId,
     revisionId,
-    revision: 2,
+    revision,
     revisionSha256: ZERO_SHA256,
     sourceClass: 'builtin',
     display: { ...clone(source.display), previewImage: preview },
@@ -410,7 +485,7 @@ export async function buildR2Asset(input: {
       authoredRootMatrix: [...input.authoredRootMatrix],
       fitReceipt: {
         contract: HAIR_FIT_RECEIPT_CONTRACT,
-        receiptId: `${source.assetId}-fit-r2`,
+        receiptId: `${source.assetId}-fit-r${revision}`,
         assetId: source.assetId,
         assetRevisionId: revisionId,
         assetRevisionSha256: ZERO_SHA256,
@@ -451,7 +526,9 @@ export async function buildR2Asset(input: {
     },
     provenance: {
       ...clone(source.provenance),
-      sourceTool: `${source.provenance.sourceTool} + Batshit deterministic v38 refit`
+      sourceTool: revision === 2
+        ? `${source.provenance.sourceTool} + Batshit deterministic v38 refit`
+        : `${source.provenance.sourceTool} + Batshit Source-bound Hair fit`
     },
     receiptRefs: [acceptedSourceReceipt, refitReceipt].sort((left, right) =>
       left.ref.localeCompare(right.ref)
@@ -460,7 +537,10 @@ export async function buildR2Asset(input: {
   draft.revisionSha256 = await hairAssetRevisionSha256(draft)
   draft.attachment.fitReceipt.assetRevisionSha256 = draft.revisionSha256
   draft.attachment.fitReceipt.fitSha256 = await hairFitReceiptSha256(draft.attachment.fitReceipt)
-  return verifyHairAsset(draft)
+  const asset = await verifyHairAsset(draft)
+  await verifyHairFollowerDefinitionBytes(asset, followerBytes)
+  await verifyHairSecondaryMotionDefinitionBytes(asset, physicsBytes)
+  return asset
 }
 
 export async function buildV2Catalog(r1Assets: HairAssetV1[], r2Assets: HairAssetV1[]) {
@@ -638,18 +718,11 @@ async function writeAndVerifyStage(input: {
 }): Promise<void> {
   const outputRoot = resolve(input.outputRoot)
   const staticV1Root = resolve(import.meta.dirname, '../static/goon-assets/hair/v1')
-  if (under(staticV1Root, outputRoot) || under(outputRoot, staticV1Root)) {
-    fail('output may not be the immutable static hair/v1 tree or one of its ancestors')
-  }
-  try {
-    await access(outputRoot)
-    fail(`output already exists; immutable staging never overwrites ${outputRoot}`)
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith(`[${BUILTIN_HAIR_REFIT_CONTRACT}]`)) {
-      throw error
-    }
-  }
+  await assertSafeBuiltinHairOutput(outputRoot, staticV1Root)
+  await assertNewBuiltinHairOutput(outputRoot)
   await mkdir(dirname(outputRoot), { recursive: true })
+  await assertSafeBuiltinHairOutput(outputRoot, staticV1Root)
+  await assertNewBuiltinHairOutput(outputRoot)
   const temporary = await mkdtemp(join(dirname(outputRoot), '.hair-r2-stage-'))
   try {
     for (const product of input.products) {

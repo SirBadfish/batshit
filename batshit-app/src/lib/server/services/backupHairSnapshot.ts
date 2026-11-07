@@ -92,6 +92,11 @@ export function parseHairBackupSnapshot(answer: unknown): Map<string, HairSnapsh
       throw new Error('Hair backup snapshot returned an invalid record. Retry backup.')
     }
     const [key, type, ttl, raw] = row
+    // The atomic cut records actual TYPE/TTL together. Only -1 means no expiry; a live
+    // subsecond deadline cannot round-trip through this archive's positive-relative TTL.
+    if (typeof ttl !== 'number' || !Number.isInteger(ttl) || ttl < -1 || ttl === 0) {
+      throw new Error('Hair backup snapshot returned invalid or unrepresentable expiry metadata. Retry backup.')
+    }
     let value: unknown
     if (type === 'json') value = JSON.parse(raw)
     else if (type === 'string') value = raw
@@ -102,7 +107,7 @@ export function parseHairBackupSnapshot(answer: unknown): Map<string, HairSnapsh
     } else if (type === 'zset') {
       value = Array.from({ length: raw.length / 2 }, (_, i) => ({ value: raw[i * 2], score: Number(raw[i * 2 + 1]) }))
     } else throw new Error('Hair backup snapshot returned an unsupported type. Retry backup.')
-    records.set(key, { key, type, value, ttlSeconds: ttl > 0 ? ttl : null })
+    records.set(key, { key, type, value, ttlSeconds: ttl === -1 ? null : ttl })
   }
   return records
 }

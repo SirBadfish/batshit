@@ -16,6 +16,8 @@
  * `brain_type: "pinokio_app"` is the completion transport that runs that recipe.
  */
 
+import { LOCAL_PINOKIO_MACHINE_ID, readPinokioMachineSelector } from '$lib/pinokio/machines'
+
 export const PINOKIO_RUNTIME_MANAGER = 'pinokio'
 export const PINOKIO_APP_BRAIN_TYPE = 'pinokio_app'
 
@@ -67,6 +69,8 @@ export interface PinokioCustomRecipe {
 
 export interface PinokioArtifactBinding {
   appId: string
+  /** Absent retains the original local Artifact shape. */
+  machineId?: string
   kind: PinokioArtifactKind
   runtime: Record<string, unknown> | null
 }
@@ -91,8 +95,11 @@ export function readPinokioArtifactBinding(artifact: any): PinokioArtifactBindin
   const appId = typeof metadata.pinokio_app_id === 'string' ? metadata.pinokio_app_id.trim() : ''
   const kind = isPinokioKind(metadata.source_type) ? metadata.source_type : null
   if (!appId || !kind) return null
+  const machine = readPinokioMachineSelector(metadata)
+  if (!machine) return null
   return {
     appId,
+    ...(machine.machineId !== LOCAL_PINOKIO_MACHINE_ID ? { machineId: machine.machineId } : {}),
     kind,
     runtime: isRecord(metadata.pinokio_runtime) ? metadata.pinokio_runtime : null
   }
@@ -268,6 +275,13 @@ export function pinokioArtifactProblems(input: {
   }
 
   const problems: string[] = []
+  const machine = readPinokioMachineSelector(metadata)
+  if (!machine) {
+    problems.push('metadata.pinokio_machine_id must name one saved computer, or be absent for This computer. Do not save a target revision or address.')
+  }
+  for (const key of ['pinokio_launch_fingerprint', 'pinokio_binding_fingerprint', 'pinokio_machine_address', 'pinokio_machine_host', 'pinokio_base_url', 'pinokio_ready_url']) {
+    if (Object.hasOwn(metadata, key)) problems.push(`Remove metadata.${key}: save only the stable computer id; Batshit resolves current request authority.`)
+  }
   const appIdProblem = pinokioArtifactAppIdProblem(metadata.pinokio_app_id)
   if (appIdProblem) problems.push(appIdProblem)
   if (!isPinokioKind(metadata.source_type)) {

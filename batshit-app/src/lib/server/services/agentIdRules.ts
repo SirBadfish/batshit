@@ -1,4 +1,6 @@
 import { sanitizeId } from '$lib/utils/idSanitizer'
+import { AGENT_ID_PATTERN } from '$lib/utils/agentId'
+export { AGENT_ID_PATTERN } from '$lib/utils/agentId'
 
 /**
  * BL-283 / BL-285 (2026-09-27): the ids a new Primary Agent or Subagent may have.
@@ -16,7 +18,6 @@ import { sanitizeId } from '$lib/utils/idSanitizer'
  */
 
 /** The owner id rule `redis.deleteAgent`, the avatar upload, and its owner sweep enforce. */
-export const AGENT_ID_PATTERN = /^[A-Za-z0-9_-]+$/
 
 /** Lowercased, as `buildAgentProfileId` lowercases a Primary Agent's id into its folder name. */
 const CLI_DELEGATED_RUNTIME_PREFIX = 'subagent_cli'
@@ -66,7 +67,7 @@ export function resolveNewAgentId(
     return {
       ok: false,
       code: 'agent_id_reserved',
-      error: `Agent ids starting with '${CLI_DELEGATED_RUNTIME_PREFIX}' are kept for CLI Subagent and Worker runs, whose managed CLI profile folders use that name. Give this agent another name.`
+      error: `Agent ids starting with '${CLI_DELEGATED_RUNTIME_PREFIX}' are reserved. Give this agent another name.`
     }
   }
   return { ok: true, id }

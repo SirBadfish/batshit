@@ -50,6 +50,8 @@ Jev never writes text, never runs anything, and never approves anything. If the 
 
 What leaves your computer when this is on: whatever the agent puts in the call. That can include parts of your messages, files, or search results the agent chooses to send, so turn this on for agents you trust with that. Every call shows in the Execution Viewer as a **Judge Juice calls** row and as a tool card under the reply, so you can always see what was sent.
 
+The Judgment Tool also needs the agent’s **Fabric & Utilities** switch. While that is off, the Judgment Tool choice is unavailable. Its saved choice returns when Fabric & Utilities is back on.
+
 ### Smart speaker in a Group (per group agent)
 
 Settings → Groups → pick the group → an agent's **Speaking Preset** → **Judge Juice: Smart**.
@@ -123,7 +125,7 @@ When something is off you get a small chip under the reply, such as **Reply chec
 
 It is a second opinion, not a verdict. Jev can be wrong, which is why the note to the agent says "advisory" and the chip shows a number. If you told the agent to skip something on purpose, a flag about it means nothing.
 
-What leaves your computer when this is on: your message, the agent's finished reply, and the one-line labels of the tools it used in that chat (tool names, file paths, commands, search words, web addresses). Never what those tools returned. It runs once each reply from that agent is finished, and never makes you wait: the reply is already on your screen when it runs. On an agent that uses an API model, a reply that stops for your Approve or Deny is checked after you answer, as one reply with the words from both sides of the approval card. On a Codex or Claude Code agent, an approval card for one of Batshit's own controls (importing a Skill, for example) works differently: the words before the card are not checked, and the reply that follows your Approve is checked on its own. A reply that Batshit continues because the agent ran out of room is checked once, when the continuation ends. A reply that the model cut off at its output limit is not checked.
+What leaves your computer when this is on: your message, the agent's finished reply, and the one-line labels of the tools it used in that chat (tool names, file paths, commands, search words, web addresses). Never what those tools returned. It runs after the reply is on screen. A reply paused for Approve or Deny is checked after you answer, as one reply with the words from both sides of the card. A reply Batshit continues because it ran out of context is checked when the continuation ends. A reply cut off at its output limit is not checked.
 
 ### Style coach (per agent)
 

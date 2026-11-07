@@ -5,6 +5,7 @@ import {
   auditGoonUploadAssets,
   cleanupOrphanGoonUploadAssets,
   cleanupOrphanGoonUploadAssetsForClient,
+  collectAllGoonUploadReferencesForClient,
   deleteGoonRecipeRecordsForClient
 } from '../goonAssetCleanupService'
 
@@ -22,6 +23,45 @@ async function seedUpload(uploadType: string, filename: string, size = 10) {
 }
 
 describe('goonAssetCleanupService', () => {
+  it.each(['goon_closet'])('retains %s Clip borrowers in initial and final audits, including legacy and malformed-shape rows', async uploadType => {
+    await seedUpload(uploadType, 'preview.png')
+    await redis.json.set('clip:josh:borrower', '$', { localUrl: `/uploads/${uploadType}/preview.png`,
+      fileType: { malformed: true }, content: `/uploads/${uploadType}/not-owned.png` })
+    await redis.execute(client => client.set('clip:system:legacy', JSON.stringify({
+      displayUrl: `http://display.test/uploads/%67${uploadType.slice(1)}/preview.png?view=1`
+    })))
+    const audit = await auditGoonUploadAssets('josh')
+    expect(audit.entries).toMatchObject([{ uploadType, filename: 'preview.png', referenced: true,
+      references: ['clip:josh:borrower', 'clip:system:legacy'], cleanupEligible: false }])
+    const refs = await redis.execute(client => collectAllGoonUploadReferencesForClient(client, {
+      candidateFiles: [{ uploadType, filename: 'preview.png' }]
+    }))
+    expect(refs.get(`${uploadType}/preview.png`)).toEqual(new Set(['clip:josh:borrower', 'clip:system:legacy']))
+    expect(refs.has(`${uploadType}/not-owned.png`)).toBe(false)
+  })
+
+  it('retains unused legacy global items, local owners and history without rewriting inline string upload metadata', async () => {
+    const raw = '{"base64":"AQID","size":3,"legacyNumber":0.123456789012345678901}'
+    await redis.execute(client => client.set('upload:goon_closet:legacy.png', raw))
+    await redis.json.set('user:josh:settings', '$', { goons_settings: { globalCloset: { items: {
+      unused: { id: 'unused', texture: { url: '/uploads/goon_closet/legacy.png' } }
+    } } } })
+    await redis.json.set('goon:unindexed', '$', { id: 'unindexed', user_id: 'josh', closet: { items: {
+      local: { id: 'local', xwear: { textures: { main: { url: '/uploads/goon_closet/legacy.png' } } } }
+    } } })
+    await redis.json.set('goon_recipe_job:josh:unindexed:history', '$', { retained: { ref: '/uploads/goon_closet/legacy.png' } })
+    expect((await auditGoonUploadAssets('josh')).entries[0]).toMatchObject({ uploadType: 'goon_closet', storage: 'redis', referenced: true })
+    const refs = await redis.execute(client => collectAllGoonUploadReferencesForClient(client, {
+      candidateFiles: [{ uploadType: 'goon_closet', filename: 'legacy.png' }]
+    }))
+    expect([...refs.get('goon_closet/legacy.png')!]).toEqual(expect.arrayContaining([
+      'goon_recipe_job:josh:unindexed:history', 'user:josh:settings', 'goon:unindexed'
+    ]))
+    expect(await redis.execute(client => client.get('upload:goon_closet:legacy.png'))).toBe(raw)
+    await redis.execute(client => client.set('upload:goon_closet:unknown.png', 'unparseable original'))
+    await expect(auditGoonUploadAssets('josh')).rejects.toThrow('unreadable metadata')
+    expect(await redis.execute(client => client.get('upload:goon_closet:unknown.png'))).toBe('unparseable original')
+  })
   it('recognizes Clip-only retained Hair media in the initial audit, including encoded system URLs', async () => {
     await seedUpload('goon_hair_assets', 'shared.png')
     await redis.json.set('clip:system:borrower', '$', { localUrl: '/uploads/%67oon_hair_assets/shared.png',

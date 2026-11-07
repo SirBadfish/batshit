@@ -14,7 +14,7 @@ import {
   fingerprintSegments,
   resolveCacheForensicsKey,
 } from '$lib/server/services/cacheForensics/fingerprint'
-import { compiledConversation, compiledElement } from '$lib/utils/compiledChatTags'
+import { compiledConversation, compiledCurrentMessage, compiledElement } from '$lib/utils/compiledChatTags'
 
 /**
  * SA-108: Batshit compiles the whole conversation into ONE user message. SA-128: these
@@ -446,3 +446,30 @@ describe('Responses-shaped request bodies (DQ-D-028, splitter v3)', () => {
     ])
   })
 })
+
+describe('Decision 11: the labeled current message', () => {
+  const current = compiledCurrentMessage(compiledElement('user', 'Hello', [['time', '9:00 AM']]))
+  const dcm = compiledElement('dynamic_info', 'project_path: /p')
+
+  it('recognizes a first message that opens with <current_message>, and keeps it in the current segment', () => {
+    const split = splitCompiledUserMessageContent(`${current}\n\n${dcm}`)
+    expect(split).toMatchObject({ matched: true, historyMessages: [], zipAppend: null })
+    expect(split.current!.startsWith('<current_message>\n<user time="9:00 AM">\nHello\n</user>\n</current_message>')).toBe(true)
+  })
+
+  it('leaves every history segment byte-identical: the label lives only in the current segment', () => {
+    const history = compiledConversation([
+      compiledElement('user', 'Q', [['time', '8:00 AM']]),
+      compiledElement('assistant', 'A')
+    ])
+    const labeled = splitCompiledUserMessageContent(`${history}\n\n${current}\n\n${dcm}`)
+    const unlabeled = splitCompiledUserMessageContent(`${history}\n\n${compiledElement('user', 'Hello', [['time', '9:00 AM']])}\n\n${dcm}`)
+    expect(labeled.historyMessages).toEqual(unlabeled.historyMessages)
+    expect(labeled.current!.startsWith('<current_message>\n')).toBe(true)
+  })
+
+  it('still reads a record written before the label', () => {
+    expect(splitCompiledUserMessageContent(`${compiledElement('note', 'Ping')}\n\n${dcm}`).matched).toBe(true)
+  })
+})
+

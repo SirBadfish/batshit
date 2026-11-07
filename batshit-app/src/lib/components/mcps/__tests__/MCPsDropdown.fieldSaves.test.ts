@@ -1,3 +1,5 @@
+import { withoutExpectedMcpSettings } from '$lib/utils/agentSettingsSectionSaves'
+import { CLI_GROUP_KEY, cliGroupEnablePatch } from '$lib/utils/cliToolGridEnable'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import { tick } from 'svelte'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -11,6 +13,12 @@ import {
   storedAgent,
   type AgentPut
 } from '$lib/test-utils/agentPutRoute'
+
+const deadCopies = vi.hoisted(() => ({ refreshAll: vi.fn(async () => {}) }))
+vi.mock('$lib/stores/zipDeadCopies.svelte', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$lib/stores/zipDeadCopies.svelte')>()),
+  refreshAllDeadCopies: deadCopies.refreshAll
+}))
 
 /**
  * BL-855, the chat bar's Tools menu. Its two saves send only what the user changed, against the
@@ -28,10 +36,8 @@ import {
  * body the browser sent and the record after another window's change.
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   syncAgentClaudeProfiles: vi.fn(async () => {}),
@@ -91,6 +97,7 @@ beforeAll(async () => {
 }, 60_000)
 
 beforeEach(() => {
+  deadCopies.refreshAll.mockClear()
   failNextPuts = 0
   failNextGatewayFetches = 0
   heldPut = null
@@ -124,6 +131,7 @@ async function openMenu(
     staleOverrides?: Record<string, unknown>
     /** False: the gateway list fails to load, so the menu shows its error and no card. */
     expectCard?: boolean
+    gateways?: typeof GATEWAYS
   } = {}
 ) {
   await redis.createAgent({
@@ -159,10 +167,11 @@ async function openMenu(
           failNextGatewayFetches -= 1
           return jsonResponse({ error: 'Probe outage' }, 500)
         }
-        return jsonResponse({ gateways: GATEWAYS })
+        return jsonResponse({ gateways: input.gateways ?? GATEWAYS })
       }
       if (path.startsWith('/api/mcp/gateways/') && path.endsWith('/tools')) return jsonResponse({ mcps: [] })
       if (path === '/api/cli-tools') return jsonResponse({ tools: [] })
+      if (path === '/api/native-tools/sandbox/status') return jsonResponse({ typedFileToolsHost: { platform: 'darwin', containerized: false, linuxKernel: null } })
       return undefined
     }
   })
@@ -197,13 +206,102 @@ async function waitForRecord(read: (record: Record<string, any>) => unknown, exp
 }
 
 describe('the Tools menu sends only the MCP settings the user changed (BL-855)', () => {
+  it('the single CLI switch saves its native/display pair once and OFF keeps discovery/members', async () => {
+    const dcm = { ...DCM_EMPTY, groups: { [CLI_GROUP_KEY]: 'hidden', other: 'group-only' }, groupDisplayPreferences: { [CLI_GROUP_KEY]: 'group+tools+names' }, tools: { member: 'hidden' } }
+    const original = { provider_specific_settings: { nativeTools: { cliToolsEnabled: false, webSearchEnabled: false } }, dcmDisplaySettings: null, dcm_display_settings: dcm }
+    await openMenu({ otherWindow: original, staleOverrides: original })
+    await waitFor(() => expect(card().getEnableControl('cli_tools').disabled).toBe(false))
+    await fire(() => card().getEnableControl('cli_tools').onChange(true, cliGroupEnablePatch(dcm, 'hidden')))
+    await waitForPuts(1)
+    expect(puts[0].body).toMatchObject({ provider_specific_settings: { nativeTools: { cliToolsEnabled: true } }, dcmDisplaySettings: { groups: { [CLI_GROUP_KEY]: 'group+tools+names', other: 'group-only' }, tools: { member: 'hidden' } } })
+    await waitFor(() => expect(card().getEnableControl('cli_tools').disabled).toBe(false))
+    await fire(() => card().getEnableControl('cli_tools').onChange(false))
+    await waitForPuts(2)
+    expect(puts[1].body).toEqual({ provider_specific_settings: { nativeTools: { cliToolsEnabled: false } } })
+    expect(await storedAgent(AGENT)).toMatchObject({ defaultTools: ['cli_x'], provider_specific_settings: { nativeTools: { webSearchEnabled: false } }, dcmDisplaySettings: { groups: { other: 'group-only' } } })
+  }, 60_000)
+
+  it('CLI unknown recovery reads both saved leaves without promoting a legacy cache or replaying a PUT', async () => {
+    const dcm = { ...DCM_EMPTY, groups: { [CLI_GROUP_KEY]: 'hidden', other: 'group-only' } }
+    const original = { provider_specific_settings: { nativeTools: { cliToolsEnabled: false } }, dcmDisplaySettings: null, dcm_display_settings: dcm }
+    await openMenu({ otherWindow: original, staleOverrides: original })
+    await waitFor(() => expect(card().getEnableControl('cli_tools').disabled).toBe(false))
+    failNextPuts = 1
+    await fire(() => card().getEnableControl('cli_tools').onChange(true, cliGroupEnablePatch(dcm, 'hidden')))
+    await waitForPuts(1)
+    await waitFor(() => expect(card().getEnableControl('cli_tools').notice).toContain('unconfirmed'))
+    // Independent zip intent stays usable while the CLI/MCP pair needs recovery.
+    await fire(() => card().onZipToolNotesChange('enabled'))
+    await waitForPuts(2)
+    expect(puts[1].body).toEqual({ zip_tool_notes_enabled: true })
+    await fire(() => card().getEnableControl('cli_tools').onRead())
+    await waitFor(() => expect(card().getEnableControl('cli_tools').disabled).toBe(false))
+    expect(card().getEnableControl('cli_tools').checked).toBe(false)
+    expect(card().dcmDisplaySettings).toMatchObject(dcm)
+    expect(agentStore.getAgentById(AGENT)?.dcmDisplaySettings).toBeNull()
+    expect((agentStore.getAgentById(AGENT) as any).dcm_display_settings).toMatchObject(dcm)
+    await pause(500)
+    expect(puts).toHaveLength(2)
+  }, 60_000)
+
+  it('keeps the full selected-agent grid with no saved MCP gateways and exposes the compact top controls', async () => {
+    await openMenu({ gateways: [] })
+    expect(card().subjectKind).toBe('primary')
+    expect(card().showZipModeControls).toBe(true)
+    expect(card().showCardHeader).toBe(false)
+    expect(card().showPostTableControls).toBe(false)
+    expect(card().getEnableControl('bash')).toBeTruthy()
+    expect(puts).toEqual([])
+  }, 60_000)
+
+  it('Tool Notes and Refreshed File Reads save their own sparse choices and inheritance resets', async () => {
+    await openMenu({ staleOverrides: { zip_tool_notes_enabled: false, live_file_reads: false } })
+    await fire(() => card().onZipToolNotesChange('enabled'))
+    await waitForPuts(1)
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ zip_tool_notes_enabled: true })
+    expect(deadCopies.refreshAll).not.toHaveBeenCalled()
+    await waitFor(() => expect(card().liveFileReadsUnavailableReason).toBeNull())
+    await fire(() => card().onLiveFileReadsChange('enabled'))
+    await waitForPuts(2)
+    expect(withoutExpectedMcpSettings(puts[1].body)).toEqual({ live_file_reads: true })
+    expect(deadCopies.refreshAll).toHaveBeenCalledTimes(1)
+    await fire(() => card().onLiveFileReadsChange('__inherit__'))
+    await waitForPuts(3)
+    expect(withoutExpectedMcpSettings(puts[2].body)).toEqual({ live_file_reads: null })
+    expect(deadCopies.refreshAll).toHaveBeenCalledTimes(2)
+  }, 60_000)
+
+  it('follows Settings/store top selector changes without a hydration PUT', async () => {
+    await openMenu()
+    agentStore.updateAgent(AGENT, { zip_tool_notes_enabled: false, live_file_reads: true } as any)
+    await waitFor(() => expect(card().zipToolNotesEnabled).toBe('disabled'))
+    expect(card().liveFileReads).toBe('enabled')
+    await pause(300)
+    expect(puts).toEqual([])
+  }, 60_000)
+
+  it('a saved top-selector callback cannot change the newly selected agent', async () => {
+    await openMenu()
+    const oldLayout = card().onZipAiViewModeChange
+    const oldNotes = card().onZipToolNotesChange
+    const oldReads = card().onLiveFileReadsChange
+    agentStore.addAgent({ ...agentStore.getAgentById(AGENT), id: 'new-grid-owner', created_at: 'another-birth' } as any)
+    agentStore.setCurrentAgentId('new-grid-owner')
+    await tick()
+    oldLayout('inline')
+    oldNotes('disabled')
+    oldReads('enabled')
+    await pause(350)
+    expect(puts).toEqual([])
+    expect(vi.mocked(global.fetch).mock.calls.filter(([url, init]) => String(url).startsWith('/api/agents/') && init?.method === 'PUT')).toEqual([])
+  }, 60_000)
   it('a gateway toggle sends the gateway list alone; CLI tools and display settings saved in another window survive', async () => {
     await openMenu({ otherWindow: OTHER_WINDOW })
 
     await fire(() => card().onGatewaysChange(['gw_a', 'gw_b']))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
     await waitForRecord((record) => record.defaultMCPGateways, ['gw_a', 'gw_b'])
     const record = await storedAgent(AGENT)
     expect(record.defaultTools).toEqual(['cli_y'])
@@ -218,7 +316,7 @@ describe('the Tools menu sends only the MCP settings the user changed (BL-855)',
     )
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({
       dcmDisplaySettings: {
         groups: { 'gw_b::Reading': 'group-only' },
         groupDisplayPreferences: { 'gw_b::Reading': 'group-only' }
@@ -259,7 +357,7 @@ describe('the Tools menu sends only the MCP settings the user changed (BL-855)',
     )
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({
       dcmDisplaySettings: {
         groups: { 'gw_a::Files': null },
         groupDisplayPreferences: { 'gw_a::Files': null }
@@ -274,7 +372,7 @@ describe('the Tools menu sends only the MCP settings the user changed (BL-855)',
     await fire(() => card().onCliToolIdsChange(['cli_x', 'cli_z']))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ defaultTools: ['cli_x', 'cli_z'] })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ defaultTools: ['cli_x', 'cli_z'] })
     await waitForRecord((record) => record.defaultTools, ['cli_x', 'cli_z'])
     expect((await storedAgent(AGENT)).defaultMCPGateways).toEqual(['gw_a', 'gw_c'])
   }, 60_000)
@@ -287,8 +385,8 @@ describe('the Tools menu sends only the MCP settings the user changed (BL-855)',
     await fire(() => card().onCliToolIdsChange(['cli_x', 'cli_z']))
     await waitForPuts(2)
 
-    expect(puts[0].body).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
-    expect(puts[1].body).toEqual({ defaultTools: ['cli_x', 'cli_z'] })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
+    expect(withoutExpectedMcpSettings(puts[1].body)).toEqual({ defaultTools: ['cli_x', 'cli_z'] })
   }, 60_000)
 
   it('a change that leaves every value as it was sends nothing', async () => {
@@ -307,12 +405,12 @@ describe('the Tools menu sends only the MCP settings the user changed (BL-855)',
 
     await fire(() => card().onGatewaysChange(['gw_a', 'gw_b']))
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
     expect((await storedAgent(AGENT)).dcmDisplaySettings ?? null).toBeNull()
 
     await fire(() => card().onDcmDisplaySettingsChange({ ...DCM_EMPTY, tools: { 'gw_a::read': 'hidden' } }))
     await waitForPuts(2)
-    expect(puts[1].body).toEqual({
+    expect(withoutExpectedMcpSettings(puts[1].body)).toEqual({
       dcmDisplaySettings: {
         tools: { 'gw_a::read': 'hidden' },
         toolDisplayPreferences: { 'gw_a::read': 'inherit' }
@@ -337,26 +435,21 @@ describe('the Tools menu sends only the MCP settings the user changed (BL-855)',
     })
   }, 60_000)
 
-  it('a failed save keeps nothing: the same change is sent again, and an unrelated one does not carry it', async () => {
+  it('an unconfirmed whole-list save keeps its draft and never repeats until an explicit saved read and new choice', async () => {
     await openMenu()
     failNextPuts = 1
-
-    await fire(() => card().onGatewaysChange(['gw_a', 'gw_b']))
+    await fire(() => card().onGatewaysChange(['gw_a','gw_b']))
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
-    // The store rolled the copy back, and the menu with it.
-    await waitFor(() => expect(card().defaultMCPGateways).toEqual(['gw_a']), { timeout: 5_000 })
-
-    await fire(() =>
-      card().onDcmDisplaySettingsChange({ ...DCM_EMPTY, groups: { 'gw_b::Reading': 'group-only' } })
-    )
+    expect((await storedAgent(AGENT)).defaultMCPGateways).toEqual(['gw_a'])
+    expect(card().defaultMCPGateways).toEqual(['gw_a','gw_b'])
+    await fire(() => card().onDcmDisplaySettingsChange({ ...DCM_EMPTY, groups: { 'gw_b::Reading': 'group-only' } }))
+    await pause(400); expect(puts).toHaveLength(1)
+    await fireEvent.click(screen.getByRole('button', { name: 'Use Saved Tool Settings', hidden: true }))
+    await waitFor(() => expect(card().defaultMCPGateways).toEqual(['gw_a']))
+    expect(puts).toHaveLength(1)
+    await fire(() => card().onGatewaysChange(['gw_a','gw_b']))
     await waitForPuts(2)
-    expect(Object.keys(puts[1].body)).toEqual(['dcmDisplaySettings'])
-
-    await fire(() => card().onGatewaysChange(['gw_a', 'gw_b']))
-    await waitForPuts(3)
-    expect(puts[2].body).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
-    await waitForRecord((record) => record.defaultMCPGateways, ['gw_a', 'gw_b'])
+    await waitForRecord(record => record.defaultMCPGateways, ['gw_a','gw_b'])
   }, 60_000)
 })
 
@@ -371,7 +464,7 @@ describe('the gateway list a save sends is the saved list plus the user\'s own t
     await fire(() => card().onCliToolIdsChange(['cli_x', 'cli_z']))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ defaultTools: ['cli_x', 'cli_z'] })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ defaultTools: ['cli_x', 'cli_z'] })
     expect((await storedAgent(AGENT)).defaultMCPGateways).toEqual(['gw_a', 'gw_off'])
   }, 60_000)
 
@@ -392,12 +485,12 @@ describe('the gateway list a save sends is the saved list plus the user\'s own t
 
     await toggleGateway('gw_b')
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ defaultMCPGateways: ['gw_a', 'gw_off', 'gw_b'] })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ defaultMCPGateways: ['gw_a', 'gw_off', 'gw_b'] })
     await waitForRecord((record) => record.defaultMCPGateways, ['gw_a', 'gw_off', 'gw_b'])
 
     await toggleGateway('gw_a')
     await waitForPuts(2)
-    expect(puts[1].body).toEqual({ defaultMCPGateways: ['gw_off', 'gw_b'] })
+    expect(withoutExpectedMcpSettings(puts[1].body)).toEqual({ defaultMCPGateways: ['gw_off', 'gw_b'] })
     await waitForRecord((record) => record.defaultMCPGateways, ['gw_off', 'gw_b'])
   }, 60_000)
 
@@ -413,7 +506,7 @@ describe('the gateway list a save sends is the saved list plus the user\'s own t
     await fire(() => card().onCliToolIdsChange(['cli_x', 'cli_z']))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ defaultTools: ['cli_x', 'cli_z'] })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ defaultTools: ['cli_x', 'cli_z'] })
     expect((await storedAgent(AGENT)).defaultMCPGateways).toEqual(['gw_a'])
   }, 60_000)
 
@@ -433,7 +526,7 @@ describe('the gateway list a save sends is the saved list plus the user\'s own t
     await fire(() => card().onDcmDisplaySettingsChange(DCM_EMPTY))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({
       dcmDisplaySettings: {
         groups: { 'gw_a::Files': null },
         groupDisplayPreferences: { 'gw_a::Files': null }
@@ -444,26 +537,41 @@ describe('the gateway list a save sends is the saved list plus the user\'s own t
 })
 
 describe('the baseline after a save (BL-855 review)', () => {
-  it('a save that resolves after a newer read of the agent does not put its older values back as the baseline', async () => {
+  it('a pending save keeps its section, then a settled saved read follows a newer CLI choice without sending it back', async () => {
     await openMenu()
     let release: () => void = () => {}
     heldPut = new Promise<void>((resolve) => {
       release = resolve
     })
 
-    await fire(() => card().onGatewaysChange(['gw_a', 'gw_b']))
-    await waitForPuts(1)
-    // Meanwhile the agents store takes another surface's CLI tool choice (this window's Agent Settings).
-    agentStore.updateAgent(AGENT, { defaultTools: ['cli_y'] })
-    await waitFor(() => expect(card().defaultCliToolIds).toEqual(['cli_y']), { timeout: 5_000 })
-    release()
-    await waitFor(() => expect(card().mcpSaveState).toBe('saved'), { timeout: 5_000 })
+    try {
+      await fire(() => card().onGatewaysChange(['gw_a', 'gw_b']))
+      await waitForPuts(1)
+      // Another surface saves a CLI choice while this section owns its gateway flight.
+      // A pending section cannot hydrate from that store copy. Its saved read follows
+      // after settlement, keeping the original request and the newer saved choice.
+      const record = await storedAgent(AGENT)
+      await redis.json.set(`agent:${AGENT}`, '$', { ...record, defaultTools: ['cli_y'] } as any)
+      await fire(() => agentStore.updateAgent(AGENT, { defaultTools: ['cli_y'] }))
+      expect(card().defaultCliToolIds).toEqual(['cli_x'])
+      expect(card().defaultMCPGateways).toEqual(['gw_a', 'gw_b'])
+      expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
+      release()
+      await waitFor(() => expect(card().defaultCliToolIds).toEqual(['cli_y']), { timeout: 5_000 })
+      await waitForRecord((saved) => saved.defaultMCPGateways, ['gw_a', 'gw_b'])
+      expect(card().defaultMCPGateways).toEqual(['gw_a', 'gw_b'])
 
-    await fire(() =>
-      card().onDcmDisplaySettingsChange({ ...DCM_EMPTY, groups: { 'gw_b::Reading': 'group-only' } })
-    )
-    await waitForPuts(2)
-    expect(Object.keys(puts[1].body)).toEqual(['dcmDisplaySettings'])
+      await fire(() =>
+        card().onDcmDisplaySettingsChange({ ...DCM_EMPTY, groups: { 'gw_b::Reading': 'group-only' } })
+      )
+      await waitForPuts(2)
+      expect(Object.keys(puts[1].body)).toEqual(['dcmDisplaySettings'])
+      expect((await storedAgent(AGENT)).defaultTools).toEqual(['cli_y'])
+    } finally {
+      release()
+      // Do not leave the real store's write owner pending if an assertion fails.
+      await waitFor(() => expect(agentStore.getAgentMcpSettingsReadState(AGENT).pending).toBe(false))
+    }
   }, 60_000)
 
   it('a save the read of the agent does not re-run for (the same CLI tools in another order) still becomes the baseline', async () => {
@@ -472,12 +580,12 @@ describe('the baseline after a save (BL-855 review)', () => {
 
     await fire(() => card().onCliToolIdsChange(['cli_b', 'cli_a']))
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ defaultTools: ['cli_b', 'cli_a'] })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ defaultTools: ['cli_b', 'cli_a'] })
     await waitFor(() => expect(card().mcpSaveState).toBe('saved'), { timeout: 5_000 })
 
     await toggleGateway('gw_b')
     await waitForPuts(2)
-    expect(puts[1].body).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
+    expect(withoutExpectedMcpSettings(puts[1].body)).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
   }, 60_000)
 })
 
@@ -493,7 +601,7 @@ describe('the Tools menu sends only the zip settings the user changed (BL-855)',
     await fire(() => card().onNonMcpZipOverrideChange('read_file', { buffer_size: '9' }))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ buffer_size_read_file: 9 })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ buffer_size_read_file: 9 })
     await waitForRecord((record) => record.buffer_size_read_file, 9)
     const record = await storedAgent(AGENT)
     expect(record.zip_agent_control_experiment).toBe(true)
@@ -508,7 +616,7 @@ describe('the Tools menu sends only the zip settings the user changed (BL-855)',
     await fire(() => card().onZipAiViewModeChange('appended'))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ zip_ai_view_mode: 'appended' })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ zip_ai_view_mode: 'appended' })
   }, 60_000)
 
   it('putting a zip field back to inherit is sent as null (a real value)', async () => {
@@ -517,7 +625,7 @@ describe('the Tools menu sends only the zip settings the user changed (BL-855)',
     await fire(() => card().onZipAiViewModeChange('__inherit__'))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ zip_ai_view_mode: null })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ zip_ai_view_mode: null })
     await waitForRecord((record) => record.zip_ai_view_mode ?? null, null)
   }, 60_000)
 
@@ -527,7 +635,7 @@ describe('the Tools menu sends only the zip settings the user changed (BL-855)',
     await fire(() => card().onToolZipOverrideChange('tool_x', { buffer_size: '7' }))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ custom_tool_settings: [{ tool_name: 'tool_x', buffer_size: 7 }] })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ custom_tool_settings: [{ tool_name: 'tool_x', buffer_size: 7 }] })
     await waitForRecord((record) => record.custom_tool_settings, [{ tool_name: 'tool_x', buffer_size: 7 }])
     expect((await storedAgent(AGENT)).zip_ai_view_mode).toBe('inline')
   }, 60_000)
@@ -538,7 +646,7 @@ describe('the Tools menu sends only the zip settings the user changed (BL-855)',
     await fire(() => card().onNonMcpZipOverrideChange('read_file', { buffer_size: '9' }))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ buffer_size_read_file: 9 })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ buffer_size_read_file: 9 })
     await waitForRecord((record) => record.buffer_size_read_file, 9)
     const record = await storedAgent(AGENT)
     expect(record.custom_tool_settings).toEqual(OTHER_WINDOW.custom_tool_settings)
@@ -551,7 +659,7 @@ describe('the Tools menu sends only the zip settings the user changed (BL-855)',
     await fire(() => card().onNonMcpZipOverrideChange('read_file', { auto_zip: 'enabled' }))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ auto_zip_read_file: true })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ auto_zip_read_file: true })
   }, 60_000)
 
   it('two zip changes inside the debounce go out as one save of both fields, and nothing else', async () => {
@@ -561,7 +669,7 @@ describe('the Tools menu sends only the zip settings the user changed (BL-855)',
     await fire(() => card().onZipAiViewModeChange('appended'))
 
     await waitForPuts(1)
-    expect(puts[0].body).toEqual({ buffer_size_read_file: 9, zip_ai_view_mode: 'appended' })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ buffer_size_read_file: 9, zip_ai_view_mode: 'appended' })
     await pause(400)
     expect(puts).toHaveLength(1)
   }, 60_000)
@@ -574,8 +682,8 @@ describe('the Tools menu sends only the zip settings the user changed (BL-855)',
     await fire(() => card().onZipAiViewModeChange('appended'))
     await waitForPuts(2)
 
-    expect(puts[0].body).toEqual({ buffer_size_read_file: 9 })
-    expect(puts[1].body).toEqual({ zip_ai_view_mode: 'appended' })
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ buffer_size_read_file: 9 })
+    expect(withoutExpectedMcpSettings(puts[1].body)).toEqual({ zip_ai_view_mode: 'appended' })
   }, 60_000)
 
   it('a zip change put back before the save goes out sends nothing', async () => {
@@ -586,19 +694,146 @@ describe('the Tools menu sends only the zip settings the user changed (BL-855)',
     await pause(700)
 
     expect(puts).toEqual([])
+    expect(card().zipAiViewMode).toBe('__inherit__')
+    // Cancellation only retires that unstarted item; a subsequent deliberate choice
+    // still uses the original displayed baseline and the ordinary save owner.
+    await fire(() => card().onZipAiViewModeChange('inline'))
+    await waitForPuts(1)
+    expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ zip_ai_view_mode: 'inline' })
+    await waitForRecord(record => record.zip_ai_view_mode, 'inline')
   }, 60_000)
 
-  it('a failed zip save is sent again by the same change', async () => {
+  it('a failed unguarded zip save keeps its draft and sends again only on the same deliberate choice', async () => {
     await openMenu()
     failNextPuts = 1
 
     await fire(() => card().onZipAiViewModeChange('appended'))
     await waitForPuts(1)
-    await waitFor(() => expect(card().zipAiViewMode).toBe('__inherit__'), { timeout: 5_000 })
+    await waitFor(() => expect(card().zipSaveError).toBeTruthy(), { timeout: 5_000 })
+    expect(card().zipAiViewMode).toBe('appended')
+    await pause(400)
+    expect(puts).toHaveLength(1)
 
     await fire(() => card().onZipAiViewModeChange('appended'))
     await waitForPuts(2)
-    expect(puts[1].body).toEqual({ zip_ai_view_mode: 'appended' })
+    expect(withoutExpectedMcpSettings(puts[1].body)).toEqual({ zip_ai_view_mode: 'appended' })
     await waitForRecord((record) => record.zip_ai_view_mode, 'appended')
+  }, 60_000)
+})
+
+
+describe('human whole-field dirty/read/queue ownership in the mounted Tools menu', () => {
+  it('a pending list save defers refresh, keeps its dirty draft after actual conflict, and reads current only on explicit recovery', async () => {
+    await openMenu()
+    let release!: () => void
+    heldPut = new Promise<void>(resolve => { release = resolve })
+    try {
+      await fire(() => card().onGatewaysChange(['gw_a','gw_b']))
+      await waitForPuts(1)
+      const original = puts[0].body.expectedMcpSettings.defaultMCPGateways
+      const current = await storedAgent(AGENT)
+      await redis.json.set(`agent:${AGENT}`, '$', { ...current, defaultMCPGateways: ['gw_a','gw_c'] } as any)
+      const requests = vi.mocked(global.fetch).mock.calls.length
+      await agentStore.refreshAgentFieldsFromServer(AGENT, 'mcp-settings')
+      expect(vi.mocked(global.fetch).mock.calls.length).toBe(requests)
+      expect(card().defaultMCPGateways).toEqual(['gw_a','gw_b'])
+      release()
+      await waitFor(() => expect(card().mcpSaveError).toMatch(/changed/))
+      expect(card().defaultMCPGateways).toEqual(['gw_a','gw_b'])
+      expect(puts[0].body.expectedMcpSettings.defaultMCPGateways).toBe(original)
+      await pause(400); expect(puts).toHaveLength(1)
+      await fireEvent.click(screen.getByRole('button', { name: 'Use Saved Tool Settings', hidden: true }))
+      await waitFor(() => expect(card().defaultMCPGateways).toEqual(['gw_a','gw_c']))
+      expect(puts).toHaveLength(1)
+      await fire(() => card().onGatewaysChange(['gw_a','gw_c','gw_b']))
+      await waitForPuts(2)
+      expect(puts[1].body.expectedMcpSettings.defaultMCPGateways).not.toBe(original)
+      await waitForRecord(row => row.defaultMCPGateways, ['gw_a','gw_c','gw_b'])
+    } finally { release() }
+  }, 60_000)
+
+  it('a queued non-MCP custom-array draft cannot adopt a newer store base or erase an MCP sibling', async () => {
+    const row = { tool_name: 'web_search', buffer_size: 2, auto_zip: false }
+    await openMenu({ otherWindow: { custom_tool_settings: [row] } })
+    const original = agentStore.getAgentMcpSettingsCut(AGENT)!.revisions.custom_tool_settings
+    await fire(() => card().onNonMcpZipOverrideChange('web_search', { buffer_size: '9' }))
+    const current = await storedAgent(AGENT), winner = [row, { tool_name: 'C_remote_write', buffer_size: 0, auto_zip: false }]
+    await redis.json.set(`agent:${AGENT}`, '$', { ...current, custom_tool_settings: winner } as any)
+    await agentStore.refreshAgentFieldsFromServer(AGENT, 'mcp-settings')
+    expect(card().getNonMcpZipOverride('web_search').buffer_size).toBe('9')
+    await waitForPuts(1)
+    expect(puts[0].body.expectedMcpSettings).toEqual({ custom_tool_settings: original })
+    expect((await storedAgent(AGENT)).custom_tool_settings).toEqual(winner)
+    expect(card().zipSaveError).toMatch(/changed/)
+    expect(card().getNonMcpZipOverride('web_search').buffer_size).toBe('9')
+    await pause(400); expect(puts).toHaveLength(1)
+  }, 60_000)
+
+  it('a failed or malformed explicit read cannot discard a held draft by returning an older cached cut', async () => {
+    await openMenu()
+    failNextPuts = 1
+    await fire(() => card().onGatewaysChange(['gw_a','gw_b']))
+    await waitForPuts(1)
+    const installed = global.fetch
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).split('?')[0] === `/api/agents/${AGENT}` && (init?.method ?? 'GET') === 'GET') return jsonResponse({ ...(await storedAgent(AGENT)) }) // missing actual header
+      return installed(input, init)
+    }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Use Saved Tool Settings', hidden: true }))
+    await waitFor(() => expect(card().mcpSaveError).toMatch(/could not be read/))
+    expect(card().defaultMCPGateways).toEqual(['gw_a','gw_b'])
+    expect(puts).toHaveLength(1)
+    expect(screen.getByRole('button', { name: 'Use Saved Tool Settings', hidden: true })).toBeTruthy()
+  }, 60_000)
+})
+
+
+describe('untouched custom-row properties survive a fresh human whole-array edit', () => {
+  it('keeps unknown properties and unrelated zero/false rows while changing only Web Search', async () => {
+    const rows = [{ tool_name: 'web_search', buffer_size: 2, auto_zip: false, future: { keep: true } },
+      { tool_name: 'C_remote_write', buffer_size: 1, zip_threshold: 0, auto_zip: false, future: ['opaque'] }]
+    await openMenu({ otherWindow: { custom_tool_settings: rows } })
+    await fire(() => card().onNonMcpZipOverrideChange('web_search', { buffer_size: '9' }))
+    await waitForPuts(1)
+    await waitFor(async () => expect((await storedAgent(AGENT)).custom_tool_settings.find((row: any) => row.tool_name === 'web_search').buffer_size).toBe(9))
+    const saved = (await storedAgent(AGENT)).custom_tool_settings
+    expect(saved.find((row: any) => row.tool_name === 'web_search').future).toEqual({ keep: true })
+    expect(saved.find((row: any) => row.tool_name === 'C_remote_write')).toMatchObject(rows[1])
+    expect(Object.keys(puts[0].body.expectedMcpSettings)).toEqual(['custom_tool_settings'])
+  }, 90000)
+})
+
+
+describe('returning a Zip draft to baseline does not cancel already-issued custody', () => {
+  it('lets the issued captured body settle and records a later explicit baseline choice separately', async () => {
+    await openMenu()
+    let release!: () => void
+    heldPut = new Promise<void>(resolve => { release = resolve })
+    try {
+      await fire(() => card().onZipAiViewModeChange('appended'))
+      await waitForPuts(1)
+      expect(withoutExpectedMcpSettings(puts[0].body)).toEqual({ zip_ai_view_mode: 'appended' })
+      await fire(() => card().onZipAiViewModeChange('__inherit__'))
+      expect(card().zipAiViewMode).toBe('__inherit__')
+      expect(puts).toHaveLength(1)
+      release()
+      await waitForRecord(record => record.zip_ai_view_mode, 'appended')
+      await waitFor(() => expect(card().zipSaveState).toBe('saved'))
+      // Returning to baseline cannot revoke, compensate or rebase the issued request.
+      expect(puts[0].body.zip_ai_view_mode).toBe('appended')
+      expect(card().zipAiViewMode).toBe('__inherit__')
+      expect(puts).toHaveLength(1)
+
+      // A new deliberate choice after settlement is a separate captured save.
+      await fire(() => card().onZipAiViewModeChange('__inherit__'))
+      await waitForPuts(2)
+      expect(withoutExpectedMcpSettings(puts[1].body)).toEqual({ zip_ai_view_mode: null })
+      await waitForRecord(record => record.zip_ai_view_mode ?? null, null)
+      await waitFor(() => expect(card().zipSaveState).not.toBe('saving'))
+      expect(card().zipSaveError).toBeNull()
+      expect(puts).toHaveLength(2)
+    } finally {
+      release()
+    }
   }, 60_000)
 })

@@ -945,6 +945,36 @@ export class CustomPerformanceRigRuntime {
     this.applied.clear()
   }
 
+  /** Every node this owner can write, including currently neutral channels.
+   * The caller must bind these objects to the current model and skin. */
+  getMotionWriteNodes(): readonly THREE.Object3D[] | null {
+    if (this.disposed) return null
+    const nodes = [
+      ...Object.values(this.lookNodes).flatMap(binding => binding ? [binding.node] : []),
+      ...this.targetTransforms.map(binding => binding.node)
+    ]
+    return Object.freeze([...new Set(nodes)])
+  }
+
+  /** True when a currently applied procedural transform can move this skin.
+   * Motion contact may refuse such a transient overlay until it has its own
+   * qualified sampling contract. */
+  affectsMotionSkin(body: THREE.SkinnedMesh): boolean {
+    if (this.disposed || !body?.isSkinnedMesh || !body.skeleton || !Array.isArray(body.skeleton.bones)) return true
+    for (const affected of this.applied.keys()) {
+      for (const leaf of [body, ...body.skeleton.bones]) {
+        let node: THREE.Object3D | null = leaf
+        const seen = new Set<THREE.Object3D>()
+        while (node) {
+          if (node === affected) return true
+          if (seen.has(node)) return true
+          seen.add(node); node = node.parent
+        }
+      }
+    }
+    return false
+  }
+
   apply(
     direction: CustomPerformanceDirection,
     finalTargetWeights: ReadonlyMap<string, number>

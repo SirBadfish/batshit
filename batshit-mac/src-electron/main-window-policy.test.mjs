@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { resolveMainWindowSizePolicy, restoreMainWindowBounds } from './main-window-policy.mjs';
+import {
+  MAIN_WINDOW_TITLE_BAR_HEIGHT,
+  resolveMainWindowSizePolicy,
+  resolveMainWindowTitleBarPolicy,
+  restoreMainWindowBounds
+} from './main-window-policy.mjs';
 
 test('main window preserves the narrow chat column between both persistent rails', () => {
   const policy = resolveMainWindowSizePolicy();
@@ -13,6 +19,30 @@ test('main window preserves the narrow chat column between both persistent rails
     minHeight: 720
   });
   assert.equal(policy.minWidth - 48 - 48, 480);
+});
+
+test('on macOS the main window hides its title bar and keeps the window buttons in the app bar', async () => {
+  const policy = resolveMainWindowTitleBarPolicy('darwin');
+  assert.deepEqual(policy.options, {
+    titleBarStyle: 'hidden',
+    titleBarOverlay: { height: MAIN_WINDOW_TITLE_BAR_HEIGHT }
+  });
+  // The buttons centre in an overlay as tall as batshit-app's top bar: read the real token.
+  const appCss = await readFile(new URL('../../batshit-app/src/app.css', import.meta.url), 'utf8');
+  const headerHeight = appCss.match(/--app-header-height:\s*([\d.]+)rem;/);
+  assert.ok(headerHeight, 'batshit-app/src/app.css must define --app-header-height in rem');
+  assert.equal(MAIN_WINDOW_TITLE_BAR_HEIGHT, Number(headerHeight[1]) * 16);
+  assert.deepEqual(policy.preloadArguments, ['--batshit-title-bar=hidden']);
+  assert.equal(Object.isFrozen(policy.options), true);
+  assert.equal(Object.isFrozen(policy.preloadArguments), true);
+});
+
+test('off macOS the main window keeps its native title bar and tells the page nothing', () => {
+  for (const platform of ['win32', 'linux']) {
+    const policy = resolveMainWindowTitleBarPolicy(platform);
+    assert.deepEqual(policy.options, {});
+    assert.deepEqual(policy.preloadArguments, []);
+  }
 });
 
 test('a remembered window is restored as saved when it still fits its display', () => {
@@ -60,6 +90,18 @@ test('a window saved on a disconnected display is pulled back into reach', () =>
     restored.y < workArea.y + workArea.height,
     'the title bar must stay reachable with the pointer'
   );
+});
+
+test('a window saved off the left edge comes back with its window buttons and logo on screen', () => {
+  // The top bar's right end can be all buttons; its left end is the drag handle that always works.
+  const workArea = { x: 0, y: 25, width: 1440, height: 875 };
+  const restored = restoreMainWindowBounds({ saved: { x: -1100, y: 100, width: 1200, height: 800 }, workArea });
+  assert.equal(restored.x, 0);
+  const onSecondDisplay = restoreMainWindowBounds({
+    saved: { x: 1500, y: 100, width: 1200, height: 800 },
+    workArea: { x: 1440, y: 0, width: 1920, height: 1080 }
+  });
+  assert.equal(onSecondDisplay.x, 1500, 'a window that fits keeps its place on a display left of x=0 or right of it');
 });
 
 test('a window saved above the menu bar cannot hide its own title bar', () => {

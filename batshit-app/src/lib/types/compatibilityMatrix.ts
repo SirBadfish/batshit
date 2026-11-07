@@ -1,4 +1,4 @@
-export type MatrixConnectionId = 'direct' | 'openrouter' | 'vercel-gateway' | 'n8n'
+export type MatrixConnectionId = 'direct' | 'openrouter' | 'vercel-gateway'
 
 export interface CompatibilityConstraint {
   min?: number

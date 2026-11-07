@@ -1,7 +1,9 @@
 <script lang="ts">
   import * as Switch from '$lib/components/ui/switch'
+  import * as Select from '$lib/components/ui/select'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
   import { TYPESAFE_FEATURES } from '$lib/utils/jevJuice'
+  import { JEV_SKILL_SESSION_MODE_LABELS, type JevSkillSessionMode } from '$lib/utils/jevJuiceControl'
 
   /**
    * SA-120 (DL-120-01/13) — the per-agent Judge Juice switches, one spine toggle per feature.
@@ -21,9 +23,12 @@
    *   the turn really did (facts first, Jev for the wording).
    * - P6 **Style Coach** (LS-056): after each reply Batshit counts repeated wording and asks
    *   Jev about habits. Neither ever edits a reply.
+   * The Judgment Tool is a Fabric control, so it needs the agent's Fabric & Utilities switch
+   * (Josh, 2026-10-24): while that is off the switch is shown as saved but cannot be changed,
+   * with a short note, and the saved choice is never rewritten.
    */
   interface Props {
-    skillToolHintsEnabled: boolean
+    skillSessionMode: JevSkillSessionMode
     judgeToolEnabled: boolean
     memoryRerankEnabled: boolean
     memoryRecallEnabled: boolean
@@ -31,8 +36,10 @@
     styleCoachEnabled: boolean
     /** The agent's Agent Memory switch, as the form holds it right now. */
     memoryEnabled: boolean
+    /** The agent's Fabric & Utilities switch, as the form holds it right now. */
+    fabricUtilitiesEnabled?: boolean
     disabled?: boolean
-    onSkillToolHintsEnabledChange: (enabled: boolean) => void
+    onSkillSessionModeChange: (mode: JevSkillSessionMode) => void
     onJudgeToolEnabledChange: (enabled: boolean) => void
     onMemoryRerankEnabledChange: (enabled: boolean) => void
     onMemoryRecallEnabledChange: (enabled: boolean) => void
@@ -41,15 +48,16 @@
   }
 
   let {
-    skillToolHintsEnabled,
+    skillSessionMode,
     judgeToolEnabled,
     memoryRerankEnabled,
     memoryRecallEnabled,
     replyCheckEnabled,
     styleCoachEnabled,
     memoryEnabled,
+    fabricUtilitiesEnabled = true,
     disabled = false,
-    onSkillToolHintsEnabledChange,
+    onSkillSessionModeChange,
     onJudgeToolEnabledChange,
     onMemoryRerankEnabledChange,
     onMemoryRecallEnabledChange,
@@ -58,30 +66,44 @@
   }: Props = $props()
 </script>
 
-<div class="batshit-settings-toggle-row is-spine-toggle">
+<div class="batshit-settings-form-row">
   <div class="batshit-settings-form-label-line">
     <span class="batshit-settings-parent-label">{TYPESAFE_FEATURES.skill_tool_hints.switchLabel}</span>
     <SettingsInfoMenu ariaLabel="About Judge Juice skill and tool hints" contentClass="w-80">
       <p>
-        Before each reply, Batshit asks your judge which of this agent's skills or tools the
-        message most likely needs, and whether it needs something that is turned off for this agent.
-        The agent gets a one-line hint it may ignore; you get a small note on the reply when a
-        capability is missing.
+        Suggest gives this agent skill and tool hints, including a note when a capability is off.
+        Help manage skill sessions also checks finished replies and closes skills whose task
+        appears complete. The agent still reads each skill itself. Your Close and explicit holds
+        take priority. If the judge is unsure or unavailable, the skill stays open.
       </p>
       <p>
-        When this is on, the text of your message, this agent's skill names, its tool names, and the
-        names of capabilities it does not have are sent to the judge chosen in Settings → Admin →
-        Judge Juice (Jev at TypeSafe unless you changed it). The card there says where each judge
-        runs. Nothing else is sent. Off by default; needs Judge Juice turned on in Settings → Admin.
+        Suggest sends your current message and capability names. Help manage also sends the task
+        request, recent user instructions, the finished reply, and names and ranges of skill files
+        actually read. It does not attach skill files. Uses the judge chosen in Settings → Admin →
+        Judge Juice (Jev at TypeSafe unless you changed it); that card says where each judge runs.
+        Off by default; existing Suggest choices stay Suggest. Needs Judge Juice turned on in Admin.
       </p>
     </SettingsInfoMenu>
   </div>
-  <Switch.Root
-    checked={skillToolHintsEnabled}
-    disabled={disabled}
-    onCheckedChange={(checked) => onSkillToolHintsEnabledChange(checked === true)}
-    data-testid="agent-jev-skill-tool-hints-toggle"
-  />
+  <div class="batshit-settings-form-control">
+    <Select.Root
+      type="single"
+      value={skillSessionMode}
+      disabled={disabled}
+      onValueChange={(value) => {
+        if (value === 'off' || value === 'suggest' || value === 'manage') onSkillSessionModeChange(value)
+      }}
+    >
+      <Select.Trigger data-testid="agent-jev-skill-tool-hints-select">
+        {JEV_SKILL_SESSION_MODE_LABELS[skillSessionMode]}
+      </Select.Trigger>
+      <Select.Content>
+        {#each Object.entries(JEV_SKILL_SESSION_MODE_LABELS) as [value, label]}
+          <Select.Item {value}>{label}</Select.Item>
+        {/each}
+      </Select.Content>
+    </Select.Root>
+  </div>
 </div>
 
 <div class="batshit-settings-toggle-row is-spine-toggle">
@@ -99,17 +121,24 @@
         Admin → Judge Juice (Jev at TypeSafe unless you changed it); the card there says where each
         judge runs. That can include parts of your messages, files, or search results the agent
         chooses to send. Every call shows in the Execution Viewer. Off by default; needs Judge Juice
-        turned on in Settings → Admin.
+        turned on in Settings → Admin and Fabric &amp; Utilities enabled in this agent’s Tools settings.
       </p>
     </SettingsInfoMenu>
   </div>
   <Switch.Root
     checked={judgeToolEnabled}
-    disabled={disabled}
+    disabled={disabled || !fabricUtilitiesEnabled}
     onCheckedChange={(checked) => onJudgeToolEnabledChange(checked === true)}
     data-testid="agent-jev-judge-tool-toggle"
   />
 </div>
+
+{#if !fabricUtilitiesEnabled}
+  <p class="batshit-settings-form-help" data-testid="agent-jev-judge-tool-needs-fabric">
+    Needs Fabric &amp; Utilities, which is off for this agent. Your choice is kept and works again
+    when it is back on.
+  </p>
+{/if}
 
 <div class="batshit-settings-toggle-row is-spine-toggle">
   <div class="batshit-settings-form-label-line">

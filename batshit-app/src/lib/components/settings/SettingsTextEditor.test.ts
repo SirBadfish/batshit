@@ -20,8 +20,9 @@ const NOTICE = 'settings-text-editor-saved-value-changed'
 type Props = {
   open: boolean
   value: string
+  baseline?: unknown
   readOnly?: boolean
-  onSave?: (value: string) => void | Promise<void>
+  onSave?: (value: string, baseline?: unknown) => void | Promise<void>
   onCancel?: () => void
 }
 
@@ -42,6 +43,51 @@ function mountEditor(props: Partial<Props> = {}) {
 }
 
 describe('SettingsTextEditor keeps what the user is typing (BL-816)', () => {
+  it('saves the opaque opening baseline even after a later saved value and baseline arrive', async () => {
+    const opening = Object.freeze({ token: 'opening' })
+    const onSave = vi.fn()
+    const { type, rerender } = mountEditor({ baseline: opening, onSave })
+    await type('my draft')
+    await rerender({ value: 'remote text', baseline: Object.freeze({ token: 'new' }) })
+    await fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith('my draft', opening))
+  })
+
+  it('clean-follows a baseline change even when the text stays equal', async () => {
+    const current = Object.freeze({ token: 'new' })
+    const onSave = vi.fn()
+    const { type, rerender } = mountEditor({ baseline: { token: 'old' }, onSave })
+    await rerender({ baseline: current })
+    expect(screen.queryByTestId(NOTICE)).toBeNull()
+    await type('my draft')
+    await fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith('my draft', current))
+  })
+
+  it('warns on an opaque revision change with equal saved text while preserving the dirty opening base', async () => {
+    const opening = Object.freeze({ token: 'old' })
+    const onSave = vi.fn()
+    const { type, rerender } = mountEditor({ baseline: opening, onSave })
+    await type('my draft')
+    await rerender({ baseline: Object.freeze({ token: 'new' }) })
+    expect(screen.getByTestId(NOTICE)).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith('my draft', opening))
+  })
+
+  it('keeps the original baseline after refusal and a current read; a retry is never rebased', async () => {
+    const opening = Object.freeze({ token: 'opening' })
+    const onSave = vi.fn().mockRejectedValue(new Error('Saved instructions changed'))
+    const { type, rerender } = mountEditor({ baseline: opening, onSave })
+    await type('my draft')
+    await fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await screen.findByText('Saved instructions changed')
+    await rerender({ value: 'remote', baseline: { token: 'new' } })
+    await fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2))
+    expect(onSave).toHaveBeenLastCalledWith('my draft', opening)
+  })
+
   it('opens on the saved value with no notice', () => {
     const { textarea } = mountEditor()
     expect(textarea().value).toBe('alpha')

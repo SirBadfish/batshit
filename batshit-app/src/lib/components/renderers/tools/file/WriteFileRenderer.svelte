@@ -4,7 +4,7 @@
 	import type { ToolData } from '../toolRendererRegistry'
 	import { getLanguageFromPath } from '$lib/utils/languageDetection'
 	import { countTextLines, extractWriteContentFromSources } from '$lib/utils/writePreview'
-	import { failedCommandExitCode } from '$lib/utils/toolActivityContract'
+	import { commandCutShort, failedCommandExitCode } from '$lib/utils/toolActivityContract'
 	import PrismCodeBlock from '$lib/components/renderers/shared/PrismCodeBlock.svelte'
 	import { FileEdit } from '@lucide/svelte'
 
@@ -19,6 +19,10 @@
 	let commandOutput = $derived(
 		typeof tool.toolResult?.commandOutput === 'string' ? tool.toolResult.commandOutput : ''
 	)
+	// BL-1979: a shell write cut before it finished (a Stop, its time limit, or a call that never
+	// returned) may have written the file first, so the card never says it was not written.
+	let cutShort = $derived(commandCutShort(tool.toolResult))
+	let cutWords = $derived(cutShort === 'timed-out' ? 'timed out before it finished' : 'stopped before it finished')
 
 	// Extract file info from input AND result (batshit-server returns it in result too)
 	let filePath = $derived(
@@ -93,7 +97,7 @@
 					'File Path': filePath,
 					...(tool.toolResult?.shell ? { Shell: tool.toolResult.shell } : {}),
 					...(failedExitCode !== undefined ? { 'Exit Code': failedExitCode } : {}),
-					'Result': 'Not written',
+					'Result': cutShort ? 'Unknown, cut before it finished' : 'Not written',
 					...(errorHeadline ? { 'Reason': errorHeadline } : {})
 				}
 			: {
@@ -117,7 +121,7 @@
 <FullTool
 	icon={FileEdit}
 	title={rendererTitle}
-	subtitle={failed ? `${subtitleTarget} • not written` : `${subtitleTarget} • ${lineCount} ${lineCount === 1 ? 'line' : 'lines'} written`}
+	subtitle={cutShort ? `${subtitleTarget} • ${cutWords}` : failed ? `${subtitleTarget} • not written` : `${subtitleTarget} • ${lineCount} ${lineCount === 1 ? 'line' : 'lines'} written`}
 	status={failed ? 'error' : 'success'}
 	{metadata}
 	duration={tool.metadata?.executionTime}
@@ -135,7 +139,11 @@
 		{:else if failed}
 			<div class="error-container">
 				<div class="error-message">
-					Failed to write file{errorHeadline ? `: ${errorHeadline}` : ''}
+					{#if cutShort}
+						{cutShort === 'timed-out' ? 'Timed out' : 'Stopped'} before it finished, so the file may or may not have been written{errorHeadline ? `: ${errorHeadline}` : ''}
+					{:else}
+						Failed to write file{errorHeadline ? `: ${errorHeadline}` : ''}
+					{/if}
 				</div>
 			</div>
 		{:else}

@@ -17,7 +17,9 @@ const lifecycle = vi.hoisted(() => ({
   startRecipeBake: vi.fn(),
   startRecipePackageUpdate: vi.fn(),
   registerRecipeCandidateAssets: vi.fn(),
-  stageRecipeUpdateCandidate: vi.fn()
+  stageRecipeUpdateCandidate: vi.fn(),
+  readReadyRecipeJob: vi.fn(),
+  recoverInterruptedRecipeJob: vi.fn()
 }))
 
 vi.mock('$lib/server/services/goonRecipeLifecycleService.server', () => ({
@@ -40,6 +42,7 @@ import { POST as resetRetiredHair } from './recover-retired-hair/+server'
 import { POST as registerCandidateAssets } from './jobs/[jobId]/candidate-assets/+server'
 import { POST as stageCandidate } from './jobs/[jobId]/stage/+server'
 import { GET as previewRollback } from './rollback/+server'
+import { GET as getJob } from './jobs/[jobId]/+server'
 import { GoonRecipeLifecycleError } from '$lib/server/services/goonRecipeLifecycleService.server'
 
 const USER_ID = 'user-route-1'
@@ -48,12 +51,13 @@ const JOB_ID = 'job-route-1'
 
 function event(
   body?: Record<string, unknown>,
-  options: { method?: string; authenticated?: boolean; jobId?: string; signal?: AbortSignal } = {}
+  options: { method?: string; authenticated?: boolean; jobId?: string; signal?: AbortSignal; query?: string } = {}
 ) {
   const method = options.method ?? 'POST'
   return {
     params: { id: GOON_ID, jobId: options.jobId },
     locals: options.authenticated === false ? {} : { user: { id: USER_ID } },
+    url: new URL(`http://localhost/api/goons/${GOON_ID}/recipe${options.query ?? ''}`),
     request: new Request(`http://localhost/api/goons/${GOON_ID}/recipe`, {
       method,
       signal: options.signal,
@@ -76,6 +80,42 @@ describe('Recipe lifecycle routes', () => {
 
     expect(response.status).toBe(401)
     expect(lifecycle.bootstrapRecipeV2).not.toHaveBeenCalled()
+  })
+
+  it('dispatches an authenticated ready-only read without invoking recovery', async () => {
+    const result = { goon: { id: GOON_ID }, job: { status: 'ready' }, reviewedState: {}, candidate: {}, recovered: false }
+    lifecycle.readReadyRecipeJob.mockResolvedValueOnce(result)
+    const response = await getJob(event(undefined, { method: 'GET', jobId: JOB_ID, query: '?mode=ready-only' }))
+    expect(response.status).toBe(200)
+    expect(response.headers.get('cache-control')).toBe('no-store')
+    expect(await response.json()).toEqual(result)
+    expect(lifecycle.readReadyRecipeJob).toHaveBeenCalledExactlyOnceWith({ userId: USER_ID, goonId: GOON_ID, jobId: JOB_ID })
+    expect(lifecycle.recoverInterruptedRecipeJob).not.toHaveBeenCalled()
+  })
+
+  it('refuses invalid ready-mode queries and unauthenticated requests without a job read', async () => {
+    for (const query of ['?mode=other', '?mode=ready-only&mode=ready-only', '?mode=ready-only&extra=1']) {
+      const response = await getJob(event(undefined, { method: 'GET', jobId: JOB_ID, query }))
+      expect(response.status).toBe(400)
+      expect(response.headers.get('cache-control')).toBe('no-store')
+    }
+    const unauthorized = await getJob(event(undefined, { method: 'GET', jobId: JOB_ID,
+      query: '?mode=ready-only', authenticated: false }))
+    expect(unauthorized.status).toBe(401)
+    expect(unauthorized.headers.get('cache-control')).toBe('no-store')
+    expect(lifecycle.readReadyRecipeJob).not.toHaveBeenCalled()
+    expect(lifecycle.recoverInterruptedRecipeJob).not.toHaveBeenCalled()
+  })
+
+  it('keeps ready-only errors uncached and preserves the ordinary recovery read', async () => {
+    lifecycle.readReadyRecipeJob.mockRejectedValueOnce(
+      new GoonRecipeLifecycleError('READY_JOB_UNAVAILABLE', 'Unavailable.', 409))
+    const refused = await getJob(event(undefined, { method: 'GET', jobId: JOB_ID, query: '?mode=ready-only' }))
+    expect(refused.status).toBe(409)
+    expect(refused.headers.get('cache-control')).toBe('no-store')
+    const ordinary = await getJob(event(undefined, { method: 'GET', jobId: JOB_ID }))
+    expect(ordinary.status).toBe(200)
+    expect(lifecycle.recoverInterruptedRecipeJob).toHaveBeenCalledExactlyOnceWith({ userId: USER_ID, goonId: GOON_ID, jobId: JOB_ID })
   })
 
   it('analyzes an ordinary file upload without a client map and preserves present invalid maps for server rejection', async () => {
@@ -208,7 +248,9 @@ describe('Recipe lifecycle routes', () => {
       receipt,
       state,
       liveStatus: 'up_to_date',
-      activeRevision: 99
+      activeRevision: 99,
+      requiredMotionPreparation: { contract: 'first-party-motion-requirement/v1' },
+      motionApproved: true
     }))
 
     expect(response.status).toBe(200)

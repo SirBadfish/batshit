@@ -14,6 +14,7 @@ export type SettingsPanelState = {
 }
 export type SettingsPanelHandle = {
   readAppActionState(): SettingsPanelState
+  hasActiveHairImport?(): boolean
   selectAppActionTarget?(target: SettingsTarget, context: ActionContext): void
   suppliedAvatarAvailability?(args: ImportArgs['avatar.import_file']): string
   importAppActionAvatar?(args: ImportArgs['avatar.import_file'], files: File[], context: ActionContext): Promise<ImportOutcome>

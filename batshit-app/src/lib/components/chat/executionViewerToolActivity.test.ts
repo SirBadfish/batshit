@@ -15,6 +15,15 @@ function expectedToolTokens(step: any) {
 }
 
 describe('buildExecutionToolActivityEntries', () => {
+  it.each([['sys.judge.ask', 'Ask Judge Juice'], ['sys.mcp.dynamic.find', 'Dynamic Tool Search'], ['sys.mcp.dynamic.use', 'MCP Tool']])('keeps the exact utility title for %s without changing its captured payload', (id, title) => {
+    const step = { toolName: 'batshit_tool_use', toolArgs: { ref: `batshit:${id}`, input: {} }, toolResult: { success: true, family: 'batshit', target: id, operationKind: 'fabric_use', rendererFamily: 'generic_tool' } }
+    const [entry] = buildExecutionToolActivityEntries({ steps: [step] })
+    expect(entry.displayName).toBe(title)
+    expect(entry.input).toEqual(step.toolArgs)
+    expect(entry.output).toEqual(step.toolResult)
+    expect(entry.status).toBe('success')
+  })
+
   it('normalizes Mode 4 CLI steps and prefers executed tool names for display', () => {
     const step = {
       toolName:
@@ -271,7 +280,7 @@ describe('buildExecutionToolActivityEntries', () => {
     // those the step's `toolResult` is NOT the route's JSON: it is the MCP result envelope the
     // helper returned — `{ content: [{ type: 'text', text }] }` with `text` the
     // `JSON.stringify` of the route's whole response (`scripts/lib/cli-tool-result-content.cjs`,
-    // stored as-is by `codexEventAdapter`; see that adapter's own `mcp_tool_call` fixture). The
+    // stored as-is by the CLI event adapter, as saved Codex CLI steps were before SA-139 R1). The
     // route's `actingAgentId` sits at the top level of that JSON, so the envelope must be opened.
     const routeResponse = {
       auth: 'agent',

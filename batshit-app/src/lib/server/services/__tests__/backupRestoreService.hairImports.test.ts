@@ -86,6 +86,15 @@ function archive(bytes: Uint8Array) {
   return { entries, records, manifest: JSON.parse(Buffer.from(entries['manifest.json']).toString()) }
 }
 
+it.each([Number.NaN, { missing: undefined }, { unsupported: 1n }])('refuses an unrepresentable value from the atomic cut without changing its source', async (value) => {
+  const key = `hair_asset:${USER}:source-validation:r1`
+  const source = { legacy: 'retained as written' }
+  await redis.json.set(key, '$', source)
+  vi.spyOn(hairSnapshot, 'readHairBackupSnapshot').mockResolvedValueOnce(new Map([[key, { key, type: 'json', value, ttlSeconds: null }]]))
+  await expect(createBackupBundle(USER)).rejects.toMatchObject({ status: 500, details: { code: 'BACKUP_SOURCE_READ_FAILED', operation: 'EVAL' } })
+  expect(await redis.json.get(key)).toEqual(source)
+})
+
 it('both export paths and upload audit omit positively staged pre-job/pre-CAS files without excluding unknown old files', async () => {
   const raw = await rawStaging()
   const staging = await candidate(false)

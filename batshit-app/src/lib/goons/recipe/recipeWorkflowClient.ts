@@ -16,6 +16,7 @@ import {
 } from './archiveContainmentContracts'
 import { bakeLiveGoonInWorker, type LiveGoonBakerClientOptions } from './liveGoonBakerClient'
 import { RECIPE_ROLLBACK_PREVIEW_RESULT_CONTRACT } from './recipeRollbackPreviewResult'
+import { RECIPE_SERVER_BUILD_RESULT_CONTRACT } from './recipeServerBuildResult'
 import type { LiveGoonHairBakeInput } from './liveGoonBaker'
 import { withoutAnatomyFitRecipeSibling } from './anatomyFitContracts'
 import { verifyGoonLiveBuildReceipt, type GoonLiveBuildReceipt } from './liveBuildContracts'
@@ -234,6 +235,8 @@ export type RecipeRollbackPreviewResponse = {
 
 export type RecipeWorkflowProgress =
   | 'starting'
+  | 'server-building'
+  | 'settling-server-build'
   | 'fetching-source'
   | 'validating-source'
   | 'evaluating-recipe'
@@ -265,19 +268,21 @@ export type RecipeBuildWorkflowInput = {
   /**
    * Load the staged lean-Live candidate into the real preview runtime. The
    * callback must not resolve until the candidate and its animation set are
-   * usable. Throwing prevents activation and records a durable preview-load
+   * usable. Forward cancellation to the actual mounted-load owner and finish
+   * its bounded restoration before rejecting. Throwing prevents activation
+   * and records a durable preview-load
    * failure on the pending Recipe job.
    */
-  previewCandidate: (staged: RecipeStageResponse) => Promise<void>
+  previewCandidate: (staged: RecipeStageResponse, options: { signal?: AbortSignal }) => Promise<void>
   candidateFilename?: string
 }
 
 export type RecipeBuildWorkflowResult = {
   started: RecipeJobStartResponse
-  bake: Awaited<ReturnType<typeof bakeLiveGoonInWorker>>
-  upload: CustomGoonPackageUploadResult
+  bake: Awaited<ReturnType<typeof bakeLiveGoonInWorker>> | null
+  upload: CustomGoonPackageUploadResult | null
   live: RecipeAssetSet
-  registered: RecipeCandidateAssetsResponse
+  registered: RecipeCandidateAssetsResponse | null
   staged: RecipeStageResponse
   committed: RecipeCommitResponse
 }
@@ -286,7 +291,7 @@ export type RecipeReadyResumeInput = {
   recovery: RecipeJobRecoveryResponse
   signal?: AbortSignal
   onProgress?: (stage: RecipeWorkflowProgress) => void
-  previewCandidate: (staged: RecipeStageResponse) => Promise<void>
+  previewCandidate: (staged: RecipeStageResponse, options: { signal?: AbortSignal }) => Promise<void>
 }
 
 export type RecipeWorkflowClientDependencies = {
@@ -1447,6 +1452,30 @@ export class RecipeWorkflowClient {
     )
   }
 
+  async buildAndStageCandidate(
+    jobId: string,
+    request: { expectedWriteVersion: number; expectedJobStateVersion: number },
+    options: RecipeWorkflowRequestOptions = {}
+  ): Promise<RecipeStageResponse> {
+    const result = record(await this.request(`/jobs/${encodeURIComponent(jobId)}/build-stage`,
+      this.json('POST', request, options.signal)), 'Recipe server build result')
+    if (result.contract !== RECIPE_SERVER_BUILD_RESULT_CONTRACT) {
+      throw new Error('Recipe server build returned an unsupported result contract.')
+    }
+    if (result.kind === 'error') {
+      if (!Number.isInteger(result.status) || (result.status as number) < 400 || (result.status as number) > 599 ||
+        typeof result.error !== 'string' || !result.error ||
+        (result.code !== null && typeof result.code !== 'string')) {
+        throw new Error('Recipe server build returned an invalid error result.')
+      }
+      throw new RecipeWorkflowHttpError(result.error, {
+        status: result.status as number, code: result.code as string | null, responseBody: result
+      })
+    }
+    if (result.kind !== 'success') throw new Error('Recipe server build returned an unknown result kind.')
+    return parseStageResponse(result.staged)
+  }
+
   async registerCandidateAssets(
     jobId: string,
     request: RegisterRecipeCandidateAssetsRequest,
@@ -1735,6 +1764,105 @@ export class RecipeWorkflowClient {
     })
   }
 
+  /** Poll recovery without sending Fail: Fail could steal upload ownership
+   * before the server registers its receipt. Recovery may mark an expired job
+   * interrupted. Ready never authorizes activation after a canceled request. */
+  private async waitForServerBuildSettlement(jobId: string) {
+    const deadline = Date.now() + 5 * 60_000
+    let lastError: unknown
+    while (Date.now() < deadline) {
+      const requestAbort = new AbortController()
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      try {
+        const recovery = await Promise.race([
+          this.recoverJob(jobId, { signal: requestAbort.signal }),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => {
+              requestAbort.abort()
+              reject(new Error('Checking the unfinished Goon update timed out.'))
+            }, Math.min(RECIPE_LEASE_RENEW_TIMEOUT_MS, deadline - Date.now()))
+          })
+        ])
+        if (!['validating', 'planning', 'baking', 'packaging', 'verifying', 'committing'].includes(recovery.job.status)) return recovery
+      } catch (error) {
+        // A disconnected Save may also lose the first recovery request. Keep
+        // observing within the same bound; never claim a failed poll stopped it.
+        lastError = error
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout)
+      }
+      const remaining = deadline - Date.now()
+      if (remaining > 0) await new Promise<void>((resolve) => setTimeout(resolve, Math.min(1_000, remaining)))
+    }
+    throw new Error('The Goon build has not confirmed it stopped. Its update remains pending; check Goon File before retrying.',
+      { cause: lastError })
+  }
+
+  private async buildOrdinaryOnServer(
+    started: RecipeJobStartResponse,
+    input: RecipeBuildWorkflowInput
+  ): Promise<RecipeBuildWorkflowResult> {
+    if (input.signal?.aborted) {
+      const error = abortError()
+      // No build-stage request was dispatched, so there is no server upload
+      // whose registration could race this ordinary owned-job failure.
+      await this.recordDurableFailure(started.job.jobId, 'validating', error)
+      throw error
+    }
+    const abort = new AbortController()
+    const onAbort = () => abort.abort(input.signal?.reason)
+    if (input.signal?.aborted) onAbort()
+    else input.signal?.addEventListener('abort', onAbort, { once: true })
+    let deadlineExpired = false
+    const deadline = setTimeout(() => {
+      deadlineExpired = true
+      abort.abort()
+    }, RECIPE_BROWSER_BUILD_DEADLINE_MS)
+    let staged: RecipeStageResponse | null = null
+    let failureStage: RecipeFailureStage = 'verifying'
+    try {
+      input.onProgress?.('server-building')
+      staged = await this.buildAndStageCandidate(started.job.jobId, {
+        expectedWriteVersion: (started.goon.recipe as GoonRecipeV2).writeVersion,
+        expectedJobStateVersion: started.job.stateVersion
+      }, { signal: abort.signal })
+      clearTimeout(deadline)
+      throwIfAborted(abort.signal)
+      failureStage = 'preview-load'
+      input.onProgress?.('previewing-candidate')
+      await input.previewCandidate(staged, { signal: input.signal })
+      throwIfAborted(input.signal)
+      failureStage = 'committing'
+      input.onProgress?.('committing')
+      const committed = await this.commitJob(staged.job.jobId, {
+        expectedWriteVersion: staged.owner.writeVersion,
+        expectedJobStateVersion: staged.job.stateVersion
+      })
+      input.onProgress?.('complete')
+      return { started, bake: null, upload: null, registered: null,
+        live: staged.envelope.live, staged, committed }
+    } catch (caught) {
+      const error = deadlineExpired ? new Error('Building the Goon took too long. Check its update before retrying.') : caught
+      try {
+        if (staged) {
+          // Ready was received: ingestion has ended, so preview/cancel failure
+          // may now be recorded through the existing ready-job contract.
+          await this.recordDurableFailure(started.job.jobId, failureStage, error)
+        } else {
+          input.onProgress?.('settling-server-build')
+          await this.waitForServerBuildSettlement(started.job.jobId)
+        }
+      } catch (settlementError) {
+        throw new AggregateError([error, settlementError],
+          `Goon build failed and its final saved status could not be confirmed: ${errorMessage(settlementError)}`)
+      }
+      throw error
+    } finally {
+      clearTimeout(deadline)
+      input.signal?.removeEventListener('abort', onAbort)
+    }
+  }
+
   async buildUploadStageCommit(
     input: RecipeBuildWorkflowInput
   ): Promise<RecipeBuildWorkflowResult> {
@@ -1744,6 +1872,10 @@ export class RecipeWorkflowClient {
       input.start.kind === 'package-update'
         ? await this.startPackageUpdate(input.start.request)
         : await this.startBake(input.start.request)
+    if (input.start.kind === 'bake' && started.goon.sourceProfile === 'expert-custom-glb' &&
+      ['first-bake', 'rebake'].includes(started.job.operation)) {
+      return this.buildOrdinaryOnServer(started, input)
+    }
     const buildAbort = new AbortController()
     const onInputAbort = () => buildAbort.abort(input.signal?.reason)
     if (input.signal?.aborted) onInputAbort()
@@ -1857,7 +1989,7 @@ export class RecipeWorkflowClient {
       throwIfAborted(input.signal)
       failureStage = 'preview-load'
       input.onProgress?.('previewing-candidate')
-      await input.previewCandidate(staged)
+      await input.previewCandidate(staged, { signal: input.signal })
       throwIfAborted(input.signal)
       failureStage = 'committing'
       input.onProgress?.('committing')
@@ -1935,7 +2067,7 @@ export class RecipeWorkflowClient {
     try {
       throwIfAborted(input.signal)
       input.onProgress?.('previewing-candidate')
-      await input.previewCandidate(staged)
+      await input.previewCandidate(staged, { signal: input.signal })
       throwIfAborted(input.signal)
       failureStage = 'committing'
       input.onProgress?.('committing')

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ToolGridEnableCell, { type ToolGridEnableControl } from '$lib/components/tools/ToolGridEnableCell.svelte'
   import * as Collapsible from '$lib/components/ui/collapsible'
   import * as Select from '$lib/components/ui/select'
   import { Button } from '$lib/components/ui/button'
@@ -15,9 +16,12 @@
   import { Check, ChevronDown, Clock3, Infinity } from '@lucide/svelte'
   import type { IconRef } from '$lib/icons/iconTypes'
   import type { BrokerFamilyRowControls } from '$lib/components/tools/brokerFamilyRowControls'
-  import type {
-    SharedNonMcpToolGridRowConfig,
-    SharedNonMcpToolGridRowId
+  import {
+    READ_FILE_ZIP_ROW_INFO_PARAGRAPHS,
+    TYPED_FILE_TOOL_ZIP_ROW_IDS,
+    TYPED_FILE_TOOL_ZIP_ROW_NOTE,
+    type SharedNonMcpToolGridRowConfig,
+    type SharedNonMcpToolGridRowId
   } from '$lib/components/tools/toolGridConfig'
 
   type AutoZipValue = 'inherit' | 'enabled' | 'disabled' | 'off'
@@ -59,6 +63,8 @@
      * exactly as they were.
      */
     getBrokerFamilyControls?: (rowId: SharedNonMcpToolGridRowId) => BrokerFamilyRowControls | null
+    showBrokerDiscoverable?: boolean
+    getEnableControl?: (rowId: SharedNonMcpToolGridRowId) => ToolGridEnableControl | null
     onHeaderClick: (event: MouseEvent, sectionKey: string) => void
     onToggle: (sectionKey: string) => void
     showBulkZipApply?: boolean
@@ -82,6 +88,8 @@
     getRowOverride,
     onUpdateRowOverride,
     getBrokerFamilyControls = () => null,
+    getEnableControl = () => null,
+    showBrokerDiscoverable = true,
     onHeaderClick,
     onToggle,
     showBulkZipApply = false,
@@ -208,6 +216,7 @@
     if (!patch) return
 
     for (const rowId of rowIds) {
+      if (rowId === 'typed_file_tools') continue
       onUpdateRowOverride(rowId, patch)
     }
   }
@@ -222,16 +231,21 @@
    * about what this surface's columns mean is added here, where those columns exist.
    */
   const BROKER_FAMILY_COLUMN_NOTE =
-    'On this grid, Discoverable and Display Detail control the family itself, while the ' +
-    'Zip Buffer, Zip Threshold, and Zip Behavior columns only control how the results of ' +
-    'a search get compressed in the conversation.'
+    'Display Detail controls the Artifact family’s per-message capability index entry. Enable belongs to the agent’s tool choice. ' +
+    'Zip Buffer, Zip Threshold, and ' +
+    'Zip Behavior only control how search results get compressed in the conversation.'
   const ZIP_OFF_HELP = "Off keeps this tool's results open. The size guard still applies: a result over 25,000 tokens is never sent whole."
 
   function resolveRowInfoParagraphs(
     rowId: SharedNonMcpToolGridRowId,
     hasBrokerFamilyControls: boolean
   ): string[] {
-    const paragraphs = rowConfig[rowId]?.infoParagraphs ?? []
+    const rowParagraphs = rowId === 'read_file'
+      ? READ_FILE_ZIP_ROW_INFO_PARAGRAPHS
+      : rowConfig[rowId]?.infoParagraphs ?? []
+    const paragraphs = TYPED_FILE_TOOL_ZIP_ROW_IDS.includes(rowId)
+      ? [...rowParagraphs, TYPED_FILE_TOOL_ZIP_ROW_NOTE]
+      : rowParagraphs
     if (!hasBrokerFamilyControls) return paragraphs
     return [...paragraphs, BROKER_FAMILY_COLUMN_NOTE]
   }
@@ -239,6 +253,7 @@
 
 {#snippet toolRowCells(rowId: SharedNonMcpToolGridRowId, nested: boolean)}
   {@const config = rowConfig[rowId]}
+  {@const enableControl = getEnableControl(rowId)}
   {@const rowZip = getRowOverride(rowId)}
   {@const rowAutoZipIconMode = getZipBehaviorIconMode(rowZip.auto_zip, rowZip.inherited_auto_zip, rowZip.inherited_zip_disabled)}
   {@const rowAutoZipActive = isEffectiveAutoZipEnabled(rowZip.auto_zip, rowZip.inherited_auto_zip, rowZip.inherited_zip_disabled)}
@@ -268,12 +283,20 @@
       {/if}
     </div>
   </td>
-  {#if brokerFamilyControls}
-    <BrokerFamilyDiscoverabilityCells controls={brokerFamilyControls} />
+  {#if enableControl}
+    <ToolGridEnableCell control={enableControl} label={config.label} />
+    {#if brokerFamilyControls}<BrokerFamilyDiscoverabilityCells controls={brokerFamilyControls} showDiscoverable={false} />
+    {:else}<td class="batshit-settings-table-cell"></td>{/if}
+  {:else if brokerFamilyControls}
+    {#if !showBrokerDiscoverable}<td class="batshit-settings-table-cell"></td>{/if}
+    <BrokerFamilyDiscoverabilityCells controls={brokerFamilyControls} showDiscoverable={showBrokerDiscoverable} />
   {:else}
     <td class="batshit-settings-table-cell"></td>
     <td class="batshit-settings-table-cell"></td>
   {/if}
+  {#if rowId === 'typed_file_tools'}
+    <td class="batshit-settings-table-cell"></td><td class="batshit-settings-table-cell"></td><td class="batshit-settings-table-cell"></td>
+  {:else}
   <td class="batshit-settings-table-cell">
     <input
       type={rowZipInputsDisabled ? 'text' : 'number'}
@@ -368,6 +391,7 @@
       </Select.Content>
     </Select.Root>
   </td>
+  {/if}
 {/snippet}
 
 {#if flattenSingleRow && rowIds.length === 1}
@@ -466,6 +490,7 @@
           {/if}
           <Collapsible.Trigger
             class="ml-auto flex items-center justify-end"
+            aria-label={`Toggle ${title}`}
             aria-expanded={open}
             onclick={() => onToggle(sectionKey)}
           >

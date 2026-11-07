@@ -6,6 +6,10 @@ import type { DelegatedExecutionSummary, DelegatedUsage } from '$lib/types/deleg
  * before the retirement may still carry it as stored data — the Execution Viewer renders
  * those honestly as "n8n Workflow (retired)" via a raw-string check — but nothing writes
  * it any more, so it is out of the live union.
+ *
+ * SA-139 R1: `codex` and the `codex-*` transports retired with the Codex CLI lane. Nothing
+ * writes them any more; they stay in the unions only so snapshots recorded before then still
+ * parse and are labelled as Codex, never as another runtime.
  */
 export type ExecutionRuntimeId = 'vercel' | 'codex' | 'claude'
 
@@ -82,6 +86,7 @@ export interface ExecutionLlmSummary {
 export interface ObservedUsage {
   completeness: 'partial'
   parts: Array<{
+    /** `codex-app-server-progress` appears only in replies saved before Codex CLI retired. */
     source: 'codex-app-server-progress' | 'run-usage-prefix'
     counts: DelegatedUsage
   }>
@@ -166,7 +171,6 @@ export interface ExecutionSnapshot {
   gatewayToolMap?: Record<string, string[]> | null
   voiceMetadata?: Record<string, any>
   assignedSubagents?: any[]
-  availableWorkflows?: string[]
   runtime?: ExecutionRuntimeDetails
   /**
    * SA-093 opt-in cache-forensics records, one per model call in the run

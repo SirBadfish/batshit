@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { readVoiceProviderEnvelope } from '$lib/utils/voiceProviderEnvelope'
   import { Button } from '$lib/components/ui/button'
   import {
     Mic,
@@ -13,8 +14,6 @@
     MessageCircle,
     Shield,
     ShieldPlus,
-    ShieldQuestionMark,
-    Brain,
     Loader2
   } from '@lucide/svelte'
   import { toast } from 'svelte-sonner'
@@ -27,9 +26,7 @@
   import MCPsDropdown from '$lib/components/mcps/MCPsDropdown.svelte'
   import AgentSelector from '$lib/components/agents/AgentSelector.svelte'
   import ModelSelector from '$lib/components/models/ModelSelector.svelte'
-  import CodexModelSelector from '$lib/components/models/CodexModelSelector.svelte'
-  import CodexReasoningEffortSelector from '$lib/components/models/CodexReasoningEffortSelector.svelte'
-  import ClaudeModelSelector from '$lib/components/models/ClaudeModelSelector.svelte'
+  import ModelReasoningControl from '$lib/components/models/ModelReasoningControl.svelte'
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
   import { voiceService, type VoiceInputConfig } from '$lib/services/voice'
   import {
@@ -54,15 +51,9 @@
   import { executeVoiceQuickAction } from '$lib/appActions/voice/quickActionExecutor'
   import { getPlaybackState } from '$lib/stores/voicePlayback.svelte'
   import * as agentStore from '$lib/stores/agents.svelte'
-  import { chatBarWorkModeSave } from '$lib/utils/agentProviderSettings'
-  import { chatBarBlockSave } from '$lib/utils/chatBarBlockSave'
-  import { CLAUDE_THINKING_GROUP, CODEX_PERMISSION_GROUP } from '$lib/utils/agentBlockFieldSettings'
-  import {
-    CODEX_PERMISSION_PRESETS,
-    CODEX_SANDBOX_LABELS,
-    resolveCodexRunAccess
-  } from '$lib/utils/codexRunAccess'
-  import { createPendingSaves } from '$lib/utils/pendingSaves'
+  import { applyAgentProviderSettingsUpdate, chatBarWorkModeSave } from '$lib/utils/agentProviderSettings'
+  import { refreshedFileReadsRecordInputs } from '$lib/utils/refreshedFileReadsSettings'
+  import { refreshAllDeadCopies } from '$lib/stores/zipDeadCopies.svelte'
   import * as sessionStore from '$lib/stores/session.svelte'
   import * as projectStore from '$lib/stores/projects.svelte'
   import * as savedModelsStore from '$lib/stores/savedModels.svelte'
@@ -80,8 +71,7 @@
     stripSkillInlineMetadata
   } from '$lib/utils/skillInlineNotes'
   import {
-    isCliPrimaryAgentType,
-    isManagedPrimaryAgentType,
+    isRetiredPrimaryAgentType,
     normalizePrimaryAgentType,
     primaryAgentAllowsNativeBash
   } from '$lib/utils/primaryAgentType'
@@ -96,6 +86,7 @@
   } from '$lib/utils/voiceQuickActionCommit'
   import {
     resolveModelVoiceSessionConfig,
+    findChatVoicePresetFallback,
     shouldRouteLiveKitRemoteAudioToGoon
   } from '$lib/utils/modelVoiceSession'
   import {
@@ -105,21 +96,12 @@
     normalizeVoiceSettings
   } from '$lib/utils/voiceSchema'
   import { VOICE_ENGINES_UPDATED_EVENT } from '$lib/utils/voiceEngineEvents'
-  import { onMount, tick } from 'svelte'
-  import type {
-    CodexAgentSettings,
-    CodexPermissionMode,
-    CodexApproval,
-    CodexSandbox,
-    CodexConfigScope
-  } from '$lib/types/codex'
-  import type { ClaudeAgentSettings, ClaudePermissionMode, ClaudeConfigScope } from '$lib/types/claude'
+  import { onMount, tick, untrack } from 'svelte'
   import type { SlashCommandRow } from '$lib/types/database'
   import type { SlashCommandDescriptor } from '$lib/types/slashCommands'
   import type { SavedModel } from '$lib/types/savedModels'
   import type { VoiceModeInputMode, VoiceProviderSummary } from '$lib/types/voice'
   import { LIVE_SETTINGS_EVENTS } from '$lib/utils/liveSettingsEvents'
-  import { CODEX_SUBMODEL_CHOICES } from '$lib/data/codex-models'
   import { isSlashCommandEnabledForAgent } from '$lib/utils/slashCommandAccess'
   import { neutralizeAllClipReferenceSyntax } from '$lib/utils/zipReferenceSafety'
   import { ProjectService } from '$lib/services/projects'
@@ -162,7 +144,7 @@
   }
 
   let {
-    onSend = (message: string, metadata?: any, completion?: { onNoReplyCompleted?: () => void; onReplyAdmitted?: (kind: 'direct' | 'steer' | 'queued') => void; onSteerPrepared?: (identity: { steerId: string; sessionId: string; targetMessageId?: string }) => void }) => {},
+    onSend = (message: string, metadata?: any, completion?: { onNoReplyCompleted?: () => void; onReplyAdmitted?: (kind: 'direct' | 'steer' | 'queued') => void; onSteerPrepared?: (identity: { steerId: string; sessionId: string; targetMessageId?: string }) => void; onComposerSessionCreated?: (identity: { sessionId: string; agentId: string }) => boolean }) => {},
     disabled = false,
     voiceMode = $bindable(false),
     onVoiceModeChange = (enabled: boolean) => {},
@@ -178,9 +160,9 @@
     busySendMode = 'steer' as BusySendMode,
     steerable = true,
     steerReason = null,
-    onQuickActionMessage = async (_content: string, _mark: QuickActionMark) => {}
+    onQuickActionMessage = async (_content: string, _mark: QuickActionMark) => { throw new Error('No voice-action message save owner is available.') }
   } = $props<{
-    onSend?: (message: string, metadata?: any, completion?: { onNoReplyCompleted?: () => void; onReplyAdmitted?: (kind: 'direct' | 'steer' | 'queued') => void; onSteerPrepared?: (identity: { steerId: string; sessionId: string; targetMessageId?: string }) => void }) => boolean | void | Promise<boolean | void>
+    onSend?: (message: string, metadata?: any, completion?: { onNoReplyCompleted?: () => void; onReplyAdmitted?: (kind: 'direct' | 'steer' | 'queued') => void; onSteerPrepared?: (identity: { steerId: string; sessionId: string; targetMessageId?: string }) => void; onComposerSessionCreated?: (identity: { sessionId: string; agentId: string }) => boolean }) => boolean | void | Promise<boolean | void>
     disabled?: boolean
     voiceMode?: boolean
     onVoiceModeChange?: (enabled: boolean) => void
@@ -206,6 +188,11 @@
   }>()
   
   let message = $state('')
+  let composerDraftRevision = 0
+  function setComposerMessage(text: string) {
+    composerDraftRevision += 1
+    message = text
+  }
   let textarea = $state<HTMLTextAreaElement | null>(null)
   let highlightLayer = $state<HTMLDivElement | null>(null)
   let autoResizeQueued = false
@@ -331,7 +318,6 @@
   let isDragging = $state(false)
   let dragMode = $state<'upload' | 'mention'>('upload')
   let dragMentionPath = $state<string | null>(null)
-  let defaultWorkspacePath = $state<string | null>(null)
   const projectService = new ProjectService()
   const sessionService = new SessionService()
   const playbackState = $derived(getPlaybackState())
@@ -342,39 +328,7 @@
   const voiceReplyActive = $derived(isSpeaking || hasQueuedSpeech)
   const isLiveKitVoiceConnecting = $derived(liveKitVoiceStatus === 'connecting')
   const isLiveKitVoiceConnected = $derived(liveKitVoiceStatus === 'connected')
-  const MODE4_PRELAUNCH_REPLACEMENT_PROMPT = 'You are a helpful assistant.'
-  const CLAUDE_DEFAULT_MAX_THINKING_TOKENS = 1024
   let creatingSlashSession = $state(false)
-
-  const CODEX_MODE_OPTIONS: Array<{
-    value: CodexPermissionMode
-    triggerLabel: string
-    menuLabel: string
-    description: string
-    icon: typeof MessageCircle
-  }> = [
-    {
-      value: 'chat',
-      triggerLabel: 'Chat',
-      menuLabel: 'Chat (read-only)',
-      description: 'No edits, always ask first',
-      icon: MessageCircle
-    },
-    {
-      value: 'agent',
-      triggerLabel: 'Agent',
-      menuLabel: 'Agent (workspace write)',
-      description: 'Can edit files with approval',
-      icon: Shield
-    },
-    {
-      value: 'agent_full',
-      triggerLabel: 'Agent',
-      menuLabel: 'Agent (full access)',
-      description: 'Full trust, runs commands freely',
-      icon: ShieldPlus
-    }
-  ]
 
   type NativeBashAccessMode = 'plan' | 'agent' | 'dangerous'
 
@@ -408,138 +362,34 @@
     }
   ]
 
-  const CLAUDE_MODE_OPTIONS: Array<{
-    value: ClaudePermissionMode
-    triggerLabel: string
-    menuLabel: string
-    description: string
-    icon: typeof MessageCircle
-  }> = [
-    {
-      value: 'plan',
-      triggerLabel: 'Plan',
-      menuLabel: 'Plan',
-      description: 'Plan-only, no edits or commands',
-      icon: MessageCircle
-    },
-    {
-      value: 'default',
-      triggerLabel: 'Ask',
-      menuLabel: 'Ask before edits',
-      description: 'Ask before edits and commands',
-      icon: ShieldQuestionMark
-    },
-    {
-      value: 'acceptEdits',
-      triggerLabel: 'Edit',
-      menuLabel: 'Edit automatically',
-      description: 'Edits run without asking',
-      icon: Shield
-    },
-    {
-      value: 'bypassPermissions',
-      triggerLabel: 'Bypass',
-      menuLabel: 'Bypass permissions',
-      description: 'Full trust, no approvals',
-      icon: ShieldPlus
-    }
-  ]
-
-  type ClaudeThinkingMode = 'off' | 'on'
-  const CLAUDE_THINKING_OPTIONS: Array<{
-    value: ClaudeThinkingMode
-    triggerLabel: string
-    menuLabel: string
-    description: string
-    icon: typeof Brain
-  }> = [
-    {
-      value: 'off',
-      triggerLabel: 'Thinking',
-      menuLabel: 'Thinking off',
-      description: 'No extended thinking',
-      icon: Brain
-    },
-    {
-      value: 'on',
-      triggerLabel: 'Thinking',
-      menuLabel: 'Thinking on',
-      description: `Extended thinking (${CLAUDE_DEFAULT_MAX_THINKING_TOKENS}+ token budget)`,
-      icon: Brain
-    }
-  ]
-  
   // Reference to ClipsManagerDropdown
   let clipsManager: any
   let composerClippedItems = $state<ComposerClip[]>([])
 
-  function resolveCodexPermissionFromSettings(
-    settings?: Record<string, any> | null
-  ): CodexPermissionMode | null {
-    const raw = settings?.codex_permission_mode
-    if (raw === 'chat' || raw === 'agent' || raw === 'agent_full') {
-      return raw
-    }
-    return null
-  }
-
-  function resolveAgentCodexPermission(agent: agentStore.Agent | null | undefined): CodexPermissionMode {
-    const fromCodex = agent?.codex_settings?.permissionMode
-    if (fromCodex === 'chat' || fromCodex === 'agent' || fromCodex === 'agent_full') {
-      return fromCodex
-    }
-    const fromSettings = resolveCodexPermissionFromSettings(agent?.provider_specific_settings ?? null)
-    return fromSettings ?? 'chat'
-  }
-
-  function resolveClaudePermissionFromSettings(
-    settings?: Record<string, any> | null
-  ): ClaudePermissionMode | null {
-    const raw = settings?.claude_permission_mode
-    if (
-      raw === 'default' ||
-      raw === 'acceptEdits' ||
-      raw === 'plan' ||
-      raw === 'bypassPermissions'
-    ) {
-      return raw
-    }
-    if (raw === 'chat') return 'default'
-    if (raw === 'agent') return 'acceptEdits'
-    if (raw === 'agent_full') return 'bypassPermissions'
-    return null
-  }
-
-  function resolveAgentClaudePermission(agent: agentStore.Agent | null | undefined): ClaudePermissionMode {
-    const fromClaude = agent?.claude_settings?.permissionMode
-    if (
-      fromClaude === 'default' ||
-      fromClaude === 'acceptEdits' ||
-      fromClaude === 'plan' ||
-      fromClaude === 'bypassPermissions'
-    ) {
-      return fromClaude
-    }
-    if (fromClaude === 'chat') return 'default'
-    if (fromClaude === 'agent') return 'acceptEdits'
-    if (fromClaude === 'agent_full') return 'bypassPermissions'
-    const fromSettings = resolveClaudePermissionFromSettings(agent?.provider_specific_settings ?? null)
-    return fromSettings ?? 'default'
-  }
-
   const savedModels = $derived(savedModelsStore.getSavedModels())
   const currentAgent = $derived(agentStore.getCurrentAgent())
-  const voiceQuickActionCommitContextKey = $derived(
-    `${sessionId ?? ''}\u0000${currentAgent?.id ?? ''}`
-  )
+  // Only the normalized voice inputs belong to this lifetime. A send's equal
+  // same-agent GET refresh must not retire its accepted composer draft.
+  const voiceQuickActionLifetimeKey = $derived.by(() => JSON.stringify([
+    currentAgent?.created_at ?? null,
+    normalizeAgentVoiceProfile(currentAgent?.voice_profile), activeModelVoiceSession ?? null
+  ]))
+  const voiceQuickActionCommitContextKey = $derived(JSON.stringify([
+    sessionId ?? null, currentAgent?.id ?? null, voiceQuickActionLifetimeKey
+  ]))
+  const directVoiceCaptureContextKey = $derived(JSON.stringify([
+    sessionId ?? null, currentAgent?.id ?? null, currentAgent?.created_at ?? null
+  ]))
+  let directVoiceCapture: { contextKey: string } | null = null
 
   function currentVoiceQuickActionContext() {
-    return { sessionId: sessionId ?? null, agentId: currentAgent?.id ?? null }
+    return { sessionId: sessionId ?? null, agentId: currentAgent?.id ?? null, voiceLifetimeKey: voiceQuickActionLifetimeKey }
   }
 
   let voiceQueuedReplyWait: ReturnType<typeof createVoiceQueuedReplyWait> | null = null
 
   function invalidatePendingVoiceQuickActionCommit(context?: ReturnType<typeof currentVoiceQuickActionContext>) {
+    if (!context) directVoiceCapture = null
     const invalidated = context
       ? voiceQuickActionCommits.invalidateContext(context)
       : voiceQuickActionCommits.invalidate()
@@ -548,8 +398,16 @@
 
   $effect(() => {
     voiceQuickActionCommitContextKey
-    const ownedContext = currentVoiceQuickActionContext()
+    const ownedContext = untrack(currentVoiceQuickActionContext)
     return () => invalidatePendingVoiceQuickActionCommit(ownedContext)
+  })
+  // A started capture keeps its transport across semantic Voice setting changes.
+  // Only its actual actor/chat incarnation, End or a newer capture retires callbacks.
+  $effect(() => {
+    const contextKey = directVoiceCaptureContextKey
+    return () => {
+      if (directVoiceCapture?.contextKey === contextKey) directVoiceCapture = null
+    }
   })
   const activeAgentVoiceSessionRuntime = $derived(
     normalizeAgentVoiceProfile(currentAgent?.voice_profile)?.voiceSessionRuntime
@@ -569,7 +427,12 @@
   )
   const currentSession = $derived(sessionStore.getCurrentSession())
   const projects = $derived(projectStore.getProjects())
+  // BL-2372: the current project is the agent's, chosen by `watchAgentProjectSelection`
+  // (ProjectsSidebar) whether or not the sidebar is open; a newer saved default replaces a
+  // sidebar pick. BL-2373: it may be the Default Project, whose folder is the Default Project Path.
   const currentProject = $derived(projectStore.getCurrentProject())
+  // The Default Project Path, held by the project store so the sidebar and chat read one value.
+  const defaultWorkspacePath = $derived(projectStore.getDefaultProjectPath())
   const flatFiles = $derived(projectStore.getFlatFileList())
   const mentionIndexStatus = $derived(projectStore.getMentionIndexStatus())
   const mentionIndexError = $derived(projectStore.getMentionIndexError())
@@ -617,7 +480,7 @@
       const data = await response.json()
       voiceProviderSummaryCache = {
         loadedAt: now,
-        providers: Array.isArray(data?.providers) ? data.providers : []
+        providers: readVoiceProviderEnvelope(data)
       }
     }
     return voiceProviderSummaryCache.providers.find((entry) => entry.id === provider) ?? null
@@ -835,6 +698,7 @@
   }
 
   function endDirectVoiceMode(options: { notify?: boolean; preservePendingCommit?: boolean } = {}) {
+    directVoiceCapture = null
     if (!options.preservePendingCommit) invalidatePendingVoiceQuickActionCommit()
     voiceService.stopAll()
     voiceService.stopListening()
@@ -1006,17 +870,10 @@
     endDirectVoiceMode({ notify: true })
   }
 
-  function normalizeWorkspacePath(value: unknown): string | null {
-    if (typeof value !== 'string') return null
-    const trimmed = value.trim()
-    if (!trimmed || !trimmed.startsWith('/')) return null
-    return trimmed
-  }
-
   async function loadDefaultWorkspacePreference() {
     try {
-      const preferences = await projectService.loadPreferences()
-      defaultWorkspacePath = normalizeWorkspacePath(preferences?.default_workspace_path)
+      // A save in Settings that lands while this read is on its way is newer and is kept.
+      await projectStore.loadDefaultProjectPath(() => projectService.loadPreferences())
     } catch (error) {
       console.error('Failed to load project preferences for chat input:', error)
       toast.error('Default project directory is unavailable. Check Projects settings and try again.')
@@ -1044,12 +901,6 @@
     return projects.find((project) => project.id === defaultProjectId) ?? null
   })
 
-  const baseProjectPath = $derived.by(() => {
-    if (currentProject?.root_path) return currentProject.root_path
-    if (agentDefaultProject?.root_path) return agentDefaultProject.root_path
-    if (currentAgent?.default_project_id?.trim()) return null
-    return defaultWorkspacePath
-  })
   const agentDefaultModelPreset = $derived.by<SavedModel | null>(() => {
     if (!currentAgent) return null
 
@@ -1058,34 +909,7 @@
       return savedModels.find((model) => model.id === presetId) ?? null
     }
 
-    const rawProvider = currentAgent.primary_model_provider?.trim() ?? ''
-    const rawModelId = currentAgent.primary_model_name?.trim() ?? ''
-    if (!rawProvider && !rawModelId) return null
-
-    let developerId = rawProvider
-    let modelId = rawModelId
-    if (rawModelId.includes('/')) {
-      const [parsedDeveloperId, ...rest] = rawModelId.split('/')
-      const parsedModelId = rest.join('/').trim()
-      if (!developerId && parsedDeveloperId.trim()) developerId = parsedDeveloperId.trim()
-      if (parsedModelId) modelId = parsedModelId
-    }
-
-    return (
-      savedModels.find((model) => model.provider === developerId && model.modelId === modelId) ??
-      null
-    )
-  })
-
-  const activeModelProvider = $derived.by(() => {
-    return {
-      provider: currentAgent?.primary_model_provider ?? agentDefaultModelPreset?.provider ?? '',
-      connectionService:
-        currentAgent?.primary_model_connection?.service ??
-        agentDefaultModelPreset?.connection?.service ??
-        '',
-      settings: agentDefaultModelPreset?.settings ?? currentAgent?.provider_specific_settings ?? null
-    }
+    return findChatVoicePresetFallback(savedModels, currentAgent)
   })
 
   const activeModelVoiceSession = $derived(resolveModelVoiceSessionConfig(agentDefaultModelPreset))
@@ -1310,22 +1134,6 @@
     desktopControlsVoiceOwner?.publish(state)
   })
 
-function includesCodexIdentifier(value?: string | null) {
-  if (!value) return false
-  return value.toLowerCase().includes('codex')
-}
-
-function includesClaudeIdentifier(value?: string | null) {
-  if (!value) return false
-  return value.toLowerCase().includes('claude-cli')
-}
-
-function includesCliIdentifier(value?: string | null) {
-  if (!value) return false
-  const normalized = value.toLowerCase()
-  return normalized.includes('codex') || normalized.includes('claude-cli')
-}
-
 function parseBooleanSetting(value: unknown): boolean | null {
   if (typeof value === 'boolean') return value
   if (typeof value === 'string') {
@@ -1387,59 +1195,15 @@ function resolveNativeBashAccessMode(
 }
 
 const primaryAgentType = $derived.by(() => normalizePrimaryAgentType(currentAgent))
-const isManagedAgent = $derived.by(() => isManagedPrimaryAgentType(primaryAgentType))
 
   const groupSelected = $derived.by(() => {
     return Boolean(currentSession?.metadata?.group_chat?.group_id)
   })
 
-  let isCodexModelSelected = $state(false)
-  $effect(() => {
-    isCodexModelSelected =
-      includesCodexIdentifier(activeModelProvider.provider) ||
-      includesCodexIdentifier(activeModelProvider.connectionService)
-  })
-  let isClaudeModelSelected = $state(false)
-  $effect(() => {
-    isClaudeModelSelected =
-      includesClaudeIdentifier(activeModelProvider.provider) ||
-      includesClaudeIdentifier(activeModelProvider.connectionService)
-  })
-let isCodexMode3 = $state(false)
-$effect(() => {
-  isCodexMode3 = Boolean(
-    isCliPrimaryAgentType(primaryAgentType) && (isCodexModelSelected as unknown as boolean)
-  )
-})
-let isClaudeMode3 = $state(false)
-$effect(() => {
-  isClaudeMode3 = Boolean(
-    isCliPrimaryAgentType(primaryAgentType) && (isClaudeModelSelected as unknown as boolean)
-  )
-})
-  const codexConfigScope = $derived.by<CodexConfigScope>(() => 'managed')
-  const claudeConfigScope = $derived.by<ClaudeConfigScope>(() => 'managed')
-  const cliProvider = $derived.by<'codex' | 'claude' | null>(() => {
-    if (isCodexMode3) return 'codex'
-    if (isClaudeMode3) return 'claude'
-    return null
-  })
-  const cliScope = $derived.by<'managed' | 'global' | null>(() => {
-    if (cliProvider === 'codex') return codexConfigScope
-    if (cliProvider === 'claude') return claudeConfigScope
-    return null
-  })
-
-  function resolveCliProjectPath(
-    agent: agentStore.Agent | null | undefined,
-    provider: 'codex' | 'claude' | null,
-    fallbackPath: string | null
-  ) {
-    if (!agent || !provider) return fallbackPath
-    // CLI agents use the active project when selected, then the agent default project,
-    // then the global default workspace.
-    return fallbackPath
-  }
+  // SA-139 R1/R4: a leftover Primary of a retired type (the Claude Code CLI lane, Codex CLI or
+  // n8n) has no live lane. The server refuses its send with a readable 409, so the chat bar shows
+  // it no model control.
+  const isRetiredPrimaryAgent = $derived(isRetiredPrimaryAgentType(primaryAgentType))
 
   function normalizeProjectRules(value: unknown): Record<string, any> | null {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -1448,7 +1212,6 @@ $effect(() => {
 
   const mode123ProjectContext = $derived.by(() => {
     if (currentProject?.root_path) return currentProject
-    if (cliProvider) return null
     if (agentDefaultProject?.root_path) return agentDefaultProject
     return null
   })
@@ -1459,20 +1222,13 @@ $effect(() => {
     return defaultWorkspacePath
   })
 
-  const resolvedProjectPath = $derived.by(() => {
-    if (cliProvider) {
-      return resolveCliProjectPath(currentAgent, cliProvider, baseProjectPath)
-    }
-    return mode123ProjectPath
-  })
-
   const resolvedProjectRules = $derived.by(() => {
     return normalizeProjectRules(mode123ProjectContext?.rules_json)
   })
 
   const activeMentionExclusions = $derived.by(() => {
     if (currentProject?.custom_exclusions?.length) return currentProject.custom_exclusions
-    if (!cliProvider && mode123ProjectContext?.custom_exclusions?.length) {
+    if (mode123ProjectContext?.custom_exclusions?.length) {
       return mode123ProjectContext.custom_exclusions
     }
     return []
@@ -1480,80 +1236,10 @@ $effect(() => {
 
   const uploadProjectRootPath = $derived.by(() => {
     if (currentProject?.root_path) return currentProject.root_path
-    if (!cliProvider && mode123ProjectContext?.root_path) return mode123ProjectContext.root_path
+    if (mode123ProjectContext?.root_path) return mode123ProjectContext.root_path
     return null
   })
 
-  const commandProjectPath = $derived.by(() => resolvedProjectPath)
-  const codexPermissionActive = $derived.by<CodexPermissionMode>(() => {
-    const fromAgentSettings = currentAgent?.codex_settings?.permissionMode
-    if (fromAgentSettings === 'chat' || fromAgentSettings === 'agent' || fromAgentSettings === 'agent_full') {
-      return fromAgentSettings
-    }
-    const fromProviderSettings = resolveCodexPermissionFromSettings(activeModelProvider.settings)
-    if (fromProviderSettings) return fromProviderSettings
-    return resolveAgentCodexPermission(currentAgent)
-  })
-  const activeCodexModeOption = $derived.by<(typeof CODEX_MODE_OPTIONS)[number]>(() => {
-    return CODEX_MODE_OPTIONS.find((option) => option.value === codexPermissionActive) ?? CODEX_MODE_OPTIONS[0]
-  })
-  /**
-   * BL-941: the Sandbox Level that a send from this chat bar runs with. The record is the upper
-   * bound: a send runs with the tighter of its mode's own level and the saved level (Agent
-   * Settings can save a tighter level by hand). The same function decides the run on the server,
-   * so the screen and the run agree. The saved level is read from where the mode above was read.
-   */
-  const codexSendSandbox = $derived.by(() => {
-    const block = currentAgent?.codex_settings
-    const modeFromBlock =
-      block?.permissionMode === 'chat' ||
-      block?.permissionMode === 'agent' ||
-      block?.permissionMode === 'agent_full'
-    const savedSandbox = modeFromBlock
-      ? block?.sandbox
-      : (activeModelProvider.settings as Record<string, unknown> | null)?.codex_sandbox ??
-        currentAgent?.provider_specific_settings?.codex_sandbox
-    return resolveCodexRunAccess({
-      recordMode: codexPermissionActive,
-      recordSandbox: savedSandbox,
-      sentMode: codexPermissionActive
-    }).sandbox
-  })
-  /** The level's words when a send runs with a level other than the mode's own (else null). */
-  const codexSendSandboxLabel = $derived(
-    codexSendSandbox !== CODEX_PERMISSION_PRESETS[codexPermissionActive].sandbox
-      ? CODEX_SANDBOX_LABELS[codexSendSandbox]
-      : null
-  )
-  const claudePermissionActive = $derived.by<ClaudePermissionMode>(() => {
-    const fromAgentSettings = currentAgent?.claude_settings?.permissionMode
-    if (
-      fromAgentSettings === 'default' ||
-      fromAgentSettings === 'acceptEdits' ||
-      fromAgentSettings === 'plan' ||
-      fromAgentSettings === 'bypassPermissions'
-    ) {
-      return fromAgentSettings
-    }
-    if (fromAgentSettings === 'chat') return 'default'
-    if (fromAgentSettings === 'agent') return 'acceptEdits'
-    if (fromAgentSettings === 'agent_full') return 'bypassPermissions'
-    const fromProviderSettings = resolveClaudePermissionFromSettings(activeModelProvider.settings)
-    if (fromProviderSettings) return fromProviderSettings
-    return resolveAgentClaudePermission(currentAgent)
-  })
-  const activeClaudeModeOption = $derived.by<(typeof CLAUDE_MODE_OPTIONS)[number]>(() => {
-    return CLAUDE_MODE_OPTIONS.find((option) => option.value === claudePermissionActive) ?? CLAUDE_MODE_OPTIONS[0]
-  })
-  const claudeThinkingModeActive = $derived.by<ClaudeThinkingMode>(() => {
-    return normalizeClaudeSettings(currentAgent?.claude_settings).alwaysThinkingEnabled === true ? 'on' : 'off'
-  })
-  const activeClaudeThinkingOption = $derived.by<(typeof CLAUDE_THINKING_OPTIONS)[number]>(() => {
-    return (
-      CLAUDE_THINKING_OPTIONS.find((option) => option.value === claudeThinkingModeActive) ??
-      CLAUDE_THINKING_OPTIONS[0]
-    )
-  })
   const bashModeSelectorVisible = $derived.by(() =>
     Boolean(primaryAgentAllowsNativeBash(primaryAgentType) && isNativeBashEnabled(currentAgent))
   )
@@ -1568,7 +1254,6 @@ $effect(() => {
   })
 
   let batshitSlashCommands = $state<SlashCommandRow[]>([])
-  let cliSlashCommands = $state<SlashCommandDescriptor[]>([])
   let slashCommandsLoading = $state(false)
   let slashCommandsReloadQueued = false
   let slashCommandCacheKey = $state<string | null>(null)
@@ -1625,21 +1310,9 @@ $effect(() => {
         }
       })
   })
-  const combinedSlashOptions = $derived.by(() => [...batshitSlashCommandOptions, ...cliSlashCommands])
-  const slashInvocationSourceIndex = $derived.by(() => {
-    const index = new Map<string, Set<SlashCommandDescriptor['source']>>()
-    for (const option of combinedSlashOptions) {
-      const key = normalizeInvocation(option.invocation)
-      if (!key) continue
-      const existing = index.get(key) ?? new Set<SlashCommandDescriptor['source']>()
-      existing.add(option.source)
-      index.set(key, existing)
-    }
-    return index
-  })
   const slashOptions = $derived.by(() => {
     if (!slashOpen) return []
-    return filterSlashOptions(slashQuery, combinedSlashOptions).slice(0, 8)
+    return filterSlashOptions(slashQuery, batshitSlashCommandOptions).slice(0, 8)
   })
   
   function formatMentionsForSend(text: string, _mentions: MentionMatch[]) {
@@ -1723,7 +1396,7 @@ $effect(() => {
   }
 
   function hasSlashToken(text: string): boolean {
-    return /(^|\s)\/[\w:-]+/.test(text)
+    return /(^|\s)\/[\w.:-]+/.test(text)
   }
 
   function hasSkillNoteToken(text: string): boolean {
@@ -1752,24 +1425,35 @@ $effect(() => {
     return matches
   }
 
-  async function ensureSessionForSlashInvocation() {
+  async function ensureSessionForSlashInvocation(onCreated?: (identity: { sessionId: string; agentId: string }) => boolean) {
     const activeSessionId = resolveSessionId(sessionStore.getCurrentSessionId()) ?? resolveSessionId(sessionId)
-    if (activeSessionId) return activeSessionId
+    if (activeSessionId) return onCreated ? null : activeSessionId
 
     if (creatingSlashSession) {
-      return resolveSessionId(sessionStore.getCurrentSessionId())
+      return onCreated ? null : resolveSessionId(sessionStore.getCurrentSessionId())
     }
 
     const userId = resolveSessionId(data?.user?.id)
     if (!userId) return null
 
+    const creatingAgentId = currentAgent?.id ?? null
+    if (onCreated && !creatingAgentId) return null
     creatingSlashSession = true
     try {
       if (foldersStore.folders.length === 0) {
         await foldersStore.loadFolders()
       }
       const folderId = foldersStore.defaultFolder?.id
-      const created = await sessionService.createSession(userId, folderId)
+      let adopted = true
+      const created = await sessionService.createSession(userId, folderId, onCreated ? creatingAgentId : undefined, {
+        beforeSelect: row => {
+          if (!onCreated) return
+          adopted = sessionStore.getCurrentSessionId() === null && currentAgent?.id === creatingAgentId &&
+            onCreated({ sessionId: row.id, agentId: creatingAgentId! })
+          return adopted
+        }
+      })
+      if (!adopted) return null
       return resolveSessionId(created?.id) ?? resolveSessionId(sessionStore.getCurrentSessionId())
     } catch (error) {
       console.error('Failed to create session before slash invocation:', error)
@@ -1853,28 +1537,16 @@ $effect(() => {
     return `chat-mode-menu-item ${isActive ? 'is-active' : 'is-muted'}`
   }
 
-  function isSlashInvocationCollision(option: SlashCommandDescriptor) {
-    const key = normalizeInvocation(option.invocation)
-    if (!key) return false
-    const sources = slashInvocationSourceIndex.get(key)
-    if (!sources || sources.size < 2) return false
-    return sources.has('batshit') && (sources.has('claude') || sources.has('codex'))
-  }
-
   const slashCommandContextKey = $derived.by(() => {
     const agentId = currentAgent?.id
     if (!agentId) return null
-    const provider = cliProvider ?? 'none'
-    const scope = cliScope ?? 'none'
-    const projectPath = commandProjectPath ?? ''
-    return `${agentId}|${provider}|${scope}|${projectPath}`
+    return `${agentId}|${mode123ProjectPath ?? ''}`
   })
 
   $effect(() => {
     const key = slashCommandContextKey
     if (!key) {
       batshitSlashCommands = []
-      cliSlashCommands = []
       slashCommandCacheKey = null
       return
     }
@@ -1894,20 +1566,6 @@ $effect(() => {
       const batshitResponse = await fetch('/api/slash-commands')
       const batshitData = await batshitResponse.json()
       batshitSlashCommands = Array.isArray(batshitData.slashCommands) ? batshitData.slashCommands : []
-
-      if (cliProvider) {
-        const params = new URLSearchParams()
-        params.set('provider', cliProvider)
-        params.set('scope', cliScope ?? 'managed')
-        if (currentAgent?.id) params.set('agentId', currentAgent.id)
-        if (commandProjectPath) params.set('projectPath', commandProjectPath)
-
-        const cliResponse = await fetch(`/api/slash-commands/cli?${params.toString()}`)
-        const cliData = await cliResponse.json()
-        cliSlashCommands = Array.isArray(cliData.commands) ? cliData.commands : []
-      } else {
-        cliSlashCommands = []
-      }
     } catch (error) {
       console.error('Failed to load slash commands', error)
     } finally {
@@ -1920,7 +1578,7 @@ $effect(() => {
   }
 
   function resetComposer() {
-    message = ''
+    setComposerMessage('')
     composerHasSttTranscript = false
     slashOpen = false
     slashQuery = ''
@@ -1938,7 +1596,7 @@ $effect(() => {
 
   function getActiveSlashCommand(text: string, caretIndex: number) {
     const beforeCaret = text.slice(0, caretIndex)
-    const match = beforeCaret.match(/(^|\s)\/([\w:-]*)$/)
+    const match = beforeCaret.match(/(^|\s)\/([\w.:-]*)$/)
     if (!match || match.index === undefined) return null
     const query = match[2] ?? ''
     const start = match.index + match[1].length
@@ -1979,7 +1637,7 @@ $effect(() => {
   function handleSlashSelect(command: SlashCommandDescriptor) {
     if (slashStart === null || !textarea) return
     const afterStart = message.slice(slashStart + 1)
-    const match = afterStart.match(/^[\w:-]*/)
+    const match = afterStart.match(/^[\w.:-]*/)
     const slashEnd = slashStart + 1 + (match ? match[0].length : 0)
     const before = message.slice(0, slashStart)
     const after = message.slice(slashEnd)
@@ -1989,7 +1647,7 @@ $effect(() => {
         ? `${buildSkillInlineNote(batshitCommand.name || batshitCommand.id || batshitCommand.displayName || 'skill')} `
         : `${command.invocation} `
 
-    message = `${before}${insertion}${after}`
+    setComposerMessage(`${before}${insertion}${after}`)
     slashOpen = false
     slashQuery = ''
     slashStart = null
@@ -2025,7 +1683,7 @@ $effect(() => {
     const mapAllAgents = buildBatshitSlashCommandMap({ ignoreAgentEnablement: true })
     const inlineSkillMatches = getInlineSkillTokenMatches(text)
 
-    if (map.size === 0 && cliSlashCommands.length === 0 && inlineSkillMatches.length === 0) {
+    if (map.size === 0 && inlineSkillMatches.length === 0) {
       return {
         text,
         blocked: false,
@@ -2033,7 +1691,7 @@ $effect(() => {
       }
     }
 
-    const initialSlashRegex = /(^|\s)(\/[\w:-]+)/g
+    const initialSlashRegex = /(^|\s)(\/[\w.:-]+)/g
     const initialSlashMatches = Array.from(text.matchAll(initialSlashRegex))
     if (initialSlashMatches.length === 0 && inlineSkillMatches.length === 0) {
       return {
@@ -2042,10 +1700,6 @@ $effect(() => {
         expandedPrompts: []
       }
     }
-
-    const cliInvocationSet = new Set(
-      cliSlashCommands.map((command) => normalizeInvocation(command.invocation))
-    )
 
     const slashSkillInvocationCount = initialSlashMatches.reduce((count, match) => {
       const token = match?.[2] ?? ''
@@ -2136,7 +1790,7 @@ $effect(() => {
       }
     }
 
-    const slashRegex = /(^|\s)(\/[\w:-]+)/g
+    const slashRegex = /(^|\s)(\/[\w.:-]+)/g
     const matches = Array.from(result.matchAll(slashRegex))
     for (let i = matches.length - 1; i >= 0; i -= 1) {
       const match = matches[i]
@@ -2197,24 +1851,6 @@ $effect(() => {
           expandedPrompts: []
         }
       }
-
-      if (cliInvocationSet.has(token) && !cliProvider) {
-        toast.error('CLI slash commands are only available for CLI agents')
-        return {
-          text,
-          blocked: true,
-          expandedPrompts: []
-        }
-      }
-
-      if (!cliProvider && token.includes(':')) {
-        toast.error('CLI slash commands are only available for CLI agents')
-        return {
-          text,
-          blocked: true,
-          expandedPrompts: []
-        }
-      }
     }
 
     return {
@@ -2241,7 +1877,9 @@ $effect(() => {
       onNoReplyCompleted?: () => void
       /** The page chooses the local completion owner; never message/provider metadata. */
       onReplyAdmitted?: (kind: 'direct' | 'steer' | 'queued') => void
-    onSteerPrepared?: (identity: { steerId: string; sessionId: string; targetMessageId?: string }) => void
+      onSteerPrepared?: (identity: { steerId: string; sessionId: string; targetMessageId?: string }) => void
+      /** Exact page-created session, before its selection is published. Local only. */
+      onComposerSessionCreated?: (identity: { sessionId: string; agentId: string }) => boolean
     }
   ): Promise<boolean> {
     if (!rawText.trim() || disabled) return false
@@ -2322,7 +1960,7 @@ $effect(() => {
       : resolveSessionId(sessionId) ?? resolveSessionId(sessionStore.getCurrentSessionId())
 
     if ((hasSlashToken(finalMessage) || hasSkillNoteToken(finalMessage)) && !slashInvocationSessionId) {
-      slashInvocationSessionId = await ensureSessionForSlashInvocation()
+      slashInvocationSessionId = await ensureSessionForSlashInvocation(overrides?.onComposerSessionCreated)
       if (!slashInvocationSessionId) {
         return false
       }
@@ -2339,7 +1977,7 @@ $effect(() => {
     }
     const fileReferences = mapMentionsToFileReferences(currentMentions)
 
-    // Send with appropriate metadata for voice mode + Codex permission
+    // Send with appropriate metadata for voice mode
     const shouldSpeak = overrides?.tts ?? voiceMode
     const messageIncludesStt = overrides?.stt ?? composerHasSttTranscript
     const sentClipIds = clippedItems
@@ -2353,6 +1991,7 @@ $effect(() => {
     const handleAccepted = async (waitForServer = false) => {
       if (acceptedHandled) return
       acceptedHandled = true
+      resetAcceptedComposer()
 
       // DL-119-04: the text-only reset. `resetComposer` has only ever cleared the TEXT —
       // the clips are cleared here, by telling the clips manager the message was accepted —
@@ -2364,17 +2003,11 @@ $effect(() => {
         })
       }
 
-      resetAcceptedComposer()
     }
 
     const composerSessionId = hasCapturedComposerSession
       ? resolveSessionId(overrides?.composerSessionId) ?? slashInvocationSessionId
       : resolveSessionId(sessionId) ?? resolveSessionId(sessionStore.getCurrentSessionId())
-    // BL-941: a mode pick that has not landed yet goes first, so the mode read below is saved.
-    // The chat is taken above, so a chat opened during the wait does not get this message.
-    if (!(await modeSaves.settled(MODE_SAVE_WAIT_MS))) {
-      toast.warning('Your mode change is still saving, so this message may run with the mode the agent has saved.')
-    }
     const metadata: Record<string, any> = {
       stt: Boolean(messageIncludesStt),
       tts: Boolean(shouldSpeak),
@@ -2402,14 +2035,8 @@ $effect(() => {
       // SA-114 P3 (DL-114-01): present only when Cmd/Ctrl+Enter asked for the other mode.
       busySendModeOverride: overrides?.busySendModeOverride
     }
-    if (isCodexMode3) {
-      metadata.codexPermissionMode = codexPermissionActive
-    }
-    if (isClaudeMode3) {
-      metadata.claudePermissionMode = claudePermissionActive
-    }
-    if (resolvedProjectPath) {
-      metadata.projectPath = resolvedProjectPath
+    if (mode123ProjectPath) {
+      metadata.projectPath = mode123ProjectPath
     }
     if (resolvedProjectRules) {
       metadata.projectRules = resolvedProjectRules
@@ -2418,7 +2045,8 @@ $effect(() => {
     const sendAccepted = await Promise.resolve(onSend(finalMessage, metadata, {
       onNoReplyCompleted: overrides?.onNoReplyCompleted,
       onReplyAdmitted: overrides?.onReplyAdmitted,
-      onSteerPrepared: overrides?.onSteerPrepared
+      onSteerPrepared: overrides?.onSteerPrepared,
+      onComposerSessionCreated: overrides?.onComposerSessionCreated
     }))
     if (sendAccepted === false) {
       return false
@@ -2525,7 +2153,7 @@ $effect(() => {
     const after = message.slice(mentionEnd)
     const spacerAfter = /^\s/.test(after) ? '' : ' '
     const updated = `${before}@${entry.path}${spacerAfter}${after}`
-    message = updated
+    setComposerMessage(updated)
     mentionOpen = false
     mentionQuery = ''
     mentionStart = null
@@ -2543,7 +2171,7 @@ $effect(() => {
   function insertMentionAtCaret(path: string) {
     if (!textarea) {
       const spacerBefore = message.endsWith(' ') || message.length === 0 ? '' : ' '
-      message = `${message}${spacerBefore}@${path} `
+      setComposerMessage(`${message}${spacerBefore}@${path} `)
       mentionOpen = false
       mentionQuery = ''
       mentionStart = null
@@ -2555,7 +2183,7 @@ $effect(() => {
     const after = message.slice(caretIndex)
     const spacerBefore = before && !before.endsWith(' ') ? ' ' : ''
     const spacerAfter = /^\s/.test(after) ? '' : ' '
-    message = `${before}${spacerBefore}@${path}${spacerAfter}${after}`
+    setComposerMessage(`${before}${spacerBefore}@${path}${spacerAfter}${after}`)
     mentionOpen = false
     mentionQuery = ''
     mentionStart = null
@@ -2652,7 +2280,7 @@ $effect(() => {
     const end = textarea.selectionEnd ?? message.length
     const before = message.slice(0, start)
     const after = message.slice(end)
-    message = `${before}${normalized}${after}`
+    setComposerMessage(`${before}${normalized}${after}`)
 
     requestAnimationFrame(() => {
       if (!textarea) return
@@ -2665,6 +2293,7 @@ $effect(() => {
   }
 
   function handleInput() {
+    composerDraftRevision += 1
     if (!message.trim()) {
       composerHasSttTranscript = false
     }
@@ -2802,7 +2431,7 @@ $effect(() => {
     }
     const handleProjectPreferencesUpdated = (event: Event) => {
       const detail = (event as CustomEvent<{ defaultWorkspacePath?: string | null }>).detail
-      defaultWorkspacePath = normalizeWorkspacePath(detail?.defaultWorkspacePath ?? null)
+      projectStore.setDefaultProjectPath(detail?.defaultWorkspacePath ?? null)
     }
     const handlePrefillChatInput = (event: Event) => {
       const detail = (event as CustomEvent<{ text?: string; mode?: 'replace' | 'append' }>).detail
@@ -2812,9 +2441,9 @@ $effect(() => {
 
       const mode = detail?.mode === 'append' ? 'append' : 'replace'
       if (mode === 'append' && message.trim().length > 0) {
-        message = `${message.trimEnd()}\n\n${normalized}`
+        setComposerMessage(`${message.trimEnd()}\n\n${normalized}`)
       } else {
-        message = normalized
+        setComposerMessage(normalized)
       }
 
       requestAnimationFrame(() => {
@@ -2892,273 +2521,22 @@ $effect(() => {
   //   fileInput?.click()
   // }
   
-  function normalizeCodexSettings(settings?: CodexAgentSettings | null): CodexAgentSettings {
-    const defaults: CodexAgentSettings = {
-      permissionMode: 'chat',
-      includeProjectInstructions: true,
-      model: CODEX_SUBMODEL_CHOICES[0]?.value ?? 'gpt-6-astra',
-      sandbox: 'read-only',
-      approval: 'never',
-      streamingEffect: true,
-      search: true,
-      addDirs: [],
-      enableFeatures: [],
-      disableFeatures: [],
-      configOverrides: [],
-      workingDirectoryMode: 'project',
-      customWorkingDirectory: '',
-      configScope: 'managed',
-      unifiedExec: true,
-      historyPersistence: 'none'
-    }
-
-    if (!settings) return defaults
-
-    return {
-      ...defaults,
-      ...settings,
-      approval:
-        settings.approval === 'on-request' ||
-        (settings.approval as string) === 'on-failure' ||
-        (settings.approval as string) === 'untrusted'
-          ? 'on-request'
-          : 'never',
-      includeProjectInstructions:
-        typeof settings.includeProjectInstructions === 'boolean'
-          ? settings.includeProjectInstructions
-          : (settings as any).includeCoreSystemPrompt === true,
-      addDirs: settings.addDirs ?? defaults.addDirs,
-      enableFeatures: settings.enableFeatures ?? defaults.enableFeatures,
-      disableFeatures: settings.disableFeatures ?? defaults.disableFeatures,
-      configOverrides: settings.configOverrides ?? defaults.configOverrides,
-      historyPersistence: settings.historyPersistence ?? defaults.historyPersistence,
-      streamingEffect: true,
-      workingDirectoryMode: 'project',
-      customWorkingDirectory: '',
-      configScope: 'managed',
-      unifiedExec: true
-    }
-  }
-
-  function normalizeClaudeSettings(settings?: ClaudeAgentSettings | null): ClaudeAgentSettings {
-    const defaults: ClaudeAgentSettings = {
-      permissionMode: 'default',
-      includeCoreSystemPrompt: false,
-      includeProjectInstructions: true,
-      model: '',
-      alwaysThinkingEnabled: false,
-      maxThinkingTokens: undefined,
-      configScope: 'managed',
-      systemPromptMode: 'replace',
-      systemPrompt: MODE4_PRELAUNCH_REPLACEMENT_PROMPT,
-      systemPromptFile: undefined,
-      chrome: false,
-      addDirs: [],
-      allowedTools: [],
-      disallowedTools: [],
-      configOverrides: [],
-      workingDirectoryMode: 'project',
-      customWorkingDirectory: ''
-    }
-
-    if (!settings) return defaults
-
-    const rawPermission = (settings as any).permissionMode
-    const permissionMode =
-      rawPermission === 'default' ||
-      rawPermission === 'acceptEdits' ||
-      rawPermission === 'plan' ||
-      rawPermission === 'bypassPermissions'
-        ? rawPermission
-        : rawPermission === 'chat'
-          ? 'default'
-          : rawPermission === 'agent'
-            ? 'acceptEdits'
-            : rawPermission === 'agent_full'
-              ? 'bypassPermissions'
-              : defaults.permissionMode
-
-    const alwaysThinkingEnabled =
-      typeof (settings as any).alwaysThinkingEnabled === 'boolean'
-        ? (settings as any).alwaysThinkingEnabled
-        : defaults.alwaysThinkingEnabled
-    const maxThinkingTokens =
-      alwaysThinkingEnabled === true
-        ? typeof (settings as any).maxThinkingTokens === 'number' && (settings as any).maxThinkingTokens > 0
-          ? (settings as any).maxThinkingTokens
-          : CLAUDE_DEFAULT_MAX_THINKING_TOKENS
-        : undefined
-
-    return {
-      ...defaults,
-      ...settings,
-      permissionMode,
-      includeCoreSystemPrompt: settings.includeCoreSystemPrompt === true,
-      includeProjectInstructions:
-        typeof settings.includeProjectInstructions === 'boolean'
-          ? settings.includeProjectInstructions
-          : defaults.includeProjectInstructions,
-      model: typeof settings.model === 'string' ? settings.model : defaults.model,
-      alwaysThinkingEnabled,
-      maxThinkingTokens,
-      configScope: 'managed',
-      systemPromptMode: settings.includeCoreSystemPrompt === true ? 'default' : 'replace',
-      systemPrompt:
-        settings.includeCoreSystemPrompt === true
-          ? undefined
-          : MODE4_PRELAUNCH_REPLACEMENT_PROMPT,
-      systemPromptFile: undefined,
-      workingDirectoryMode: 'project',
-      customWorkingDirectory: '',
-      addDirs: settings.addDirs ?? defaults.addDirs,
-      allowedTools: settings.allowedTools ?? defaults.allowedTools,
-      disallowedTools: settings.disallowedTools ?? defaults.disallowedTools,
-      configOverrides: settings.configOverrides ?? defaults.configOverrides
-    }
-  }
-
-  /**
-   * BL-941: the chat bar's own mode saves that have not landed yet. The page's copy of the agent
-   * takes a pick at once, and the server runs a send with the SAVED record as its upper bound, so
-   * a send made before a looser pick landed would run with the older record. A send waits for
-   * these first (`sendMessageWithText`) and then reads the mode, so it carries what was saved (a
-   * failed save puts the older mode back on the copy, and the send carries that). A save that
-   * never answers holds a send for `MODE_SAVE_WAIT_MS` at most, with a notice; the server still
-   * runs it with no more than the saved record allows.
-   */
-  const modeSaves = createPendingSaves()
-  const MODE_SAVE_WAIT_MS = 10_000
-  function trackModeSave<T>(save: Promise<T>): Promise<T> {
-    return modeSaves.track(save)
-  }
-
-  /**
-   * BL-941: the Codex menu names the saved Sandbox Level from the page's copy of the agent, and
-   * another window may have saved since (no event updates this copy). So opening the menu reads
-   * the record again and takes its Codex settings; a read that a mode pick overtook (or that ends
-   * while a pick is saving) changes nothing.
-   */
-  async function refreshCodexSettingsForMenu() {
-    const agentId = currentAgent?.id
-    if (!agentId || modeSaves.size > 0) return
-    const generation = modeSaves.generation
-    try {
-      const response = await fetch(`/api/agents/${agentId}`)
-      if (!response.ok) return
-      const fresh = (await response.json()) as agentStore.Agent
-      if (modeSaves.generation !== generation || modeSaves.size > 0) return
-      const copy = agentStore.getAgentById(agentId)
-      if (!copy) return
-      const freshProvider = (fresh.provider_specific_settings ?? {}) as Record<string, unknown>
-      const providerCodexKeys = Object.fromEntries(
-        ['codex_permission_mode', 'codex_sandbox', 'codex_approval']
-          .filter((key) => key in freshProvider)
-          .map((key) => [key, freshProvider[key]])
-      )
-      agentStore.updateAgent(agentId, {
-        codex_settings: fresh.codex_settings,
-        provider_specific_settings: { ...(copy.provider_specific_settings ?? {}), ...providerCodexKeys }
-      })
-    } catch (error) {
-      console.warn('[ChatInput] Could not read the agent again for the Codex menu', error)
-    }
-  }
-
-  async function handleCodexModeSelect(mode: CodexPermissionMode) {
-    if (!currentAgent) return
-    const preset: { sandbox: CodexSandbox; approval: CodexApproval } =
-      mode === 'agent_full'
-        ? { sandbox: 'danger-full-access', approval: 'never' }
-        : mode === 'agent'
-          ? { sandbox: 'workspace-write', approval: 'on-request' }
-          : { sandbox: 'read-only', approval: 'never' }
-    try {
-      const viewedCodex = normalizeCodexSettings(currentAgent.codex_settings)
-      const nextCodex: CodexAgentSettings = {
-        ...viewedCodex,
-        permissionMode: mode,
-        sandbox: preset.sandbox,
-        approval: preset.approval
-      }
-      // BL-833, BL-848: only its own keys. A Codex mode is one choice of three keys (the mode, its
-      // sandbox and its approval): all three always go out, so the record never holds a mix of this
-      // pick and another window's mode. The server writes the Codex settings key by key, so every
-      // other key stays, the model keys included.
-      await trackModeSave(
-        agentStore.updateAgentSettings(currentAgent.id, {
-          ...chatBarBlockSave('codex_settings', currentAgent.codex_settings, viewedCodex, nextCodex, {
-            group: CODEX_PERMISSION_GROUP
-          }),
-          provider_specific_settings: { codex_permission_mode: mode }
-        })
-      )
-    } catch (error) {
-      console.error('Failed to update Codex mode', error)
-      toast.error('Could not save Codex mode')
-    }
-  }
-
-  async function handleClaudeModeSelect(mode: ClaudePermissionMode) {
-    if (!currentAgent) return
-    try {
-      const viewedClaude = normalizeClaudeSettings(currentAgent.claude_settings)
-      const nextClaude: ClaudeAgentSettings = { ...viewedClaude, permissionMode: mode }
-      // BL-833, BL-848: only its own key, always sent (a pick the copy already shows must still
-      // write it: the record may hold another mode); the server writes the Claude settings key by
-      // key, so every other key stays, the model keys included.
-      await trackModeSave(
-        agentStore.updateAgentSettings(currentAgent.id, {
-          ...chatBarBlockSave('claude_settings', currentAgent.claude_settings, viewedClaude, nextClaude, {
-            group: ['permissionMode']
-          }),
-          provider_specific_settings: { claude_permission_mode: mode }
-        })
-      )
-    } catch (error) {
-      console.error('Failed to update Claude mode', error)
-      toast.error('Could not save Claude mode')
-    }
-  }
-
-  async function handleClaudeThinkingModeSelect(mode: ClaudeThinkingMode) {
-    if (!currentAgent) return
-    try {
-      const currentClaude = normalizeClaudeSettings(currentAgent.claude_settings)
-      const enableThinking = mode === 'on'
-      // On keeps the copy's own budget (or none), so the budget never differs from the copy and
-      // never goes out: it is not the chat bar's choice (only Agent Settings sets it), and a budget
-      // saved in another window stays. With thinking on and no budget saved, the server runs 1024
-      // (`claudeSettings.ts`), as the display does. Off removes the budget.
-      const nextClaude: ClaudeAgentSettings = {
-        ...currentClaude,
-        alwaysThinkingEnabled: enableThinking,
-        maxThinkingTokens: enableThinking ? currentClaude.maxThinkingTokens : undefined
-      }
-
-      // BL-848: the switch always goes out, even where the copy already shows it. Off is one choice
-      // of two keys: the budget always goes with it, as null (Off removes the budget). On sends the
-      // switch alone.
-      await agentStore.updateAgentSettings(
-        currentAgent.id,
-        chatBarBlockSave('claude_settings', currentAgent.claude_settings, currentClaude, nextClaude, {
-          group: enableThinking ? ['alwaysThinkingEnabled'] : CLAUDE_THINKING_GROUP
-        })
-      )
-    } catch (error) {
-      console.error('Failed to update Claude thinking mode', error)
-      toast.error('Could not save Claude thinking mode')
-    }
-  }
-
   async function handleNativeBashModeSelect(mode: NativeBashAccessMode) {
     if (!currentAgent) return
+    // BL-833, BL-841: only the nativeTools fields this control changes (the mode, the command
+    // location it moves, the retired legacy alias); the server writes nativeTools field by
+    // field, so a never-allow list or web search choice saved elsewhere since stays.
+    const change = chatBarWorkModeSave(currentAgent.provider_specific_settings, mode)
+    // BL-2048: whether Refreshed File Reads can run reads the agent's Bash mode and command
+    // location, so a landed save that moves either asks every open chat's badge facts again
+    // (this save's own result, not the store's copy, which a later pick may already hold).
+    const movesRefreshInputs = refreshedFileReadsRecordInputs(currentAgent) !== refreshedFileReadsRecordInputs({
+      agentType: currentAgent.agentType,
+      provider_specific_settings: applyAgentProviderSettingsUpdate(currentAgent.provider_specific_settings, change)
+    })
     try {
-      // BL-833, BL-841: only the nativeTools fields this control changes (the mode, the command
-      // location it moves, the retired legacy alias); the server writes nativeTools field by
-      // field, so a never-allow list or web search choice saved elsewhere since stays.
-      await agentStore.updateAgentSettings(currentAgent.id, {
-        provider_specific_settings: chatBarWorkModeSave(currentAgent.provider_specific_settings, mode)
-      })
+      await agentStore.updateAgentSettings(currentAgent.id, { provider_specific_settings: change })
+      if (movesRefreshInputs) void refreshAllDeadCopies()
     } catch (error) {
       console.error('Failed to update bash mode', error)
       toast.error('Could not save bash mode')
@@ -3371,7 +2749,7 @@ $effect(() => {
       waitingForAI = true
       voiceModeTurnSendPending = false
       voiceModeCommittedTranscript = ''
-      message = finalMessage
+      setComposerMessage(finalMessage)
       void commitVoiceModeTurn(finalMessage)
     }, delayMs)
   }
@@ -3383,6 +2761,9 @@ $effect(() => {
    * check means "no quick action": the turn is sent exactly as it always was.
    */
   async function commitVoiceModeTurn(finalMessage: string) {
+    const draftRevision = composerDraftRevision
+    const capturedVoiceCapture = directVoiceCapture
+    const capturedVoiceActorKey = directVoiceCaptureContextKey
     const pending = voiceQuickActionCommits.begin(currentVoiceQuickActionContext())
     const replyWait = createVoiceQueuedReplyWait({
       coordinator: voiceQuickActionCommits, token: pending, currentContext: currentVoiceQuickActionContext,
@@ -3393,6 +2774,7 @@ $effect(() => {
     // never judged: no Jev call, no wait. Jev sees the words after the wake word.
     const gate = quickActionsEnabled() ? resolveQuickActionWakeGate(finalMessage, quickActionVoiceModeSettings()) : null
     const snapshotStillOwnsComposer = () =>
+      composerDraftRevision === draftRevision &&
       voiceQuickActionCommits.ownsLatestGeneration(pending) &&
       voiceQuickActionSnapshotMatches(
         pending.context,
@@ -3421,8 +2803,22 @@ $effect(() => {
           // A live-transcript lane may already have printed the user's NEXT words while Jev
           // was deciding. Persist first so a storage failure leaves the words recoverable, then
           // clear only the captured generation and snapshot that were actually stored.
-          await onQuickActionMessage(finalMessage, mark)
-          if (snapshotStillOwnsComposer()) message = ''
+          try {
+            await onQuickActionMessage(finalMessage, mark)
+          } catch (error) {
+            const current = currentVoiceQuickActionContext()
+            const ownsVoice = composerDraftRevision === draftRevision &&
+              directVoiceCapture === capturedVoiceCapture &&
+              voiceQuickActionCommits.ownsLatestGeneration(pending) &&
+              pending.context.sessionId === current.sessionId && pending.context.agentId === current.agentId &&
+              pending.context.voiceLifetimeKey === current.voiceLifetimeKey
+            if (ownsVoice) endDirectVoiceMode({ notify: false })
+            toast.error(ownsVoice
+              ? 'The voice action ran, but its words were not confirmed saved. Voice Mode is paused; your composer was not cleared.'
+              : 'The voice action ran, but its words were not confirmed saved. Your composer was not cleared.')
+            throw error
+          }
+          if (snapshotStillOwnsComposer()) setComposerMessage('')
         },
         send: async (mark, beforeSend) => {
           try {
@@ -3437,6 +2833,14 @@ $effect(() => {
                 coordinator: voiceQuickActionCommits, token: pending, currentContext: currentVoiceQuickActionContext,
                 releaseWaiting: () => { waitingForAI = false }
               }),
+              onComposerSessionCreated: ({ sessionId: createdId, agentId }) => {
+                if (agentId !== pending.context.agentId ||
+                  !voiceQuickActionCommits.adoptCreatedSession(pending, currentVoiceQuickActionContext(), createdId)) return false
+                if (directVoiceCapture === capturedVoiceCapture && capturedVoiceCapture?.contextKey === capturedVoiceActorKey) {
+                  capturedVoiceCapture.contextKey = JSON.stringify([createdId, agentId, currentAgent?.created_at ?? null])
+                }
+                return true
+              },
               onReplyAdmitted: replyWait.onReplyAdmitted,
               onSteerPrepared: replyWait.onSteerPrepared
             })
@@ -3536,7 +2940,7 @@ $effect(() => {
           const transcript = cleanTranscript(interim)
           if (transcript) {
             interimTranscript = transcript
-            message = mergeDictationTranscript(transcript)
+            setComposerMessage(mergeDictationTranscript(transcript))
           }
         }
       : undefined
@@ -3546,7 +2950,7 @@ $effect(() => {
       (text) => {
         const transcript = cleanTranscript(text)
         if (transcript) {
-          message = mergeDictationTranscript(transcript)
+          setComposerMessage(mergeDictationTranscript(transcript))
         }
       },
       handleDictationInterim,
@@ -3625,6 +3029,10 @@ $effect(() => {
   }
 
   async function startDirectVoiceModeCapture(options: { announce?: boolean } = {}) {
+    const capture = { contextKey: directVoiceCaptureContextKey }
+    directVoiceCapture = capture
+    const ownsCapture = () => directVoiceCapture === capture && isVoiceMode &&
+      capture.contextKey === directVoiceCaptureContextKey
     try {
       const wasVoiceModeActive = isVoiceMode
       isVoiceMode = true
@@ -3636,7 +3044,9 @@ $effect(() => {
       resetVoiceModeActivityFeedback()
       const realtimeSttConfig = getCurrentAgentSttConfig('realtime')
       const voiceModeSttProvider = getEffectiveVoiceModeSttProvider(realtimeSttConfig)
-      voiceModeInputKind = (await usesContinuousVoiceModeStt(voiceModeSttProvider)) ? 'continuous' : 'recorded'
+      const continuous = await usesContinuousVoiceModeStt(voiceModeSttProvider)
+      if (!ownsCapture()) return
+      voiceModeInputKind = continuous ? 'continuous' : 'recorded'
       if (options.announce !== false && !wasVoiceModeActive) {
         toast.success(
           voiceModeInputKind === 'recorded'
@@ -3650,34 +3060,36 @@ $effect(() => {
       await voiceService.startVoiceMode(
         // Final result callback
         (text) => {
-          if (text.trim() && !waitingForAI) {
+          if (ownsCapture() && text.trim() && !waitingForAI) {
             recordedVoiceModeCaptureFinalizing = false
             resetVoiceModeActivityFeedback()
             voiceModeCommittedTranscript = appendTranscript(voiceModeCommittedTranscript, text)
-            message = voiceModeCommittedTranscript
+            setComposerMessage(voiceModeCommittedTranscript)
             scheduleVoiceModeSend(voiceModeSttProvider)
           }
         },
         // Interim result callback
         (interim) => {
-          if (voiceModeInputKind === 'recorded') {
+          if (!ownsCapture() || voiceModeInputKind === 'recorded') {
             return
           }
 
           if (!waitingForAI) {
             clearVoiceModeSendTimer()
             const interimText = cleanTranscript(interim)
-            message = appendTranscript(voiceModeCommittedTranscript, interimText)
+            setComposerMessage(appendTranscript(voiceModeCommittedTranscript, interimText))
           }
         },
         realtimeSttConfig
       )
 
+      if (!ownsCapture()) return
       if (voiceModeInputKind === 'recorded') {
         isListening = false
         recordedVoiceModeCaptureFinalizing = false
       }
     } catch (error) {
+      if (!ownsCapture()) return
       console.error('Voice mode error:', error)
       const errorMessage =
         error instanceof Error ? error.message : 'Failed to enable voice mode'
@@ -3835,7 +3247,6 @@ $effect(() => {
             options={slashOptions}
             highlightIndex={slashHighlightIndex}
             onSelect={handleSlashSelect}
-            isInvocationCollision={isSlashInvocationCollision}
           />
 
           <ChatMentionAutocomplete
@@ -4017,47 +3428,9 @@ $effect(() => {
       <div class="chat-selector-cluster">
         <AgentSelector {data} />
         {#if !groupSelected}
-          {#if isCodexMode3}
-            <CodexModelSelector />
-            <CodexReasoningEffortSelector />
-          {:else if isClaudeMode3}
-            <ClaudeModelSelector />
-            <DropdownMenu.Root>
-              <DropdownMenu.Trigger
-                class="chat-mode-selector-trigger mode-selector-trigger claude-thinking-selector"
-                aria-label="Claude thinking mode"
-                title="Claude thinking mode"
-                data-ab-control="claude-thinking-mode"
-              >
-                {@const TriggerIcon = activeClaudeThinkingOption.icon}
-                <div class="mode-selector-inner">
-                  <TriggerIcon class="chat-mode-selector-icon" />
-                  <span class="mode-selector-label">{activeClaudeThinkingOption.triggerLabel}</span>
-                </div>
-                <ChevronDown class="chat-mode-selector-chevron" />
-              </DropdownMenu.Trigger>
-              <DropdownMenu.Content align="start" class="chat-mode-menu-content">
-                <DropdownMenu.Label>Claude Thinking</DropdownMenu.Label>
-                <DropdownMenu.RadioGroup value={claudeThinkingModeActive}>
-                  {#each CLAUDE_THINKING_OPTIONS as option}
-                    <DropdownMenu.RadioItem
-                      value={option.value}
-                      onSelect={() => handleClaudeThinkingModeSelect(option.value)}
-                      class={getModeItemClass(option.value === claudeThinkingModeActive)}
-                    >
-                      {@const OptionIcon = option.icon}
-                      <OptionIcon class="chat-mode-menu-icon" />
-                      <div class="chat-mode-menu-copy is-stacked">
-                        <span class="chat-mode-menu-title">{option.menuLabel}</span>
-                        <span class="chat-mode-menu-description">{option.description}</span>
-                      </div>
-                    </DropdownMenu.RadioItem>
-                  {/each}
-                </DropdownMenu.RadioGroup>
-              </DropdownMenu.Content>
-            </DropdownMenu.Root>
-          {:else}
+          {#if !isRetiredPrimaryAgent}
             <ModelSelector {sessionId} {data} />
+            <ModelReasoningControl />
           {/if}
           {#if bashModeSelectorVisible}
             <DropdownMenu.Root>
@@ -4082,83 +3455,6 @@ $effect(() => {
                       value={option.value}
                       onSelect={() => handleNativeBashModeSelect(option.value)}
                       class={getModeItemClass(option.value === nativeBashAccessModeActive)}
-                    >
-                      {@const OptionIcon = option.icon}
-                      <OptionIcon class="chat-mode-menu-icon" />
-                      <div class="chat-mode-menu-copy">
-                        <span class="chat-mode-menu-title">{option.menuLabel.split('(')[0]?.trim() || option.menuLabel}</span>
-                      </div>
-                    </DropdownMenu.RadioItem>
-                  {/each}
-                </DropdownMenu.RadioGroup>
-              </DropdownMenu.Content>
-            </DropdownMenu.Root>
-          {/if}
-          {#if isCodexMode3}
-            <DropdownMenu.Root onOpenChange={(open) => { if (open) void refreshCodexSettingsForMenu() }}>
-              <DropdownMenu.Trigger
-                class="chat-mode-selector-trigger mode-selector-trigger codex-mode-selector"
-                aria-label="Codex permission mode"
-                title="Codex permission mode"
-                data-ab-control="codex-permission-mode"
-                data-sandbox-level={codexSendSandbox}
-              >
-                {@const TriggerIcon = activeCodexModeOption.icon}
-                <div class="mode-selector-inner">
-                  <TriggerIcon class="chat-mode-selector-icon" />
-                  <span class="mode-selector-label">{activeCodexModeOption.triggerLabel}</span>
-                </div>
-                <ChevronDown class="chat-mode-selector-chevron" />
-              </DropdownMenu.Trigger>
-              <DropdownMenu.Content align="start" class="chat-mode-menu-content">
-                <DropdownMenu.Label>Switch Codex Mode</DropdownMenu.Label>
-                <DropdownMenu.RadioGroup value={codexPermissionActive}>
-                  {#each CODEX_MODE_OPTIONS as option}
-                    <DropdownMenu.RadioItem
-                      value={option.value}
-                      onSelect={() => handleCodexModeSelect(option.value)}
-                      class={getModeItemClass(option.value === codexPermissionActive)}
-                    >
-                      {@const OptionIcon = option.icon}
-                      {@const showsSavedLevel = option.value === codexPermissionActive && codexSendSandboxLabel !== null}
-                      <OptionIcon class="chat-mode-menu-icon" />
-                      <!-- BL-941: the chosen mode's line names a saved Sandbox Level that is tighter than the
-                           mode's own (Josh: inside the menu, no more width in the chat bar). -->
-                      <div class="chat-mode-menu-copy" class:is-stacked={showsSavedLevel}>
-                        <span class="chat-mode-menu-title">{option.menuLabel.split('(')[0]?.trim() || option.menuLabel}</span>
-                        {#if showsSavedLevel}
-                          <span class="chat-mode-menu-description" data-testid="codex-mode-sandbox-level">Sandbox Level from Agent Settings: {codexSendSandboxLabel}</span>
-                        {/if}
-                      </div>
-                    </DropdownMenu.RadioItem>
-                  {/each}
-                </DropdownMenu.RadioGroup>
-              </DropdownMenu.Content>
-            </DropdownMenu.Root>
-          {/if}
-          {#if isClaudeMode3}
-            <DropdownMenu.Root>
-              <DropdownMenu.Trigger
-                class="chat-mode-selector-trigger mode-selector-trigger claude-mode-selector"
-                aria-label="Claude permission mode"
-                title="Claude permission mode"
-                data-ab-control="claude-permission-mode"
-              >
-                {@const TriggerIcon = activeClaudeModeOption.icon}
-                <div class="mode-selector-inner">
-                  <TriggerIcon class="chat-mode-selector-icon" />
-                  <span class="mode-selector-label">{activeClaudeModeOption.triggerLabel}</span>
-                </div>
-                <ChevronDown class="chat-mode-selector-chevron" />
-              </DropdownMenu.Trigger>
-              <DropdownMenu.Content align="start" class="chat-mode-menu-content">
-                <DropdownMenu.Label>Switch Claude Mode</DropdownMenu.Label>
-                <DropdownMenu.RadioGroup value={claudePermissionActive}>
-                  {#each CLAUDE_MODE_OPTIONS as option}
-                    <DropdownMenu.RadioItem
-                      value={option.value}
-                      onSelect={() => handleClaudeModeSelect(option.value)}
-                      class={getModeItemClass(option.value === claudePermissionActive)}
                     >
                       {@const OptionIcon = option.icon}
                       <OptionIcon class="chat-mode-menu-icon" />
@@ -5092,8 +4388,7 @@ $effect(() => {
       padding-right: 0.5rem;
     }
 
-    :global(.agent-selector-label),
-    :global(.agent-selector-type-badge) {
+    :global(.agent-selector-label) {
       display: none;
     }
   }
@@ -5110,10 +4405,7 @@ $effect(() => {
 	      display: none;
 	    }
 
-	    :global(.codex-mode-selector),
-	    :global(.codex-reasoning-selector),
-      :global(.claude-thinking-selector),
-	    :global(.claude-mode-selector),
+      :global(.api-reasoning-selector),
       :global(.bash-mode-selector) {
 	      display: none;
 	    }

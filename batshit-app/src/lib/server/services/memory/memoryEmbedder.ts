@@ -18,6 +18,7 @@ import { embedMany } from 'ai'
 import { createOpenAI } from '@ai-sdk/openai'
 import path from 'node:path'
 import { isChatgptPlanConnection } from '$lib/utils/chatgptPlanConnection'
+import { isClaudePlanSelection } from '$lib/utils/claudePlanConnection'
 import { resolveManagedInstallsRoot } from '$lib/server/services/voiceLocalRuntimePaths'
 import type { MemoryEmbeddingConfig } from './memoryTypes'
 
@@ -69,6 +70,15 @@ export const DEFAULT_MEMORY_EMBEDDING_CONFIG: MemoryEmbeddingConfig = {
   modelId: 'builtin:embeddinggemma-300m'
 }
 
+/** A known configuration refusal, distinct from storage and embedding-service failures. */
+export class MemoryEmbeddingConfigError extends Error {
+  readonly status = 400
+  constructor(message: string) {
+    super(message)
+    this.name = 'MemoryEmbeddingConfigError'
+  }
+}
+
 export function canonicalEmbeddingModelId(config: MemoryEmbeddingConfig): string {
   if (config.lane === 'builtin') {
     const spec = requireBuiltinSpec(config.modelId)
@@ -90,7 +100,7 @@ export function requirePresetConfig(
   config: MemoryEmbeddingConfig
 ): NonNullable<MemoryEmbeddingConfig['preset']> {
   if (!config.preset?.presetId || !config.preset.provider || !config.preset.modelName || !config.preset.dims) {
-    throw new Error(
+    throw new MemoryEmbeddingConfigError(
       "Memory embedding lane 'preset' requires preset.presetId, preset.provider, preset.modelName, and preset.dims in batshit:memory_config. Re-save the Memory System configuration."
     )
   }
@@ -101,7 +111,7 @@ function requireBuiltinSpec(modelId: string): BuiltinModelSpec {
   const spec = BUILTIN_EMBEDDING_MODELS.find((candidate) => candidate.id === modelId)
   if (!spec) {
     const known = BUILTIN_EMBEDDING_MODELS.map((candidate) => candidate.id).join(', ')
-    throw new Error(
+    throw new MemoryEmbeddingConfigError(
       `Unknown builtin memory embedding model '${modelId}'. Known builtin models: ${known}.`
     )
   }
@@ -110,7 +120,7 @@ function requireBuiltinSpec(modelId: string): BuiltinModelSpec {
 
 function requireLocalAiConfig(config: MemoryEmbeddingConfig): NonNullable<MemoryEmbeddingConfig['localAi']> {
   if (!config.localAi?.baseUrl || !config.localAi.modelName || !config.localAi.dims) {
-    throw new Error(
+    throw new MemoryEmbeddingConfigError(
       "Memory embedding lane 'local-ai' requires localAi.baseUrl, localAi.modelName, and localAi.dims in batshit:memory_config."
     )
   }
@@ -119,7 +129,7 @@ function requireLocalAiConfig(config: MemoryEmbeddingConfig): NonNullable<Memory
 
 function requireApiConfig(config: MemoryEmbeddingConfig): NonNullable<MemoryEmbeddingConfig['api']> {
   if (!config.api?.provider || !config.api.modelName || !config.api.dims) {
-    throw new Error(
+    throw new MemoryEmbeddingConfigError(
       "Memory embedding lane 'api' requires api.provider, api.modelName, and api.dims in batshit:memory_config."
     )
   }
@@ -176,6 +186,24 @@ interface TransformersModule {
 
 let transformersModulePromise: Promise<TransformersModule> | null = null
 const builtinPipelines = new Map<string, Promise<FeatureExtractionPipeline>>()
+const fulfilledBuiltinPipelines = new Map<string, Promise<FeatureExtractionPipeline>>()
+
+export interface BuiltinMemoryReadinessObservation {
+  readonly state: 'ready' | 'preparing' | 'preparation-required'
+  /** Rechecks the exact observed fulfilled promise, without loading or probing. */
+  isCurrent(): boolean
+}
+
+/** Process-local observation only. Disk presence and the latest preparation job are not readiness. */
+export function observeBuiltinMemoryReadiness(modelId: string): BuiltinMemoryReadinessObservation {
+  const pipeline = builtinPipelines.get(modelId)
+  const ready = !!pipeline && fulfilledBuiltinPipelines.get(modelId) === pipeline
+  return {
+    state: ready ? 'ready' : pipeline ? 'preparing' : 'preparation-required',
+    isCurrent: () => ready && builtinPipelines.get(modelId) === pipeline &&
+      fulfilledBuiltinPipelines.get(modelId) === pipeline
+  }
+}
 
 function resolveBuiltinModelCacheDir(): string {
   return path.join(resolveManagedInstallsRoot(), 'memory-embedder', 'models')
@@ -216,8 +244,13 @@ function getBuiltinPipeline(
     })
   )
   builtinPipelines.set(spec.id, created)
-  created.catch(() => {
-    builtinPipelines.delete(spec.id)
+  void created.then(() => {
+    if (builtinPipelines.get(spec.id) === created) fulfilledBuiltinPipelines.set(spec.id, created)
+  }, () => {
+    if (builtinPipelines.get(spec.id) === created) {
+      builtinPipelines.delete(spec.id)
+      fulfilledBuiltinPipelines.delete(spec.id)
+    }
   })
   return created
 }
@@ -439,10 +472,13 @@ interface SavedPresetRecordLike {
   connection?: { type?: string; id?: string; service?: string }
 }
 
-/** Embeddings have no ChatGPT-plan endpoint; never borrow the paid OpenAI key. */
+/** Embeddings have no ChatGPT-plan or Claude-plan endpoint; never borrow a paid OpenAI or Anthropic key. */
 export function assertPresetEmbeddingConnection(preset: SavedPresetRecordLike) {
   if (preset.connection?.service === 'chatgpt-plan' || isChatgptPlanConnection(preset.connection?.id)) {
-    throw new Error('ChatGPT-plan presets cannot provide memory embeddings. Choose the built-in embedding model or a separate embedding preset with its own connection in Settings → Memory.')
+    throw new MemoryEmbeddingConfigError('ChatGPT-plan presets cannot provide memory embeddings. Choose the built-in embedding model or a separate embedding preset with its own connection in Settings → Memory.')
+  }
+  if (isClaudePlanSelection(preset.connection)) {
+    throw new MemoryEmbeddingConfigError('Claude plan presets cannot provide memory embeddings. Choose the built-in embedding model or a separate embedding preset with its own connection in Settings → Memory.')
   }
 }
 
@@ -467,7 +503,7 @@ export function resolvePresetEmbeddingTarget(input: {
   | { kind: 'google' | 'mistral'; apiKey: string; modelId: string } {
   const { preset, snapshot, presetId } = input
   if (!preset) {
-    throw new Error(
+    throw new MemoryEmbeddingConfigError(
       `The memory embedding model preset '${presetId}' no longer exists. Pick a preset again in Settings → Memory → Memory System (and re-index if the model changed).`
     )
   }
@@ -478,14 +514,14 @@ export function resolvePresetEmbeddingTarget(input: {
     provider !== snapshot.provider.trim().toLowerCase() ||
     modelId !== snapshot.modelName.trim()
   ) {
-    throw new Error(
+    throw new MemoryEmbeddingConfigError(
       `The memory embedding preset '${presetId}' changed since it was saved here (was ${snapshot.provider}/${snapshot.modelName}, now ${provider || '?'}/${modelId || '?'}). ` +
         'Re-save the Memory System configuration and run Re-Index Memories so stored vectors match.'
     )
   }
   const transport = preset.connection?.type
   if (transport === 'openrouter' || transport === 'vercel-gateway') {
-    throw new Error(
+    throw new MemoryEmbeddingConfigError(
       `The preset '${presetId}' routes through ${transport}, which has no embeddings endpoint. Use a preset with a direct provider connection.`
     )
   }
@@ -493,7 +529,7 @@ export function resolvePresetEmbeddingTarget(input: {
   if (MEMORY_LOCAL_RUNTIME_PROVIDERS.has(provider)) {
     const server = input.localAiServers.find((entry) => entry.id === provider)
     if (!server || !server.baseUrl) {
-      throw new Error(
+      throw new MemoryEmbeddingConfigError(
         `The preset '${presetId}' points at the local runtime '${provider}', but that runtime has no base URL configured in Settings → Local AI.`
       )
     }
@@ -509,14 +545,14 @@ export function resolvePresetEmbeddingTarget(input: {
 
   const apiKey = input.apiKeys[provider]
   if (provider === 'openai') {
-    if (!apiKey) throw new Error(missingKeyMessage(provider))
+    if (!apiKey) throw new MemoryEmbeddingConfigError(missingKeyMessage(provider))
     return { kind: 'openai-compatible', apiKey, modelId }
   }
   if (provider === 'google' || provider === 'mistral') {
-    if (!apiKey) throw new Error(missingKeyMessage(provider))
+    if (!apiKey) throw new MemoryEmbeddingConfigError(missingKeyMessage(provider))
     return { kind: provider, apiKey, modelId }
   }
-  throw new Error(
+  throw new MemoryEmbeddingConfigError(
     `Memory embeddings support presets on these providers right now: ${MEMORY_PRESET_CLOUD_EMBEDDING_PROVIDERS.join(', ')} (cloud) and the Local AI runtimes (${[...MEMORY_LOCAL_RUNTIME_PROVIDERS].join(', ')}). ` +
       `The preset '${presetId}' uses '${provider}', which has no embeddings path here yet.`
   )

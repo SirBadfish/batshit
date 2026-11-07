@@ -512,13 +512,13 @@ export class RealtimeSpeechCoordinator {
   }
 
   /**
-   * BL-759: a managed lane took the end of this reply back (Codex lost its connection mid-answer
-   * and started the answer again): `removedText` went, and the reply now reads `content`. What was
-   * handed to the voice is spoken and stays spoken. Of what still waits here, the words taken back
-   * go: when the waiting words end with them, only they go (a finished message's last words before
-   * them are still spoken); when they lie inside them, or the words cannot be told apart (a hidden
-   * control block in them, or no `removedText`), everything waiting goes. Speech goes on with the
-   * words that come next.
+   * BL-759: a managed lane took the end of this reply back (the removed Codex CLI lost its
+   * connection mid-answer and started the answer again): `removedText` went, and the reply now
+   * reads `content`. What was handed to the voice is spoken and stays spoken. Of what still
+   * waits here, the words taken back go: when the waiting words end with them, only they go (a
+   * finished message's last words before them are still spoken); when they lie inside them, or
+   * the words cannot be told apart (a hidden control block in them, or no `removedText`),
+   * everything waiting goes. Speech goes on with the words that come next.
    */
   discardUnspoken(messageId: string, content: string, removedText: string | null = null): void {
     const session = this.sessions.get(messageId)

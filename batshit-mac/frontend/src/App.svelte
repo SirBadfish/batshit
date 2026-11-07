@@ -156,6 +156,8 @@
   });
 </script>
 
+<div class="window-drag-strip" aria-hidden="true"></div>
+
 {#if booting && !error}
   <main class="boot-shell" aria-live="polite">
     <div class="boot-mark">

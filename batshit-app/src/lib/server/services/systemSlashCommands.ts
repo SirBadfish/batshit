@@ -1,8 +1,10 @@
 import { getBatshitHomeDir } from './batshitHome'
 import { readFileSync, existsSync, readdirSync, rmSync } from 'node:fs'
-import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 
+import { APP_ACTIONS_COMMAND_ID, APP_ACTIONS_SKILL_ID, isCanonicalAppActionsCommand, resolveBuiltinSystemSkillDirectory } from './systemPluginPackage'
+import { AgentPluginError, ensureBuiltinAgentPlugin, listAgentPlugins, type AgentPluginRecord } from './agentPlugins'
+import { isExactSavedAccessAgentId } from '$lib/utils/agentAccessIds'
 import { redis } from '$lib/server/redis'
 import { upsertSkill } from '$lib/server/services/skillRegistry'
 import {
@@ -10,6 +12,7 @@ import {
   DEFAULT_CLI_TOOL_ICON_REF
 } from '$lib/icons/iconCatalog'
 import type { SlashCommandRow } from '$lib/types/database'
+import { beginSlashCommandWrite, captureSlashCommandWriteBasis, type SlashCommandWritePreparation, COMMAND_ACCESS_FIELDS, deleteSlashCommandRecord, saveSlashCommandBatch } from './slashCommandRevision'
 
 const ARTIFACT_SKILL_ALLOWED_TOOLS = [
   'native_batshit_tool_search',
@@ -48,6 +51,7 @@ const BATSHIT_GUIDE_ALLOWED_TOOLS = [
   'native_batshit_tool_use',
   'native_skill'
 ]
+const APP_ACTIONS_ALLOWED_TOOLS = ['native_batshit_tool_search', 'native_batshit_tool_use']
 
 const LEGACY_ARTIFACT_SKILL_IDS = [
   'artifacts-general',
@@ -75,6 +79,7 @@ const ARTIFACT_CREATOR_COMMAND_ID = 'artifact-creator'
 const CLI_TOOL_CREATOR_COMMAND_ID = 'cli-tool-creator'
 const GOON_SCENE_CREATOR_COMMAND_ID = 'goon-scene-creator'
 const BATSHIT_GUIDE_COMMAND_ID = 'batshit-guide'
+const GOON_GUIDE_COMMAND_ID = 'goon-guide'
 
 const SYSTEM_SKILL_IDS_BY_COMMAND_ID: Record<string, string> = {
   [SKILL_CREATOR_COMMAND_ID]: 'skill_creator',
@@ -82,7 +87,9 @@ const SYSTEM_SKILL_IDS_BY_COMMAND_ID: Record<string, string> = {
   [ARTIFACT_CREATOR_COMMAND_ID]: 'artifact_creator',
   [CLI_TOOL_CREATOR_COMMAND_ID]: 'cli_tool_creator',
   [GOON_SCENE_CREATOR_COMMAND_ID]: 'goon_scene_creator',
-  [BATSHIT_GUIDE_COMMAND_ID]: 'batshit_guide'
+  [BATSHIT_GUIDE_COMMAND_ID]: 'batshit_guide',
+  [GOON_GUIDE_COMMAND_ID]: 'goon_guide',
+  [APP_ACTIONS_COMMAND_ID]: APP_ACTIONS_SKILL_ID
 }
 
 const LEGACY_VOICE_ENGINE_INSTALLER_IDS = ['speech-setup']
@@ -95,7 +102,9 @@ export const SYSTEM_SLASH_COMMAND_IDS = [
   ARTIFACT_CREATOR_COMMAND_ID,
   CLI_TOOL_CREATOR_COMMAND_ID,
   GOON_SCENE_CREATOR_COMMAND_ID,
-  BATSHIT_GUIDE_COMMAND_ID
+  BATSHIT_GUIDE_COMMAND_ID,
+  GOON_GUIDE_COMMAND_ID,
+  APP_ACTIONS_COMMAND_ID
 ] as const
 
 export function expectedSystemSkillIdForCommand(commandId: string | null | undefined): string | null {
@@ -151,8 +160,9 @@ function pickExistingCommand(...candidates: Array<SlashCommandRow | null | undef
 }
 
 function resolveSystemSkillDir(skillId: string): string {
-  const currentFile = fileURLToPath(import.meta.url)
-  return join(dirname(currentFile), '..', 'system-skills', skillId)
+  const directory = resolveBuiltinSystemSkillDirectory(skillId)
+  if (!directory) throw new Error(`Unknown built-in plugin skill: ${skillId}`)
+  return directory
 }
 
 function directoryHasFiles(dirPath: string): boolean {
@@ -208,11 +218,11 @@ function cleanupLegacyUserSkillDirs(skillIds: string[]): void {
   }
 }
 
-async function cleanupLegacyArtifactSkills(userId: string): Promise<void> {
+async function cleanupLegacyArtifactSkills(userId: string, preparation: SlashCommandWritePreparation): Promise<void> {
   for (const legacyId of LEGACY_ARTIFACT_SKILL_IDS) {
+    await deleteSlashCommandRecord(userId, legacyId, await captureSlashCommandWriteBasis(preparation, [legacyId]))
     try {
       await redis.del(`skill:${userId}:${legacyId}`)
-      await redis.del(`slash_command:${userId}:${legacyId}`)
     } catch {
       // Ignore cleanup errors for keys that don't exist.
     }
@@ -221,11 +231,11 @@ async function cleanupLegacyArtifactSkills(userId: string): Promise<void> {
   cleanupLegacyUserSkillDirs(LEGACY_ARTIFACT_SKILL_IDS)
 }
 
-async function cleanupLegacySpeechSkills(userId: string): Promise<void> {
+async function cleanupLegacySpeechSkills(userId: string, preparation: SlashCommandWritePreparation): Promise<void> {
   for (const legacyId of LEGACY_SPEECH_SKILL_IDS) {
+    await deleteSlashCommandRecord(userId, legacyId, await captureSlashCommandWriteBasis(preparation, [legacyId]))
     try {
       await redis.del(`skill:${userId}:${legacyId}`)
-      await redis.del(`slash_command:${userId}:${legacyId}`)
     } catch {
       // Ignore cleanup errors for keys that don't exist.
     }
@@ -234,11 +244,11 @@ async function cleanupLegacySpeechSkills(userId: string): Promise<void> {
   cleanupLegacyUserSkillDirs(LEGACY_SPEECH_SKILL_IDS)
 }
 
-async function cleanupLegacyCommandCreator(userId: string): Promise<void> {
+async function cleanupLegacyCommandCreator(userId: string, preparation: SlashCommandWritePreparation): Promise<void> {
   for (const legacyId of LEGACY_COMMAND_CREATOR_IDS) {
+    await deleteSlashCommandRecord(userId, legacyId, await captureSlashCommandWriteBasis(preparation, [legacyId]))
     try {
       await redis.del(`skill:${userId}:${legacyId}`)
-      await redis.del(`slash_command:${userId}:${legacyId}`)
     } catch {
       // Ignore cleanup errors for keys that don't exist.
     }
@@ -247,11 +257,11 @@ async function cleanupLegacyCommandCreator(userId: string): Promise<void> {
   cleanupLegacyUserSkillDirs(LEGACY_COMMAND_CREATOR_IDS)
 }
 
-async function cleanupLegacyGoonSceneCreator(userId: string): Promise<void> {
+async function cleanupLegacyGoonSceneCreator(userId: string, preparation: SlashCommandWritePreparation): Promise<void> {
   for (const legacyId of LEGACY_GOON_SCENE_CREATOR_IDS) {
+    await deleteSlashCommandRecord(userId, legacyId, await captureSlashCommandWriteBasis(preparation, [legacyId]))
     try {
       await redis.del(`skill:${userId}:${legacyId}`)
-      await redis.del(`slash_command:${userId}:${legacyId}`)
     } catch {
       // Ignore cleanup errors for keys that don't exist.
     }
@@ -260,11 +270,11 @@ async function cleanupLegacyGoonSceneCreator(userId: string): Promise<void> {
   cleanupLegacyUserSkillDirs(LEGACY_GOON_SCENE_CREATOR_IDS)
 }
 
-async function cleanupRenamedSystemSkillIds(userId: string, legacyIds: string[]): Promise<void> {
+async function cleanupRenamedSystemSkillIds(userId: string, legacyIds: string[], preparation: SlashCommandWritePreparation): Promise<void> {
   for (const legacyId of legacyIds) {
+    await deleteSlashCommandRecord(userId, legacyId, await captureSlashCommandWriteBasis(preparation, [legacyId]))
     try {
       await redis.del(`skill:${userId}:${legacyId}`)
-      await redis.del(`slash_command:${userId}:${legacyId}`)
     } catch {
       // Ignore cleanup errors for keys that don't exist.
     }
@@ -325,7 +335,8 @@ export async function buildSkillCreatorSkillCommand(
     has_scripts: skill.has_scripts ?? false,
     has_references: skill.has_references ?? true,
     has_assets: skill.has_assets ?? false,
-    invocation_pattern: '/skill-creator',
+    plugin_id: 'batshit',
+    invocation_pattern: '/batshit:skill-creator',
     can_be_attached_to_agents: accessState.canBeAttachedToAgents,
     can_be_invoked_in_chat: true,
     category: 'skills',
@@ -395,7 +406,8 @@ export async function buildSpeechSetupSkillCommand(
     has_scripts: skill.has_scripts ?? false,
     has_references: skill.has_references ?? true,
     has_assets: skill.has_assets ?? false,
-    invocation_pattern: '/voice-engine-installer',
+    plugin_id: 'batshit',
+    invocation_pattern: '/batshit:voice-engine-installer',
     can_be_attached_to_agents: accessState.canBeAttachedToAgents,
     can_be_invoked_in_chat: true,
     category: 'voice',
@@ -465,7 +477,8 @@ export async function buildCliToolsSkillCommand(
     has_scripts: skill.has_scripts ?? false,
     has_references: skill.has_references ?? false,
     has_assets: skill.has_assets ?? false,
-    invocation_pattern: '/cli-tool-creator',
+    plugin_id: 'batshit',
+    invocation_pattern: '/batshit:cli-tool-creator',
     can_be_attached_to_agents: accessState.canBeAttachedToAgents,
     can_be_invoked_in_chat: true,
     category: 'tools',
@@ -538,7 +551,8 @@ export async function buildGoonSceneCreatorSkillCommand(
     has_scripts: skill.has_scripts ?? false,
     has_references: skill.has_references ?? true,
     has_assets: skill.has_assets ?? false,
-    invocation_pattern: '/goon-scene-creator',
+    plugin_id: 'batshit',
+    invocation_pattern: '/batshit:goon-scene-creator',
     can_be_attached_to_agents: accessState.canBeAttachedToAgents,
     can_be_invoked_in_chat: true,
     category: 'goons',
@@ -608,7 +622,8 @@ export async function buildBatshitGuideSkillCommand(
     has_scripts: skill.has_scripts ?? false,
     has_references: skill.has_references ?? true,
     has_assets: skill.has_assets ?? false,
-    invocation_pattern: '/batshit-guide',
+    plugin_id: 'batshit',
+    invocation_pattern: '/batshit:batshit-guide',
     can_be_attached_to_agents: accessState.canBeAttachedToAgents,
     can_be_invoked_in_chat: true,
     category: 'help',
@@ -682,7 +697,8 @@ export async function buildUnifiedArtifactSkillCommand(
     has_scripts: skill.has_scripts ?? false,
     has_references: skill.has_references ?? true,
     has_assets: skill.has_assets ?? false,
-    invocation_pattern: '/artifact-creator',
+    plugin_id: 'batshit',
+    invocation_pattern: '/batshit:artifact-creator',
     can_be_attached_to_agents: accessState.canBeAttachedToAgents,
     can_be_invoked_in_chat: true,
     category: 'artifacts',
@@ -700,10 +716,48 @@ export async function buildUnifiedArtifactSkillCommand(
   }
 }
 
-export async function bootstrapSystemSlashCommands(userId: string): Promise<{
+export async function buildGoonGuideSkillCommand(userId: string, now: string): Promise<SlashCommandRow> {
+  const sourceDir = resolveSystemSkillDir('goon-guide')
+  const { markdown, hasReferences, hasAssets } = readSystemSkillContent('goon-guide')
+  const skill = await upsertSkill({ userId, commandId: GOON_GUIDE_COMMAND_ID, nowIso: now,
+    skill: { id: GOON_GUIDE_COMMAND_ID, name: GOON_GUIDE_COMMAND_ID, displayName: 'Goon Guide',
+      description: 'Understand Goon characters, scenes, placement and the current scene context.', markdown,
+      source: 'system', sourceRef: sourceDir, trustLevel: 'trusted', isSystem: true, isActive: true,
+      allowedTools: BATSHIT_GUIDE_ALLOWED_TOOLS, hasReferences, hasAssets } })
+  return { id: GOON_GUIDE_COMMAND_ID, user_id: userId, name: GOON_GUIDE_COMMAND_ID, displayName: 'Goon Guide',
+    description: skill.description, type: 'skill', instructions: 'Load the Goon Guide before explaining Goon features or scene context.',
+    parameters: [], skill_id: skill.id, skill_source: skill.source, skill_source_ref: skill.source_ref,
+    skill_summary: skill.description, skill_allowed_tools: skill.allowed_tools, trust_level: skill.trust_level,
+    has_scripts: false, has_references: hasReferences, has_assets: hasAssets, plugin_id: 'batshit',
+    invocation_pattern: '/batshit:goon-guide', can_be_attached_to_agents: false, can_be_invoked_in_chat: true,
+    enabled_for_all_agents: false, enabled_agent_ids: [], category: 'goons', tags: ['goons', 'help'],
+    usage_count: 0, is_active: true, is_system: true, created_at: now, updated_at: now }
+}
+
+export async function buildAppActionsSkillCommand(userId: string, now: string): Promise<SlashCommandRow> {
+  const sourceDir = resolveSystemSkillDir(APP_ACTIONS_SKILL_ID)
+  const { markdown, hasReferences, hasAssets } = readSystemSkillContent(APP_ACTIONS_SKILL_ID)
+  const description = 'Open Settings, show or hide the Goon, open the Execution Viewer, or read and change supported agent settings for the user.'
+  const skill = await upsertSkill({ userId, commandId: APP_ACTIONS_COMMAND_ID, nowIso: now, builtinAppActionsSeed: true,
+    skill: { id: APP_ACTIONS_SKILL_ID, name: APP_ACTIONS_COMMAND_ID, displayName: 'App Actions', description, markdown,
+      source: 'system', sourceRef: sourceDir, trustLevel: 'trusted', isSystem: true, isActive: true,
+      allowedTools: APP_ACTIONS_ALLOWED_TOOLS, hasReferences, hasAssets } })
+  return { id: APP_ACTIONS_COMMAND_ID, user_id: userId, name: APP_ACTIONS_COMMAND_ID, displayName: 'App Actions',
+    description, type: 'skill', instructions: 'Use App Actions for Batshit views and supported Settings work. Read the matching operating guide before acting.',
+    parameters: [], skill_id: skill.id, skill_source: skill.source, skill_source_ref: skill.source_ref,
+    skill_summary: skill.description, skill_allowed_tools: skill.allowed_tools, trust_level: skill.trust_level,
+    has_scripts: false, has_references: hasReferences, has_assets: hasAssets, plugin_id: 'batshit',
+    invocation_pattern: '/batshit:app-actions', can_be_attached_to_agents: false, can_be_invoked_in_chat: true,
+    enabled_for_all_agents: false, enabled_agent_ids: [], category: 'settings', tags: ['app-actions', 'settings', 'ui'],
+    usage_count: 0, is_active: true, is_system: true, created_at: now, updated_at: now }
+}
+
+export async function bootstrapSystemSlashCommands(userId: string, preparation = beginSlashCommandWrite(userId)): Promise<{
   hadExisting: boolean
   slashCommands: string[]
 }> {
+  // Migrate the user's original effective access before any seed can change a legacy row.
+  await ensureBuiltinAgentPlugin(userId)
   const now = new Date().toISOString()
 
   const skillCreatorId = SKILL_CREATOR_COMMAND_ID
@@ -723,6 +777,7 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
   const legacyCliToolsKey = `slash_command:${userId}:cli-tools`
   const legacyGoonSceneCreatorKey = `slash_command:${userId}:batshit-goon-scene-creator`
 
+  await captureSlashCommandWriteBasis(preparation, [...SYSTEM_SLASH_COMMAND_IDS])
   const [
     existingSkillCreator,
     existingSpeech,
@@ -797,22 +852,25 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
     batshitGuideSeed
   )
 
-  await Promise.all([
-    redis.json.set(skillCreatorKey, '$', skillCreatorCommand),
-    redis.json.set(speechKey, '$', speechCommand),
-    redis.json.set(artifactKey, '$', artifactCommand),
-    redis.json.set(cliToolsKey, '$', cliToolsCommand),
-    redis.json.set(goonSceneCreatorKey, '$', goonSceneCreatorCommand),
-    redis.json.set(batshitGuideKey, '$', batshitGuideCommand)
-  ])
+  const goonGuideCommand = await buildGoonGuideSkillCommand(userId, now)
+  const appActionsCommand = await buildAppActionsSkillCommand(userId, now)
+  const commands = [skillCreatorCommand, speechCommand, artifactCommand, cliToolsCommand,
+    goonSceneCreatorCommand, batshitGuideCommand, goonGuideCommand, appActionsCommand]
+  // Existing command rows retain their historical settings; grouped access is projected at read.
+  // Only absent metadata rows are created. A later request repairs a missing backing skill.
+  for (const command of commands) {
+    if (await redis.json.get(`slash_command:${userId}:${command.id}`) !== null) continue
+    const createBasis = await captureSlashCommandWriteBasis(preparation, [command.id])
+    await saveSlashCommandBatch(userId, [{ record: command, mode: 'create', preserveAccess: COMMAND_ACCESS_FIELDS }], createBasis)
+  }
 
-  await cleanupLegacyArtifactSkills(userId)
-  await cleanupLegacySpeechSkills(userId)
-  await cleanupLegacyCommandCreator(userId)
-  await cleanupLegacyGoonSceneCreator(userId)
-  await cleanupRenamedSystemSkillIds(userId, LEGACY_VOICE_ENGINE_INSTALLER_IDS)
-  await cleanupRenamedSystemSkillIds(userId, LEGACY_ARTIFACT_CREATOR_IDS)
-  await cleanupRenamedSystemSkillIds(userId, LEGACY_CLI_TOOL_CREATOR_IDS)
+  await cleanupLegacyArtifactSkills(userId, preparation)
+  await cleanupLegacySpeechSkills(userId, preparation)
+  await cleanupLegacyCommandCreator(userId, preparation)
+  await cleanupLegacyGoonSceneCreator(userId, preparation)
+  await cleanupRenamedSystemSkillIds(userId, LEGACY_VOICE_ENGINE_INSTALLER_IDS, preparation)
+  await cleanupRenamedSystemSkillIds(userId, LEGACY_ARTIFACT_CREATOR_IDS, preparation)
+  await cleanupRenamedSystemSkillIds(userId, LEGACY_CLI_TOOL_CREATOR_IDS, preparation)
 
   return {
     hadExisting: [
@@ -831,7 +889,31 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
   }
 }
 
-export async function ensureSystemSlashCommands(userId: string): Promise<void> {
+/**
+ * BL-2863 (2026-11-05): one check-and-bootstrap at a time per user in this process. Every
+ * capability read used to call this. On a fresh store,
+ * three sends at once each captured a write basis, the first bootstrap advanced the revision, and the
+ * other two failed `SLASH_COMMAND_CONFLICT` inside `cleanupLegacyArtifactSkills`, so their sends
+ * answered 409 (SA-126 quick check on the bench). A caller that arrives while a run is going joins
+ * that run and gets its outcome, error included; the next caller after it settles starts afresh.
+ * Startup, sign-in and confirmed restore now own required initialization; DCM catalog reads do not.
+ */
+const ensureSystemSlashCommandsRuns = new Map<string, Promise<void>>()
+
+export function ensureSystemSlashCommands(userId: string): Promise<void> {
+  const running = ensureSystemSlashCommandsRuns.get(userId)
+  if (running) return running
+  const run = ensureSystemSlashCommandsOnce(userId).finally(() => {
+    if (ensureSystemSlashCommandsRuns.get(userId) === run) ensureSystemSlashCommandsRuns.delete(userId)
+  })
+  ensureSystemSlashCommandsRuns.set(userId, run)
+  return run
+}
+
+async function ensureSystemSlashCommandsOnce(userId: string): Promise<void> {
+  await ensureBuiltinAgentPlugin(userId)
+  const preparation = beginSlashCommandWrite(userId)
+  await captureSlashCommandWriteBasis(preparation, [...SYSTEM_SLASH_COMMAND_IDS])
   const keys = SYSTEM_SLASH_COMMAND_IDS.map((commandId) => `slash_command:${userId}:${commandId}`)
   const legacyKeys = [
     `slash_command:${userId}:speech-setup`,
@@ -853,7 +935,7 @@ export async function ensureSystemSlashCommands(userId: string): Promise<void> {
     }) && legacyExisting.every((value) => !value)
 
   if (!commandsReady) {
-    await bootstrapSystemSlashCommands(userId)
+    await bootstrapSystemSlashCommands(userId, preparation)
     return
   }
 
@@ -870,5 +952,78 @@ export async function ensureSystemSlashCommands(userId: string): Promise<void> {
     return
   }
 
-  await bootstrapSystemSlashCommands(userId)
+  await bootstrapSystemSlashCommands(userId, preparation)
+}
+
+/** A catalogue read never repairs a missing group/member or borrows legacy access. */
+export function assertBuiltinCommandCatalogue(
+  userId: string,
+  plugins: AgentPluginRecord[],
+  commandRecords: ReadonlyMap<string, unknown>
+): void {
+  const appActionsKey = `slash_command:${userId}:${APP_ACTIONS_COMMAND_ID}`
+  const commands = [...commandRecords.values()]
+  // A known row is present even when its saved identity is malformed. Never
+  // turn that collision into the accepted absent-eighth catalogue.
+  const invalidAppActions = (commandRecords.has(appActionsKey) &&
+    !isCanonicalAppActionsCommand(commandRecords.get(appActionsKey), userId)) ||
+    [...commandRecords].some(([key, value]) => {
+      if (!value || typeof value !== 'object') return false
+      const row = value as SlashCommandRow
+      return (row.id === APP_ACTIONS_COMMAND_ID || row.skill_id === APP_ACTIONS_SKILL_ID) &&
+        (key !== appActionsKey || !isCanonicalAppActionsCommand(row, userId))
+    })
+  const plugin = plugins.find(row => row.id === 'batshit' && row.builtIn && row.user_id === userId)
+  if (invalidAppActions || !plugin || plugin.skills.some(member => {
+    // Read-only discovery preserves the accepted seven-skill catalogue. The eighth
+    // App Actions entry appears only from its positively owned command, never a phantom.
+    if (member.commandId === APP_ACTIONS_COMMAND_ID) return false
+    const command = commands.find(value => {
+      if (!value || typeof value !== 'object') return false
+      const row = value as SlashCommandRow
+      return row.id === member.commandId && row.user_id === userId && row.type === 'skill' && row.skill_id === member.skillId
+    })
+    return !command
+  })) {
+    throw new AgentPluginError('SYSTEM_SKILLS_UNAVAILABLE',
+      'Built-in skills and their saved access are not ready. No default access was assumed.', 503)
+  }
+}
+
+/** Explicit startup/sign-in/confirmed-restore owner; failures retain their original custody. */
+export async function initializeSystemSlashCommandsForUser(userId: string): Promise<void> {
+  await ensureSystemSlashCommands(userId)
+  const plugins = await listAgentPlugins(userId, { readOnly: true })
+  const plugin = plugins.find(row => row.id === 'batshit' && row.builtIn)
+  const keys = (plugin?.skills ?? []).map(member => `slash_command:${userId}:${member.commandId}`)
+  const commands = await Promise.all(keys.map(key => redis.json.get(key) as Promise<SlashCommandRow | null>))
+  assertBuiltinCommandCatalogue(userId, plugins, new Map(keys.flatMap((key, index) =>
+    commands[index] === null ? [] : [[key, commands[index]] as const])))
+  if (plugin!.skills.some(member => member.commandId === APP_ACTIONS_COMMAND_ID) &&
+      !commands.some(command => command && isCanonicalAppActionsCommand(command, userId))) {
+    throw new AgentPluginError('SYSTEM_SKILLS_UNAVAILABLE', 'Built-in App Actions metadata is not ready. Saved access was kept.', 503)
+  }
+  for (const member of plugin!.skills) {
+    const skill = await redis.json.get(`skill:${userId}:${member.skillId}`)
+    if (!skill || typeof skill !== 'object' || (skill as any).id !== member.skillId || (skill as any).user_id !== userId) {
+      throw new AgentPluginError('SYSTEM_SKILLS_UNAVAILABLE',
+        'Built-in skill metadata is not ready. Saved access was kept; no default access was assumed.', 503)
+    }
+  }
+}
+
+/** Startup blocks instance work until every indexed account has trustworthy built-in state. */
+export async function initializeSystemSlashCommandsAtStartup(): Promise<void> {
+  const users = await redis.execute(async client => {
+    const kind = await client.type('users:all')
+    if (kind !== 'none' && kind !== 'set') throw new Error('The saved account inventory is unreadable; built-in skills were not initialized.')
+    const members = await client.sMembers('users:all')
+    if (members.some(id => !isExactSavedAccessAgentId(id))) throw new Error('The saved account inventory is malformed; built-in skills were not initialized.')
+    for (const id of members) {
+      const account = await client.json.get(`user:${id}:data`) as Record<string, unknown> | null
+      if (!account || account.id !== id) throw new Error('The saved account inventory changed; built-in skills were not initialized.')
+    }
+    return members
+  })
+  for (const userId of users) await initializeSystemSlashCommandsForUser(userId)
 }

@@ -207,6 +207,7 @@ services:
         required: false
     environment:
       NODE_ENV: production
+      BATSHIT_CONTAINERIZED: "1"
       BATSHIT_SERVER_HOST: 0.0.0.0
       PORT: 5600
       REDIS_URL: redis://redis:6379/0
@@ -268,13 +269,14 @@ services:
     # exited helper stays `STAT Z` indefinitely, with init it is gone from the table.
     # This is container process hygiene, not a substitute for the helper's own shutdown rule.
     init: true
+    stop_grace_period: 45s
     env_file:
       - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
     environment:
       NODE_ENV: production
       BATSHIT_CONTAINERIZED: "1"
-      BATSHIT_APP_VERSION: ${BATSHIT_APP_VERSION:-0.1.0-alpha.3}
+      BATSHIT_APP_VERSION: ${BATSHIT_APP_VERSION:-0.1.0-alpha.4}
       BATSHIT_APP_CHANNEL: ${BATSHIT_APP_CHANNEL:-alpha}
       BATSHIT_UPDATE_CHECK_DISABLED: ${BATSHIT_UPDATE_CHECK_DISABLED:-0}
       BATSHIT_UPDATE_FEED_URL: ${BATSHIT_UPDATE_FEED_URL:-}
@@ -284,6 +286,12 @@ services:
       BATSHIT_SESSION_COOKIE_NAME: ${BATSHIT_SESSION_COOKIE_NAME:-batshit_session_docker}
       HOST: 0.0.0.0
       PORT: 3000
+      # The plan owner has a 30-second reporting/drain deadline. The HTTP server
+      # and container must not force exit before that owner can settle.
+      SHUTDOWN_TIMEOUT: "40"
+      BATSHIT_CHATGPT_PLAN_DEPLOYMENT: local-docker
+      BATSHIT_CHATGPT_PLAN_BIND_HOST: ${BATSHIT_DOCKER_BIND_HOST:-127.0.0.1}
+      BATSHIT_CHATGPT_PLAN_PUBLISHED_PORT: ${BATSHIT_DOCKER_APP_PORT:-5620}
       BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-1G}
       ORIGIN: ${ORIGIN:-http://localhost:5620}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:5620}
@@ -308,7 +316,6 @@ services:
       PUBLIC_BATSHIT_SERVER_URL: ${PUBLIC_BATSHIT_SERVER_URL:-http://localhost:5600}
       PUBLIC_BATSHIT_SERVER_API_URL: ${PUBLIC_BATSHIT_SERVER_API_URL:-http://localhost:5600/api/v1}
       BATSHIT_ARTIFACT_COMPLETE_URL: ${BATSHIT_ARTIFACT_COMPLETE_URL:-http://app:3000/api/artifacts/complete}
-      BATSHIT_N8N_CALLBACK_BASE_URL: ${BATSHIT_N8N_CALLBACK_BASE_URL:-http://app:3000}
       BATSHIT_CLOUDFLARED_TARGET_URL: ${BATSHIT_CLOUDFLARED_TARGET_URL:-http://batshit-server:5600}
       BATSHIT_CLOUDFLARED_DOCKER_STATE_PATH: /runtime/cloudflared/status.json
       BATSHIT_FBX2VRMA_WORKER_URL: ${BATSHIT_FBX2VRMA_WORKER_URL:-http://fbx2vrma-worker:8079}
@@ -351,10 +358,11 @@ services:
       - batshit_backup_restore_staging:/data/backup-restore-staging
       - batshit_logs:/data/logs
       - ${BATSHIT_WORKSPACE_MOUNT:-batshit_workspace}:/workspace
-      - batshit_codex_home:/root/.codex
       - batshit_agent_runtime:/root/.batshit
       - batshit_agent_runtime:/home/batshit-cli/.batshit
       - batshit_runtime_state:/runtime
+      # App-only custody. Never mount this in helper/operator/CLI containers.
+      - batshit_chatgpt_plan:/var/lib/batshit-plan
     healthcheck:
       test:
         [
@@ -708,9 +716,9 @@ volumes:
   batshit_backup_restore_staging:
   batshit_logs:
   batshit_workspace:
-  batshit_codex_home:
   batshit_agent_runtime:
   batshit_runtime_state:
+  batshit_chatgpt_plan:
   batshit_fbx2vrma_work:
   batshit_audio2face_cache:
   batshit_agent_browser_data:

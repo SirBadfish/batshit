@@ -12,6 +12,7 @@ import {
 import { detectToolSource } from "./toolSourceDetector";
 import { extractManagedPatchFromSources } from "./editDiff";
 import { countTextLines } from "./writePreview";
+import { typedFileChangeOutcome, typedFileFactsFields } from "./typedFileFacts";
 import { logger } from '$lib/utils/logger'
 import type { IntermediateStep, ToolProvider, ToolSource } from './toolStepTypes'
 import { unwrapDynamicMcpUsePayload } from './toolPayloadUnwrap'
@@ -20,6 +21,8 @@ import {
   failedCommandExitCode,
   failedCommandOutput,
   joinListingSectionPath,
+  managedPatchLeftChangedFields,
+  shellCommandCutFields,
   outputCutFields,
   shellActionCommand,
   shellCommandFailed,
@@ -121,6 +124,7 @@ function extractExplicitNonSubagentOperationKind(step: IntermediateStep, args: a
     case "artifact":
       return "artifact_use"
     case "fabric":
+    case "batshit":
       return "fabric_use"
     case "mcp":
       return "dynamic_use"
@@ -1300,6 +1304,8 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
   }
 
   failureDetails = failureDetails ?? getToolFailureDetails(result);
+  // SA-136: an applied typed write or edit is not a failed step (see `toolStepFailureMessage`).
+  if (failureDetails && typedFileChangeOutcome(result) === "applied") failureDetails = null;
   // A search that matched nothing is not a failed tool (`toolStepFoundNothing`).
   if (failureDetails && toolStepFoundNothing(canonical, args, result)) {
     failureDetails = null;
@@ -1313,7 +1319,7 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
   // A command whose RESULT is shaped like a file action (a list of files, a diff, content beside a
   // path) is remapped before shaping. Its command TEXT is never read here (BL-233): every lane
   // already classified the command once, with the shared mapper (`mapBashCommandToRendererTool`,
-  // the API lane in send-routed and the Codex and Claude adapters), and a step still named a
+  // the API lane in send-routed and the Claude adapter), and a step still named a
   // command is one the mapper called a command. A second reading of the text disagreed with it:
   // `npm test 2>&1 | tail -12 && node src/cli.js` was stored as a Read File of `src/cli.js`, and
   // `cat notes.md; exit 3` as a read, while the Execution Viewer and Plan mode said Bash.
@@ -1322,7 +1328,7 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
       Array.isArray((result as any)?.files) ||
       Array.isArray((result as any)?.items) ||
       Array.isArray(result as any);
-    // A diff is text. Codex reports a native patch's targets as a `changes` LIST, and reading
+    // A diff is text. Saved Codex steps report a native patch's targets as a `changes` LIST, and reading
     // that as a diff turned every delete, rename, and move into an Edit File card whose "diff"
     // was the JSON of those objects (F-P6-5 follow-up item 4).
     const hasDiff = [
@@ -1408,6 +1414,8 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
             ? countTextLines(content)
             : undefined,
         ...(exitCode !== undefined ? { exitCode } : {}),
+        // SA-136: a typed read keeps its frozen block (the range shown and the file's total).
+        ...typedFileFactsFields(result),
       };
       clone.toolArgs = { ...args, filePath };
       break;
@@ -1444,6 +1452,8 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
         filePath,
         language,
         ...shellFailureResultFields(result, command, failed),
+        ...shellCommandCutFields(result, command),
+        ...typedFileFactsFields(result),
       };
       clone.toolArgs = { ...args, filePath };
       break;
@@ -1461,8 +1471,8 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
       const command = shellActionCommand(args, result);
       const failed = shellCommandFailed(result, command);
       // A failed edit keeps only a patch or diff the command meant to apply, never what it
-      // printed and never Codex's `changes` list (F-P6-5).
-      // `changes` counts only as diff TEXT: Codex's list of changed paths is not a diff (item 4).
+      // printed and never a saved Codex step's `changes` list (F-P6-5).
+      // `changes` counts only as diff TEXT: a list of changed paths is not a diff (item 4).
       const changesText = (value: unknown) =>
         typeof value === "string" && value.length > 0 ? value : undefined;
       const diffCandidate = failed
@@ -1510,6 +1520,9 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
         language: result?.language || detectLanguage(filePath),
         ...(failureDetails ?? {}),
         ...shellFailureResultFields(result, command, failed),
+        ...managedPatchLeftChangedFields(result),
+        ...shellCommandCutFields(result, command),
+        ...typedFileFactsFields(result),
       };
       clone.toolArgs = { ...args, filePath };
       break;
@@ -1762,8 +1775,8 @@ function namedFailureReason(record: Record<string, any>): string | undefined {
  *   out. `status` is a failure signal ONLY on a delegated-run payload (SA-111): ordinary tools
  *   report the status of their SUBJECT (a CI run, a deployment, a queued job), not of the call,
  *   while `/api/subagents/managed-execute` returns `success: true` with the run's own `status`;
- * - a shell command that exited non-zero. Codex and Claude report that as an exit code with no
- *   `success: false`, so a failed Codex command was a Success row. A command stored as a file
+ * - a shell command that exited non-zero. Claude (and saved Codex steps) report that as an exit
+ *   code with no `success: false`, so a failed command was a Success row. A command stored as a file
  *   action reads its exit code by the zip's rule (`failedCommandExitCode`: exit 1 from a search is
  *   an answer); a bash command, like the API lane's own bash, fails on any non-zero exit. An exit
  *   code on any other tool is its subject's, not a failure of the call.
@@ -1772,13 +1785,24 @@ function namedFailureReason(record: Record<string, any>): string | undefined {
 export function toolStepFailureMessage(toolName: string | undefined, args: unknown, result: unknown): string | undefined {
   const record = plainRecord(toolStepFailureSource(toolName, args, result));
   if (!record) return undefined;
+  // SA-136: a typed write or edit that renamed its file is applied, even when a Stop ended the
+  // reply before the call returned (its record then says stopped with no result, BL-1978's path).
+  if (typedFileChangeOutcome(record) === "applied") return undefined;
   const isDelegatedRun = record.kind === "subagent" || record.kind === "worker";
   if (
     record.success === false ||
     record.blocked === true ||
     (isDelegatedRun && (record.status === "failed" || record.status === "timed_out"))
   ) {
-    return namedFailureReason(record) ?? toolFailureFallbackMessage(record);
+    const message = namedFailureReason(record) ?? toolFailureFallbackMessage(record);
+    // SA-126 item 2: a managed patch that applied, then a command after it failed, stopped or
+    // never started: the call's one step (the Execution Viewer row, the saved step list) says
+    // the patch applied. The zip adapter stores the two parts with their own errors.
+    const patch = plainRecord(record.managedApplyPatch);
+    if (patch?.applied === true && plainRecord(patch.afterPatch)) {
+      return `The patch applied; ${message.charAt(0).toLowerCase()}${message.slice(1)}`;
+    }
+    return message;
   }
   const canonical = canonicalToolName(toolName);
   const exitCode = MAPPED_SHELL_FILE_LANES.has(canonical)

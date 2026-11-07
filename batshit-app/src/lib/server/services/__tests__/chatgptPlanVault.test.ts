@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, readFileSync, realpathSync, rmSync, chmodSync, symlinkSync, unlinkSync, linkSync } from 'node:fs'
+import { mkdtempSync, readFileSync, realpathSync, rmSync, chmodSync, symlinkSync, unlinkSync, linkSync, statSync, writeFileSync, existsSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { pathToFileURL } from 'node:url'
+import { DatabaseSync } from 'node:sqlite'
 import path from 'node:path'
 import os from 'node:os'
 import { ChatgptPlanVault, type PlanTokens } from '../chatgptPlanVault'
@@ -79,5 +83,73 @@ describe('ChatGPT host-local vault', () => {
     unlinkSync(hardlink)
     const link = folder + '-link'; symlinkSync(folder, link)
     try { expect(() => open(link)).toThrow(/must not use links/) } finally { unlinkSync(link) }
+  })
+  it('owns a private Docker key exclusively, persists it across restart, and refuses a second actual process', () => {
+    const folder = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'sa130-private-key-'))); folders.push(folder)
+    const vault = new ChatgptPlanVault(folder, { privateKeyFile: true }); vaults.push(vault)
+    const row = vault.connect(identity, tokens, vault.beginAuthorization(identity.userId)), hostId = vault.hostId
+    const keyPath = path.join(folder, 'vault.key'), digest = () => createHash('sha256').update(readFileSync(keyPath)).digest('hex')
+    const before = digest()
+    expect(statSync(keyPath).mode & 0o777).toBe(0o600); expect(statSync(keyPath).nlink).toBe(1)
+    const child = spawnSync(process.execPath, ['--experimental-transform-types', '--input-type=module', '-e',
+      `import { ChatgptPlanVault } from ${JSON.stringify(pathToFileURL(path.resolve('src/lib/server/services/chatgptPlanVault.ts')).href)};
+       try { new ChatgptPlanVault(process.argv[1], { privateKeyFile: true }); process.exitCode=2 }
+       catch (error) { process.exitCode=error.code==='vault_owner_busy'?0:3 }`, folder], { encoding: 'utf8', timeout: 10_000 })
+    expect(child.status, child.stderr).toBe(0); expect(digest()).toBe(before)
+    vault.close()
+    const next = new ChatgptPlanVault(folder, { privateKeyFile: true }); vaults.push(next)
+    expect(next.hostId).toBe(hostId); expect(digest()).toBe(before)
+    expect(next.tokens(identity.userId, row.id, next.binding(row))).toEqual(tokens)
+  })
+  it('never regenerates a lost private key or adopts unsafe/wrong key files; releases failed initialization ownership', () => {
+    const folder = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'sa130-private-key-refusal-'))); folders.push(folder)
+    const vault = new ChatgptPlanVault(folder, { privateKeyFile: true }); vaults.push(vault)
+    vault.connect(identity, tokens, vault.beginAuthorization(identity.userId)); vault.close()
+    const keyPath = path.join(folder, 'vault.key'), key = readFileSync(keyPath), before = readFileSync(path.join(folder, 'credentials.sqlite'))
+    const denied = () => expect(() => new ChatgptPlanVault(folder, { privateKeyFile: true })).toThrow()
+    chmodSync(keyPath, 0o644); denied(); chmodSync(keyPath, 0o600)
+    const alias = path.join(folder, 'key-alias'); linkSync(keyPath, alias); denied(); unlinkSync(alias)
+    unlinkSync(keyPath); denied(); expect(existsSync(keyPath)).toBe(false)
+    writeFileSync(keyPath, 'a'.repeat(64), { mode: 0o600 }); denied()
+    expect(readFileSync(path.join(folder, 'credentials.sqlite'))).toEqual(before)
+    unlinkSync(keyPath); symlinkSync(path.join(folder, 'credentials.sqlite'), keyPath); denied(); unlinkSync(keyPath)
+    writeFileSync(keyPath, key, { mode: 0o600 })
+    const reopened = new ChatgptPlanVault(folder, { privateKeyFile: true }); vaults.push(reopened)
+    expect(reopened.list(identity.userId)).toHaveLength(1)
+    const uncertain = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'sa130-uncertain-key-'))); folders.push(uncertain)
+    writeFileSync(path.join(uncertain, 'credentials.sqlite-journal'), 'synthetic existing sidecar', { mode: 0o600 })
+    expect(() => new ChatgptPlanVault(uncertain, { privateKeyFile: true })).toThrow(/missing/)
+    expect(existsSync(path.join(uncertain, 'vault.key'))).toBe(false)
+  })
+  it.each([false, true])('refuses a different private key with no retained ciphertext (disconnected=%s)', disconnected => {
+    const folder = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'sa130-empty-private-key-'))); folders.push(folder)
+    const vault = new ChatgptPlanVault(folder, { privateKeyFile: true }); vaults.push(vault)
+    if (disconnected) {
+      const row = vault.connect(identity, tokens, vault.beginAuthorization(identity.userId))
+      const removed = vault.disconnect(identity.userId, row.id); vault.finishRevocation(removed.registration, true)
+    }
+    vault.close()
+    writeFileSync(path.join(folder, 'vault.key'), 'b'.repeat(64), { mode: 0o600 })
+    expect(() => new ChatgptPlanVault(folder, { privateKeyFile: true })).toThrow(/does not match/)
+  })
+  it('refuses an existing Docker database without a verifier instead of adopting its supplied key', () => {
+    const folder = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'sa130-missing-verifier-'))); folders.push(folder)
+    const vault = new ChatgptPlanVault(folder, { privateKeyFile: true }); vaults.push(vault); vault.close()
+    const db = new DatabaseSync(path.join(folder, 'credentials.sqlite'))
+    try { db.prepare('DELETE FROM meta WHERE key=?').run('privateKeyVerifier') } finally { db.close() }
+    const before = readFileSync(path.join(folder, 'credentials.sqlite'))
+    expect(() => new ChatgptPlanVault(folder, { privateKeyFile: true })).toThrow(/does not match/)
+    expect(readFileSync(path.join(folder, 'credentials.sqlite'))).toEqual(before)
+  })
+  it('refuses a missing credential database after Docker key/owner persistence without inventing a new host', () => {
+    const folder = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'sa130-missing-private-db-'))); folders.push(folder)
+    const vault = new ChatgptPlanVault(folder, { privateKeyFile: true }); vaults.push(vault); vault.close()
+    const keyPath = path.join(folder, 'vault.key'), keyDigest = createHash('sha256').update(readFileSync(keyPath)).digest('hex')
+    const dbPath = path.join(folder, 'credentials.sqlite'); unlinkSync(dbPath)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(() => new ChatgptPlanVault(folder, { privateKeyFile: true })).toThrow(/incomplete/)
+      expect(existsSync(dbPath)).toBe(false)
+      expect(createHash('sha256').update(readFileSync(keyPath)).digest('hex')).toBe(keyDigest)
+    }
   })
 })

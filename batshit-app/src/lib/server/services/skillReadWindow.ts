@@ -11,10 +11,14 @@
  * helper's `native_skill` (`/api/skills/runtime`), the native-tools dispatch (n8n Workflow
  * Subagents), and the later-turn zip view of a kept-open reference.
  *
- * This module imports nothing on purpose: `nativeTools.test.ts` mocks the whole skill runtime
+ * This module imports no other Batshit service on purpose: `nativeTools.test.ts` mocks the whole skill runtime
  * service, so a helper living there would disappear from that test's view of `nativeTools.ts`.
  */
 
+import { createHash } from 'node:crypto'
+import { describeSkillReadVersion } from '$lib/utils/skillSessions'
+
+export const skillSourceSha256 = (text: string) => createHash('sha256').update(text).digest('hex')
 export type SkillReadAction = 'read' | 'script_read'
 
 export type SkillReadWindow = {
@@ -24,6 +28,7 @@ export type SkillReadWindow = {
   originalChars: number
   /** Where the window starts, in characters from the start of the file. */
   offset: number
+  sourceSha256: string
 }
 
 export function readSkillTextWindow(text: string, maxChars: number, offset = 0): SkillReadWindow {
@@ -36,7 +41,8 @@ export function readSkillTextWindow(text: string, maxChars: number, offset = 0):
     content,
     truncated: start + content.length < text.length,
     originalChars: text.length,
-    offset: start
+    offset: start,
+    sourceSha256: skillSourceSha256(text)
   }
 }
 
@@ -97,6 +103,7 @@ export function partialSkillReadFields(input: {
  * from before this rule has no sentence and keeps its old bare marker.
  */
 export function skillReadNoteLine(output: Record<string, unknown>): string {
-  if (typeof output.readMore === 'string' && output.readMore.trim()) return `[${output.readMore}]`
-  return output.contentTruncated === true ? '[truncated]' : ''
+  const readMore = typeof output.readMore === 'string' && output.readMore.trim() ? `[${output.readMore}]`
+    : output.contentTruncated === true ? '[truncated]' : ''
+  return [describeSkillReadVersion(output), readMore].filter(Boolean).join('\n')
 }

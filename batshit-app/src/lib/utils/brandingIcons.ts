@@ -47,8 +47,6 @@ const PROVIDER_SLUG_OVERRIDES: Record<string, BrandIconSlug | string> = {
   fal: 'fal-color',
   'fal-ai': 'fal-color',
   codex: 'codex-color',
-  'codex-cli': 'codex-color',
-  'openai-codex': 'codex-color',
   google: 'google-color',
   'google-gemini': 'gemini-color',
   googlegemini: 'gemini-color',
@@ -236,6 +234,8 @@ function applyThemeVariant(slug?: BrandIconSlug | null, theme?: ThemeMode) {
 }
 
 function resolveProviderIconSlug(providerId?: string | null, fallbackProviderId?: string | null) {
+  providerId = typeof providerId === 'string' ? providerId : null
+  fallbackProviderId = typeof fallbackProviderId === 'string' ? fallbackProviderId : null
   if (!providerId) {
     if (fallbackProviderId) {
       return resolveProviderIconSlug(fallbackProviderId, null)
@@ -343,7 +343,7 @@ export function getProviderIconEntry(
 }
 
 export function getProviderBackground(providerId: string) {
-  return providerBackgrounds[providerId]
+  return typeof providerId === 'string' ? providerBackgrounds[providerId] : undefined
 }
 
 export function needsDarkModeInvert(iconPath: string) {
@@ -370,12 +370,13 @@ export function getModelProviderIcons(
     theme,
     fallbackProviderId
   )
+  const backgroundColor = getProviderBackground(providerId)
 
   return {
     modelIcon: modelEntry.icon,
     providerIcon: providerEntry.icon,
-    needsBackground: !!providerBackgrounds[providerId],
-    backgroundColor: providerBackgrounds[providerId],
+    needsBackground: !!backgroundColor,
+    backgroundColor,
     modelMonochrome: modelEntry.monochrome,
     providerMonochrome: providerEntry.monochrome,
     modelBrandColor: modelEntry.brandColor,

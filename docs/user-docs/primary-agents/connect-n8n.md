@@ -1,15 +1,15 @@
 # Connect n8n
 
-Batshit is built to work with n8n as an automation and tool platform. `API` and `CLI` Primary Agents can call n8n workflows as ordinary tools or as specialist n8n Workflow Subagents.
+Batshit is built to work with n8n as an automation and tool platform. Primary Agents can call your n8n workflows as ordinary tools, and an n8n workflow can call Batshit to wake an agent.
+
+n8n is not a kind of agent. Primary Agents and Subagents run on the saved model you pick. A saved n8n Workflow Subagent no longer runs or appears in Settings, and Batshit does not convert it. Your n8n workflows themselves are untouched. Publish one as a tool, or recreate the specialist as a [Subagent](../subagents/overview.md).
 
 ## The two n8n uses
 
 | Use | What it means | Batshit setup |
 | --- | --- | --- |
 | n8n workflow tool | A Primary Agent calls a published workflow for a focused action. | Add the workflow through Batshit's n8n/MCP tooling and enable it for the agent. |
-| n8n Workflow Subagent | A Primary Agent delegates a task to a separate workflow that has its own model, prompt, and tools. | Create an `n8n Workflow Subagent`, paste its production webhook URL, and assign it to an `API` or `CLI` Primary Agent. |
-
-n8n is not a Primary Agent type. Batshit Primary Agents are `API` and `CLI`.
+| n8n wakes a Batshit agent | A workflow calls Batshit and starts a chat for one agent when something happens outside Batshit. | Create a [wake-up webhook](agent-dms-and-wake-ups.md#wake-up-webhooks), then use the official wake-up template or your own HTTP Request node. |
 
 ## Choose existing or the optional Docker n8n profile
 
@@ -21,7 +21,7 @@ n8n is not a Primary Agent type. Batshit Primary Agents are `API` and `CLI`.
 
 The Docker n8n profile is opt-in. Existing self-hosted n8n is first-class.
 
-## Official Workflow Subagent templates
+## Official template
 
 The official template source lives at:
 
@@ -29,65 +29,11 @@ The official template source lives at:
 docs/user-docs/user-templates/batshit-official-n8n-workflow-templates/
 ```
 
-The supported templates are:
-
-- `batshit-n8n-workflow-subagent.json`
-- `batshit-docker-n8n-workflow-subagent.json`
-
-Use the first template for a host/local n8n instance. Use the Docker version when n8n runs in Batshit's optional Docker profile.
-
-## What an n8n Workflow Subagent needs
-
-- The matching official Workflow Subagent template imported into n8n.
-- Provider credentials and a model node configured in n8n.
-- A production webhook URL pasted into the Batshit Subagent.
-- The workflow activated in n8n.
-- The official Batshit Subagent Tools HTTP Request Tool node if the workflow needs Batshit tools.
-- A parent `API` or `CLI` Primary Agent assignment.
-
-## Native tool authentication
-
-Current official Workflow Subagent templates do not need a saved Batshit Header Auth credential. Batshit sends a short-lived, per-message native-tool token in the webhook payload, and the workflow forwards it with this dynamic header:
-
-| Header name | Header value expression |
-| --- | --- |
-| `x-batshit-native-tool-token` | `{{$json.body.batshit_native_tool_token}}` |
-
-The workflow also forwards the parent agent ID, Subagent ID, session ID, message ID, and the caller's Primary Agent type. Those fields keep tool permissions scoped to the exact parent/Subagent call.
+It holds one template, `batshit-n8n-wake-agent-on-schedule.json`, which has n8n wake a Batshit agent on a timer. [Templates](../reference/templates.md#wake-an-agent-on-a-schedule-with-n8n) explains how to set it up. For a trigger that is only time, Batshit's built-in Schedules need no n8n at all.
 
 ## Create provider credentials in n8n
 
-Provider credentials for n8n workflows belong in n8n—for example an OpenAI, Anthropic, OpenRouter, or Vercel AI Gateway credential. Batshit Settings → API Keys does not copy provider keys into n8n.
-
-## Configure Redis memory if the template uses it
-
-Use a Redis host the n8n process can reach:
-
-| n8n location | Redis host guidance |
-| --- | --- |
-| Local n8n on the same host as Mac app Batshit | `localhost`, port `5639` |
-| Local n8n on the same host as source-checkout Batshit | `localhost`, port `6379` |
-| Optional Docker n8n profile | `redis`, port `6379` |
-| Existing host n8n connected to Docker Batshit | A Redis reachable from that host n8n, or adjust the workflow memory path intentionally |
-
-Docker Batshit's Redis is internal-only by default. Do not assume an external host n8n can reach the Docker `redis` service unless you deliberately expose or route it.
-
-Keep `subagent_thread_id` in the template's Redis Chat Memory session key and retain the seven-day expiry. Batshit changes that id for a fresh Subagent call and reuses it for a resumed call. If you already imported an older template, update that node or re-import the current template; upgrading Batshit does not update workflows inside n8n. See the [conversation-thread setup](../resources/n8n-workflow-templates.md#conversation-threads).
-
-## Import the Workflow Subagent template
-
-In n8n:
-
-1. Open Workflows.
-2. Import from file.
-3. Choose `batshit-n8n-workflow-subagent.json`, or the Docker version for the optional Docker n8n profile.
-4. Configure missing provider and Redis credentials.
-5. Confirm the Batshit Subagent Tools URL matches the caller. The template prefers the Batshit URL sent in the webhook payload, then `BATSHIT_FRONTEND_URL` from the n8n environment, then `http://127.0.0.1:5620`.
-6. Configure the model node.
-7. Save and activate the workflow.
-8. Copy the Production webhook URL.
-
-Use the production webhook URL, not a temporary test URL.
+Provider credentials for n8n workflows belong in n8n, for example an OpenAI, Anthropic, OpenRouter, or Vercel AI Gateway credential. Batshit Settings → API Keys does not copy provider keys into n8n.
 
 ## URL rules
 
@@ -99,7 +45,7 @@ Use the URL from the point of view of the service making the request.
 | --- | --- |
 | Batshit app | `http://127.0.0.1:5620` |
 | n8n browser/editor | `http://localhost:5678` |
-| n8n calls Batshit native tool dispatch | `http://127.0.0.1:5620/api/native-tools/dispatch` |
+| n8n calls a Batshit wake-up webhook | `http://127.0.0.1:5620/api/wake/<webhook id>` |
 | batshit-server | `http://localhost:5600` |
 
 Prefer `127.0.0.1` for Mac app server-to-server calls. This avoids cases where Node/n8n resolves `localhost` to IPv6 while the packaged app listens on IPv4 loopback.
@@ -121,7 +67,7 @@ If you override `BATSHIT_FRONTEND_HOST`, also set `N8N_BATSHIT_FRONTEND_URL` to 
 | Browser opens Batshit | `http://localhost:5620` |
 | Browser opens n8n | `http://localhost:5678` |
 | n8n container calls Batshit app | `http://app:3000` |
-| n8n container calls native tool dispatch | `http://app:3000/api/native-tools/dispatch` |
+| n8n container calls a wake-up webhook | `http://app:3000/api/wake/<webhook id>` |
 | App container calls n8n API | `http://n8n:5678` |
 
 Batshit's Docker n8n profile sets `BATSHIT_FRONTEND_URL=http://app:3000`. Keep `N8N_EDITOR_BASE_URL`, `WEBHOOK_URL`, and `N8N_WEBHOOK_URL` browser-facing.
@@ -137,38 +83,17 @@ Batshit's Docker n8n profile sets `BATSHIT_FRONTEND_URL=http://app:3000`. Keep `
 
 If your n8n runs in a separate container stack, use the URL reachable from that container.
 
-## Connect the Workflow Subagent in Batshit
-
-1. Open Settings → Agents.
-2. Create a Subagent.
-3. Choose `n8n Workflow Subagent`.
-4. Paste the production webhook URL.
-5. Choose the model preset that represents the workflow's model node.
-6. Save the Subagent.
-7. Assign it to an `API` or `CLI` Primary Agent.
-8. Ask the Primary Agent to delegate a small test task.
-
-Saving an n8n Workflow Subagent refreshes Batshit's local n8n parameter-compatibility snapshot. Opening its model card refreshes a stale snapshot at most once per day, and the model card has a manual refresh button. A sync failure appears on that surface; it does not silently hide the problem.
-
 ## Use n8n workflows as tools
 
-Use a workflow tool when the operation has a clear input/output contract and does not need a separate specialist conversation. Publish the workflow through your configured n8n/MCP integration, enable it in the Primary Agent's Tool Grid, and use Batshit Tool Search/Use to discover it on demand.
+Use a workflow tool when the operation has a clear input/output contract. Publish the workflow through your configured n8n/MCP integration, enable it in the Primary Agent's Tool Grid, and use Batshit Tool Search/Use to discover it on demand.
 
-Use an n8n Workflow Subagent when the workflow should have its own system prompt, model, memory, or collection of tools.
+If you want a specialist with its own system prompt, model, memory, or collection of tools, create a Subagent instead. See [Subagents](../subagents/overview.md).
 
 ## Optional n8n API key in Batshit
 
-Batshit can store an n8n API key in Settings → API Keys for workflow discovery, model-node compatibility refresh, and other Batshit-side n8n API integrations. This key is separate from provider credentials stored inside n8n.
+Batshit can store an n8n API key in Settings → API Keys for workflow discovery and other Batshit-side n8n API integrations. This key is separate from provider credentials stored inside n8n.
 
 ## Troubleshooting
-
-### Workflow Subagent does not answer
-
-Check that the workflow is active, the Batshit Subagent uses the Production webhook URL, the workflow was imported from the current Workflow Subagent template, and its provider/model credentials work.
-
-### Batshit Subagent Tools returns an authentication error
-
-Check that the node sends `x-batshit-native-tool-token`, the value reads `batshit_native_tool_token` from the webhook payload, and the template still forwards `parent_agent_id`.
 
 ### Docker URL works in a browser but fails in the workflow
 
@@ -182,4 +107,4 @@ Create the provider credential in n8n. Batshit API Keys do not appear inside n8n
 
 Use the sanitized Batshit templates when possible. Raw exports from another n8n instance can carry source credential IDs, owner metadata, and old local URLs.
 
-Next: [n8n workflow templates](../resources/n8n-workflow-templates.md)
+Next: [Templates](../reference/templates.md)

@@ -1,4 +1,5 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
+import { deleteGoonUploadAssetDisposition } from '$lib/server/services/goonAssetCleanupService'
 import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerUrl,
@@ -44,20 +45,17 @@ export const DELETE: RequestHandler = async ({ request, locals }) => {
 
   const body = await request.json().catch(() => ({}))
   const filename = typeof body?.filename === 'string' ? body.filename : ''
-  if (!filename) {
+  if (!filename || /[/\\\0]/.test(filename)) {
     return json({ error: 'Filename is required' }, { status: 400 })
   }
 
-  const response = await fetch(`${getInternalBatshitServerUrl()}/api/upload/goon-closet`, {
-    method: 'DELETE',
-    headers: { 'Content-Type': 'application/json', ...getInternalBatshitServerAuthHeaders() },
-    body: JSON.stringify({ filename })
-  })
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => '')
-    return json({ error: text || 'Closet delete failed' }, { status: response.status })
+  try {
+    // The app owns reservation and fresh borrower audit. A browser-supplied
+    // token or upload type is never authority for physical file deletion.
+    const disposition = await deleteGoonUploadAssetDisposition('goon_closet', filename)
+    return json({ success: true, disposition, deleted: disposition === 'deleted',
+      retained: disposition === 'retained', missing: disposition === 'missing' })
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : 'Closet delete failed' }, { status: 500 })
   }
-
-  return json({ success: true })
 }

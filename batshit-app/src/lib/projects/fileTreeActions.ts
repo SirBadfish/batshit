@@ -27,6 +27,54 @@ let mentionIndexSeq = 0
 // Directories with an in-flight children fetch (project-relative paths).
 const expandInFlight = new Set<string>()
 
+/**
+ * Whether a load started for `project` may still change the shown tree: the same project id AND
+ * the same root folder. BL-2373: the Default Project keeps its id when the Default Project Path
+ * changes (and a saved project keeps its id when its Root Path is edited), so an answer for the
+ * old folder that lands after the change must be dropped, never shown as the new folder's files.
+ */
+function isStillShown(project: Project): boolean {
+  const current = projectStore.getCurrentProject()
+  return current?.id === project.id && current.root_path === project.root_path
+}
+
+/**
+ * BL-2373 review A4: the Default Project is built from a free-text setting and is shown for every
+ * agent on Default, so its background @ mention walk never starts by itself over a filesystem
+ * root, a disk, a system folder or a home folder. Its top level still lists, and folders still
+ * open on expand. Saved projects keep their walk: the user created each one for its folder.
+ *
+ * The path is resolved first (`.`, `..`, repeated and trailing slashes) and matched without
+ * case (macOS volumes are case-insensitive by default). The macOS data volume
+ * (`/System/Volumes/Data`) shows the same tree as `/`, so it is read as `/`. Broad means: `/`;
+ * `/Users`, `/home`, `/Volumes`, `/media`, `/mnt`, `/private` and one name under each (a home
+ * folder, a mounted disk such as WSL's `/mnt/c`, `/private/tmp`); and `/root`, `/var/root`. Never
+ * a folder inside them, such as `/Users/tester/project`.
+ */
+export const BROAD_DEFAULT_PROJECT_INDEX_NOTE =
+  'Not indexed for @ mentions: the Default Project is a whole disk or home folder. Set its Root Path to a folder inside it to use @ mentions.'
+
+const BROAD_TOP_FOLDERS = new Set(['users', 'home', 'volumes', 'media', 'mnt', 'private'])
+
+function resolvedPathParts(rootPath: string): string[] {
+  const parts: string[] = []
+  for (const part of rootPath.trim().replace(/\\/g, '/').split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') parts.pop()
+    else parts.push(part.toLowerCase())
+  }
+  return parts
+}
+
+export function isBroadFolder(rootPath: string): boolean {
+  let parts = resolvedPathParts(rootPath)
+  if (parts[0] === 'system' && parts[1] === 'volumes' && parts[2] === 'data') parts = parts.slice(3)
+  if (parts.length === 0) return true
+  const joined = parts.join('/')
+  if (joined === 'root' || joined === 'var/root' || joined === 'private/var/root') return true
+  return parts.length <= 2 && BROAD_TOP_FOLDERS.has(parts[0])
+}
+
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback
 }
@@ -65,7 +113,7 @@ export async function refreshProjectTree(
     (a, b) => a.split('/').length - b.split('/').length
   )
   for (const path of sortedPaths) {
-    if (projectStore.getCurrentProjectId() !== project.id) return
+    if (!isStillShown(project)) return
     if (!projectStore.findTreeNode(path)) continue // directory no longer exists
     await expandDirectory(path)
   }
@@ -89,7 +137,7 @@ async function loadRootLevel(
       '',
       project.custom_exclusions || []
     )
-    if (seq !== treeLoadSeq || projectStore.getCurrentProjectId() !== project.id) {
+    if (seq !== treeLoadSeq || !isStillShown(project)) {
       return false
     }
 
@@ -102,11 +150,16 @@ async function loadRootLevel(
     }
 
     // Background @ mention index hydration — intentionally not awaited so the
-    // tree stays interactive while the full walk runs.
-    void hydrateMentionIndex(project)
+    // tree stays interactive while the full walk runs. Never by itself for a Default Project
+    // whose folder is a whole disk or a home folder (`isBroadFolder`).
+    if (project.is_default_project && isBroadFolder(project.root_path)) {
+      projectStore.setMentionIndexError(BROAD_DEFAULT_PROJECT_INDEX_NOTE)
+    } else {
+      void hydrateMentionIndex(project)
+    }
     return true
   } catch (error) {
-    if (seq !== treeLoadSeq || projectStore.getCurrentProjectId() !== project.id) {
+    if (seq !== treeLoadSeq || !isStillShown(project)) {
       return false
     }
     console.error('Error loading file tree:', error)
@@ -150,14 +203,14 @@ export async function expandDirectory(path: string): Promise<void> {
       path,
       project.custom_exclusions || []
     )
-    if (projectStore.getCurrentProjectId() !== project.id) return
+    if (!isStillShown(project)) return
 
     projectStore.setDirectoryChildren(path, result.children)
     if (result.truncated) {
       toast.warning(truncationWarning(result.totalBeforeTruncation))
     }
   } catch (error) {
-    if (projectStore.getCurrentProjectId() !== project.id) return
+    if (!isStillShown(project)) return
     console.error(`[fileTreeActions] Failed to load folder "${path}":`, error)
     // FileTreeService throws classified errors with user-safe messages
     projectStore.setDirectoryError(path, errorMessage(error, 'Failed to load folder'))
@@ -181,7 +234,7 @@ export async function hydrateMentionIndex(project: Project): Promise<void> {
       project.max_depth || 10,
       project.custom_exclusions || []
     )
-    if (seq !== mentionIndexSeq || projectStore.getCurrentProjectId() !== project.id) {
+    if (seq !== mentionIndexSeq || !isStillShown(project)) {
       return
     }
 
@@ -192,7 +245,7 @@ export async function hydrateMentionIndex(project: Project): Promise<void> {
       )
     }
   } catch (error) {
-    if (seq !== mentionIndexSeq || projectStore.getCurrentProjectId() !== project.id) {
+    if (seq !== mentionIndexSeq || !isStillShown(project)) {
       return
     }
     console.error('[fileTreeActions] @ mention index hydration failed:', error)

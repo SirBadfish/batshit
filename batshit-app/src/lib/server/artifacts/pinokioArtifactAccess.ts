@@ -8,7 +8,7 @@
  */
 
 import { ArtifactsService, type ArtifactRecord } from '$lib/server/artifacts/artifactsService'
-import { readPinokioArtifactBinding, type PinokioArtifactBinding } from '$lib/artifacts/pinokioArtifact'
+import { PINOKIO_APP_BRAIN_TYPE, readPinokioArtifactBinding, type PinokioArtifactBinding } from '$lib/artifacts/pinokioArtifact'
 
 export type PinokioArtifactAccess =
   | { ok: true; artifact: ArtifactRecord; binding: PinokioArtifactBinding }
@@ -27,12 +27,12 @@ export async function loadPinokioArtifactForUser(
     return { ok: false, status: 404, code: 'artifact_not_found', message: 'Artifact not found.' }
   }
   const binding = readPinokioArtifactBinding(artifact)
-  if (!binding) {
+  if (!binding || artifact.brain_type !== PINOKIO_APP_BRAIN_TYPE) {
     return {
       ok: false,
       status: 400,
       code: 'not_a_pinokio_artifact',
-      message: 'This artifact is not a Pinokio app artifact (metadata.runtime_manager "pinokio" with a pinokio_app_id).'
+      message: 'This artifact has no valid Pinokio app power source and saved app/computer binding.'
     }
   }
   return { ok: true, artifact, binding }

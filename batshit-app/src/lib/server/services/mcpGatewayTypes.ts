@@ -16,4 +16,7 @@ export interface GatewayMetadata {
 export interface ToolMetadataMap {
   tools: Record<string, Tool>
   metadata: Map<string, GatewayMetadata>
+  /** A failed registry/discovery read is not an authoritative empty tool set. */
+  unavailable?: boolean
+  gatewayAvailability?: Array<{ gatewayId: string; gatewayName: string; available: boolean }>
 }
