@@ -2,7 +2,7 @@
 import { readFile, readdir } from 'node:fs/promises'
 import path from 'node:path'
 import ts from 'typescript'
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 import { variables } from './env'
 
 const forwardedOwners = [
@@ -56,6 +56,15 @@ async function sources(directory: string): Promise<string[]> {
 }
 
 describe('the explicit Kit environment preserves supported runtime configuration', () => {
+  let sourcePartitions: string[][]
+  beforeAll(async () => {
+    const files = [...new Set([...await sources('src'), ...forwardedOwners])].sort()
+    // Keep every discovered/delegated owner, once, while each complete AST scan
+    // stays within the runner's existing per-case budget on supported CI hosts.
+    sourcePartitions = [0, 1, 2, 3].map(partition => files.filter((_, index) => index % 4 === partition))
+    expect(sourcePartitions.flat().sort()).toEqual(files)
+  })
+
   it('keeps all declared variables dynamic and optional without collapsing blank or zero', () => {
     for (const configuration of Object.values(variables)) {
       expect(configuration.static).toBe(false)
@@ -68,8 +77,9 @@ describe('the explicit Kit environment preserves supported runtime configuration
     ])
   })
 
-  it('covers imported, cast-wrapped, finite-computed and delegated environment readers', async () => {
-    const files = new Set([...await sources('src'), ...forwardedOwners])
+  it.each([0, 1, 2, 3])('covers imported, cast-wrapped, finite-computed and delegated environment readers (complete partition %i)', async partition => {
+    const files = sourcePartitions[partition]
+    expect(files.length).toBeGreaterThan(0)
     const required = new Map<string, string>()
     const excludedFromPrivate = new Set<string>()
     const unreviewed: string[] = []

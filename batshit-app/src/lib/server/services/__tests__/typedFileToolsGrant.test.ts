@@ -218,7 +218,8 @@ describe('the typed_file_tools grant on a Primary API agent', () => {
     expect(typedNames(await build(globalOn, root, { typedFileToolsEnabled: true, executionBackend: 'local' }))).toEqual([...TYPED_FILE_TOOL_NAMES])
   })
 
-  it('refuses typed admission in the unqualified app-container lane even with a saved grant', async () => {
+  it.each(['darwin', 'win32'] as const)('refuses typed admission in an unsupported %s app-container even with a saved grant', async platform => {
+    vi.spyOn(os, 'platform').mockReturnValue(platform)
     vi.stubEnv('BATSHIT_CONTAINERIZED', '1')
     const root = await project()
     const globalOn = await userWith(true)

@@ -314,6 +314,19 @@ describe('messageFormatter – code stays code beside structured tags (BL-475)',
     expect(segments[2].content).toBe('After.')
   })
 
+  it.each([
+    'https://example.com/chart"data-zip-id="address.png',
+    'https://example.com/chart.png?label=&amp;original=true'
+  ])('keeps a next-line image address as data without changing attributes: %s', src => {
+    const segments = parseMessageContent(`<img alt="Chart">\n${src}\nAfter.`, 'assistant')
+
+    expect(segments.map(segment => segment.type)).toEqual(['image', 'text'])
+    expect(segments[0].src).toBe(src)
+    expect(segments[0].alt).toBe('Chart')
+    expect(segments[0].zipId).toBeUndefined()
+    expect(segments[1].content).toBe('After.')
+  })
+
   it('keeps prose after a tag on the same line as prose in the second scan, not as indented code', () => {
     // The terminal's output opens a fence, so the second scan runs; the tag read there must not
     // leave blank room that turns the text after it into an indented code block.

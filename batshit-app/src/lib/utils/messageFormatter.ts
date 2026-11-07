@@ -531,13 +531,16 @@ function errorElementSource(content: string, element: StructuredElement & { open
 function readStructuredElement(content: string, element: StructuredElement): MessageSegment | null {
   const source =
     element.srcFromNextLine !== undefined && element.openEnd !== undefined
-      ? `${content.substring(element.start, element.openEnd - 1)} src="${element.srcFromNextLine}">`
+      ? content.substring(element.start, element.openEnd)
       : element.name === 'error' && element.openEnd !== undefined
         ? errorElementSource(content, { ...element, openEnd: element.openEnd })
         : content.substring(element.start, element.end)
   const $ = cheerio.load(`<root>${source}</root>`, CHEERIO_OPTIONS)
   const elem = $('root').find(element.name).first()
   if (elem.length === 0) return null
+  if (element.srcFromNextLine !== undefined && element.openEnd !== undefined) {
+    elem.attr('src', element.srcFromNextLine)
+  }
   const xmlSegment = readXmlElement($, elem.get(0), element.name)
   return xmlSegment ? toMessageSegment(xmlSegment) : null
 }

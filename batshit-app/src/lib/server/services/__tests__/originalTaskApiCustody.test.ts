@@ -60,11 +60,9 @@ vi.mock('../hostProcessIdentity', () => ({
 }))
 const epoch = 1_800_000_000_000
 const missing = () => Object.assign(new Error('synthetic missing'), { code: 'ENOENT' })
-const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!
 beforeEach(() => {
   vi.clearAllMocks()
   mock.closeSync.mockReset().mockImplementation((fd: number) => factoryOwners.actualCloseSync(fd))
-  Object.defineProperty(process, 'platform', { ...platformDescriptor, value: 'darwin' })
   vi.spyOn(Date, 'now').mockReturnValue(epoch)
   mock.realpath.mockImplementation(async value => value)
   mock.stat.mockResolvedValue({ isDirectory: () => true })
@@ -72,14 +70,12 @@ beforeEach(() => {
   mock.open.mockRejectedValue(missing())
   mock.lstatSync.mockImplementation(() => { throw missing() })
 })
-afterEach(() => { vi.restoreAllMocks(); Object.defineProperty(process, 'platform', platformDescriptor) })
+afterEach(() => { vi.restoreAllMocks() })
 
 describe('App Actions P5 original-task custody for API Primaries', () => {
-  const archDescriptor = Object.getOwnPropertyDescriptor(process, 'arch')!
   let root: string, previousRuntime: string | undefined, previousInstalls: string | undefined, previousRecords: string | undefined
   const disposals: Array<() => Promise<void>> = []
   beforeEach(async () => {
-    Object.defineProperty(process, 'arch', { ...archDescriptor, value: 'arm64' })
     root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'batshit-api-custody-')))
     previousRuntime = process.env.BATSHIT_AGENT_RUNTIME_ROOT
     previousInstalls = process.env.BATSHIT_MANAGED_INSTALLS_ROOT
@@ -113,7 +109,6 @@ describe('App Actions P5 original-task custody for API Primaries', () => {
     else process.env.BATSHIT_MANAGED_INSTALLS_ROOT = previousInstalls
     if (previousRecords === undefined) delete process.env.BATSHIT_COMMAND_RECORDS_DIR
     else process.env.BATSHIT_COMMAND_RECORDS_DIR = previousRecords
-    Object.defineProperty(process, 'arch', archDescriptor)
     factoryOwners.actualHome = ''
     await rm(root, { recursive: true, force: true })
   })

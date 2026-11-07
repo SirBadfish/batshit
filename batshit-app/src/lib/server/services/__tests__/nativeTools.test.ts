@@ -7673,6 +7673,19 @@ PATCH`
       binDir = await mkdtemp(path.join(os.tmpdir(), 'batshit-fake-sbx-bin-'))
       stateDir = await mkdtemp(path.join(os.tmpdir(), 'batshit-fake-sbx-state-'))
       workspace = await realpath(await mkdtemp(path.join(os.tmpdir(), 'batshit-sbx-workspace-')))
+      // The mocked Apple home adapter does not bootstrap real mount folders.
+      // Own them here instead of depending on the runner's existing ~/.batshit.
+      const fixtureHome = path.join(await realpath(stateDir), 'home')
+      await mkdir(fixtureHome)
+      vi.spyOn(os, 'homedir').mockReturnValue(fixtureHome)
+      const batshitHome = path.join(fixtureHome, '.batshit')
+      vi.stubEnv('BATSHIT_HOME_DIR', batshitHome)
+      vi.stubEnv('BATSHIT_AGENT_RUNTIME_ROOT', batshitHome)
+      vi.stubEnv('BATSHIT_MANAGED_INSTALLS_ROOT', path.join(batshitHome, 'installs'))
+      vi.stubEnv('BATSHIT_SANDBOX_PROTECTED_HOME_DIR', batshitHome)
+      vi.stubEnv('CODEX_HOME', path.join(fixtureHome, '.codex'))
+      vi.stubEnv('CLAUDE_CONFIG_DIR', path.join(fixtureHome, '.claude'))
+      await sandboxMounts.ensureBatshitHomeSandboxMountPaths(batshitHome)
       await writeFile(
         path.join(binDir, 'sbx'),
         `#!/bin/sh\nexec "${process.execPath}" "${FAKE_SBX}" "$@"\n`,
