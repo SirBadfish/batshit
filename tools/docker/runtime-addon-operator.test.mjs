@@ -454,13 +454,18 @@ async function voiceHost(t) {
     await rm(hostRoot, { recursive: true, force: true })
   })
   // An "engine" whose command line carries its install path, like a real one.
+  // Install once: another launch must not truncate a script the first is still loading.
+  const installed = new Map()
   const install = async (engineId) => {
+    if (installed.has(engineId)) return installed.get(engineId)
     const installRoot = path.join(hostRoot, 'installs', engineId)
     await mkdir(installRoot, { recursive: true })
     const command = path.join(installRoot, 'fake-voice-engine')
     await writeFile(command, `#!${process.execPath}\nsetInterval(() => {}, 1000)\n`)
     await chmod(command, 0o755)
-    return { installRoot, command }
+    const installation = { installRoot, command }
+    installed.set(engineId, installation)
+    return installation
   }
   return {
     hostRoot,
